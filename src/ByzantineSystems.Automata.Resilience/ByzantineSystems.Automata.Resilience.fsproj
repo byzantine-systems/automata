@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <GenerateDocumentationFile>true</GenerateDocumentationFile>
+        <IsPackable>true</IsPackable>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <Compile Include="Placeholder.fs" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\ByzantineSystems.Automata.Core\ByzantineSystems.Automata.Core.fsproj" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <PackageReference Include="Polly.Core" />
+    </ItemGroup>
+
+</Project>

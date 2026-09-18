@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <GenerateDocumentationFile>true</GenerateDocumentationFile>
+        <IsPackable>true</IsPackable>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <Compile Include="Placeholder.fs" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\ByzantineSystems.Automata.Core\ByzantineSystems.Automata.Core.fsproj" />
+        <ProjectReference Include="..\ByzantineSystems.Automata.Storage\ByzantineSystems.Automata.Storage.fsproj" />
+        <ProjectReference Include="..\ByzantineSystems.Automata.Resilience\ByzantineSystems.Automata.Resilience.fsproj" />
+    </ItemGroup>
+
+</Project>

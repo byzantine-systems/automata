@@ -1,0 +1,27 @@
+<Project>
+
+    <PropertyGroup>
+        <TargetFramework>net10.0</TargetFramework>
+        <LangVersion>latest</LangVersion>
+        <Deterministic>true</Deterministic>
+        <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+        <!-- Central package management: versions live in Directory.Packages.props only. -->
+        <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+        <CentralPackageTransitivePinningEnabled>true</CentralPackageTransitivePinningEnabled>
+    </PropertyGroup>
+
+    <!-- NuGet packaging metadata. Release versions come from git tags via `make pack`. -->
+    <PropertyGroup>
+        <Version>0.1.0</Version>
+        <Authors>ByzantineSystems</Authors>
+        <Company>ByzantineSystems</Company>
+        <Product>ByzantineSystems.Automata</Product>
+        <PackageLicenseExpression>BSD-3-Clause</PackageLicenseExpression>
+        <RepositoryUrl>https://github.com/byzantine-systems/automata</RepositoryUrl>
+        <RepositoryType>git</RepositoryType>
+        <PackageTags>fsharp;statechart;state-machine;hierarchical;polly;postgresql</PackageTags>
+        <IncludeSymbols>true</IncludeSymbols>
+        <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    </PropertyGroup>
+
+</Project>

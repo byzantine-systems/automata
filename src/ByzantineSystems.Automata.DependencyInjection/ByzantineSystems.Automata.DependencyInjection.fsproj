@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <GenerateDocumentationFile>true</GenerateDocumentationFile>
+        <IsPackable>true</IsPackable>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <Compile Include="Placeholder.fs" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\ByzantineSystems.Automata.Storage\ByzantineSystems.Automata.Storage.fsproj" />
+        <ProjectReference Include="..\ByzantineSystems.Automata.Storage.InMemory\ByzantineSystems.Automata.Storage.InMemory.fsproj" />
+        <ProjectReference Include="..\ByzantineSystems.Automata.Storage.Postgres\ByzantineSystems.Automata.Storage.Postgres.fsproj" />
+        <ProjectReference Include="..\ByzantineSystems.Automata.Resilience\ByzantineSystems.Automata.Resilience.fsproj" />
+        <ProjectReference Include="..\ByzantineSystems.Automata.Runtime\ByzantineSystems.Automata.Runtime.fsproj" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <PackageReference Include="Microsoft.Extensions.Hosting" />
+        <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
+        <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+        <PackageReference Include="Polly.Extensions" />
+    </ItemGroup>
+
+</Project>

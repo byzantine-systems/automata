@@ -1,0 +1,32 @@
+<Project>
+
+    <PropertyGroup>
+        <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <!-- F# runtime: pinned so transitive >=4.7.0 constraints (FSharp.SystemTextJson) cannot downgrade it -->
+        <PackageVersion Include="FSharp.Core" Version="10.1.401" />
+        <!-- Test -->
+        <PackageVersion Include="Expecto" Version="11.1.0" />
+        <PackageVersion Include="FsCheck" Version="3.4.0" />
+
+        <!-- Resilience (Polly v8) -->
+        <PackageVersion Include="Polly.Core" Version="8.8.0" />
+        <PackageVersion Include="Polly.Extensions" Version="8.8.0" />
+
+        <!-- Host integration -->
+        <PackageVersion Include="Microsoft.Extensions.Hosting" Version="10.0.0" />
+        <PackageVersion Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.0" />
+        <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.0" />
+
+        <!-- Persistence: raw Npgsql instead of Npgsql.FSharp (avoids the 8.x/9.x version skew) -->
+        <PackageVersion Include="Npgsql" Version="10.0.3" />
+        <PackageVersion Include="dbup-postgresql" Version="7.0.1" />
+        <PackageVersion Include="FSharp.SystemTextJson" Version="1.3.13" />
+
+        <!-- Optional, package-edge ergonomics only; never referenced by Core -->
+        <PackageVersion Include="FsToolkit.ErrorHandling" Version="5.1.0" />
+    </ItemGroup>
+
+</Project>

@@ -1,0 +1,56 @@
+name: "[.NET] Build & Test"
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - '.github/**'
+      - 'flake.nix'
+      - 'flake.lock'
+      - 'src/**'
+      - 'tests/**'
+      - 'samples/**'
+      - 'tools/**'
+      - 'Makefile'
+      - 'global.json'
+      - 'Directory.Build.props'
+      - 'Directory.Packages.props'
+      - 'nuget.config'
+  pull_request:
+    paths:
+      - '.github/**'
+      - 'flake.nix'
+      - 'flake.lock'
+      - 'src/**'
+      - 'tests/**'
+      - 'samples/**'
+      - 'tools/**'
+      - 'Makefile'
+      - 'global.json'
+      - 'Directory.Build.props'
+      - 'Directory.Packages.props'
+      - 'nuget.config'
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        token: ${{ github.token }}
+
+    - name: Install Nix
+      uses: cachix/install-nix-action@v30
+      with:
+        # Mostly to avoid GitHub rate limiting
+        extra_nix_config: |
+          access-tokens = github.com=${{ github.token }}
+
+    - name: Build
+      run: nix develop .#ci --impure -c make build
+    - name: Run testing suite
+      run: nix develop .#ci --impure -c make test
+    - name: Check Nix outputs and formatting
+      run: nix flake check

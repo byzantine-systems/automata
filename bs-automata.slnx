@@ -1,0 +1,24 @@
+<Solution>
+    <Folder Name="/src/">
+        <Project Path="src/ByzantineSystems.Automata.Core/ByzantineSystems.Automata.Core.fsproj" />
+        <Project Path="src/ByzantineSystems.Automata.Storage/ByzantineSystems.Automata.Storage.fsproj" />
+        <Project Path="src/ByzantineSystems.Automata.Resilience/ByzantineSystems.Automata.Resilience.fsproj" />
+        <Project Path="src/ByzantineSystems.Automata.Runtime/ByzantineSystems.Automata.Runtime.fsproj" />
+        <Project Path="src/ByzantineSystems.Automata.Storage.InMemory/ByzantineSystems.Automata.Storage.InMemory.fsproj" />
+        <Project Path="src/ByzantineSystems.Automata.Storage.Postgres/ByzantineSystems.Automata.Storage.Postgres.fsproj" />
+        <Project Path="src/ByzantineSystems.Automata.DependencyInjection/ByzantineSystems.Automata.DependencyInjection.fsproj" />
+    </Folder>
+    <Folder Name="/tests/">
+        <Project Path="tests/ByzantineSystems.Automata.Core.Tests/ByzantineSystems.Automata.Core.Tests.fsproj" />
+        <Project Path="tests/ByzantineSystems.Automata.Runtime.Tests/ByzantineSystems.Automata.Runtime.Tests.fsproj" />
+        <Project Path="tests/ByzantineSystems.Automata.Resilience.Tests/ByzantineSystems.Automata.Resilience.Tests.fsproj" />
+        <Project Path="tests/ByzantineSystems.Automata.Storage.Postgres.Tests/ByzantineSystems.Automata.Storage.Postgres.Tests.fsproj" />
+    </Folder>
+    <Folder Name="/samples/">
+        <Project Path="samples/ByzantineSystems.Automata.Samples.PaymentProcessor/ByzantineSystems.Automata.Samples.PaymentProcessor.fsproj" />
+        <Project Path="samples/ByzantineSystems.Automata.Samples.Supervision/ByzantineSystems.Automata.Samples.Supervision.fsproj" />
+    </Folder>
+    <Folder Name="/tools/">
+        <Project Path="tools/ByzantineSystems.Automata.Migrate/ByzantineSystems.Automata.Migrate.fsproj" />
+    </Folder>
+</Solution>
