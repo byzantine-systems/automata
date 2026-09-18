@@ -6,7 +6,10 @@
     </PropertyGroup>
 
     <ItemGroup>
-        <Compile Include="Placeholder.fs" />
+        <Compile Include="Identifiers.fs" />
+        <Compile Include="Transition.fs" />
+        <Compile Include="Errors.fs" />
+        <Compile Include="Codec.fs" />
     </ItemGroup>
 
 </Project>
