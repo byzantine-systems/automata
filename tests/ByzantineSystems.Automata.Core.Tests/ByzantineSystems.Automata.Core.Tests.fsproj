@@ -7,11 +7,16 @@
     </PropertyGroup>
 
     <ItemGroup>
+        <Compile Include="CoreTypeTests.fs" />
+        <Compile Include="ChartTests.fs" />
+        <Compile Include="ChartPropertyTests.fs" />
         <Compile Include="Program.fs" />
     </ItemGroup>
 
     <ItemGroup>
         <PackageReference Include="Expecto" />
-        <ProjectReference Include="..\..\src\ByzantineSystems.Automata.Core\ByzantineSystems.Automata.Core.fsproj" />    </ItemGroup>
+        <PackageReference Include="FsCheck" />
+        <ProjectReference Include="..\..\src\ByzantineSystems.Automata.Core\ByzantineSystems.Automata.Core.fsproj" />
+    </ItemGroup>
 
 </Project>
