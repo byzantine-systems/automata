@@ -6,7 +6,10 @@
     </PropertyGroup>
 
     <ItemGroup>
-        <Compile Include="Placeholder.fs" />
+        <Compile Include="Disposition.fs" />
+        <Compile Include="Telemetry.fs" />
+        <Compile Include="RetryConfig.fs" />
+        <Compile Include="Supervisor.fs" />
     </ItemGroup>
 
     <ItemGroup>

@@ -4,7 +4,5 @@ open Expecto
 
 [<EntryPoint>]
 let main argv =
-    testList
-        "ByzantineSystems.Automata.Resilience.Tests"
-        [ test "scaffold" { Expect.isTrue true "project compiles and runs" } ]
+    testList "ByzantineSystems.Automata.Resilience.Tests" [ ResiliencePipelineTests.tests; SupervisorTests.tests ]
     |> runTestsWithCLIArgs [] argv

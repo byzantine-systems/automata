@@ -1,11 +1,48 @@
 namespace ByzantineSystems.Automata.Storage.InMemory
 
 open System
-open System.Collections.Generic
 open System.Threading
 open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
+
+type private StoreState<'EntityId, 'State, 'Event, 'Action> =
+    { Instances: ((MachineId * 'EntityId) * Snapshot<'State>) list
+      History: ((MachineId * 'EntityId) * Transition<'EntityId, 'State, 'Event, 'Action> list) list
+      Receipts: ((MachineId * 'EntityId * string) * CommitReceipt) list
+      Retries: (RetryId * RetryItem<'EntityId, 'Event>) list
+      RetryIdsByKey: ((MachineId * 'EntityId * string) * RetryId) list
+      Outbox: (OutboxKey<'EntityId> * OutboxItem<'EntityId, 'Action>) list
+      DeadLetters: DeadLetter<'EntityId, 'Event> list
+      NextRetryId: int64 }
+
+[<RequireQualifiedAccess>]
+module private StoreState =
+
+    let empty<'EntityId, 'State, 'Event, 'Action> : StoreState<'EntityId, 'State, 'Event, 'Action> =
+        { Instances = []
+          History = []
+          Receipts = []
+          Retries = []
+          RetryIdsByKey = []
+          Outbox = []
+          DeadLetters = []
+          NextRetryId = 0L }
+
+    let tryFind key entries =
+        entries
+        |> List.tryPick (fun (candidate, value) -> if candidate = key then Some value else None)
+
+    // Replace in place or append, matching the observable insertion order of the old stores.
+    let upsert key value entries =
+        if entries |> List.exists (fun (candidate, _) -> candidate = key) then
+            entries
+            |> List.map (fun (candidate, current) -> if candidate = key then key, value else candidate, current)
+        else
+            entries @ [ key, value ]
+
+    let remove key entries =
+        entries |> List.filter (fun (candidate, _) -> candidate <> key)
 
 /// <summary>
 /// Thread-safe reference implementation of every storage contract, for tests and samples.
@@ -18,242 +55,298 @@ type InMemoryStore<'EntityId, 'State, 'Event, 'Action when 'EntityId: equality>(
 
     let timeProvider = defaultArg timeProvider TimeProvider.System
     let gate = obj ()
+    let state = ref StoreState.empty<'EntityId, 'State, 'Event, 'Action>
 
-    // (machine, entity) -> live snapshot
-    let instances = Dictionary<MachineId * 'EntityId, Snapshot<'State>>()
-
-    // (machine, entity) -> append-only log, ordered by epoch
-    let history =
-        Dictionary<MachineId * 'EntityId, ResizeArray<Transition<'EntityId, 'State, 'Event, 'Action>>>()
-
-    // (machine, entity, event key) -> receipt
-    let receipts = Dictionary<MachineId * 'EntityId * string, CommitReceipt>()
-
-    // retry queue: assigned identity -> item, plus the reverse index for idempotent enqueue
-    let retries = Dictionary<RetryId, RetryItem<'EntityId, 'Event>>()
-    let retryIdByKey = Dictionary<MachineId * 'EntityId * string, RetryId>()
-
-    // action outbox: action key -> item
-    let outbox = Dictionary<string, OutboxItem<'EntityId, 'Action>>()
-
-    let deadLetters = ResizeArray<DeadLetter<'EntityId, 'Event>>()
-    let mutable nextRetryId = 0L
-
-    let actionKeyOf (eventKey: string) (ordinal: int) = $"%s{eventKey}#{ordinal}"
+    let actionKeyOf machineId entityId eventKey ordinal : OutboxKey<'EntityId> =
+        { MachineId = machineId
+          EntityId = entityId
+          EventIdempotencyKey = eventKey
+          Ordinal = ordinal }
 
     let checkCancelled (ct: CancellationToken) = ct.ThrowIfCancellationRequested()
 
-    let tryGet (machineId: MachineId) (entityId: 'EntityId) : Snapshot<'State> option =
+    let read projection =
+        lock gate (fun _ -> projection state.Value)
+
+    let update transition =
+        lock gate (fun _ -> state.Value <- transition state.Value)
+
+    let transact transition =
         lock gate (fun _ ->
-            match instances.TryGetValue((machineId, entityId)) with
-            | true, snapshot -> Some snapshot
-            | _ -> None)
+            let next, result = transition state.Value
+            state.Value <- next
+            result)
+
+    let transactAtCurrentTime transition =
+        lock gate (fun _ ->
+            let next, result = transition (timeProvider.GetUtcNow()) state.Value
+            state.Value <- next
+            result)
+
+    let tryGet (machineId: MachineId) (entityId: 'EntityId) : Snapshot<'State> option =
+        read (fun current -> current.Instances |> StoreState.tryFind (machineId, entityId))
 
     let findReceipt (machineId: MachineId) (entityId: 'EntityId) (idempotencyKey: string) : CommitReceipt option =
-        lock gate (fun _ ->
-            match receipts.TryGetValue((machineId, entityId, idempotencyKey)) with
-            | true, receipt -> Some receipt
-            | _ -> None)
+        read (fun current -> current.Receipts |> StoreState.tryFind (machineId, entityId, idempotencyKey))
 
-    let commit
+    let commitTransition
         (transition: Transition<'EntityId, 'State, 'Event, 'Action>)
         (expected: Epoch)
-        : Result<CommitReceipt, StoreError> =
-        lock gate (fun _ ->
-            let instanceKey = (transition.MachineId, transition.EntityId)
+        (current: StoreState<'EntityId, 'State, 'Event, 'Action>)
+        : StoreState<'EntityId, 'State, 'Event, 'Action> * Result<CommitReceipt, StoreError> =
+        let instanceKey = transition.MachineId, transition.EntityId
 
-            let receiptKey =
-                (transition.MachineId, transition.EntityId, transition.IdempotencyKey)
+        let receiptKey =
+            transition.MachineId, transition.EntityId, transition.IdempotencyKey
 
-            // An already-committed key answers with the original receipt and writes nothing.
-            match receipts.TryGetValue receiptKey with
-            | true, receipt -> Ok receipt
-            | _ ->
-                let actual =
-                    match instances.TryGetValue instanceKey with
-                    | true, snapshot -> snapshot.Epoch
-                    | false, _ -> Epoch.initial
+        // An already-committed key answers with the original receipt and writes nothing.
+        match current.Receipts |> StoreState.tryFind receiptKey with
+        | Some receipt -> current, Ok receipt
+        | None ->
+            let actual =
+                current.Instances
+                |> StoreState.tryFind instanceKey
+                |> Option.map (fun snapshot -> snapshot.Epoch)
+                |> Option.defaultValue Epoch.initial
 
-                let wellFormed = actual = expected && transition.Epoch = Epoch.next actual
+            let wellFormed = actual = expected && transition.Epoch = Epoch.next actual
 
-                if not wellFormed then
-                    Error(Concurrency(expected, actual))
-                else
-                    let receipt =
-                        { IdempotencyKey = transition.IdempotencyKey
-                          Epoch = transition.Epoch
-                          OccurredAt = transition.OccurredAt }
+            if not wellFormed then
+                current, Error(Concurrency(expected, actual))
+            else
+                let receipt =
+                    { IdempotencyKey = transition.IdempotencyKey
+                      Epoch = transition.Epoch
+                      OccurredAt = transition.OccurredAt }
 
-                    instances[instanceKey] <-
-                        { State = transition.ToState
-                          Epoch = transition.Epoch
-                          Status = transition.Status }
+                let snapshot =
+                    { State = transition.ToState
+                      Epoch = transition.Epoch
+                      Status = transition.Status }
 
-                    let log =
-                        match history.TryGetValue instanceKey with
-                        | true, log -> log
-                        | false, _ ->
-                            let log = ResizeArray()
-                            history[instanceKey] <- log
-                            log
+                let log =
+                    current.History |> StoreState.tryFind instanceKey |> Option.defaultValue []
 
-                    log.Add transition
-                    receipts[receiptKey] <- receipt
-
+                let outbox =
                     transition.Actions
-                    |> List.iteri (fun ordinal action ->
-                        outbox[actionKeyOf transition.IdempotencyKey ordinal] <-
-                            { ActionKey = actionKeyOf transition.IdempotencyKey ordinal
-                              MachineId = transition.MachineId
-                              EntityId = transition.EntityId
-                              EventIdempotencyKey = transition.IdempotencyKey
-                              Action = action
-                              Attempts = 0
-                              NextAttemptAt = transition.OccurredAt
-                              LockedUntil = None })
+                    |> List.indexed
+                    |> List.fold
+                        (fun items (ordinal, action) ->
+                            let actionKey =
+                                actionKeyOf transition.MachineId transition.EntityId transition.IdempotencyKey ordinal
 
-                    Ok receipt)
+                            let item =
+                                { ActionKey = actionKey
+                                  MachineId = transition.MachineId
+                                  EntityId = transition.EntityId
+                                  EventIdempotencyKey = transition.IdempotencyKey
+                                  Action = action
+                                  Attempts = 0
+                                  NextAttemptAt = transition.OccurredAt
+                                  LockedUntil = None }
+
+                            items |> StoreState.upsert actionKey item)
+                        current.Outbox
+
+                { current with
+                    Instances = current.Instances |> StoreState.upsert instanceKey snapshot
+                    History = current.History |> StoreState.upsert instanceKey (log @ [ transition ])
+                    Receipts = current.Receipts |> StoreState.upsert receiptKey receipt
+                    Outbox = outbox },
+                Ok receipt
+
+    let commit transition expected =
+        transact (commitTransition transition expected)
 
     let historyPage
         (machineId: MachineId)
         (entityId: 'EntityId)
         (page: Page)
         : Transition<'EntityId, 'State, 'Event, 'Action> list =
-        lock gate (fun _ ->
-            match history.TryGetValue((machineId, entityId)) with
-            | false, _ -> []
-            | true, log ->
-                // Log epochs start at 1, so an absent cursor degrades to `> initial`.
-                let cursor = page |> Page.cursor |> Option.defaultValue Epoch.initial
+        read (fun current ->
+            let cursor = page |> Page.cursor |> Option.defaultValue Epoch.initial
 
-                log
-                |> Seq.filter (fun transition -> transition.Epoch > cursor)
-                |> Seq.truncate (Page.limit page)
-                |> List.ofSeq)
+            current.History
+            |> StoreState.tryFind (machineId, entityId)
+            |> Option.defaultValue []
+            |> List.filter (fun transition -> transition.Epoch > cursor)
+            |> List.truncate (Page.limit page))
 
-    let enqueue (request: RetryRequest<'EntityId, 'Event>) : unit =
-        lock gate (fun _ ->
-            let key = (request.MachineId, request.EntityId, request.IdempotencyKey)
+    let enqueueTransition
+        (request: RetryRequest<'EntityId, 'Event>)
+        (current: StoreState<'EntityId, 'State, 'Event, 'Action>)
+        : StoreState<'EntityId, 'State, 'Event, 'Action> =
+        let key = request.MachineId, request.EntityId, request.IdempotencyKey
 
-            match retryIdByKey.TryGetValue key with
-            | true, retryId when retries.ContainsKey retryId ->
-                // Still pending: refresh the schedule, keep identity and attempt count.
-                retries[retryId] <-
-                    { retries[retryId] with
-                        NextAttemptAt = request.NextAttemptAt
-                        LastError = request.LastError
-                        LockedUntil = None }
-            | _ ->
-                nextRetryId <- nextRetryId + 1L
-                let retryId = RetryId.create nextRetryId
+        let pending =
+            current.RetryIdsByKey
+            |> StoreState.tryFind key
+            |> Option.bind (fun retryId ->
+                current.Retries
+                |> StoreState.tryFind retryId
+                |> Option.map (fun item -> retryId, item))
 
-                retries[retryId] <-
-                    { RetryId = retryId
-                      MachineId = request.MachineId
-                      EntityId = request.EntityId
-                      IdempotencyKey = request.IdempotencyKey
-                      Event = request.Event
-                      Attempts = 0
-                      NextAttemptAt = request.NextAttemptAt
-                      LockedUntil = None
-                      LastError = request.LastError }
+        match pending with
+        | Some(retryId, item) ->
+            let refreshed =
+                { item with
+                    NextAttemptAt = request.NextAttemptAt
+                    LastError = request.LastError }
 
-                retryIdByKey[key] <- retryId)
+            { current with
+                Retries = current.Retries |> StoreState.upsert retryId refreshed }
+        | None ->
+            let nextRetryId = current.NextRetryId + 1L
+            let retryId = RetryId.create nextRetryId
 
-    let claimRetries (batch: int) (lease: TimeSpan) : RetryItem<'EntityId, 'Event> list =
-        lock gate (fun _ ->
-            let now = timeProvider.GetUtcNow()
+            let item =
+                { RetryId = retryId
+                  MachineId = request.MachineId
+                  EntityId = request.EntityId
+                  IdempotencyKey = request.IdempotencyKey
+                  Event = request.Event
+                  Attempts = 0
+                  NextAttemptAt = request.NextAttemptAt
+                  LockedUntil = None
+                  LastError = request.LastError }
 
-            let due =
-                retries.Values
-                |> Seq.filter (fun item ->
-                    item.NextAttemptAt <= now
-                    && (item.LockedUntil |> Option.forall (fun lockedUntil -> lockedUntil < now)))
-                |> Seq.sortBy (fun item -> item.NextAttemptAt, item.RetryId)
-                |> Seq.truncate batch
-                |> List.ofSeq
+            { current with
+                Retries = current.Retries |> StoreState.upsert retryId item
+                RetryIdsByKey = current.RetryIdsByKey |> StoreState.upsert key retryId
+                NextRetryId = nextRetryId }
 
-            due
+    let enqueue request = update (enqueueTransition request)
+
+    let claimRetryTransition
+        (now: DateTimeOffset)
+        (batch: int)
+        (lease: TimeSpan)
+        (current: StoreState<'EntityId, 'State, 'Event, 'Action>)
+        : StoreState<'EntityId, 'State, 'Event, 'Action> * RetryItem<'EntityId, 'Event> list =
+        let claimed =
+            current.Retries
+            |> List.map snd
+            |> List.filter (fun item ->
+                item.NextAttemptAt <= now
+                && (item.LockedUntil |> Option.forall (fun lockedUntil -> lockedUntil < now)))
+            |> List.sortBy (fun item -> item.NextAttemptAt, item.RetryId)
+            |> List.truncate batch
             |> List.map (fun item ->
-                let claimed =
-                    { item with
-                        Attempts = item.Attempts + 1
-                        LockedUntil = Some(now.Add lease) }
+                { item with
+                    Attempts = item.Attempts + 1
+                    LockedUntil = Some(now.Add lease) })
 
-                retries[item.RetryId] <- claimed
-                claimed))
+        let retries =
+            claimed
+            |> List.fold (fun items item -> items |> StoreState.upsert item.RetryId item) current.Retries
 
-    let completeRetry (retryId: RetryId) : unit =
-        lock gate (fun _ ->
-            retries.Remove retryId |> ignore
+        { current with Retries = retries }, claimed
 
-            retryIdByKey
-            |> Seq.toList
-            |> List.iter (fun (KeyValue(key, id)) ->
-                if id = retryId then
-                    retryIdByKey.Remove(key) |> ignore))
+    let claimRetries batch lease =
+        transactAtCurrentTime (fun now -> claimRetryTransition now batch lease)
 
-    let failRetry (retryId: RetryId) (nextAttemptAt: DateTimeOffset) (error: string) : unit =
-        lock gate (fun _ ->
-            match retries.TryGetValue retryId with
-            | true, item ->
-                retries[retryId] <-
-                    { item with
-                        NextAttemptAt = nextAttemptAt
-                        LastError = Some error
-                        LockedUntil = None }
-            | false, _ -> ())
+    let completeRetryTransition
+        (retryId: RetryId)
+        (current: StoreState<'EntityId, 'State, 'Event, 'Action>)
+        : StoreState<'EntityId, 'State, 'Event, 'Action> =
+        { current with
+            Retries = current.Retries |> StoreState.remove retryId
+            RetryIdsByKey =
+                current.RetryIdsByKey
+                |> List.filter (fun (_, mappedRetryId) -> mappedRetryId <> retryId) }
 
-    let claimOutbox (batch: int) (lease: TimeSpan) : OutboxItem<'EntityId, 'Action> list =
-        lock gate (fun _ ->
-            let now = timeProvider.GetUtcNow()
+    let completeRetry retryId =
+        update (completeRetryTransition retryId)
 
-            let due =
-                outbox.Values
-                |> Seq.filter (fun item ->
-                    item.NextAttemptAt <= now
-                    && (item.LockedUntil |> Option.forall (fun lockedUntil -> lockedUntil < now)))
-                |> Seq.sortBy (fun item -> item.NextAttemptAt, item.ActionKey)
-                |> Seq.truncate batch
-                |> List.ofSeq
+    let failRetryTransition
+        (retryId: RetryId)
+        (nextAttemptAt: DateTimeOffset)
+        (error: string)
+        (current: StoreState<'EntityId, 'State, 'Event, 'Action>)
+        : StoreState<'EntityId, 'State, 'Event, 'Action> =
+        match current.Retries |> StoreState.tryFind retryId with
+        | None -> current
+        | Some item ->
+            let failed =
+                { item with
+                    NextAttemptAt = nextAttemptAt
+                    LastError = Some error
+                    LockedUntil = None }
 
-            due
+            { current with
+                Retries = current.Retries |> StoreState.upsert retryId failed }
+
+    let failRetry retryId nextAttemptAt error =
+        update (failRetryTransition retryId nextAttemptAt error)
+
+    let claimOutboxTransition
+        (now: DateTimeOffset)
+        (batch: int)
+        (lease: TimeSpan)
+        (current: StoreState<'EntityId, 'State, 'Event, 'Action>)
+        : StoreState<'EntityId, 'State, 'Event, 'Action> * OutboxItem<'EntityId, 'Action> list =
+        let claimed =
+            current.Outbox
+            |> List.map snd
+            |> List.filter (fun item ->
+                item.NextAttemptAt <= now
+                && (item.LockedUntil |> Option.forall (fun lockedUntil -> lockedUntil < now)))
+            |> List.sortBy _.NextAttemptAt
+            |> List.truncate batch
             |> List.map (fun item ->
-                let claimed =
-                    { item with
-                        Attempts = item.Attempts + 1
-                        LockedUntil = Some(now.Add lease) }
+                { item with
+                    Attempts = item.Attempts + 1
+                    LockedUntil = Some(now.Add lease) })
 
-                outbox[item.ActionKey] <- claimed
-                claimed))
+        let outbox =
+            claimed
+            |> List.fold (fun items item -> items |> StoreState.upsert item.ActionKey item) current.Outbox
 
-    let completeOutbox (actionKey: string) : unit =
-        lock gate (fun _ -> outbox.Remove actionKey |> ignore)
+        { current with Outbox = outbox }, claimed
 
-    let failOutbox (actionKey: string) (nextAttemptAt: DateTimeOffset) : unit =
-        lock gate (fun _ ->
-            match outbox.TryGetValue actionKey with
-            | true, item ->
-                outbox[actionKey] <-
-                    { item with
-                        NextAttemptAt = nextAttemptAt
-                        LockedUntil = None }
-            | false, _ -> ())
+    let claimOutbox batch lease =
+        transactAtCurrentTime (fun now -> claimOutboxTransition now batch lease)
 
-    let recordDeadLetter (deadLetter: DeadLetter<'EntityId, 'Event>) : unit =
-        lock gate (fun _ -> deadLetters.Add deadLetter)
+    let completeOutbox actionKey =
+        update (fun current ->
+            { current with
+                Outbox = current.Outbox |> StoreState.remove actionKey })
+
+    let failOutboxTransition
+        (actionKey: OutboxKey<'EntityId>)
+        (nextAttemptAt: DateTimeOffset)
+        (current: StoreState<'EntityId, 'State, 'Event, 'Action>)
+        : StoreState<'EntityId, 'State, 'Event, 'Action> =
+        match current.Outbox |> StoreState.tryFind actionKey with
+        | None -> current
+        | Some item ->
+            let failed =
+                { item with
+                    NextAttemptAt = nextAttemptAt
+                    LockedUntil = None }
+
+            { current with
+                Outbox = current.Outbox |> StoreState.upsert actionKey failed }
+
+    let failOutbox actionKey nextAttemptAt =
+        update (failOutboxTransition actionKey nextAttemptAt)
+
+    let recordDeadLetter deadLetter =
+        update (fun current ->
+            { current with
+                DeadLetters = current.DeadLetters @ [ deadLetter ] })
 
     /// <summary>Test-facing view of pending retry items; does not mutate state.</summary>
     member _.PendingRetries() : RetryItem<'EntityId, 'Event> list =
-        lock gate (fun _ -> retries.Values |> List.ofSeq)
+        read (fun current -> current.Retries |> List.map snd)
 
     /// <summary>Test-facing view of pending outbox items; does not mutate state.</summary>
     member _.PendingOutbox() : OutboxItem<'EntityId, 'Action> list =
-        lock gate (fun _ -> outbox.Values |> List.ofSeq)
+        read (fun current -> current.Outbox |> List.map snd)
 
     /// <summary>Test-facing view of the dead-letter log; does not mutate state.</summary>
     member _.DeadLetterLog() : DeadLetter<'EntityId, 'Event> list =
-        lock gate (fun _ -> List.ofSeq deadLetters)
+        read (fun current -> current.DeadLetters)
 
     interface IStateStore<'EntityId, 'State, 'Event, 'Action> with
 

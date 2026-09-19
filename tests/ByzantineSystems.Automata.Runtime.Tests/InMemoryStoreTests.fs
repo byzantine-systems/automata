@@ -53,6 +53,12 @@ let asDeadLetterStore (store: InMemoryStore<'EntityId, 'State, 'Event, 'Action>)
 let asOutbox (store: InMemoryStore<'EntityId, 'State, 'Event, 'Action>) : IActionOutbox<'EntityId, 'Action> =
     store :> IActionOutbox<'EntityId, 'Action>
 
+let outboxKey entity eventKey ordinal : OutboxKey<EntityId<Payment>> =
+    { MachineId = machine
+      EntityId = entity
+      EventIdempotencyKey = eventKey
+      Ordinal = ordinal }
+
 let mkTransition
     (entity: EntityId<Payment>)
     (key: string)
@@ -299,9 +305,9 @@ let stateStoreTests =
               let s = asStateStore store
               let entity = entityId "ORD-7"
 
-              let! seed =
+              let rec seed ordinal =
                   task {
-                      for ordinal in 1..3 do
+                      if ordinal <= 3 then
                           let key = $"pay-%d{ordinal}"
                           let epoch = Epoch.ofUInt64 (uint64 ordinal)
                           let occurredAt = startTime.AddSeconds(float ordinal)
@@ -314,11 +320,11 @@ let stateStoreTests =
                               )
 
                           match committed with
-                          | Ok _ -> ()
+                          | Ok _ -> return! seed (ordinal + 1)
                           | Error error -> return failtestf "seed commit %d failed: %A" ordinal error
                   }
 
-              ignore seed
+              do! seed 1
 
               let! (firstPage: Transition list) =
                   s.History(machine, entity, Page.create 2, ct) |> mapTask (expectOk "first page")
@@ -506,6 +512,26 @@ let retryQueueTests =
               | other -> failtestf "expected one item, got %A" other
           }
 
+          testTask "re-enqueueing a leased key preserves its lease" {
+              let store, _ = newStore ()
+              let q = asRetryQueue store
+              let entity = entityId "ORD-13-LEASED"
+              let lease = TimeSpan.FromSeconds 10.
+
+              do!
+                  q.Enqueue(mkRequest entity "defer-1" startTime, ct)
+                  |> mapTask (expectOkUnit "enqueue")
+
+              let! (_: RetryList) = q.Claim(1, lease, ct) |> mapTask (expectOk "claim")
+
+              do!
+                  q.Enqueue(mkRequest entity "defer-1" startTime, ct)
+                  |> mapTask (expectOkUnit "refresh")
+
+              let! (claimedAgain: RetryList) = q.Claim(1, lease, ct) |> mapTask (expectOk "claim while leased")
+              Expect.isEmpty claimedAgain "refreshing the item cannot revoke an active worker's lease"
+          }
+
           testTask "fail unlocks, reschedules, and records the error" {
               let store, time = newStore ()
               let q = asRetryQueue store
@@ -568,12 +594,13 @@ let outboxTests =
                   )
                   |> mapTask (expectOk "commit")
 
-              let pending = store.PendingOutbox() |> List.sortBy (fun item -> item.ActionKey)
+              let pending =
+                  store.PendingOutbox() |> List.sortBy (fun item -> item.ActionKey.Ordinal)
 
               Expect.equal
-                  [ "pay-1#0"; "pay-1#1" ]
+                  [ outboxKey entity "pay-1" 0; outboxKey entity "pay-1" 1 ]
                   (pending |> List.map (fun item -> item.ActionKey))
-                  "action keys derive from the event key and ordinal"
+                  "action keys include their full machine-instance scope"
 
               Expect.equal
                   [ "notify"; "reserve" ]
@@ -609,10 +636,12 @@ let outboxTests =
               Expect.equal 2 claimed.Length "both actions are claimable"
               Expect.isTrue (claimed |> List.forall (fun item -> item.Attempts = 1)) "claiming counts the attempt"
 
-              do! o.Complete("pay-1#0", ct) |> mapTask (expectOkUnit "complete")
+              do! o.Complete(outboxKey entity "pay-1" 0, ct) |> mapTask (expectOkUnit "complete")
               Expect.equal 1 (store.PendingOutbox().Length) "the delivered action is removed"
 
-              do! o.Fail("pay-1#1", startTime.AddSeconds 20., ct) |> mapTask (expectOkUnit "fail")
+              do!
+                  o.Fail(outboxKey entity "pay-1" 1, startTime.AddSeconds 20., ct)
+                  |> mapTask (expectOkUnit "fail")
 
               let! (notDue: OutboxList) =
                   o.Claim(10, TimeSpan.FromSeconds 5., ct)
@@ -626,9 +655,45 @@ let outboxTests =
 
               match due with
               | [ item ] ->
-                  Expect.equal "pay-1#1" item.ActionKey "the same action key is redelivered"
+                  Expect.equal (outboxKey entity "pay-1" 1) item.ActionKey "the same action key is redelivered"
                   Expect.equal 2 item.Attempts "attempts accumulate"
               | other -> failtestf "expected the failed action back, got %A" other
+          }
+
+          testTask "matching event keys from different entities cannot collide" {
+              let store, _ = newStore ()
+              let s = asStateStore store
+              let firstEntity = entityId "ORD-16-A"
+              let secondEntity = entityId "ORD-16-B"
+
+              let commit entity action =
+                  s.Commit(
+                      mkTransition
+                          entity
+                          "shared-event-key"
+                          (Epoch.next Epoch.initial)
+                          "idle"
+                          "active"
+                          [ action ]
+                          Running
+                          startTime,
+                      Epoch.initial,
+                      ct
+                  )
+                  |> mapTask (expectOk "commit")
+
+              let! _ = commit firstEntity "notify-first"
+              let! _ = commit secondEntity "notify-second"
+              let pending = store.PendingOutbox()
+
+              Expect.equal 2 pending.Length "both committed actions remain pending"
+
+              Expect.equal
+                  (set
+                      [ outboxKey firstEntity "shared-event-key" 0
+                        outboxKey secondEntity "shared-event-key" 0 ])
+                  (pending |> List.map _.ActionKey |> Set.ofList)
+                  "entity scope distinguishes otherwise matching action keys"
           } ]
 
 let deadLetterTests =

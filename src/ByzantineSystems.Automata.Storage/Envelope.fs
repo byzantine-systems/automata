@@ -123,14 +123,22 @@ type DeadLetter<'EntityId, 'Event> =
     }
 
 /// <summary>
-/// One pending side effect produced by a committed transition. The action key is derived by
-/// the store from the event's idempotency key and the action's ordinal
-/// (<c>&lt;event key&gt;#&lt;ordinal&gt;</c>), which makes redelivery after a crash
-/// detectable by the destination.
+/// Stable identity of one action within a machine instance. The full scope prevents actions
+/// emitted by different machines or entities from colliding when event idempotency keys match.
+/// </summary>
+type OutboxKey<'EntityId> =
+    { MachineId: MachineId
+      EntityId: 'EntityId
+      EventIdempotencyKey: string
+      Ordinal: int }
+
+/// <summary>
+/// One pending side effect produced by a committed transition. Redelivery carries the same
+/// scoped action key so the destination can detect a repeated effect after a crash.
 /// </summary>
 type OutboxItem<'EntityId, 'Action> =
     {
-        ActionKey: string
+        ActionKey: OutboxKey<'EntityId>
         MachineId: MachineId
         EntityId: 'EntityId
         /// <summary>The idempotency key of the event that emitted this action.</summary>

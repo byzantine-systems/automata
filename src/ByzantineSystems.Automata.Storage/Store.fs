@@ -32,8 +32,8 @@ type IStateStore<'EntityId, 'State, 'Event, 'Action> =
     /// Applies one transition against the expected epoch. Implementations must: reject a
     /// stale epoch with <see cref="F:ByzantineSystems.Automata.Core.StoreError.Concurrency" />;
     /// return the original receipt when the idempotency key already exists; create the
-    /// instance on first commit; and derive outbox rows from <c>Actions</c> with stable
-    /// <c>&lt;event key&gt;#&lt;ordinal&gt;</c> action keys.
+    /// instance on first commit; and derive outbox rows from <c>Actions</c> with stable keys
+    /// scoped by machine, entity, event idempotency key, and action ordinal.
     /// </summary>
     abstract Commit:
         transition: Transition<'EntityId, 'State, 'Event, 'Action> * expected: Epoch * ct: CancellationToken ->
@@ -104,11 +104,12 @@ type IActionOutbox<'EntityId, 'Action> =
             Task<Result<OutboxItem<'EntityId, 'Action> list, StoreError>>
 
     /// <summary>Marks an action as delivered. Completing an unknown key succeeds.</summary>
-    abstract Complete: actionKey: string * ct: CancellationToken -> Task<Result<unit, StoreError>>
+    abstract Complete: actionKey: OutboxKey<'EntityId> * ct: CancellationToken -> Task<Result<unit, StoreError>>
 
     /// <summary>
     /// Records a recoverable delivery failure: the item is unlocked and rescheduled to the
     /// given time. Failing an unknown key succeeds, symmetrically with <c>Complete</c>.
     /// </summary>
     abstract Fail:
-        actionKey: string * nextAttemptAt: DateTimeOffset * ct: CancellationToken -> Task<Result<unit, StoreError>>
+        actionKey: OutboxKey<'EntityId> * nextAttemptAt: DateTimeOffset * ct: CancellationToken ->
+            Task<Result<unit, StoreError>>

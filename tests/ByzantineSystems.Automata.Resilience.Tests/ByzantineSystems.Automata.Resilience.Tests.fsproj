@@ -7,11 +7,14 @@
     </PropertyGroup>
 
     <ItemGroup>
+        <Compile Include="ResiliencePipelineTests.fs" />
+        <Compile Include="SupervisorTests.fs" />
         <Compile Include="Program.fs" />
     </ItemGroup>
 
     <ItemGroup>
         <PackageReference Include="Expecto" />
-        <ProjectReference Include="..\..\src\ByzantineSystems.Automata.Resilience\ByzantineSystems.Automata.Resilience.fsproj" />    </ItemGroup>
+        <ProjectReference Include="..\..\src\ByzantineSystems.Automata.Resilience\ByzantineSystems.Automata.Resilience.fsproj" />
+    </ItemGroup>
 
 </Project>
