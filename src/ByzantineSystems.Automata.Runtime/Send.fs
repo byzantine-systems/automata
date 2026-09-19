@@ -15,7 +15,7 @@ type internal SendResult<'EntityId, 'State, 'Event, 'Action, 'Err> =
 
 /// <summary>
 /// The read-resolve-commit machinery shared by the actor path and the durable retry pump.
-/// The whole operation — idempotency check, snapshot read, resolution, and commit — runs
+/// The whole operation (idempotency check, snapshot read, resolution, and commit) runs
 /// inside the resilience pipeline so every concurrency conflict re-reads and re-resolves
 /// against the winning state rather than replaying a stale transition.
 /// </summary>
@@ -116,7 +116,8 @@ module internal Send =
         (entityId: 'EntityId)
         (envelope: EventEnvelope<'Event>)
         (observer: ObserverDispatcher<'EntityId, 'State, 'Event, 'Action> option)
-        (signal: WorkSignal)
+        (retrySignal: WorkSignal)
+        (outboxSignal: WorkSignal)
         (ct: CancellationToken)
         : Task<Result<SendOutcome, MachineError<'Err>>> =
         task {
@@ -129,7 +130,7 @@ module internal Send =
                 | None -> ()
 
                 if not (List.isEmpty transition.Actions) then
-                    signal.TrySignal()
+                    outboxSignal.TrySignal()
 
                 return Ok Committed
 
@@ -148,7 +149,8 @@ module internal Send =
                           EntityId = entityId
                           IdempotencyKey = key
                           Event = event
-                          NextAttemptAt = config.TimeProvider.GetUtcNow().Add config.RetryPolicy.Delay
+                          NextAttemptAt =
+                            config.TimeProvider.GetUtcNow().Add((ValidatedRetryPolicy.value config.RetryPolicy).Delay)
                           LastError = Some(sprintf "%A" error) }
 
                     let! enqueued = config.RetryQueue.Enqueue(request, ct)
@@ -156,7 +158,7 @@ module internal Send =
                     match enqueued with
                     | Error storeError -> return Error(MachineError.Store storeError)
                     | Ok retryId ->
-                        signal.TrySignal()
+                        retrySignal.TrySignal()
                         return Ok(Deferred retryId)
 
                 | Disposition.DeadLetter ->

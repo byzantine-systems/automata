@@ -71,7 +71,7 @@ type ChildSpec =
 
 /// <summary>
 /// Erlang restart-intensity semantics: at most <c>Intensity</c> child restarts within any
-/// <c>Period</c> window, across all children. Exceeding it escalates — the supervisor stops
+/// <c>Period</c> window, across all children. Exceeding it escalates; the supervisor stops
 /// everything and faults. This is an exact sliding window the supervisor maintains itself;
 /// a circuit breaker cannot express it, because a rarely-restarting child never reaches a
 /// breaker's minimum throughput.
@@ -107,7 +107,7 @@ type SupervisionEvent =
 /// <summary>
 /// Raised (as the fault of <see cref="P:ByzantineSystems.Automata.Resilience.ISupervisor.Completion" />
 /// and of the initial start) when restart intensity is exceeded or a child cannot be started.
-/// The parent — a host, or another supervisor — decides what an escalation means.
+/// The parent (a host, or another supervisor) decides what an escalation means.
 /// </summary>
 exception SupervisorEscalated of childId: string * reason: string
 
@@ -142,6 +142,9 @@ type ISupervisor =
 
     /// <summary>Snapshot of the supervision event log, in occurrence order.</summary>
     abstract Events: unit -> SupervisionEvent list
+
+    /// <summary>Asynchronously snapshots the event log, allowing replies during shutdown.</summary>
+    abstract EventsAsync: ct: CancellationToken -> Task<SupervisionEvent list>
 
 type private ExitKind =
     | ExitNormal
@@ -975,6 +978,10 @@ module Supervisor =
                 }
 
             member _.Events() : SupervisionEvent list = agent.PostAndReply Snapshot
+
+            member _.EventsAsync(ct: CancellationToken) : Task<SupervisionEvent list> =
+                agent.PostAndAsyncReply(fun reply -> Snapshot reply)
+                |> fun operation -> Async.StartImmediateAsTask(operation, cancellationToken = ct)
 
     /// <summary>
     /// Starts a supervisor: children start sequentially in declaration order, and the

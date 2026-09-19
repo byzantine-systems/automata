@@ -143,6 +143,28 @@ let actionDispatcherTests =
 
               Expect.equal (Some(outboxKeyFor entity "d-1" 0)) delivered.Value "the stable key was passed through"
               Expect.isEmpty (store.PendingOutbox()) "the delivered action is removed"
+          }
+
+          testTask "a completed signal stops the run loop" {
+              let time = newTime ()
+              let store = TestStore(time)
+              let signal = new WorkSignal()
+
+              let handler (_key: OutboxKey<Entity>) (_action: TestAction) (_ct: CancellationToken) =
+                  task { return Ok() }
+
+              let dispatcher =
+                  ActionDispatcher(
+                      store :> IActionOutbox<Entity, TestAction>,
+                      handler,
+                      RetryPolicy.defaults,
+                      time,
+                      signal
+                  )
+
+              signal.Complete()
+              let! result = dispatcher.RunAsync(noCancellation)
+              Expect.equal result (Ok()) "signal completion ended the worker normally"
           } ]
 
 let tests = testList "workers" [ retryPumpTests; actionDispatcherTests ]

@@ -9,6 +9,7 @@
         <Compile Include="Serialization.fs" />
         <Compile Include="Sql.fs" />
         <Compile Include="PostgresStore.fs" />
+        <Compile Include="PostgresSupervisionStore.fs" />
         <Compile Include="Migrator.fs" />
     </ItemGroup>
 

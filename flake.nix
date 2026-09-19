@@ -64,11 +64,11 @@
           #         ]
           #       );
           #   };
-          #   projectFile = "samples/ByzantineSystems.Automata.Samples.PaymentProcessor/ByzantineSystems.Automata.Samples.PaymentProcessor.fsproj";
+          #   projectFile = "examples/ByzantineSystems.Automata.Examples.PaymentProcessor/ByzantineSystems.Automata.Examples.PaymentProcessor.fsproj";
           #   nugetDeps = ./deps.json;
           #   dotnet-sdk = net10;
           #   dotnet-runtime = pkgs.dotnet-aspnetcore_10;
-          #   executables = [ "ByzantineSystems.Automata.Samples.PaymentProcessor" ];
+          #   executables = [ "ByzantineSystems.Automata.Examples.PaymentProcessor" ];
           #   doCheck = false;
           # };
         in
@@ -223,7 +223,7 @@
               migrate.exec = "make migrate";
               db-connect.exec = "make db";
               db-reset.exec = "make db-reset";
-              run-sample.exec = "dotnet run --project samples/ByzantineSystems.Automata.Samples.PaymentProcessor/ByzantineSystems.Automata.Samples.PaymentProcessor.fsproj";
+              run-example.exec = "dotnet run --project examples/ByzantineSystems.Automata.Examples.PaymentProcessor/ByzantineSystems.Automata.Examples.PaymentProcessor.fsproj";
             };
 
             enterShell = ''

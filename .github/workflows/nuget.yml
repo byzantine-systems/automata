@@ -25,8 +25,8 @@ jobs:
 
       - name: Test before releasing
         run: nix develop .#ci --impure -c make test
-      - name: Pack release
-        run: nix develop .#ci --impure -c make pack
+      - name: Pack and smoke-test release
+        run: nix develop .#ci --impure -c make package-smoke
       - name: Publish the packages to nuget.org
         run: nix develop .#ci --impure -c make push
         env:

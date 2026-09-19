@@ -8,6 +8,7 @@ let main argv =
         "ByzantineSystems.Automata.Runtime.Tests"
         [ InMemoryStoreTests.tests
           MachineOutcomeTests.tests
+          RuntimeRefactorTests.tests
           ParallelismTests.tests
           WorkSignalsTests.tests
           WorkerTests.tests ]

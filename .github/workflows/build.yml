@@ -9,9 +9,13 @@ on:
       - 'flake.lock'
       - 'src/**'
       - 'tests/**'
-      - 'samples/**'
+      - 'examples/**'
       - 'tools/**'
       - 'Makefile'
+      - 'README.md'
+      - 'docfx.json'
+      - 'docs/**'
+      - '.config/dotnet-tools.json'
       - 'global.json'
       - 'Directory.Build.props'
       - 'Directory.Packages.props'
@@ -23,9 +27,13 @@ on:
       - 'flake.lock'
       - 'src/**'
       - 'tests/**'
-      - 'samples/**'
+      - 'examples/**'
       - 'tools/**'
       - 'Makefile'
+      - 'README.md'
+      - 'docfx.json'
+      - 'docs/**'
+      - '.config/dotnet-tools.json'
       - 'global.json'
       - 'Directory.Build.props'
       - 'Directory.Packages.props'
@@ -52,5 +60,9 @@ jobs:
       run: nix develop .#ci --impure -c make build
     - name: Run testing suite
       run: nix develop .#ci --impure -c make test
+    - name: Build documentation
+      run: nix develop .#ci --impure -c make docs
+    - name: Smoke-test packages
+      run: nix develop .#ci --impure -c make package-smoke
     - name: Check Nix outputs and formatting
       run: nix flake check

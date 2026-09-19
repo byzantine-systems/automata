@@ -115,7 +115,28 @@ let buildMachineWithPolicy
             timeProvider time
         }
 
-    expectMachine result
+    let built = expectMachine result
+    built.StartAsync(CancellationToken.None).GetAwaiter().GetResult()
+    built
+
+/// Builds a machine without starting its asynchronous lifecycle.
+let buildUnstartedMachine
+    (classify: MachineError<string> -> Disposition)
+    (storeArg: MachineStore)
+    (time: TimeProvider)
+    : TestMachine =
+    let retryConfig =
+        { RetryConfig.defaults<string> with
+            Classify = classify }
+
+    machine<Entity, TestState, TestEvent, TestAction, string> (machineId "test") {
+        chart testChart
+        initialState Idle
+        store storeArg
+        retry retryConfig
+        timeProvider time
+    }
+    |> expectMachine
 
 /// Builds a machine with the given classify hook and the default durable retry policy.
 let buildMachine

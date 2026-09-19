@@ -32,14 +32,43 @@ type WorkSignal() =
         with :? ObjectDisposedException ->
             ()
 
-    /// <summary>Completes when a hint is available, or the token is cancelled.</summary>
-    member _.WaitAsync(ct: CancellationToken) : Task =
+    /// <summary>Returns true when a hint is consumed, or false when the signal is completed.</summary>
+    member _.WaitAsync(ct: CancellationToken) : Task<bool> =
         task {
+            let! available = reader.WaitToReadAsync(ct)
+
+            if not available then
+                return false
+            else
+                let mutable hint = ()
+                return reader.TryRead(&hint)
+        }
+
+    /// <summary>Waits for a hint, signal completion, or the polling interval.</summary>
+    member this.WaitOrTimeoutAsync(interval: TimeSpan, timeProvider: TimeProvider, ct: CancellationToken) : Task<bool> =
+        task {
+            use waitCancellation = CancellationTokenSource.CreateLinkedTokenSource(ct)
+            let signalWait = this.WaitAsync(waitCancellation.Token)
+            let timerWait = Task.Delay(interval, timeProvider, waitCancellation.Token)
+            let! _ = Task.WhenAny(signalWait :> Task, timerWait)
+
+            waitCancellation.Cancel()
+
+            let mutable signalOpen = true
+
             try
-                let! _ = reader.ReadAsync(ct)
-                return ()
-            with :? ChannelClosedException ->
-                return ()
+                let! openResult = signalWait
+                signalOpen <- openResult
+            with :? OperationCanceledException when waitCancellation.IsCancellationRequested ->
+                ()
+
+            try
+                do! timerWait
+            with :? OperationCanceledException when waitCancellation.IsCancellationRequested ->
+                ()
+
+            ct.ThrowIfCancellationRequested()
+            return signalOpen
         }
 
     /// <summary>Completes the channel so pending waiters finish; idempotent.</summary>

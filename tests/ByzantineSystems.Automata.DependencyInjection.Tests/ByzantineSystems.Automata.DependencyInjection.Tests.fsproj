@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <IsPackable>false</IsPackable>
+        <IsTestProject>true</IsTestProject>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <Compile Include="TestSupport.fs" />
+        <Compile Include="RegistrationTests.fs" />
+        <Compile Include="ActionDispatchTests.fs" />
+        <Compile Include="SupervisionAuditTests.fs" />
+        <Compile Include="ValidationTests.fs" />
+        <Compile Include="LifecycleTests.fs" />
+        <Compile Include="Program.fs" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <PackageReference Include="Expecto" />
+        <ProjectReference Include="..\..\src\ByzantineSystems.Automata.DependencyInjection\ByzantineSystems.Automata.DependencyInjection.fsproj" />
+    </ItemGroup>
+
+</Project>

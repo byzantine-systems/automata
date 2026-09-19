@@ -6,7 +6,8 @@
     </PropertyGroup>
 
     <ItemGroup>
-        <Compile Include="Placeholder.fs" />
+        <Compile Include="HostedServices.fs" />
+        <Compile Include="ServiceCollectionExtensions.fs" />
     </ItemGroup>
 
     <ItemGroup>

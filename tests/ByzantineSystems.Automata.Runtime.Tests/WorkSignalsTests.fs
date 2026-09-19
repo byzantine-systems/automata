@@ -12,7 +12,8 @@ let tests =
               let ct = CancellationToken.None
 
               signal.TrySignal()
-              do! signal.WaitAsync(ct)
+              let! signalOpen = signal.WaitAsync(ct)
+              Expect.isTrue signalOpen "the hint was consumed"
               signal.Complete()
           }
 
@@ -24,7 +25,8 @@ let tests =
               signal.TrySignal()
               signal.TrySignal()
 
-              do! signal.WaitAsync(ct)
+              let! signalOpen = signal.WaitAsync(ct)
+              Expect.isTrue signalOpen "one coalesced hint was consumed"
               signal.Complete()
           }
 
@@ -34,5 +36,6 @@ let tests =
 
               let wait = signal.WaitAsync(ct)
               signal.Complete()
-              do! wait
+              let! signalOpen = wait
+              Expect.isFalse signalOpen "completion is distinguishable from a hint"
           } ]

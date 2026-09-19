@@ -21,6 +21,7 @@ let main argv =
               PostgresRetryQueueTests.tests
               PostgresOutboxTests.tests
               PostgresDeadLetterTests.tests
+              PostgresSupervisionStoreTests.tests
               PostgresAcceptanceTests.tests ]
         |> testSequenced
         |> runTestsWithCLIArgs [] argv

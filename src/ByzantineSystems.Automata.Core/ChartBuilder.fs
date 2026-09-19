@@ -31,7 +31,7 @@ type ChartPart<'State, 'Event, 'Action, 'Err> =
 /// <summary>
 /// Builder for the inside of <c>state "name" { ... }</c> and <c>compound "name" { ... }</c>.
 /// Statements are plain values (rules, entry/exit actions, initial-child, terminal flag,
-/// child nodes) implicitly yielded and combined — no custom operations, so implicit yields
+/// child nodes) implicitly yielded and combined; no custom operations, so implicit yields
 /// stay enabled.
 /// </summary>
 type NodeBuilder<'State, 'Event, 'Action, 'Err>(name: string) =

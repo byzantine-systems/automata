@@ -52,8 +52,8 @@ type Snapshot<'State> =
 
 /// <summary>
 /// Proof of a committed (or already-applied) transition. A send that repeats an idempotency
-/// key receives the original receipt — the epoch did not advance and no duplicate work was
-/// created — which is how a lost response or a client retry is recognised after the fact.
+/// key receives the original receipt: the epoch did not advance and no duplicate work was
+/// created, which is how a lost response or a client retry is recognised after the fact.
 /// </summary>
 type CommitReceipt =
     { IdempotencyKey: string

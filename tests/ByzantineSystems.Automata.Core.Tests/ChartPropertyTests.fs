@@ -95,7 +95,7 @@ let private property (name: string) (prop: 'a -> bool) : Test =
         )
 
         if failures.Count > 0 then
-            failtestf "%s — %d counterexamples, first: %A" name failures.Count (Seq.head failures))
+            failtestf "%s - %d counterexamples, first: %A" name failures.Count (Seq.head failures))
 
 let tests =
     testList

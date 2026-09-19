@@ -6,6 +6,7 @@ open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Resilience
 open ByzantineSystems.Automata.Storage
+open Polly
 
 /// <summary>One statement inside a <c>machine { ... }</c> block.</summary>
 type MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err> =
@@ -13,8 +14,8 @@ type MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err> =
     | MachineInitial of 'State
     | MachineStore of IMachineStore<'EntityId, 'State, 'Event, 'Action>
     | MachineRetry of RetryConfig<'Err>
+    | MachinePipeline of ResiliencePipeline<PipelineResult<'Err>> * (MachineError<'Err> -> Disposition)
     | MachineRetryPolicy of RetryPolicy
-    | MachineSupervise of SupervisorSpec
     | MachineObserver of TransitionObserver<'EntityId, 'State, 'Event, 'Action>
     | MachineMailboxCapacity of int
     | MachineIdleTimeout of TimeSpan
@@ -22,6 +23,28 @@ type MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err> =
 
 /// <summary>Shared assembly step behind the builder: accumulate defects, then construct.</summary>
 module private MachineBuild =
+
+    let private duplicateErrors parts =
+        let declaration =
+            function
+            | MachineChart _ -> MachineDeclaration.Chart
+            | MachineInitial _ -> MachineDeclaration.Initial
+            | MachineStore _ -> MachineDeclaration.Store
+            | MachineRetry _ -> MachineDeclaration.Retry
+            | MachinePipeline _ -> MachineDeclaration.Retry
+            | MachineRetryPolicy _ -> MachineDeclaration.RetryPolicy
+            | MachineObserver _ -> MachineDeclaration.Observer
+            | MachineMailboxCapacity _ -> MachineDeclaration.MailboxCapacity
+            | MachineIdleTimeout _ -> MachineDeclaration.IdleTimeout
+            | MachineTimeProvider _ -> MachineDeclaration.TimeProvider
+
+        parts
+        |> List.countBy declaration
+        |> List.choose (fun (name, count) ->
+            if count > 1 then
+                Some(MachineConfigError.DuplicateDeclaration name)
+            else
+                None)
 
     let internal build
         (machineId: MachineId)
@@ -48,7 +71,8 @@ module private MachineBuild =
         let retry =
             parts
             |> List.tryPick (function
-                | MachineRetry r -> Some r
+                | MachineRetry config -> Some(Choice1Of2 config)
+                | MachinePipeline(pipeline, classify) -> Some(Choice2Of2(pipeline, classify))
                 | _ -> None)
 
         let retryPolicy =
@@ -57,12 +81,6 @@ module private MachineBuild =
                 | MachineRetryPolicy p -> Some p
                 | _ -> None)
             |> Option.defaultValue RetryPolicy.defaults
-
-        let supervise =
-            parts
-            |> List.tryPick (function
-                | MachineSupervise s -> Some s
-                | _ -> None)
 
         let observer =
             parts
@@ -122,35 +140,31 @@ module private MachineBuild =
 
         let retryErrors =
             match retry with
-            | Some r ->
+            | Some(Choice1Of2 r) ->
                 match RetryConfig.validate r with
                 | Ok _ -> []
                 | Error errors -> [ MachineConfigError.InvalidRetry errors ]
+            | Some(Choice2Of2 _) -> []
             | None -> []
 
-        let retryPolicyErrors =
+        let validatedRetryPolicy, retryPolicyErrors =
             match RetryPolicy.validate retryPolicy with
-            | Ok _ -> []
-            | Error errors -> [ MachineConfigError.InvalidRetryPolicy errors ]
-
-        let superviseErrors =
-            match supervise with
-            | Some spec ->
-                match Supervisor.validate spec with
-                | Ok _ -> []
-                | Error errors -> [ MachineConfigError.InvalidSupervision errors ]
-            | None -> []
+            | Ok validated -> Some validated, []
+            | Error errors -> None, [ MachineConfigError.InvalidRetryPolicy errors ]
 
         let errors =
-            missingErrors
+            duplicateErrors parts
+            @ missingErrors
             @ initialErrors
             @ retryErrors
             @ retryPolicyErrors
-            @ superviseErrors
 
-        match errors, chart, initial, store, retry with
-        | [], Some c, Some s, Some st, Some r ->
-            let pipeline = RetryConfig.toPipeline r ignore
+        match errors, chart, initial, store, retry, validatedRetryPolicy with
+        | [], Some c, Some s, Some st, Some configuredRetry, Some policy ->
+            let pipeline, classify =
+                match configuredRetry with
+                | Choice1Of2 retry -> RetryConfig.toPipeline retry ignore, retry.Classify
+                | Choice2Of2(pipeline, classify) -> pipeline, classify
 
             let config =
                 { MachineId = machineId
@@ -159,21 +173,22 @@ module private MachineBuild =
                   Store = st :> IStateStore<'EntityId, 'State, 'Event, 'Action>
                   RetryQueue = st :> IRetryQueue<'EntityId, 'Event>
                   DeadLetter = st :> IDeadLetterStore<'EntityId, 'Event>
+                  Outbox = st :> IActionOutbox<'EntityId, 'Action>
                   Pipeline = pipeline
-                  Classify = r.Classify
-                  RetryPolicy = retryPolicy
-                  Supervisor = supervise
+                  Classify = classify
+                  RetryPolicy = policy
                   TimeProvider = timeProvider
                   MailboxCapacity = mailboxCapacity
                   IdleTimeout = idleTimeout }
 
-            let signal = new WorkSignal()
+            let retrySignal = new WorkSignal()
+            let outboxSignal = new WorkSignal()
 
             let observerBus =
                 observer |> Option.map (fun o -> ObserverDispatcher(o, mailboxCapacity))
 
-            let registry = Registry(config, observerBus, signal)
-            Ok(Machine(config, registry, observerBus, signal))
+            let registry = Registry(config, observerBus, retrySignal, outboxSignal)
+            Ok(Machine(config, registry, observerBus, retrySignal, outboxSignal))
         | _ -> Error errors
 
 /// <summary>
@@ -232,12 +247,16 @@ module MachineCE =
     /// <summary>Declares the short-horizon Polly resilience policy.</summary>
     let retry (retry: RetryConfig<'Err>) : MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err> = MachineRetry retry
 
+    /// <summary>Uses a pre-built shared resilience pipeline, such as a keyed DI registration.</summary>
+    let resiliencePipeline
+        (pipeline: ResiliencePipeline<PipelineResult<'Err>>)
+        (classify: MachineError<'Err> -> Disposition)
+        : MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err> =
+        MachinePipeline(pipeline, classify)
+
     /// <summary>Declares the durable retry-queue policy.</summary>
     let retryPolicy (policy: RetryPolicy) : MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err> =
         MachineRetryPolicy policy
-
-    /// <summary>Declares the supervision policy applied when actors are wired to a supervisor (M5).</summary>
-    let supervise (spec: SupervisorSpec) : MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err> = MachineSupervise spec
 
     /// <summary>Declares a best-effort, post-commit transition observer.</summary>
     let onTransition

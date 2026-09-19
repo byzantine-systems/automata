@@ -73,6 +73,16 @@ module internal Sql =
            WHERE machine_id = @machine_id AND entity_id = @entity_id
              AND event_idempotency_key = @event_idempotency_key AND ordinal = @ordinal"""
 
+    let recordSupervisionEvent =
+        """INSERT INTO fsm.supervision_event (supervisor, child_id, kind, strategy, reason, at)
+           VALUES (@supervisor, @child_id, @kind, @strategy, @reason::jsonb, @at)"""
+
+    let listRecentSupervisionEvents =
+        """SELECT supervisor, child_id, kind, strategy, reason, at
+           FROM fsm.supervision_event
+           ORDER BY at DESC, id DESC
+           LIMIT @limit"""
+
 /// <summary>Shared column-mapping helpers for the PostgreSQL stores.</summary>
 [<RequireQualifiedAccess>]
 module internal Db =

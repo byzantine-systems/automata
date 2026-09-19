@@ -32,7 +32,7 @@ type PaymentAction =
     | NotifyCustomer of string
     | Log of string
 
-/// The chart from REFACTOR.md §4.3: one Cancel rule on `active` inherited by every descendant.
+/// One Cancel rule on `active` inherited by every descendant.
 let private paymentChart =
     statechart<PaymentState, PaymentEvent, PaymentAction, string> {
         root "root"

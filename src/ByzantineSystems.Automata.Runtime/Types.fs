@@ -63,6 +63,9 @@ type RetryPolicyError =
     | PollingIntervalNotPositive of TimeSpan
     | ConcurrencyBelowOne of int
 
+/// <summary>A durable retry policy whose structural invariants have been checked.</summary>
+type ValidatedRetryPolicy = private ValidatedRetryPolicy of RetryPolicy
+
 /// <summary>Construction and validation of <see cref="T:ByzantineSystems.Automata.Runtime.RetryPolicy" />.</summary>
 [<RequireQualifiedAccess>]
 module RetryPolicy =
@@ -77,7 +80,7 @@ module RetryPolicy =
           Concurrency = 4 }
 
     /// <summary>Accumulates every defect rather than stopping at the first.</summary>
-    let validate (policy: RetryPolicy) : Result<RetryPolicy, RetryPolicyError list> =
+    let validate (policy: RetryPolicy) : Result<ValidatedRetryPolicy, RetryPolicyError list> =
         let errors =
             [ if policy.MaxAttempts < 1 then
                   MaxAttemptsBelowOne policy.MaxAttempts
@@ -98,8 +101,26 @@ module RetryPolicy =
                   ConcurrencyBelowOne policy.Concurrency ]
 
         match errors with
-        | [] -> Ok policy
+        | [] -> Ok(ValidatedRetryPolicy policy)
         | errors -> Error errors
+
+/// <summary>Operations on a validated durable retry policy.</summary>
+[<RequireQualifiedAccess>]
+module ValidatedRetryPolicy =
+
+    let internal value (ValidatedRetryPolicy policy) = policy
+
+/// <summary>A declaration that may occur at most once in a machine expression.</summary>
+type MachineDeclaration =
+    | Chart
+    | Initial
+    | Store
+    | Retry
+    | RetryPolicy
+    | Observer
+    | MailboxCapacity
+    | IdleTimeout
+    | TimeProvider
 
 /// <summary>Structural defects accumulated by the machine builder.</summary>
 type MachineConfigError =
@@ -109,10 +130,20 @@ type MachineConfigError =
     | MissingRetry
     | InvalidRetry of ConfigError list
     | InvalidRetryPolicy of RetryPolicyError list
-    | InvalidSupervision of SupervisorError list
+    | DuplicateDeclaration of MachineDeclaration
     | InitialStateUnknown of StateId
     | MailboxCapacityBelowOne of capacity: int
     | IdleTimeoutNotPositive of TimeSpan
+
+/// <summary>Counts the durable queue work performed by one poll.</summary>
+type PollSummary =
+    { Claimed: int
+      Completed: int
+      Rescheduled: int
+      Abandoned: int }
+
+/// <summary>An infrastructure failure that prevents a durable worker from making progress.</summary>
+type WorkerError = StoreFailure of StoreError
 
 /// <summary>
 /// A best-effort, post-commit observer: it cannot change an already committed send result.
@@ -133,10 +164,10 @@ type internal RuntimeConfig<'EntityId, 'State, 'Event, 'Action, 'Err when 'Entit
       Store: IStateStore<'EntityId, 'State, 'Event, 'Action>
       RetryQueue: IRetryQueue<'EntityId, 'Event>
       DeadLetter: IDeadLetterStore<'EntityId, 'Event>
+      Outbox: IActionOutbox<'EntityId, 'Action>
       Pipeline: ResiliencePipeline<PipelineResult<'Err>>
       Classify: MachineError<'Err> -> Disposition
-      RetryPolicy: RetryPolicy
-      Supervisor: SupervisorSpec option
+      RetryPolicy: ValidatedRetryPolicy
       TimeProvider: TimeProvider
       MailboxCapacity: int
       IdleTimeout: TimeSpan }

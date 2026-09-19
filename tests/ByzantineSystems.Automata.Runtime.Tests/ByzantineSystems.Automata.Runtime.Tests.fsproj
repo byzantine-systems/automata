@@ -9,6 +9,7 @@
     <ItemGroup>
         <Compile Include="InMemoryStoreTests.fs" />
         <Compile Include="TestSupport.fs" />
+        <Compile Include="RuntimeRefactorTests.fs" />
         <Compile Include="MachineOutcomeTests.fs" />
         <Compile Include="ParallelismTests.fs" />
         <Compile Include="WorkSignalsTests.fs" />

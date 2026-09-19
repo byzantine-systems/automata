@@ -306,7 +306,7 @@ module Retry =
     /// breaker becomes <c>CircuitOpen</c> with its retry hint. Polly's <c>ValueTask</c>
     /// interop and pooled contexts stay private to this module. Caller cancellation
     /// propagates as cancellation and is never converted into an error. An unexpected
-    /// exception from the operation propagates unchanged — classifying those is the
+    /// exception from the operation propagates unchanged; classifying those is the
     /// runtime supervisor's job, not the pipeline's.
     /// </summary>
     let execute

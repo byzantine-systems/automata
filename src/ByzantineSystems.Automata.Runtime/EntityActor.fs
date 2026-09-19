@@ -19,7 +19,8 @@ type internal EntityActor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityI
         config: RuntimeConfig<'EntityId, 'State, 'Event, 'Action, 'Err>,
         entityId: 'EntityId,
         observerBus: ObserverDispatcher<'EntityId, 'State, 'Event, 'Action> option,
-        signal: WorkSignal
+        retrySignal: WorkSignal,
+        outboxSignal: WorkSignal
     ) =
 
     let options =
@@ -49,11 +50,12 @@ type internal EntityActor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityI
                     reply.TrySetCanceled(sendCt) |> ignore
                 else
                     try
-                        let! outcome = Send.dispatch config entityId envelope observerBus signal sendCt
+                        let! outcome =
+                            Send.dispatch config entityId envelope observerBus retrySignal outboxSignal sendCt
+
                         reply.TrySetResult(outcome) |> ignore
-                    with
-                    | :? OperationCanceledException -> reply.TrySetCanceled(sendCt) |> ignore
-                    | ex -> reply.TrySetException(ex) |> ignore
+                    with :? OperationCanceledException when sendCt.IsCancellationRequested ->
+                        reply.TrySetCanceled(sendCt) |> ignore
 
             | ReadState(readCt, reply) ->
                 try
@@ -62,10 +64,21 @@ type internal EntityActor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityI
                     match snapshot with
                     | Ok found -> reply.TrySetResult(Ok found) |> ignore
                     | Error e -> reply.TrySetResult(Error(MachineError.Store e)) |> ignore
-                with
-                | :? OperationCanceledException -> reply.TrySetCanceled(readCt) |> ignore
-                | ex -> reply.TrySetException(ex) |> ignore
+                with :? OperationCanceledException when readCt.IsCancellationRequested ->
+                    reply.TrySetCanceled(readCt) |> ignore
         }
+
+    let failMessage (error: exn) message =
+        match message with
+        | Send(_, _, reply) -> reply.TrySetException(error) |> ignore
+        | ReadState(_, reply) -> reply.TrySetException(error) |> ignore
+
+    let failPending error =
+        let mutable pending =
+            Unchecked.defaultof<ActorMessage<'EntityId, 'State, 'Event, 'Action, 'Err>>
+
+        while reader.TryRead(&pending) do
+            failMessage error pending
 
     let runLoop =
         let rec run sinceYield =
@@ -73,7 +86,14 @@ type internal EntityActor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityI
                 try
                     let! message = reader.ReadAsync()
                     touch ()
-                    do! handle message
+
+                    try
+                        do! handle message
+                    with error ->
+                        writer.TryComplete(error) |> ignore
+                        failMessage error message
+                        failPending error
+                        return raise error
 
                     if sinceYield + 1 >= 64 then
                         do! Task.Yield()

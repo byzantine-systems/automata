@@ -93,7 +93,7 @@ module Rule =
     /// <summary>
     /// Guard combinator: when the predicate refuses, the rule reports
     /// <see cref="F:ByzantineSystems.Automata.Core.RuleVerdict`3.GuardFailed" /> instead of
-    /// silently not matching — the search stops with a reportable reason rather than bubbling.
+    /// silently not matching; the search stops with a reportable reason rather than bubbling.
     /// </summary>
     let guarded
         (predicate: 'State -> 'Event -> bool)

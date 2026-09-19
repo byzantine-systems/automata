@@ -9,13 +9,15 @@ DB_URL ?= postgresql://$(PROJECT_NAME):$(PROJECT_NAME)@127.0.0.1:5432/$(PROJECT_
 
 SOLUTION := bs-automata.slnx
 MIGRATE_PROJECT := tools/ByzantineSystems.Automata.Migrate/ByzantineSystems.Automata.Migrate.fsproj
-SAMPLE_PROJECT := samples/ByzantineSystems.Automata.Samples.PaymentProcessor/ByzantineSystems.Automata.Samples.PaymentProcessor.fsproj
+EXAMPLE_PAYMENT_PROJECT := examples/ByzantineSystems.Automata.Examples.PaymentProcessor/ByzantineSystems.Automata.Examples.PaymentProcessor.fsproj
+EXAMPLE_SUPERVISION_PROJECT := examples/ByzantineSystems.Automata.Examples.Supervision/ByzantineSystems.Automata.Examples.Supervision.fsproj
 
 SRC_PROJECTS := $(wildcard src/*/*.fsproj)
 UNIT_TEST_PROJECTS := \
 	tests/ByzantineSystems.Automata.Core.Tests/ByzantineSystems.Automata.Core.Tests.fsproj \
 	tests/ByzantineSystems.Automata.Resilience.Tests/ByzantineSystems.Automata.Resilience.Tests.fsproj \
-	tests/ByzantineSystems.Automata.Runtime.Tests/ByzantineSystems.Automata.Runtime.Tests.fsproj
+	tests/ByzantineSystems.Automata.Runtime.Tests/ByzantineSystems.Automata.Runtime.Tests.fsproj \
+	tests/ByzantineSystems.Automata.DependencyInjection.Tests/ByzantineSystems.Automata.DependencyInjection.Tests.fsproj
 INTEGRATION_TEST_PROJECTS := \
 	tests/ByzantineSystems.Automata.Storage.Postgres.Tests/ByzantineSystems.Automata.Storage.Postgres.Tests.fsproj
 
@@ -23,14 +25,17 @@ NUGET_SOURCE := https://api.nuget.org/v3/index.json
 NUGET_API_KEY ?= None
 NUGET_PACKAGES_DIR := out/nix-lock
 NUGET_TO_JSON ?= nixpkgs\#nuget-to-json
+DOCS_OUTPUT := out/docs
+PACKAGE_OUTPUT := out/packages
 
 release := $(shell git tag -l --sort=-creatordate | head -n 1)
+VERSION ?= $(if $(release),$(patsubst v%,%,$(release)),0.1.0)
 
-PROJECT_FILES := $(wildcard src/*/*.fsproj tests/*/*.fsproj tools/*/*.fsproj samples/*/*.fsproj)
+PROJECT_FILES := $(wildcard src/*/*.fsproj tests/*/*.fsproj tools/*/*.fsproj examples/*/*.fsproj)
 RESTORE_INPUTS := Makefile $(SOLUTION) global.json nuget.config $(PROJECT_FILES) \
 	$(wildcard Directory.Build.* Directory.Packages.*)
 
-.PHONY: build test test-unit test-integration migrate run-sample db db-reset fmt nix-lock pack push
+.PHONY: build test test-unit test-integration migrate run-example run-example-supervision db db-reset fmt docs nix-lock pack package-smoke push
 
 build:
 	$(DOTNET) build $(SOLUTION) -m:1
@@ -51,8 +56,11 @@ test-integration: build
 migrate:
 	BS_AUTOMATA_CONN='$(DB_CONNECTION_STRING)' $(DOTNET) run --project $(MIGRATE_PROJECT)
 
-run-sample:
-	$(DOTNET) run --project $(SAMPLE_PROJECT)
+run-example:
+	$(DOTNET) run --project $(EXAMPLE_PAYMENT_PROJECT)
+
+run-example-supervision:
+	$(DOTNET) run --project $(EXAMPLE_SUPERVISION_PROJECT)
 
 db:
 	psql '$(DB_URL)'
@@ -64,6 +72,11 @@ db-reset:
 fmt:
 	$(NIX) fmt
 
+docs:
+	$(DOTNET) tool restore
+	$(RM) -r $(DOCS_OUTPUT)
+	$(DOTNET) docfx docfx.json
+
 # SOURCE:
 # https://github.com/NixOS/nixpkgs/blob/master/doc/languages-frameworks/dotnet.section.md#generating-and-updating-nuget-dependencies-generating-and-updating-nuget-dependencies
 nix-lock: deps.json
@@ -74,13 +87,25 @@ deps.json: $(RESTORE_INPUTS)
 	$(NIX) run '$(NUGET_TO_JSON)' -- $(NUGET_PACKAGES_DIR) > $@.tmp
 	mv $@.tmp $@
 
-# Packages the newest git tag as a .NET release
+# Packages VERSION, defaulting to the newest git tag or the repository version.
 pack:
-	@echo "PACKING RELEASE: $(release)"
-	rm -f src/*/bin/Release/*.nupkg src/*/bin/Release/*.snupkg
-	$(DOTNET) pack -c Release /p:Version=$(release:v%=%) $(SRC_PROJECTS)
+	@echo "PACKING RELEASE: $(VERSION)"
+	$(RM) -r $(PACKAGE_OUTPUT)
+	@for project in $(SRC_PROJECTS); do \
+		$(DOTNET) pack "$$project" -c Release /p:Version=$(VERSION) /p:PackageOutputPath=$(CURDIR)/$(PACKAGE_OUTPUT) || exit 1; \
+	done
+
+# Restores every locally packed library into a clean F# consumer and compiles it.
+package-smoke: pack
+	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+		$(DOTNET) new classlib --language F# --framework net10.0 --output "$$tmp" --no-restore; \
+		for package in $(notdir $(basename $(SRC_PROJECTS))); do \
+			$(DOTNET) add "$$tmp" package "$$package" --version "$(VERSION)" --no-restore || exit 1; \
+		done; \
+		$(DOTNET) restore "$$tmp" --source "$(CURDIR)/$(PACKAGE_OUTPUT)" --source "$(NUGET_SOURCE)" || exit 1; \
+		$(DOTNET) build "$$tmp" --no-restore
 
 # Pushes the packed release to NuGet
 push:
-	@echo "Pushing release '$(release)' to $(NUGET_SOURCE)"
-	$(DOTNET) nuget push 'src/*/bin/Release/*.nupkg' -k "$(NUGET_API_KEY)" -s $(NUGET_SOURCE) --skip-duplicate
+	@echo "Pushing release '$(VERSION)' to $(NUGET_SOURCE)"
+	$(DOTNET) nuget push '$(PACKAGE_OUTPUT)/*.nupkg' -k "$(NUGET_API_KEY)" -s $(NUGET_SOURCE) --skip-duplicate

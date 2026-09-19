@@ -16,12 +16,17 @@
         <Authors>ByzantineSystems</Authors>
         <Company>ByzantineSystems</Company>
         <Product>ByzantineSystems.Automata</Product>
-        <PackageLicenseExpression>BSD-3-Clause</PackageLicenseExpression>
+        <PackageLicenseExpression>LGPL-3.0-or-later</PackageLicenseExpression>
+        <PackageReadmeFile>README.md</PackageReadmeFile>
         <RepositoryUrl>https://github.com/byzantine-systems/automata</RepositoryUrl>
         <RepositoryType>git</RepositoryType>
         <PackageTags>fsharp;statechart;state-machine;hierarchical;polly;postgresql</PackageTags>
         <IncludeSymbols>true</IncludeSymbols>
         <SymbolPackageFormat>snupkg</SymbolPackageFormat>
     </PropertyGroup>
+
+    <ItemGroup>
+        <None Include="$(MSBuildThisFileDirectory)README.md" Pack="true" PackagePath="\" />
+    </ItemGroup>
 
 </Project>

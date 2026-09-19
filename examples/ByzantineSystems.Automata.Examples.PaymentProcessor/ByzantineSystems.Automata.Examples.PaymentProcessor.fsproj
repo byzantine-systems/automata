@@ -10,9 +10,13 @@
     </ItemGroup>
 
     <ItemGroup>
+        <PackageReference Include="FSharp.Core" />
         <ProjectReference Include="..\..\src\ByzantineSystems.Automata.Core\ByzantineSystems.Automata.Core.fsproj" />
         <ProjectReference Include="..\..\src\ByzantineSystems.Automata.Resilience\ByzantineSystems.Automata.Resilience.fsproj" />
         <ProjectReference Include="..\..\src\ByzantineSystems.Automata.Runtime\ByzantineSystems.Automata.Runtime.fsproj" />
-        <ProjectReference Include="..\..\src\ByzantineSystems.Automata.Storage.InMemory\ByzantineSystems.Automata.Storage.InMemory.fsproj" />    </ItemGroup>
+        <ProjectReference Include="..\..\src\ByzantineSystems.Automata.Storage\ByzantineSystems.Automata.Storage.fsproj" />
+        <ProjectReference Include="..\..\src\ByzantineSystems.Automata.Storage.InMemory\ByzantineSystems.Automata.Storage.InMemory.fsproj" />
+        <ProjectReference Include="..\..\src\ByzantineSystems.Automata.Storage.Postgres\ByzantineSystems.Automata.Storage.Postgres.fsproj" />
+    </ItemGroup>
 
 </Project>

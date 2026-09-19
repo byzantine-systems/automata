@@ -19,15 +19,40 @@ type internal Registry<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: 
     (
         config: RuntimeConfig<'EntityId, 'State, 'Event, 'Action, 'Err>,
         observerBus: ObserverDispatcher<'EntityId, 'State, 'Event, 'Action> option,
-        signal: WorkSignal
+        retrySignal: WorkSignal,
+        outboxSignal: WorkSignal
     ) =
 
     let actors =
         ConcurrentDictionary<'EntityId, Lazy<EntityActor<'EntityId, 'State, 'Event, 'Action, 'Err>>>()
 
+    let faulted =
+        TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+
     let createActor (entityId: 'EntityId) : Lazy<EntityActor<'EntityId, 'State, 'Event, 'Action, 'Err>> =
-        Lazy<EntityActor<'EntityId, 'State, 'Event, 'Action, 'Err>>(fun () ->
-            EntityActor(config, entityId, observerBus, signal))
+        let mutable holder =
+            Unchecked.defaultof<Lazy<EntityActor<'EntityId, 'State, 'Event, 'Action, 'Err>>>
+
+        holder <-
+            Lazy<EntityActor<'EntityId, 'State, 'Event, 'Action, 'Err>>(fun () ->
+                let actor = EntityActor(config, entityId, observerBus, retrySignal, outboxSignal)
+
+                actor.Completion.ContinueWith(
+                    (fun (completion: Task) ->
+                        if completion.IsFaulted then
+                            let error = completion.Exception.GetBaseException()
+                            faulted.TrySetException(error) |> ignore
+
+                        actors.TryRemove(KeyValuePair(entityId, holder)) |> ignore),
+                    CancellationToken.None,
+                    TaskContinuationOptions.ExecuteSynchronously,
+                    TaskScheduler.Default
+                )
+                |> ignore
+
+                actor)
+
+        holder
 
     /// <summary>Returns the actor for the entity, starting its loop exactly once.</summary>
     member _.GetOrCreate(entityId: 'EntityId) : EntityActor<'EntityId, 'State, 'Event, 'Action, 'Err> =
@@ -35,6 +60,7 @@ type internal Registry<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: 
 
     /// <summary>Number of live actor entries (started or not). Test-facing; internal.</summary>
     member internal _.ActorCount: int = actors.Count
+    member internal _.Faulted: Task = faulted.Task
 
     /// <summary>True when an actor's loop has been started for the entity. Test-facing; internal.</summary>
     member internal _.IsStarted(entityId: 'EntityId) : bool =
@@ -68,7 +94,8 @@ type internal Registry<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: 
     member _.TryEvictIdle(entityId: 'EntityId) : unit =
         match actors.TryGetValue entityId with
         | true, holder when holder.IsValueCreated && holder.Value.IsIdle(config.IdleTimeout) ->
-            actors.TryRemove(KeyValuePair(entityId, holder)) |> ignore
+            if actors.TryRemove(KeyValuePair(entityId, holder)) then
+                holder.Value.Stop()
         | _ -> ()
 
     /// <summary>Stops every actor: mailboxes complete, loops drain, then exit.</summary>
