@@ -51,6 +51,16 @@ type Snapshot<'State> =
       Status: InstanceStatus }
 
 /// <summary>
+/// Proof of a committed (or already-applied) transition. A send that repeats an idempotency
+/// key receives the original receipt — the epoch did not advance and no duplicate work was
+/// created — which is how a lost response or a client retry is recognised after the fact.
+/// </summary>
+type CommitReceipt =
+    { IdempotencyKey: string
+      Epoch: Epoch
+      OccurredAt: DateTimeOffset }
+
+/// <summary>
 /// An applied transition: the append-only history entry for one event. Values exist only
 /// after a successful commit. The runtime stamps <c>OccurredAt</c> from the injected
 /// <c>TimeProvider</c>; nothing in this project reads the system clock.
@@ -66,6 +76,8 @@ type Transition<'EntityId, 'State, 'Event, 'Action> =
         Actions: 'Action list
         FromState: 'State
         ToState: 'State
+        /// <summary>Lifecycle status of the instance after this transition; the store persists it with the snapshot.</summary>
+        Status: InstanceStatus
         /// <summary>Which node in the chain actually handled the event (bubbling result).</summary>
         HandledBy: StateId
         /// <summary>States exited on the way to the least common ancestor, innermost first.</summary>

@@ -103,6 +103,7 @@ let transitionTests =
                     Actions = [ "reserve-slot" ]
                     FromState = "idle"
                     ToState = "active.processing"
+                    Status = Running
                     HandledBy = stateId "idle"
                     Exited = [ stateId "idle" ]
                     Entered = [ stateId "active"; stateId "active.processing" ] }
@@ -110,6 +111,17 @@ let transitionTests =
               Expect.equal 1UL (Epoch.value transition.Epoch) "committed epoch"
               Expect.equal "active.processing" transition.ToState "target state"
               Expect.equal 2 transition.Entered.Length "entry path depth"
+          }
+          test "commit receipt carries idempotency, epoch, and timestamp" {
+              let receipt =
+                  { IdempotencyKey = "payment-request-123"
+                    Epoch = Epoch.next Epoch.initial
+                    OccurredAt = DateTimeOffset(2026, 9, 18, 17, 0, 0, TimeSpan.Zero) }
+
+              Expect.equal
+                  ("payment-request-123", 1UL)
+                  (receipt.IdempotencyKey, Epoch.value receipt.Epoch)
+                  "receipt fields"
           } ]
 
 let errorTests =

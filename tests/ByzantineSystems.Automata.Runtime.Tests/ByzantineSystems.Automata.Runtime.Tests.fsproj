@@ -7,12 +7,14 @@
     </PropertyGroup>
 
     <ItemGroup>
+        <Compile Include="InMemoryStoreTests.fs" />
         <Compile Include="Program.fs" />
     </ItemGroup>
 
     <ItemGroup>
         <PackageReference Include="Expecto" />
         <ProjectReference Include="..\..\src\ByzantineSystems.Automata.Runtime\ByzantineSystems.Automata.Runtime.fsproj" />
-        <ProjectReference Include="..\..\src\ByzantineSystems.Automata.Storage.InMemory\ByzantineSystems.Automata.Storage.InMemory.fsproj" />    </ItemGroup>
+        <ProjectReference Include="..\..\src\ByzantineSystems.Automata.Storage.InMemory\ByzantineSystems.Automata.Storage.InMemory.fsproj" />
+    </ItemGroup>
 
 </Project>

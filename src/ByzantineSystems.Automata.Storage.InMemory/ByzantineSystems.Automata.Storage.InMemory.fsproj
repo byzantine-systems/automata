@@ -6,7 +6,7 @@
     </PropertyGroup>
 
     <ItemGroup>
-        <Compile Include="Placeholder.fs" />
+        <Compile Include="InMemory.fs" />
     </ItemGroup>
 
     <ItemGroup>

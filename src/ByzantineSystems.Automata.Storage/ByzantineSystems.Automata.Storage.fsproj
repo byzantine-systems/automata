@@ -6,7 +6,8 @@
     </PropertyGroup>
 
     <ItemGroup>
-        <Compile Include="Placeholder.fs" />
+        <Compile Include="Envelope.fs" />
+        <Compile Include="Store.fs" />
     </ItemGroup>
 
     <ItemGroup>

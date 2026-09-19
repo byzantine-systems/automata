@@ -1,0 +1,29 @@
+version: 2
+updates:
+  # Manage GitHub Actions dependencies
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    target-branch: "main"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "ci:"
+    # This block groups all updates for this ecosystem together
+    groups:
+      github-actions-deps:
+        patterns:
+          - "*"
+
+  # Manage NuGet dependencies
+  - package-ecosystem: "nuget"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+
+  # Manage .NET SDK versions (via global.json)
+  - package-ecosystem: "dotnet-sdk"
+    directory: "/"
+    schedule:
+      interval: "weekly"
