@@ -407,9 +407,9 @@ let retryQueueTests =
               let entity = entityId "ORD-9"
               let lease = TimeSpan.FromSeconds 10.
 
-              do!
+              let! _ =
                   q.Enqueue(mkRequest entity "defer-1" startTime, ct)
-                  |> mapTask (expectOkUnit "enqueue")
+                  |> mapTask (expectOk "enqueue")
 
               let! (claimed: RetryList) = q.Claim(5, lease, ct) |> mapTask (expectOk "claim")
 
@@ -426,9 +426,9 @@ let retryQueueTests =
               let q = asRetryQueue store
               let entity = entityId "ORD-10"
 
-              do!
+              let! _ =
                   q.Enqueue(mkRequest entity "defer-1" startTime, ct)
-                  |> mapTask (expectOkUnit "enqueue")
+                  |> mapTask (expectOk "enqueue")
 
               let! (first: RetryList) = q.Claim(5, TimeSpan.FromSeconds 10., ct) |> mapTask (expectOk "first claim")
               Expect.equal 1 first.Length "the first claim succeeds"
@@ -450,9 +450,9 @@ let retryQueueTests =
               let q = asRetryQueue store
               let entity = entityId "ORD-11"
 
-              do!
+              let! _ =
                   q.Enqueue(mkRequest entity "defer-1" (startTime.AddHours 1.), ct)
-                  |> mapTask (expectOkUnit "enqueue")
+                  |> mapTask (expectOk "enqueue")
 
               let! (claimed: RetryList) = q.Claim(5, TimeSpan.FromSeconds 10., ct) |> mapTask (expectOk "claim")
               Expect.isEmpty claimed "future items stay put"
@@ -463,9 +463,9 @@ let retryQueueTests =
               let q = asRetryQueue store
               let entity = entityId "ORD-12"
 
-              do!
+              let! _ =
                   q.Enqueue(mkRequest entity "defer-1" startTime, ct)
-                  |> mapTask (expectOkUnit "enqueue")
+                  |> mapTask (expectOk "enqueue")
 
               let! (claimed: RetryList) = q.Claim(5, TimeSpan.FromSeconds 10., ct) |> mapTask (expectOk "claim")
 
@@ -490,17 +490,17 @@ let retryQueueTests =
               let entity = entityId "ORD-13"
               let later = startTime.AddMinutes 2.
 
-              do!
+              let! _ =
                   q.Enqueue(mkRequest entity "defer-1" startTime, ct)
-                  |> mapTask (expectOkUnit "first enqueue")
+                  |> mapTask (expectOk "first enqueue")
 
-              do!
+              let! _ =
                   q.Enqueue(
                       { mkRequest entity "defer-1" later with
                           LastError = Some "still failing" },
                       ct
                   )
-                  |> mapTask (expectOkUnit "second enqueue")
+                  |> mapTask (expectOk "second enqueue")
 
               let pending = store.PendingRetries()
               Expect.equal 1 pending.Length "the item is not duplicated"
@@ -518,15 +518,15 @@ let retryQueueTests =
               let entity = entityId "ORD-13-LEASED"
               let lease = TimeSpan.FromSeconds 10.
 
-              do!
+              let! _ =
                   q.Enqueue(mkRequest entity "defer-1" startTime, ct)
-                  |> mapTask (expectOkUnit "enqueue")
+                  |> mapTask (expectOk "enqueue")
 
               let! (_: RetryList) = q.Claim(1, lease, ct) |> mapTask (expectOk "claim")
 
-              do!
+              let! _ =
                   q.Enqueue(mkRequest entity "defer-1" startTime, ct)
-                  |> mapTask (expectOkUnit "refresh")
+                  |> mapTask (expectOk "refresh")
 
               let! (claimedAgain: RetryList) = q.Claim(1, lease, ct) |> mapTask (expectOk "claim while leased")
               Expect.isEmpty claimedAgain "refreshing the item cannot revoke an active worker's lease"
@@ -538,9 +538,9 @@ let retryQueueTests =
               let entity = entityId "ORD-14"
               let next = startTime.AddSeconds 30.
 
-              do!
+              let! _ =
                   q.Enqueue(mkRequest entity "defer-1" startTime, ct)
-                  |> mapTask (expectOkUnit "enqueue")
+                  |> mapTask (expectOk "enqueue")
 
               let! (claimed: RetryList) = q.Claim(5, TimeSpan.FromSeconds 10., ct) |> mapTask (expectOk "claim")
 

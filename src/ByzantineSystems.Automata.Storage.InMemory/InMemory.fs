@@ -175,7 +175,7 @@ type InMemoryStore<'EntityId, 'State, 'Event, 'Action when 'EntityId: equality>(
     let enqueueTransition
         (request: RetryRequest<'EntityId, 'Event>)
         (current: StoreState<'EntityId, 'State, 'Event, 'Action>)
-        : StoreState<'EntityId, 'State, 'Event, 'Action> =
+        : StoreState<'EntityId, 'State, 'Event, 'Action> * RetryId =
         let key = request.MachineId, request.EntityId, request.IdempotencyKey
 
         let pending =
@@ -194,7 +194,8 @@ type InMemoryStore<'EntityId, 'State, 'Event, 'Action when 'EntityId: equality>(
                     LastError = request.LastError }
 
             { current with
-                Retries = current.Retries |> StoreState.upsert retryId refreshed }
+                Retries = current.Retries |> StoreState.upsert retryId refreshed },
+            retryId
         | None ->
             let nextRetryId = current.NextRetryId + 1L
             let retryId = RetryId.create nextRetryId
@@ -213,9 +214,11 @@ type InMemoryStore<'EntityId, 'State, 'Event, 'Action when 'EntityId: equality>(
             { current with
                 Retries = current.Retries |> StoreState.upsert retryId item
                 RetryIdsByKey = current.RetryIdsByKey |> StoreState.upsert key retryId
-                NextRetryId = nextRetryId }
+                NextRetryId = nextRetryId },
+            retryId
 
-    let enqueue request = update (enqueueTransition request)
+    let enqueue request =
+        transact (fun current -> enqueueTransition request current)
 
     let claimRetryTransition
         (now: DateTimeOffset)
@@ -370,8 +373,7 @@ type InMemoryStore<'EntityId, 'State, 'Event, 'Action when 'EntityId: equality>(
 
         member _.Enqueue(request, ct) =
             checkCancelled ct
-            enqueue request
-            Ok() |> Task.FromResult
+            enqueue request |> Ok |> Task.FromResult
 
         member _.Claim(batch, lease, ct) =
             checkCancelled ct
@@ -409,3 +411,5 @@ type InMemoryStore<'EntityId, 'State, 'Event, 'Action when 'EntityId: equality>(
             checkCancelled ct
             failOutbox actionKey nextAttemptAt
             Ok() |> Task.FromResult
+
+    interface IMachineStore<'EntityId, 'State, 'Event, 'Action>

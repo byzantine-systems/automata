@@ -53,10 +53,12 @@ type IStateStore<'EntityId, 'State, 'Event, 'Action> =
 type IRetryQueue<'EntityId, 'Event> =
 
     /// <summary>
-    /// Enqueues an event for later retry. Re-enqueueing an idempotency key that is still
-    /// pending refreshes its schedule without duplicating the item.
+    /// Enqueues an event for later retry and returns the stable id assigned by the store.
+    /// Re-enqueueing an idempotency key that is still pending refreshes its schedule
+    /// without duplicating the item and returns the id of the existing entry.
     /// </summary>
-    abstract Enqueue: request: RetryRequest<'EntityId, 'Event> * ct: CancellationToken -> Task<Result<unit, StoreError>>
+    abstract Enqueue:
+        request: RetryRequest<'EntityId, 'Event> * ct: CancellationToken -> Task<Result<RetryId, StoreError>>
 
     /// <summary>
     /// Leases up to <c>batch</c> due items (next attempt reached, lease free), ordered by next
@@ -113,3 +115,14 @@ type IActionOutbox<'EntityId, 'Action> =
     abstract Fail:
         actionKey: OutboxKey<'EntityId> * nextAttemptAt: DateTimeOffset * ct: CancellationToken ->
             Task<Result<unit, StoreError>>
+
+/// <summary>
+/// The complete durable surface one machine needs. A single value implements state,
+/// retry, dead-letter, and outbox storage so the machine builder can accept one store
+/// dependency; each concern is still expressed through its own narrower interface.
+/// </summary>
+type IMachineStore<'EntityId, 'State, 'Event, 'Action> =
+    inherit IStateStore<'EntityId, 'State, 'Event, 'Action>
+    inherit IRetryQueue<'EntityId, 'Event>
+    inherit IDeadLetterStore<'EntityId, 'Event>
+    inherit IActionOutbox<'EntityId, 'Action>
