@@ -17,7 +17,7 @@
 
         <!-- Host integration -->
         <PackageVersion Include="Microsoft.Extensions.Hosting" Version="10.0.0" />
-        <PackageVersion Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.0" />
+        <PackageVersion Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.12" />
         <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.0" />
 
         <!-- Persistence: raw Npgsql instead of Npgsql.FSharp (avoids the 8.x/9.x version skew) -->
