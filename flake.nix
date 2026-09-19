@@ -43,6 +43,7 @@
         }:
         let
           app_name = "bs-automata";
+          db_connection_string = "Host=127.0.0.1;Port=5432;Database=${app_name};Username=${app_name};Password=${app_name}";
           net10 = pkgs.dotnet-sdk_10;
           version = "0.5.0";
           # app = pkgs.buildDotnetModule {
@@ -213,11 +214,15 @@
               '';
             };
 
-            env.ConnectionStrings__BS_AUTOMATA_CONN = "Host=127.0.0.1;Port=5432;Database=${app_name};Username=${app_name};Password=${app_name}";
+            env = {
+              AUTOMATA_TEST_DB = db_connection_string;
+              ConnectionStrings__BS_AUTOMATA_CONN = db_connection_string;
+            };
 
             scripts = {
-              migrate.exec = "dotnet run --project tools/ByzantineSystems.Automata.Migrate/ByzantineSystems.Automata.Migrate.fsproj";
-              db-connect.exec = "psql postgresql://${app_name}:${app_name}@127.0.0.1:5432/${app_name}";
+              migrate.exec = "make migrate";
+              db-connect.exec = "make db";
+              db-reset.exec = "make db-reset";
               run-sample.exec = "dotnet run --project samples/ByzantineSystems.Automata.Samples.PaymentProcessor/ByzantineSystems.Automata.Samples.PaymentProcessor.fsproj";
             };
 

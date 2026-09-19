@@ -4,6 +4,8 @@
 PROJECT_NAME ?= bs-automata
 DOTNET ?= dotnet
 NIX ?= nix
+DB_CONNECTION_STRING ?= Host=127.0.0.1;Port=5432;Database=$(PROJECT_NAME);Username=$(PROJECT_NAME);Password=$(PROJECT_NAME)
+DB_URL ?= postgresql://$(PROJECT_NAME):$(PROJECT_NAME)@127.0.0.1:5432/$(PROJECT_NAME)
 
 SOLUTION := bs-automata.slnx
 MIGRATE_PROJECT := tools/ByzantineSystems.Automata.Migrate/ByzantineSystems.Automata.Migrate.fsproj
@@ -28,7 +30,7 @@ PROJECT_FILES := $(wildcard src/*/*.fsproj tests/*/*.fsproj tools/*/*.fsproj sam
 RESTORE_INPUTS := Makefile $(SOLUTION) global.json nuget.config $(PROJECT_FILES) \
 	$(wildcard Directory.Build.* Directory.Packages.*)
 
-.PHONY: build test test-unit test-integration migrate run-sample db fmt nix-lock pack push
+.PHONY: build test test-unit test-integration migrate run-sample db db-reset fmt nix-lock pack push
 
 build:
 	$(DOTNET) build $(SOLUTION) -m:1
@@ -47,13 +49,17 @@ test-integration: build
 	done
 
 migrate:
-	$(DOTNET) run --project $(MIGRATE_PROJECT)
+	BS_AUTOMATA_CONN='$(DB_CONNECTION_STRING)' $(DOTNET) run --project $(MIGRATE_PROJECT)
 
 run-sample:
 	$(DOTNET) run --project $(SAMPLE_PROJECT)
 
 db:
-	psql postgresql://$(PROJECT_NAME):$(PROJECT_NAME)@127.0.0.1:5432/$(PROJECT_NAME)
+	psql '$(DB_URL)'
+
+db-reset:
+	psql '$(DB_URL)' -v ON_ERROR_STOP=1 -c 'DROP SCHEMA IF EXISTS fsm CASCADE; DROP TABLE IF EXISTS public.schemaversions;'
+	$(MAKE) migrate DB_CONNECTION_STRING='$(DB_CONNECTION_STRING)'
 
 fmt:
 	$(NIX) fmt

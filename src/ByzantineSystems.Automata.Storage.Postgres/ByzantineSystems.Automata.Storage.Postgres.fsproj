@@ -6,7 +6,15 @@
     </PropertyGroup>
 
     <ItemGroup>
-        <Compile Include="Placeholder.fs" />
+        <Compile Include="Serialization.fs" />
+        <Compile Include="Sql.fs" />
+        <Compile Include="PostgresStore.fs" />
+        <Compile Include="Migrator.fs" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <EmbeddedResource Include="migrations/main/*.sql" />
+        <EmbeddedResource Include="migrations/repeatable/*.sql" />
     </ItemGroup>
 
     <ItemGroup>
@@ -17,6 +25,7 @@
         <PackageReference Include="Npgsql" />
         <PackageReference Include="dbup-postgresql" />
         <PackageReference Include="FSharp.SystemTextJson" />
+        <PackageReference Include="FsToolkit.ErrorHandling" />
     </ItemGroup>
 
 </Project>

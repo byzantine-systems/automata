@@ -13,7 +13,14 @@ let main argv =
         printfn "AUTOMATA_TEST_DB is not set - skipping Postgres integration tests."
         0
     else
+        TestContext.migrate ()
+
         testList
             "ByzantineSystems.Automata.Storage.Postgres.Tests"
-            [ test "scaffold" { Expect.isTrue true "project compiles and runs" } ]
+            [ PostgresStoreTests.tests
+              PostgresRetryQueueTests.tests
+              PostgresOutboxTests.tests
+              PostgresDeadLetterTests.tests
+              PostgresAcceptanceTests.tests ]
+        |> testSequenced
         |> runTestsWithCLIArgs [] argv

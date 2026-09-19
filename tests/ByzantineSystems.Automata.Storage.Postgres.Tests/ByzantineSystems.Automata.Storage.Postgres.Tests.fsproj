@@ -7,11 +7,18 @@
     </PropertyGroup>
 
     <ItemGroup>
+        <Compile Include="TestContext.fs" />
+        <Compile Include="PostgresStoreTests.fs" />
+        <Compile Include="PostgresRetryQueueTests.fs" />
+        <Compile Include="PostgresOutboxTests.fs" />
+        <Compile Include="PostgresDeadLetterTests.fs" />
+        <Compile Include="PostgresAcceptanceTests.fs" />
         <Compile Include="Program.fs" />
     </ItemGroup>
 
     <ItemGroup>
         <PackageReference Include="Expecto" />
-        <ProjectReference Include="..\..\src\ByzantineSystems.Automata.Storage.Postgres\ByzantineSystems.Automata.Storage.Postgres.fsproj" />    </ItemGroup>
+        <ProjectReference Include="..\..\src\ByzantineSystems.Automata.Storage.Postgres\ByzantineSystems.Automata.Storage.Postgres.fsproj" />
+    </ItemGroup>
 
 </Project>
