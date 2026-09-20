@@ -4,6 +4,7 @@
         <OutputType>Exe</OutputType>
         <IsPackable>false</IsPackable>
         <IsTestProject>true</IsTestProject>
+        <GenerateProgramFile>false</GenerateProgramFile>
     </PropertyGroup>
 
     <ItemGroup>
@@ -18,6 +19,9 @@
 
     <ItemGroup>
         <PackageReference Include="Expecto" />
+        <PackageReference Include="Microsoft.NET.Test.Sdk" PrivateAssets="all" />
+        <PackageReference Include="YoloDev.Expecto.TestSdk" PrivateAssets="all" />
+        <PackageReference Include="coverlet.msbuild" PrivateAssets="all" />
         <ProjectReference Include="..\..\src\ByzantineSystems.Automata.DependencyInjection\ByzantineSystems.Automata.DependencyInjection.fsproj" />
     </ItemGroup>
 

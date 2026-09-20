@@ -24,6 +24,32 @@
       nixpkgs,
       ...
     }:
+    let
+      readXmlElement =
+        element: file:
+        let
+          contents = builtins.readFile file;
+          opening = "<${element}>";
+          closing = "</${element}>";
+          openingParts = nixpkgs.lib.splitString opening contents;
+          closingParts = nixpkgs.lib.splitString closing contents;
+        in
+        if builtins.length openingParts != 2 || builtins.length closingParts != 2 then
+          throw "readXmlElement: expected exactly one ${opening} and ${closing} in ${toString file}"
+        else
+          let
+            valueParts = nixpkgs.lib.splitString closing (builtins.elemAt openingParts 1);
+            valueMatch =
+              if builtins.length valueParts == 2 then
+                builtins.match "[[:space:]]*([^[:space:]<]+)[[:space:]]*" (builtins.elemAt valueParts 0)
+              else
+                null;
+          in
+          if valueMatch == null then
+            throw "readXmlElement: ${opening} in ${toString file} must contain one non-empty value"
+          else
+            builtins.head valueMatch;
+    in
     flake-parts.lib.mkFlake { inherit inputs; } {
       imports = [
         inputs.devenv.flakeModule
@@ -45,32 +71,49 @@
           app_name = "bs-automata";
           db_connection_string = "Host=127.0.0.1;Port=5432;Database=${app_name};Username=${app_name};Password=${app_name}";
           net10 = pkgs.dotnet-sdk_10;
-          version = "0.5.0";
-          # app = pkgs.buildDotnetModule {
-          #   pname = app_name;
-          #   inherit version;
-          #   src = pkgs.lib.cleanSourceWith {
-          #     src = ./.;
-          #     filter =
-          #       path: type:
-          #       let
-          #         name = baseNameOf path;
-          #       in
-          #       !(
-          #         type == "directory"
-          #         && builtins.elem name [
-          #           ".config"
-          #           "out"
-          #         ]
-          #       );
-          #   };
-          #   projectFile = "examples/ByzantineSystems.Automata.Examples.PaymentProcessor/ByzantineSystems.Automata.Examples.PaymentProcessor.fsproj";
-          #   nugetDeps = ./deps.json;
-          #   dotnet-sdk = net10;
-          #   dotnet-runtime = pkgs.dotnet-aspnetcore_10;
-          #   executables = [ "ByzantineSystems.Automata.Examples.PaymentProcessor" ];
-          #   doCheck = false;
-          # };
+          version = readXmlElement "Version" ./Directory.Build.props;
+          source = pkgs.lib.cleanSourceWith {
+            src = ./.;
+            filter =
+              path: type:
+              let
+                name = baseNameOf path;
+              in
+              !(
+                type == "directory"
+                && builtins.elem name [
+                  ".config"
+                  ".tools"
+                  "coverage"
+                  "out"
+                ]
+              );
+          };
+          mkExample =
+            {
+              pname,
+              projectFile,
+              executable,
+            }:
+            pkgs.buildDotnetModule {
+              inherit pname version projectFile;
+              src = source;
+              nugetDeps = ./deps.json;
+              dotnet-sdk = net10;
+              dotnet-runtime = pkgs.dotnet-aspnetcore_10;
+              executables = [ executable ];
+              doCheck = false;
+            };
+          paymentProcessor = mkExample {
+            pname = "byzantine-systems-automata-payment-processor";
+            projectFile = "examples/ByzantineSystems.Automata.Examples.PaymentProcessor/ByzantineSystems.Automata.Examples.PaymentProcessor.fsproj";
+            executable = "ByzantineSystems.Automata.Examples.PaymentProcessor";
+          };
+          supervision = mkExample {
+            pname = "byzantine-systems-automata-supervision";
+            projectFile = "examples/ByzantineSystems.Automata.Examples.Supervision/ByzantineSystems.Automata.Examples.Supervision.fsproj";
+            executable = "ByzantineSystems.Automata.Examples.Supervision";
+          };
         in
         {
           # This sets `pkgs` to a nixpkgs with allowUnfree option set.
@@ -80,7 +123,17 @@
           };
 
           packages = {
-            # default = app;
+            payment-processor = paymentProcessor;
+            inherit supervision;
+
+            # `nix build` builds and exposes both example executables.
+            default = pkgs.symlinkJoin {
+              name = "${app_name}-examples-${version}";
+              paths = [
+                paymentProcessor
+                supervision
+              ];
+            };
           };
 
           # checks.application = app;

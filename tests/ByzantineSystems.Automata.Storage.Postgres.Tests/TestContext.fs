@@ -62,9 +62,13 @@ let migrate () : unit =
 
     Migrator.migrate connectionString
 
+let private migrateOnce = lazy (migrate ())
+
 /// Truncates every table and restarts identities, for per-test isolation.
 let reset () : Task =
     task {
+        migrateOnce.Force()
+
         use! conn = dataSource.OpenConnectionAsync(noCancellation).AsTask()
 
         use cmd =

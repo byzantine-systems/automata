@@ -2,7 +2,9 @@ module ByzantineSystems.Automata.Resilience.Tests.Program
 
 open Expecto
 
-[<EntryPoint>]
-let main argv =
+[<Tests>]
+let tests =
     testList "ByzantineSystems.Automata.Resilience.Tests" [ ResiliencePipelineTests.tests; SupervisorTests.tests ]
-    |> runTestsWithCLIArgs [] argv
+
+[<EntryPoint>]
+let main argv = runTestsWithCLIArgs [] argv tests
