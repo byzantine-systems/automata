@@ -14,11 +14,11 @@ jobs:
       actions: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           token: ${{ github.token }}
       - name: Install Nix
-        uses: cachix/install-nix-action@v30
+        uses: cachix/install-nix-action@v31
         with:
           # keep-env-derivations/keep-outputs protect the ci shell's flake inputs
           # and shell derivation from the pre-save garbage collection below.
@@ -40,7 +40,7 @@ jobs:
       - name: Build documentation
         run: nix develop .#ci --impure -c make docs
       - name: Upload documentation
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: documentation-${{ github.ref_name }}
           path: out/docs
