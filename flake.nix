@@ -141,6 +141,7 @@
           # nix fmt + nix flake check (auto-wired by flakeModule)
           treefmt = {
             projectRootFile = "flake.nix";
+            programs.actionlint.enable = true;
             programs.fantomas.enable = true;
             programs.nixfmt.enable = true;
 

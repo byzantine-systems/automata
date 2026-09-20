@@ -26,8 +26,8 @@
   },
   {
     "pname": "FSharp.SystemTextJson",
-    "version": "1.3.13",
-    "hash": "sha256-bKRxiNxC3SE39maP82hGzArB/NpxvQFP+LCBsqACkoI="
+    "version": "1.4.36",
+    "hash": "sha256-zZEhjP0mdc5E3fBPS4/lqD7sxoaoT5SOspP546RWYdc="
   },
   {
     "pname": "FsToolkit.ErrorHandling",
