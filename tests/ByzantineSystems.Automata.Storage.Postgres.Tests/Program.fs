@@ -2,19 +2,14 @@ module ByzantineSystems.Automata.Storage.Postgres.Tests.Program
 
 open Expecto
 
-[<EntryPoint>]
-let main argv =
-    let configured =
-        System.Environment.GetEnvironmentVariable("AUTOMATA_TEST_DB")
-        |> System.String.IsNullOrWhiteSpace
-        |> not
+let private configured =
+    System.Environment.GetEnvironmentVariable("AUTOMATA_TEST_DB")
+    |> System.String.IsNullOrWhiteSpace
+    |> not
 
-    if not configured then
-        printfn "AUTOMATA_TEST_DB is not set - skipping Postgres integration tests."
-        0
-    else
-        TestContext.migrate ()
-
+[<Tests>]
+let tests =
+    if configured then
         testList
             "ByzantineSystems.Automata.Storage.Postgres.Tests"
             [ PostgresStoreTests.tests
@@ -24,4 +19,8 @@ let main argv =
               PostgresSupervisionStoreTests.tests
               PostgresAcceptanceTests.tests ]
         |> testSequenced
-        |> runTestsWithCLIArgs [] argv
+    else
+        ptestCase "AUTOMATA_TEST_DB is not set" (fun _ -> ())
+
+[<EntryPoint>]
+let main argv = runTestsWithCLIArgs [] argv tests

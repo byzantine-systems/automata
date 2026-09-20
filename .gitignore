@@ -489,3 +489,7 @@ $RECYCLE.BIN/
 # Nix
 result
 out
+
+# Local tooling and coverage reports
+.tools/
+coverage/

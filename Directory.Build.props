@@ -12,7 +12,7 @@
 
     <!-- NuGet packaging metadata. Release versions come from git tags via `make pack`. -->
     <PropertyGroup>
-        <Version>0.1.0</Version>
+        <Version>0.5.0</Version>
         <Authors>ByzantineSystems</Authors>
         <Company>ByzantineSystems</Company>
         <Product>ByzantineSystems.Automata</Product>

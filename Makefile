@@ -11,6 +11,7 @@ SOLUTION := bs-automata.slnx
 MIGRATE_PROJECT := tools/ByzantineSystems.Automata.Migrate/ByzantineSystems.Automata.Migrate.fsproj
 EXAMPLE_PAYMENT_PROJECT := examples/ByzantineSystems.Automata.Examples.PaymentProcessor/ByzantineSystems.Automata.Examples.PaymentProcessor.fsproj
 EXAMPLE_SUPERVISION_PROJECT := examples/ByzantineSystems.Automata.Examples.Supervision/ByzantineSystems.Automata.Examples.Supervision.fsproj
+EXAMPLE_PROJECTS := $(EXAMPLE_PAYMENT_PROJECT) $(EXAMPLE_SUPERVISION_PROJECT)
 
 SRC_PROJECTS := $(wildcard src/*/*.fsproj)
 UNIT_TEST_PROJECTS := \
@@ -20,6 +21,7 @@ UNIT_TEST_PROJECTS := \
 	tests/ByzantineSystems.Automata.DependencyInjection.Tests/ByzantineSystems.Automata.DependencyInjection.Tests.fsproj
 INTEGRATION_TEST_PROJECTS := \
 	tests/ByzantineSystems.Automata.Storage.Postgres.Tests/ByzantineSystems.Automata.Storage.Postgres.Tests.fsproj
+TEST_PROJECTS := $(UNIT_TEST_PROJECTS) $(INTEGRATION_TEST_PROJECTS)
 
 NUGET_SOURCE := https://api.nuget.org/v3/index.json
 NUGET_API_KEY ?= None
@@ -27,6 +29,8 @@ NUGET_PACKAGES_DIR := out/nix-lock
 NUGET_TO_JSON ?= nixpkgs\#nuget-to-json
 DOCS_OUTPUT := out/docs
 PACKAGE_OUTPUT := out/packages
+COVERAGE_DIR := $(CURDIR)/coverage
+COVERAGE_RAW_DIR := $(COVERAGE_DIR)/raw
 
 release := $(shell git tag -l --sort=-creatordate | head -n 1)
 VERSION ?= $(if $(release),$(patsubst v%,%,$(release)),0.1.0)
@@ -35,7 +39,7 @@ PROJECT_FILES := $(wildcard src/*/*.fsproj tests/*/*.fsproj tools/*/*.fsproj exa
 RESTORE_INPUTS := Makefile $(SOLUTION) global.json nuget.config $(PROJECT_FILES) \
 	$(wildcard Directory.Build.* Directory.Packages.*)
 
-.PHONY: build test test-unit test-integration migrate run-example run-example-supervision db db-reset fmt docs nix-lock pack package-smoke push
+.PHONY: build test test-unit test-integration coverage migrate run-example run-example-supervision db db-reset fmt docs nix-lock pack package-smoke push
 
 build:
 	$(DOTNET) build $(SOLUTION) -m:1
@@ -52,6 +56,30 @@ test-integration: build
 	@for project in $(INTEGRATION_TEST_PROJECTS); do \
 		$(DOTNET) run --project $$project --no-build || exit 1; \
 	done
+
+coverage:
+	@test -n "$${AUTOMATA_TEST_DB:-}" || { echo "AUTOMATA_TEST_DB must be set to run all coverage tests." >&2; exit 1; }
+	$(RM) -r $(COVERAGE_DIR)
+	$(DOTNET) tool restore
+	@set -eu; \
+	for project in $(TEST_PROJECTS); do \
+		name=$$(basename "$$(dirname "$$project")"); \
+		mkdir -p "$(COVERAGE_RAW_DIR)/$$name"; \
+		$(DOTNET) test "$$project" \
+			/p:CollectCoverage=true \
+			/p:CoverletOutputFormat=cobertura \
+			/p:CoverletOutput="$(COVERAGE_RAW_DIR)/$$name/"; \
+	done
+	$(DOTNET) reportgenerator \
+		-reports:"$(COVERAGE_RAW_DIR)/**/coverage.cobertura.xml" \
+		-targetdir:"$(COVERAGE_DIR)" \
+		-reporttypes:Cobertura
+	$(DOTNET) reportgenerator \
+		-reports:"$(COVERAGE_RAW_DIR)/**/coverage.cobertura.xml" \
+		-targetdir:"$(COVERAGE_DIR)/html" \
+		-reporttypes:Html
+	@echo "Cobertura coverage report: $(COVERAGE_DIR)/Cobertura.xml"
+	@echo "HTML coverage report: $(COVERAGE_DIR)/html/index.html"
 
 migrate:
 	BS_AUTOMATA_CONN='$(DB_CONNECTION_STRING)' $(DOTNET) run --project $(MIGRATE_PROJECT)
@@ -84,6 +112,9 @@ nix-lock: deps.json
 deps.json: $(RESTORE_INPUTS)
 	$(RM) -r $(NUGET_PACKAGES_DIR)
 	$(DOTNET) restore $(SOLUTION) --packages $(NUGET_PACKAGES_DIR) -m:1
+	@for project in $(EXAMPLE_PROJECTS); do \
+		$(DOTNET) restore "$$project" --packages $(NUGET_PACKAGES_DIR) -m:1 || exit 1; \
+	done
 	$(NIX) run '$(NUGET_TO_JSON)' -- $(NUGET_PACKAGES_DIR) > $@.tmp
 	mv $@.tmp $@
 

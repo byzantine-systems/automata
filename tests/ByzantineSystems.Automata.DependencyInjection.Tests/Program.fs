@@ -2,8 +2,8 @@ module ByzantineSystems.Automata.DependencyInjection.Tests.Program
 
 open Expecto
 
-[<EntryPoint>]
-let main argv =
+[<Tests>]
+let tests =
     testList
         "ByzantineSystems.Automata.DependencyInjection.Tests"
         [ RegistrationTests.registrationTests
@@ -11,4 +11,6 @@ let main argv =
           SupervisionAuditTests.supervisionAuditTests
           ValidationTests.validationTests
           LifecycleTests.lifecycleTests ]
-    |> runTestsWithCLIArgs [] argv
+
+[<EntryPoint>]
+let main argv = runTestsWithCLIArgs [] argv tests

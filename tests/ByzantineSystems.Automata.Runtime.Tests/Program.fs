@@ -2,8 +2,8 @@ module ByzantineSystems.Automata.Runtime.Tests.Program
 
 open Expecto
 
-[<EntryPoint>]
-let main argv =
+[<Tests>]
+let tests =
     testList
         "ByzantineSystems.Automata.Runtime.Tests"
         [ InMemoryStoreTests.tests
@@ -12,4 +12,6 @@ let main argv =
           ParallelismTests.tests
           WorkSignalsTests.tests
           WorkerTests.tests ]
-    |> runTestsWithCLIArgs [] argv
+
+[<EntryPoint>]
+let main argv = runTestsWithCLIArgs [] argv tests

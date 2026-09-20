@@ -15,10 +15,6 @@
         <Project Path="tests/ByzantineSystems.Automata.Storage.Postgres.Tests/ByzantineSystems.Automata.Storage.Postgres.Tests.fsproj" />
         <Project Path="tests/ByzantineSystems.Automata.DependencyInjection.Tests/ByzantineSystems.Automata.DependencyInjection.Tests.fsproj" />
     </Folder>
-    <Folder Name="/examples/">
-        <Project Path="examples/ByzantineSystems.Automata.Examples.PaymentProcessor/ByzantineSystems.Automata.Examples.PaymentProcessor.fsproj" />
-        <Project Path="examples/ByzantineSystems.Automata.Examples.Supervision/ByzantineSystems.Automata.Examples.Supervision.fsproj" />
-    </Folder>
     <Folder Name="/tools/">
         <Project Path="tools/ByzantineSystems.Automata.Migrate/ByzantineSystems.Automata.Migrate.fsproj" />
     </Folder>
