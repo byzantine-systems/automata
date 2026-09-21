@@ -11,6 +11,8 @@ open Npgsql
 [<RequireQualifiedAccess>]
 module private SupervisionMapping =
 
+    let private reasonCodec = Serialization.systemTextJson<string> ()
+
     let kindToString =
         function
         | SupervisionAuditKind.Started -> "Started"
@@ -52,26 +54,7 @@ module private SupervisionMapping =
             )
 
     let reasonFromJson (json: string) =
-        try
-            Ok(JsonSerializer.Deserialize<string> json)
-        with :? JsonException as ex ->
-            Error(StoreError.Serialization("SupervisionRecord.Reason", ex))
-
-[<RequireQualifiedAccess>]
-module private SupervisionDb =
-
-    let protect
-        (work: CancellationToken -> Task<Result<'T, StoreError>>)
-        (ct: CancellationToken)
-        : Task<Result<'T, StoreError>> =
-        task {
-            try
-                return! work ct
-            with
-            | :? OperationCanceledException when ct.IsCancellationRequested ->
-                return! Task.FromCanceled<Result<'T, StoreError>>(ct)
-            | :? NpgsqlException as ex -> return Error(StoreError.Unavailable ex)
-        }
+        reasonCodec.Decode json |> Result.mapError Db.toStoreError
 
 /// <summary>PostgreSQL append-only supervision audit writer backed by a pooled data source.</summary>
 type PostgresSupervisionStore(dataSource: NpgsqlDataSource) =
@@ -79,7 +62,7 @@ type PostgresSupervisionStore(dataSource: NpgsqlDataSource) =
     interface ISupervisionEventStore with
 
         member _.Record(record, ct) =
-            SupervisionDb.protect
+            Db.protect
                 (fun token ->
                     task {
                         use! conn = dataSource.OpenConnectionAsync(token).AsTask()
@@ -119,7 +102,7 @@ module PostgresSupervisionQueries =
         if limit < 1 then
             invalidArg (nameof limit) "The supervision query limit must be positive."
 
-        SupervisionDb.protect
+        Db.protect
             (fun token ->
                 task {
                     use! conn = dataSource.OpenConnectionAsync(token).AsTask()

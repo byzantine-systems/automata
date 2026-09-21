@@ -28,24 +28,11 @@ type PostgresStore<'EntityId, 'State, 'Event, 'Action>(options: StoreOptions<'En
     let statePath = options.StatePath
     let timeProvider = options.TimeProvider
 
-    let protect
-        (work: CancellationToken -> Task<Result<'T, StoreError>>)
-        (ct: CancellationToken)
-        : Task<Result<'T, StoreError>> =
-        task {
-            try
-                return! work ct
-            with
-            | :? OperationCanceledException when ct.IsCancellationRequested ->
-                return! Task.FromCanceled<Result<'T, StoreError>>(ct)
-            | :? NpgsqlException as ex -> return Error(StoreError.Unavailable ex)
-        }
-
     let run
         (work: NpgsqlConnection -> CancellationToken -> Task<'T>)
         (ct: CancellationToken)
         : Task<Result<'T, StoreError>> =
-        protect
+        Db.protect
             (fun token ->
                 task {
                     use! conn = dataSource.OpenConnectionAsync(token).AsTask()
@@ -58,7 +45,7 @@ type PostgresStore<'EntityId, 'State, 'Event, 'Action>(options: StoreOptions<'En
         (work: NpgsqlConnection -> CancellationToken -> Task<Result<'T, StoreError>>)
         (ct: CancellationToken)
         : Task<Result<'T, StoreError>> =
-        protect
+        Db.protect
             (fun token ->
                 task {
                     use! conn = dataSource.OpenConnectionAsync(token).AsTask()
@@ -231,7 +218,7 @@ type PostgresStore<'EntityId, 'State, 'Event, 'Action>(options: StoreOptions<'En
         let newEpoch = int64 (Epoch.value transition.Epoch)
         let expectedEpoch = int64 (Epoch.value expected)
 
-        protect
+        Db.protect
             (fun token ->
                 task {
                     use! conn = dataSource.OpenConnectionAsync(token).AsTask()
@@ -269,42 +256,34 @@ type PostgresStore<'EntityId, 'State, 'Event, 'Action>(options: StoreOptions<'En
                         return! resolveCommitConflict machineId entityKey idempotencyKey expected actual token
                     else
                         let! transitionInserted =
-                            task {
-                                try
-                                    use cmd = new NpgsqlCommand(Sql.insertTransition, conn, tx)
-                                    cmd.Parameters.AddWithValue("machine_id", machineId) |> ignore
-                                    cmd.Parameters.AddWithValue("entity_id", entityKey) |> ignore
-                                    cmd.Parameters.AddWithValue("epoch", newEpoch) |> ignore
-                                    cmd.Parameters.AddWithValue("occurred_at", occurredAt) |> ignore
-                                    cmd.Parameters.AddWithValue("event", eventJson) |> ignore
-                                    cmd.Parameters.AddWithValue("actions", actionsJson) |> ignore
-                                    cmd.Parameters.AddWithValue("from_state", fromStateJson) |> ignore
-                                    cmd.Parameters.AddWithValue("to_state", toStateJson) |> ignore
-                                    cmd.Parameters.AddWithValue("status", status) |> ignore
+                            use cmd = new NpgsqlCommand(Sql.insertTransition, conn, tx)
+                            cmd.Parameters.AddWithValue("machine_id", machineId) |> ignore
+                            cmd.Parameters.AddWithValue("entity_id", entityKey) |> ignore
+                            cmd.Parameters.AddWithValue("epoch", newEpoch) |> ignore
+                            cmd.Parameters.AddWithValue("occurred_at", occurredAt) |> ignore
+                            cmd.Parameters.AddWithValue("event", eventJson) |> ignore
+                            cmd.Parameters.AddWithValue("actions", actionsJson) |> ignore
+                            cmd.Parameters.AddWithValue("from_state", fromStateJson) |> ignore
+                            cmd.Parameters.AddWithValue("to_state", toStateJson) |> ignore
+                            cmd.Parameters.AddWithValue("status", status) |> ignore
 
-                                    cmd.Parameters.AddWithValue("handled_by", StateId.value transition.HandledBy)
-                                    |> ignore
+                            cmd.Parameters.AddWithValue("handled_by", StateId.value transition.HandledBy)
+                            |> ignore
 
-                                    cmd.Parameters.AddWithValue(
-                                        "exited",
-                                        transition.Exited |> List.map StateId.value |> List.toArray
-                                    )
-                                    |> ignore
+                            cmd.Parameters.AddWithValue(
+                                "exited",
+                                transition.Exited |> List.map StateId.value |> List.toArray
+                            )
+                            |> ignore
 
-                                    cmd.Parameters.AddWithValue(
-                                        "entered",
-                                        transition.Entered |> List.map StateId.value |> List.toArray
-                                    )
-                                    |> ignore
+                            cmd.Parameters.AddWithValue(
+                                "entered",
+                                transition.Entered |> List.map StateId.value |> List.toArray
+                            )
+                            |> ignore
 
-                                    cmd.Parameters.AddWithValue("idempotency_key", idempotencyKey) |> ignore
-                                    do! (cmd.ExecuteNonQueryAsync(token) :> Task)
-                                    return true
-                                with :? PostgresException as ex when
-                                    ex.SqlState = PostgresErrorCodes.UniqueViolation
-                                    && ex.ConstraintName = "uq_transition_idem" ->
-                                    return false
-                            }
+                            cmd.Parameters.AddWithValue("idempotency_key", idempotencyKey) |> ignore
+                            Db.insertUnlessDuplicate "uq_transition_idem" (cmd.ExecuteNonQueryAsync(token) :> Task)
 
                         if not transitionInserted then
                             do! tx.RollbackAsync(token)

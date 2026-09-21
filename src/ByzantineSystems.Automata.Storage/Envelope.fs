@@ -15,20 +15,40 @@ type EventEnvelope<'Event> =
           CausationId: string option
           CorrelationId: string option }
 
+/// <summary>Expected validation failures when constructing an event envelope.</summary>
+type EventEnvelopeError =
+    /// <summary>An idempotency key is required to make retries safe.</summary>
+    | EmptyIdempotencyKey
+
 /// <summary>Operations on <see cref="T:ByzantineSystems.Automata.Storage.EventEnvelope`1" />.</summary>
 [<RequireQualifiedAccess>]
 module EventEnvelope =
 
-    /// <summary>Wraps an event under a stable idempotency key, trimming surrounding whitespace.</summary>
+    /// <summary>
+    /// Validates and wraps an event under a stable idempotency key. Use this at an
+    /// untrusted input boundary where an empty key is an expected caller error.
+    /// </summary>
+    let tryCreate (idempotencyKey: string) (event: 'Event) : Result<EventEnvelope<'Event>, EventEnvelopeError> =
+        if String.IsNullOrWhiteSpace idempotencyKey then
+            Error EmptyIdempotencyKey
+        else
+            Ok
+                { Event = event
+                  IdempotencyKey = idempotencyKey.Trim()
+                  CausationId = None
+                  CorrelationId = None }
+
+    /// <summary>
+    /// Wraps an event under a trusted, stable idempotency key, trimming surrounding
+    /// whitespace. Prefer <see cref="M:ByzantineSystems.Automata.Storage.EventEnvelope.tryCreate``1(System.String,``0)" />
+    /// when the key comes from an untrusted caller.
+    /// </summary>
     /// <exception cref="T:System.ArgumentException">The key is null, empty, or whitespace.</exception>
     let create (idempotencyKey: string) (event: 'Event) : EventEnvelope<'Event> =
-        if String.IsNullOrWhiteSpace idempotencyKey then
+        match tryCreate idempotencyKey event with
+        | Ok envelope -> envelope
+        | Error EmptyIdempotencyKey ->
             invalidArg (nameof idempotencyKey) "An event envelope requires a non-empty idempotency key."
-
-        { Event = event
-          IdempotencyKey = idempotencyKey.Trim()
-          CausationId = None
-          CorrelationId = None }
 
     /// <summary>Attaches a causation id: the identity of the command or message that produced this event.</summary>
     let withCausation (causationId: string) (envelope: EventEnvelope<'Event>) : EventEnvelope<'Event> =

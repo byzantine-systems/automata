@@ -42,31 +42,36 @@ type internal EntityActor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityI
         Interlocked.Exchange(&lastActiveTicks.contents, config.TimeProvider.GetUtcNow().UtcTicks)
         |> ignore
 
-    let handle (message: ActorMessage<'EntityId, 'State, 'Event, 'Action, 'Err>) : Task =
+    let handleSend envelope (sendCt: CancellationToken) (reply: TaskCompletionSource<_>) : Task =
         task {
-            match message with
-            | Send(envelope, sendCt, reply) ->
-                if sendCt.IsCancellationRequested then
-                    reply.TrySetCanceled(sendCt) |> ignore
-                else
-                    try
-                        let! outcome =
-                            Send.dispatch config entityId envelope observerBus retrySignal outboxSignal sendCt
+            if sendCt.IsCancellationRequested then
+                reply.TrySetCanceled(sendCt) |> ignore
+            else
+                let! outcome =
+                    Send.dispatch config entityId envelope observerBus retrySignal outboxSignal sendCt
+                    |> TaskOutcome.capture
 
-                        reply.TrySetResult(outcome) |> ignore
-                    with :? OperationCanceledException when sendCt.IsCancellationRequested ->
-                        reply.TrySetCanceled(sendCt) |> ignore
-
-            | ReadState(readCt, reply) ->
-                try
-                    let! snapshot = config.Store.TryGet(config.MachineId, entityId, readCt)
-
-                    match snapshot with
-                    | Ok found -> reply.TrySetResult(Ok found) |> ignore
-                    | Error e -> reply.TrySetResult(Error(MachineError.Store e)) |> ignore
-                with :? OperationCanceledException when readCt.IsCancellationRequested ->
-                    reply.TrySetCanceled(readCt) |> ignore
+                match outcome with
+                | Ok result -> reply.TrySetResult(result) |> ignore
+                | Error(CanceledBy sendCt) -> reply.TrySetCanceled(sendCt) |> ignore
+                | Error error -> return raise error
         }
+
+    let handleRead (readCt: CancellationToken) (reply: TaskCompletionSource<_>) : Task =
+        task {
+            let! outcome = config.Store.TryGet(config.MachineId, entityId, readCt) |> TaskOutcome.capture
+
+            match outcome with
+            | Ok(Ok snapshot) -> reply.TrySetResult(Ok snapshot) |> ignore
+            | Ok(Error error) -> reply.TrySetResult(Error(MachineError.Store error)) |> ignore
+            | Error(CanceledBy readCt) -> reply.TrySetCanceled(readCt) |> ignore
+            | Error error -> return raise error
+        }
+
+    let handle (message: ActorMessage<'EntityId, 'State, 'Event, 'Action, 'Err>) : Task =
+        match message with
+        | Send(envelope, sendCt, reply) -> handleSend envelope sendCt reply
+        | ReadState(readCt, reply) -> handleRead readCt reply
 
     let failMessage (error: exn) message =
         match message with
@@ -83,24 +88,31 @@ type internal EntityActor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityI
     let runLoop =
         let rec run sinceYield =
             task {
-                try
-                    let! message = reader.ReadAsync()
-                    touch ()
+                let! available = reader.WaitToReadAsync().AsTask()
 
-                    try
-                        do! handle message
-                    with error ->
-                        writer.TryComplete(error) |> ignore
-                        failMessage error message
-                        failPending error
-                        return raise error
+                if available then
+                    let mutable message =
+                        Unchecked.defaultof<ActorMessage<'EntityId, 'State, 'Event, 'Action, 'Err>>
 
-                    if sinceYield + 1 >= 64 then
-                        do! Task.Yield()
-                        return! run 0
+                    if reader.TryRead(&message) then
+                        touch ()
+                        let! handled = handle message |> TaskOutcome.captureUnit
+
+                        match handled with
+                        | Error error ->
+                            writer.TryComplete(error) |> ignore
+                            failMessage error message
+                            failPending error
+                            return raise error
+                        | Ok() when sinceYield + 1 >= 64 ->
+                            do! Task.Yield()
+                            return! run 0
+                        | Ok() -> return! run (sinceYield + 1)
                     else
-                        return! run (sinceYield + 1)
-                with :? ChannelClosedException ->
+                        // Another continuation consumed the readiness notification. There is
+                        // still only one reader; simply wait for the next notification.
+                        return! run sinceYield
+                else
                     return ()
             }
 
@@ -144,8 +156,4 @@ type internal EntityActor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityI
         config.TimeProvider.GetUtcNow().UtcTicks - last > timeout.Ticks
 
     /// <summary>Completes the mailbox so the loop drains and exits; idempotent.</summary>
-    member _.Stop() : unit =
-        try
-            writer.TryComplete() |> ignore
-        with :? ObjectDisposedException ->
-            ()
+    member _.Stop() : unit = writer.TryComplete() |> ignore

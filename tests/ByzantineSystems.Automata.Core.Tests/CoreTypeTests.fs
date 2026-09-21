@@ -145,6 +145,11 @@ let errorTests =
               | GuardFailed _
               | UnknownState _
               | TargetMismatch _ -> failtest "unexpected case"
+          }
+          test "machine lifecycle rejection is structured" {
+              match MachineError<string>.Rejected(MachineRejection.InstanceNotRunning InstanceStatus.Terminated) with
+              | MachineError.Rejected(MachineRejection.InstanceNotRunning InstanceStatus.Terminated) -> ()
+              | _ -> failtest "expected a typed terminated-instance rejection"
           } ]
 
 let tests =

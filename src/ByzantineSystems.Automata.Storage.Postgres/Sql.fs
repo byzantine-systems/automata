@@ -1,7 +1,10 @@
 namespace ByzantineSystems.Automata.Storage.Postgres
 
 open System
+open System.Threading
+open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
+open Npgsql
 
 /// <summary>All SQL in one place: query strings and their parameter names.</summary>
 [<RequireQualifiedAccess>]
@@ -86,6 +89,53 @@ module internal Sql =
 /// <summary>Shared column-mapping helpers for the PostgreSQL stores.</summary>
 [<RequireQualifiedAccess>]
 module internal Db =
+
+    /// Recognises cancellation owned by the caller rather than by an unrelated operation.
+    let (|CanceledBy|_|) (ct: CancellationToken) (error: exn) =
+        match error with
+        | :? OperationCanceledException when ct.IsCancellationRequested -> Some()
+        | _ -> None
+
+    /// Recognises the named PostgreSQL uniqueness constraint used for an idempotency race.
+    let (|UniqueViolation|_|) (constraintName: string) (error: exn) =
+        match error with
+        | :? PostgresException as postgresError when
+            postgresError.SqlState = PostgresErrorCodes.UniqueViolation
+            && postgresError.ConstraintName = constraintName
+            ->
+            Some()
+        | _ -> None
+
+    /// <summary>
+    /// PostgreSQL adapter boundary. Caller cancellation remains task cancellation, known
+    /// driver failures become <c>StoreError.Unavailable</c>, and every unrelated exception
+    /// propagates to the runtime safety boundary unchanged.
+    /// </summary>
+    let protect
+        (work: CancellationToken -> Task<Result<'T, StoreError>>)
+        (ct: CancellationToken)
+        : Task<Result<'T, StoreError>> =
+        task {
+            try
+                return! work ct
+            with
+            | CanceledBy ct -> return! Task.FromCanceled<Result<'T, StoreError>>(ct)
+            | :? NpgsqlException as error -> return Error(StoreError.Unavailable error)
+        }
+
+    /// <summary>
+    /// Executes an insert whose named uniqueness conflict is an expected idempotency race.
+    /// Returns <c>false</c> only for that constraint; every other database failure continues
+    /// to the outer PostgreSQL boundary.
+    /// </summary>
+    let insertUnlessDuplicate (constraintName: string) (work: Task) : Task<bool> =
+        task {
+            try
+                do! work
+                return true
+            with UniqueViolation constraintName ->
+                return false
+        }
 
     let timestamp (dto: DateTimeOffset) : DateTime = dto.UtcDateTime
 

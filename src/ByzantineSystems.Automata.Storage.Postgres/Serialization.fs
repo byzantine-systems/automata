@@ -13,41 +13,34 @@ module Serialization =
     let private jsonOptions () : JsonSerializerOptions =
         JsonFSharpOptions.Default().WithUnionAdjacentTag().ToJsonSerializerOptions()
 
+    let private protect error work =
+        try
+            Ok(work ())
+        with exceptionRaised ->
+            Error(error exceptionRaised)
+
     /// <summary>Builds a codec for one value, serializing unions with adjacent tags.</summary>
     let systemTextJson<'T> () : Codec<'T> =
         let options = jsonOptions ()
 
         let encode (value: 'T) =
-            try
-                JsonSerializer.Serialize(value, options) |> Ok
-            with ex ->
-                Error(CodecError.EncodeError(typeof<'T>.Name, ex))
+            protect (fun error -> CodecError.EncodeError(typeof<'T>.Name, error)) (fun () ->
+                JsonSerializer.Serialize(value, options))
 
         let decode (json: string) =
-            try
-                JsonSerializer.Deserialize<'T>(json, options) |> Ok
-            with ex ->
-                Error(CodecError.DecodeError(typeof<'T>.Name, ex))
+            protect (fun error -> CodecError.DecodeError(typeof<'T>.Name, error)) (fun () ->
+                JsonSerializer.Deserialize<'T>(json, options))
+            |> Result.bind (fun value ->
+                match box value with
+                | Null ->
+                    JsonException $"JSON deserialized to null for {typeof<'T>.FullName}."
+                    |> fun error -> Error(CodecError.DecodeError(typeof<'T>.Name, error))
+                | NonNull _ -> Ok value)
 
         Codec.create encode decode
 
     /// <summary>Builds a codec for a list of values.</summary>
-    let systemTextJsonList<'T> () : Codec<'T list> =
-        let options = jsonOptions ()
-
-        let encode (values: 'T list) =
-            try
-                JsonSerializer.Serialize(values, options) |> Ok
-            with ex ->
-                Error(CodecError.EncodeError(typeof<'T list>.Name, ex))
-
-        let decode (json: string) =
-            try
-                JsonSerializer.Deserialize<'T list>(json, options) |> Ok
-            with ex ->
-                Error(CodecError.DecodeError(typeof<'T list>.Name, ex))
-
-        Codec.create encode decode
+    let systemTextJsonList<'T> () : Codec<'T list> = systemTextJson<'T list> ()
 
 /// <summary>
 /// Options for a PostgreSQL-backed store: connection, codecs, and the key/state

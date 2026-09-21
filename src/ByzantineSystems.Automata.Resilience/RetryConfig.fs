@@ -201,10 +201,9 @@ module RetryConfig =
         | Error errors -> invalidOp $"cannot build a retry pipeline from an invalid configuration: {errors}"
         | Ok config ->
             let notify event =
-                try
-                    onEvent event
-                with _ ->
-                    ()
+                // Telemetry is explicitly best effort. A broken observer must not alter
+                // retry, timeout, or circuit-breaker behavior.
+                TaskOutcome.captureSync (fun () -> onEvent event) |> ignore
 
             /// Transient outcomes the retry strategy may repeat: infrastructure
             /// unavailability, optimistic concurrency conflicts, and attempt timeouts.
@@ -317,20 +316,29 @@ module Retry =
         task {
             let context = ResilienceContextPool.Shared.Get(ct)
 
-            try
-                let callback (ctx: ResilienceContext) (_: obj) : ValueTask<Outcome<PipelineResult<'Err>>> =
-                    ValueTask<Outcome<PipelineResult<'Err>>>(
-                        task {
-                            try
-                                let! outcome = operation ctx.CancellationToken
-                                return Outcome.FromResult outcome
-                            with ex ->
-                                return Outcome.FromException<PipelineResult<'Err>>(ex)
-                        }
-                    )
+            let callback (ctx: ResilienceContext) (_: obj) : ValueTask<Outcome<PipelineResult<'Err>>> =
+                ValueTask<Outcome<PipelineResult<'Err>>>(
+                    task {
+                        let! operationOutcome = operation ctx.CancellationToken |> TaskOutcome.capture
 
-                let! pipelineOutcome = pipeline.ExecuteOutcomeAsync(callback, context, null)
+                        return
+                            match operationOutcome with
+                            | Ok result -> Outcome.FromResult result
+                            | Error error -> Outcome.FromException<PipelineResult<'Err>>(error)
+                    }
+                )
 
+            let! execution =
+                pipeline.ExecuteOutcomeAsync(callback, context, null).AsTask()
+                |> TaskOutcome.capture
+
+            // Return the pooled context before propagating any unexpected pipeline fault.
+            ResilienceContextPool.Shared.Return(context)
+
+            match execution with
+            | Error(CanceledBy ct) -> return! Task.FromCanceled<PipelineResult<'Err>>(ct)
+            | Error unexpected -> return raise unexpected
+            | Ok pipelineOutcome ->
                 match pipelineOutcome.Exception with
                 | null -> return pipelineOutcome.Result
                 | :? TimeoutRejectedException as timeout -> return Error(MachineError.Timeout timeout.Timeout)
@@ -342,9 +350,6 @@ module Retry =
                             None
 
                     return Error(CircuitOpen retryAfter)
-                | :? OperationCanceledException when ct.IsCancellationRequested ->
-                    return! Task.FromCanceled<PipelineResult<'Err>>(ct)
+                | CanceledBy ct -> return! Task.FromCanceled<PipelineResult<'Err>>(ct)
                 | unexpected -> return raise unexpected
-            finally
-                ResilienceContextPool.Shared.Return(context)
         }

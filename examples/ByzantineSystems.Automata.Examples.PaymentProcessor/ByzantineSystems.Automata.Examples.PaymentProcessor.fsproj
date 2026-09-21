@@ -11,6 +11,7 @@
 
     <ItemGroup>
         <PackageReference Include="FSharp.Core" />
+        <PackageReference Include="Microsoft.Extensions.Hosting" />
         <ProjectReference Include="..\..\src\ByzantineSystems.Automata.Core\ByzantineSystems.Automata.Core.fsproj" />
         <ProjectReference Include="..\..\src\ByzantineSystems.Automata.Resilience\ByzantineSystems.Automata.Resilience.fsproj" />
         <ProjectReference Include="..\..\src\ByzantineSystems.Automata.Runtime\ByzantineSystems.Automata.Runtime.fsproj" />

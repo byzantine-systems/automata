@@ -5,9 +5,17 @@
         <IsPackable>true</IsPackable>
     </PropertyGroup>
 
+    <!-- Runtime tests exercise actor ordering and eviction through internal seams. Keeping
+         the friend declaration here avoids a source file whose only job is assembly metadata. -->
     <ItemGroup>
-        <Compile Include="AssemblyInfo.fs" />
+        <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
+            <_Parameter1>ByzantineSystems.Automata.Runtime.Tests</_Parameter1>
+        </AssemblyAttribute>
+    </ItemGroup>
+
+    <ItemGroup>
         <Compile Include="Types.fs" />
+        <Compile Include="TaskBoundary.fs" />
         <Compile Include="WorkSignals.fs" />
         <Compile Include="ObserverDispatcher.fs" />
         <Compile Include="Envelope.fs" />

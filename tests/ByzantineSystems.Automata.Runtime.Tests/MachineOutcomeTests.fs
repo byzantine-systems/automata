@@ -128,7 +128,6 @@ let tests =
               let! result = Machine.send machine entity (EventEnvelope.create "start-2" (Start 2)) noCancellation
 
               match result with
-              | Error(MachineError.Rejected reason) ->
-                  Expect.stringContains reason "Terminated" "the refusal names the terminated status"
+              | Error(MachineError.Rejected(MachineRejection.InstanceNotRunning InstanceStatus.Terminated)) -> ()
               | other -> failtestf "expected a refusal, got %A" other
           } ]

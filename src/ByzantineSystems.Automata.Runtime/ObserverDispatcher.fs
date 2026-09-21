@@ -30,34 +30,32 @@ type internal ObserverDispatcher<'EntityId, 'State, 'Event, 'Action>
 
     /// <summary>Publishes a transition for observation. Never blocks; a full channel drops it.</summary>
     member _.TryPublish(transition: Transition<'EntityId, 'State, 'Event, 'Action>) : unit =
-        try
-            writer.TryWrite(transition) |> ignore
-        with :? ObjectDisposedException ->
-            ()
+        writer.TryWrite(transition) |> ignore
 
     /// <summary>Drains the channel until completed or cancelled, observing each transition.</summary>
     member _.RunAsync(ct: CancellationToken) : Task =
         let rec drain () =
             task {
-                try
-                    let! transition = reader.ReadAsync(ct)
+                let! readiness = reader.WaitToReadAsync(ct).AsTask() |> TaskOutcome.capture
 
-                    try
-                        do! observer transition CancellationToken.None
-                    with _ ->
-                        ()
+                match readiness with
+                | Error(CanceledBy ct) -> return ()
+                | Error error -> return raise error
+                | Ok false -> return ()
+                | Ok true ->
+                    let mutable transition =
+                        Unchecked.defaultof<Transition<'EntityId, 'State, 'Event, 'Action>>
 
-                    return! drain ()
-                with
-                | :? ChannelClosedException -> return ()
-                | :? OperationCanceledException -> return ()
+                    if reader.TryRead(&transition) then
+                        // Observation is explicitly best-effort. Capturing here prevents a
+                        // user callback from faulting the actor that already committed.
+                        let! _ = observer transition CancellationToken.None |> TaskOutcome.captureUnit
+                        return! drain ()
+                    else
+                        return! drain ()
             }
 
         drain ()
 
     /// <summary>Completes the channel so the drain loop finishes; idempotent.</summary>
-    member _.Complete() : unit =
-        try
-            writer.TryComplete() |> ignore
-        with :? ObjectDisposedException ->
-            ()
+    member _.Complete() : unit = writer.TryComplete() |> ignore
