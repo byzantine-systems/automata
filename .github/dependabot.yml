@@ -18,12 +18,20 @@ updates:
   - package-ecosystem: "nuget"
     directory: "/"
     schedule:
-      interval: "weekly"
-      day: "monday"
-      time: "06:00"
+      interval: "monthly"
+    # This block groups all updates for this ecosystem together
+    groups:
+      github-actions-deps:
+        patterns:
+          - "*"
 
   # Manage .NET SDK versions (via global.json)
   - package-ecosystem: "dotnet-sdk"
     directory: "/"
     schedule:
-      interval: "weekly"
+      interval: "monthly"
+    # This block groups all updates for this ecosystem together
+    groups:
+      github-actions-deps:
+        patterns:
+          - "*"
