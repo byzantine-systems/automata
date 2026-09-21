@@ -10,6 +10,7 @@
     </ItemGroup>
 
     <ItemGroup>
+        <PackageReference Include="Microsoft.Extensions.Hosting" />
         <ProjectReference Include="..\..\src\ByzantineSystems.Automata.Storage.Postgres\ByzantineSystems.Automata.Storage.Postgres.fsproj" />
     </ItemGroup>
 

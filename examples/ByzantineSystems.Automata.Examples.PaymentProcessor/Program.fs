@@ -9,6 +9,9 @@ open ByzantineSystems.Automata.Runtime
 open ByzantineSystems.Automata.Storage
 open ByzantineSystems.Automata.Storage.InMemory
 open ByzantineSystems.Automata.Storage.Postgres
+open Microsoft.Extensions.DependencyInjection
+open Microsoft.Extensions.Hosting
+open Microsoft.Extensions.Logging
 
 /// Phantom marker tying entity ids to the payment domain.
 type Payment = class end
@@ -118,35 +121,43 @@ let private paymentChartValue =
     | Ok chart -> chart
     | Error errors -> failwith $"payment chart failed to construct: %A{errors}"
 
-/// Prints each committed transition so the sample shows actions and hierarchy changes.
-let private printTransition
+/// Logs each committed transition with structured state, event, and action properties.
+let private logTransition
+    (logger: ILogger)
     (transition: Transition<Entity, PaymentState, PaymentEvent, PaymentAction>)
     (_ct: CancellationToken)
     =
     task {
-        printfn
-            "  %-24s --%-18A--> %-24s actions=%A"
-            (sprintf "%A" transition.FromState)
-            transition.Event
-            (sprintf "%A" transition.ToState)
+        logger.LogInformation(
+            "Payment transition {FromState} --{PaymentEvent}--> {ToState}; actions={Actions}",
+            transition.FromState,
+            transition.Event,
+            transition.ToState,
             transition.Actions
+        )
     }
 
-let private buildMachine (storeArg: IMachineStore<Entity, PaymentState, PaymentEvent, PaymentAction>) =
+let private buildMachine
+    (logger: ILogger)
+    (storeArg: IMachineStore<Entity, PaymentState, PaymentEvent, PaymentAction>)
+    =
     machine<Entity, PaymentState, PaymentEvent, PaymentAction, string> (machineId "payments") {
         chart paymentChartValue
         initialState Idle
         store storeArg
         retry RetryConfig.defaults<string>
-        onTransition printTransition
+        onTransition (logTransition logger)
         timeProvider TimeProvider.System
     }
 
 /// Runs a payment lifecycle against an in-memory or PostgreSQL store.
-let private runPayment (storeArg: IMachineStore<Entity, PaymentState, PaymentEvent, PaymentAction>) : Task =
+let private runPayment
+    (logger: ILogger)
+    (storeArg: IMachineStore<Entity, PaymentState, PaymentEvent, PaymentAction>)
+    : Task =
     task {
         let machine =
-            match buildMachine storeArg with
+            match buildMachine logger storeArg with
             | Ok machine -> machine
             | Error errors -> failwith $"machine failed to construct: %A{errors}"
 
@@ -161,14 +172,38 @@ let private runPayment (storeArg: IMachineStore<Entity, PaymentState, PaymentEve
 
         for key, event in steps do
             let! outcome = Machine.send machine order (EventEnvelope.create key event) CancellationToken.None
-            printfn "send %-20A -> %A" event outcome
+
+            match outcome with
+            | Ok Committed ->
+                logger.LogInformation("Sent payment event {PaymentEvent}; outcome={SendOutcome}", event, "Committed")
+            | Ok AlreadyApplied ->
+                logger.LogInformation(
+                    "Sent payment event {PaymentEvent}; outcome={SendOutcome}",
+                    event,
+                    "AlreadyApplied"
+                )
+            | Ok(Deferred retryId) ->
+                logger.LogInformation(
+                    "Sent payment event {PaymentEvent}; outcome={SendOutcome}; retry={RetryId}",
+                    event,
+                    "Deferred",
+                    RetryId.value retryId
+                )
+            | Ok Ignored ->
+                logger.LogInformation("Sent payment event {PaymentEvent}; outcome={SendOutcome}", event, "Ignored")
+            | Error error -> logger.LogWarning("Payment event {PaymentEvent} failed: {MachineError}", event, error)
 
         let! snapshot = Machine.state machine order CancellationToken.None
 
         match snapshot with
-        | Ok(Some current) -> printfn "final state: %A (epoch %d)" current.State (Epoch.value current.Epoch)
-        | Ok None -> printfn "final state: no snapshot"
-        | Error error -> printfn "state read failed: %A" error
+        | Ok(Some current) ->
+            logger.LogInformation(
+                "Payment finished in state {PaymentState} at epoch {Epoch}",
+                current.State,
+                Epoch.value current.Epoch
+            )
+        | Ok None -> logger.LogWarning("Payment finished without a stored snapshot")
+        | Error error -> logger.LogError("Payment state read failed: {MachineError}", error)
 
         do! Machine.stopAsync machine CancellationToken.None
     }
@@ -206,18 +241,26 @@ let private buildPostgres () : IMachineStore<Entity, PaymentState, PaymentEvent,
     )
     :> IMachineStore<Entity, PaymentState, PaymentEvent, PaymentAction>
 
-let private run argv =
+let private run (logger: ILogger) argv =
     task {
         let usePostgres = argv |> Array.contains "--postgres"
         let store = if usePostgres then buildPostgres () else buildInMemory ()
-        do! runPayment store
+        do! runPayment logger store
     }
 
 [<EntryPoint>]
 let main argv =
+    let builder = Host.CreateApplicationBuilder(argv)
+    use host = builder.Build()
+
+    let logger =
+        host.Services
+            .GetRequiredService<ILoggerFactory>()
+            .CreateLogger("ByzantineSystems.Automata.Examples.PaymentProcessor")
+
     try
-        (run argv).GetAwaiter().GetResult()
+        (run logger argv).GetAwaiter().GetResult()
         0
     with ex ->
-        eprintfn "error: %s" ex.Message
+        logger.LogError(ex, "Payment processor example failed")
         1

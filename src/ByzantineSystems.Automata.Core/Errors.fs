@@ -40,6 +40,24 @@ type StoreError =
     | NotFound of entity: string
 
 /// <summary>
+/// A machine lifecycle state that prevents new work from being accepted. These are
+/// expected, caller-actionable outcomes, so the public API reports them as data rather
+/// than throwing lifecycle exceptions or asking callers to parse a reason string.
+/// </summary>
+type MachineRejection =
+    /// <summary>The machine must be started before it accepts sends or state reads.</summary>
+    | NotStarted
+
+    /// <summary>Shutdown has started, so no new work can be admitted.</summary>
+    | Stopping
+
+    /// <summary>Shutdown has completed.</summary>
+    | Stopped
+
+    /// <summary>The persisted entity lifecycle does not permit another transition.</summary>
+    | InstanceNotRunning of InstanceStatus
+
+/// <summary>
 /// The only error type that crosses the public machine API. Only
 /// <see cref="F:ByzantineSystems.Automata.Core.MachineError`1.Store" />
 /// <c>Unavailable</c> and <see cref="F:ByzantineSystems.Automata.Core.MachineError`1.Timeout" />
@@ -60,5 +78,5 @@ type MachineError<'Err> =
     /// <summary>The shared pipeline's breaker is open; carry on after the given delay, if known.</summary>
     | CircuitOpen of retryAfter: TimeSpan option
 
-    /// <summary>The machine refused the send before resolution (queue full, machine stopped).</summary>
-    | Rejected of reason: string
+    /// <summary>The machine refused work because its lifecycle does not permit it.</summary>
+    | Rejected of MachineRejection

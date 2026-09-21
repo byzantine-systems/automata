@@ -22,7 +22,7 @@ type internal SendResult<'EntityId, 'State, 'Event, 'Action, 'Err> =
 module internal Send =
 
     let private rejectNotRunning<'Err> (status: InstanceStatus) : MachineError<'Err> =
-        MachineError.Rejected $"instance is %A{status}"
+        MachineError.Rejected(MachineRejection.InstanceNotRunning status)
 
     /// <summary>Runs one attempt under the shared pipeline, returning the raw outcome.</summary>
     let execute

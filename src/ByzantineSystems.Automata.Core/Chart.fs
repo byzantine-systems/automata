@@ -195,15 +195,24 @@ module Chart =
     let children (chart: Chart<'State, 'Event, 'Action, 'Err>) (id: StateId) : StateId list =
         chart.Children.TryFind id |> Option.defaultValue []
 
+    /// Recognises a declared node and exposes its definition to a match expression.
+    let private (|DeclaredNode|_|) (chart: Chart<'State, 'Event, 'Action, 'Err>) (id: StateId) = chart.Nodes.TryFind id
+
+    /// Recognises only declared leaf nodes. Resolution may start and finish only at a leaf.
+    let private (|LeafNode|_|) (chart: Chart<'State, 'Event, 'Action, 'Err>) (id: StateId) =
+        match id with
+        | DeclaredNode chart node when children chart id |> List.isEmpty -> Some node
+        | _ -> None
+
     /// <summary>A compound node has children; a leaf does not.</summary>
     let isCompound (chart: Chart<'State, 'Event, 'Action, 'Err>) (id: StateId) : bool =
         children chart id |> List.isEmpty |> not
 
     /// <summary>True when the classifier maps the state to a terminal leaf.</summary>
     let isTerminal (chart: Chart<'State, 'Event, 'Action, 'Err>) (state: 'State) : bool =
-        match chart.Classify state |> tryNode chart with
-        | Some node -> node.Terminal
-        | None -> false
+        match chart.Classify state with
+        | LeafNode chart node -> node.Terminal
+        | _ -> false
 
     /// <summary>
     /// Resolves one event from the current state: bubbling from the classified leaf outward,
@@ -220,10 +229,8 @@ module Chart =
 
         let leafId = chart.Classify state
 
-        match chart.Nodes.TryFind leafId with
-        | None -> Result.Error(TransitionError.UnknownState leafId)
-        | Some _ when isCompound chart leafId -> Result.Error(TransitionError.UnknownState leafId)
-        | Some _ ->
+        match leafId with
+        | LeafNode chart _ ->
             let chain = Hierarchy.chain parentOf leafId
 
             let pathsFor targetLeaf =
@@ -279,9 +286,8 @@ module Chart =
                                 | RuleOutcome.Next nextState ->
                                     let target = chart.Classify nextState
 
-                                    if not (chart.Nodes.ContainsKey target) || isCompound chart target then
-                                        Result.Error(TransitionError.UnknownState target)
-                                    else
+                                    match target with
+                                    | LeafNode chart _ ->
                                         let exited, entered =
                                             if target = leafId then
                                                 // External self-transition: exit and re-enter the handling node chain.
@@ -291,10 +297,10 @@ module Chart =
                                                 pathsFor target
 
                                         commit handlerId actions nextState exited entered
+                                    | _ -> Result.Error(TransitionError.UnknownState target)
                                 | RuleOutcome.Goto(targetId, nextState) ->
-                                    match chart.Nodes.TryFind targetId with
-                                    | None -> Result.Error(TransitionError.UnknownState targetId)
-                                    | Some _ ->
+                                    match targetId with
+                                    | DeclaredNode chart _ ->
                                         // Descend the initial-child path to the concrete leaf.
                                         let rec descend current =
                                             match chart.Nodes.[current].InitialChild with
@@ -323,7 +329,9 @@ module Chart =
                                                     pathsFor targetLeaf
 
                                             commit handlerId actions nextState exited entered
+                                    | _ -> Result.Error(TransitionError.UnknownState targetId)
 
                     tryRules node.Rules
 
             walkChain chain
+        | _ -> Result.Error(TransitionError.UnknownState leafId)

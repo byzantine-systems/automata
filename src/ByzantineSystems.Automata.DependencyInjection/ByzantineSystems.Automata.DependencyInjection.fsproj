@@ -6,6 +6,7 @@
     </PropertyGroup>
 
     <ItemGroup>
+        <Compile Include="Logging.fs" />
         <Compile Include="HostedServices.fs" />
         <Compile Include="ServiceCollectionExtensions.fs" />
     </ItemGroup>

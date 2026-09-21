@@ -362,10 +362,9 @@ module Supervisor =
             use budget = new CancellationTokenSource(childSpec.Shutdown)
 
             let stopTask =
-                try
-                    instance.Child.StopAsync(budget.Token)
-                with _ ->
-                    Task.CompletedTask
+                match TaskOutcome.captureSync (fun () -> instance.Child.StopAsync(budget.Token)) with
+                | Ok work -> work
+                | Error _ -> Task.CompletedTask
 
             let stopDeadline =
                 Task.Delay(childSpec.Shutdown, timeProvider, CancellationToken.None)
@@ -414,14 +413,7 @@ module Supervisor =
             MailboxProcessor.Start(fun inbox ->
                 let startEffect index generation purpose childSpec =
                     task {
-                        let! result =
-                            task {
-                                try
-                                    let! child = startChild childSpec childrenCancellation.Token
-                                    return Ok child
-                                with ex ->
-                                    return Error ex
-                            }
+                        let! result = startChild childSpec childrenCancellation.Token |> TaskOutcome.capture
 
                         inbox.Post(StartFinished(index, generation, purpose, result))
                     }
@@ -429,15 +421,15 @@ module Supervisor =
 
                 let monitorEffect index instance =
                     task {
-                        let! exit =
-                            task {
-                                try
-                                    do! instance.Child.Completion.WaitAsync(instance.MonitorCancellation.Token)
-                                    return ExitNormal
-                                with
-                                | :? OperationCanceledException -> return ExitCanceled
-                                | ex -> return ExitAbnormal ex
-                            }
+                        let! outcome =
+                            instance.Child.Completion.WaitAsync(instance.MonitorCancellation.Token)
+                            |> TaskOutcome.captureUnit
+
+                        let exit =
+                            match outcome with
+                            | Ok() -> ExitNormal
+                            | Error(CanceledBy instance.MonitorCancellation.Token) -> ExitCanceled
+                            | Error error -> ExitAbnormal error
 
                         inbox.Post(ChildExited(index, instance.Generation, exit))
                     }
@@ -445,10 +437,11 @@ module Supervisor =
 
                 let stopEffect index childSpec instance afterStop =
                     task {
-                        try
-                            do! stopChild timeProvider childSpec instance
-                        with _ ->
-                            instance.MonitorCancellation.Cancel()
+                        let! outcome = stopChild timeProvider childSpec instance |> TaskOutcome.captureUnit
+
+                        match outcome with
+                        | Ok() -> ()
+                        | Error _ -> instance.MonitorCancellation.Cancel()
 
                         inbox.Post(ChildStopFinished(index, instance.Generation, afterStop))
                     }
@@ -456,10 +449,14 @@ module Supervisor =
 
                 let delayEffect index generation delay =
                     task {
-                        try
-                            do! Task.Delay(delay, timeProvider, childrenCancellation.Token)
-                        with :? OperationCanceledException ->
-                            ()
+                        let! outcome =
+                            Task.Delay(delay, timeProvider, childrenCancellation.Token)
+                            |> TaskOutcome.captureUnit
+
+                        match outcome with
+                        | Ok()
+                        | Error(CanceledBy childrenCancellation.Token) -> ()
+                        | Error unexpected -> return raise unexpected
 
                         inbox.Post(RestartDelayElapsed(index, generation))
                     }
@@ -472,11 +469,7 @@ module Supervisor =
                     | MonitorChild(index, instance) -> monitorEffect index instance
                     | StopChild(index, childSpec, instance, afterStop) -> stopEffect index childSpec instance afterStop
                     | WaitForRestart(index, generation, delay) -> delayEffect index generation delay
-                    | CancelChildren ->
-                        try
-                            childrenCancellation.Cancel()
-                        with :? ObjectDisposedException ->
-                            ()
+                    | CancelChildren -> childrenCancellation.Cancel()
 
                 let startRuntime purpose child state =
                     let generation = child.Generation

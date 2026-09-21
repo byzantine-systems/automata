@@ -26,11 +26,7 @@ type WorkSignal() =
     let reader = channel.Reader
 
     /// <summary>Raises a hint. Never blocks; a full or disposed channel drops the hint.</summary>
-    member _.TrySignal() : unit =
-        try
-            writer.TryWrite(()) |> ignore
-        with :? ObjectDisposedException ->
-            ()
+    member _.TrySignal() : unit = writer.TryWrite(()) |> ignore
 
     /// <summary>Returns true when a hint is consumed, or false when the signal is completed.</summary>
     member _.WaitAsync(ct: CancellationToken) : Task<bool> =
@@ -54,29 +50,22 @@ type WorkSignal() =
 
             waitCancellation.Cancel()
 
-            let mutable signalOpen = true
-
-            try
-                let! openResult = signalWait
-                signalOpen <- openResult
-            with :? OperationCanceledException when waitCancellation.IsCancellationRequested ->
-                ()
-
-            try
-                do! timerWait
-            with :? OperationCanceledException when waitCancellation.IsCancellationRequested ->
-                ()
+            let! signalOutcome = signalWait |> TaskOutcome.capture
+            let! timerOutcome = timerWait |> TaskOutcome.captureUnit
 
             ct.ThrowIfCancellationRequested()
-            return signalOpen
+
+            match signalOutcome, timerOutcome with
+            | Ok signalOpen, Ok()
+            | Ok signalOpen, Error(CanceledBy waitCancellation.Token) -> return signalOpen
+            | Error(CanceledBy waitCancellation.Token), Ok()
+            | Error(CanceledBy waitCancellation.Token), Error(CanceledBy waitCancellation.Token) -> return true
+            | Error error, _
+            | _, Error error -> return raise error
         }
 
     /// <summary>Completes the channel so pending waiters finish; idempotent.</summary>
-    member _.Complete() : unit =
-        try
-            writer.TryComplete() |> ignore
-        with :? ObjectDisposedException ->
-            ()
+    member _.Complete() : unit = writer.TryComplete() |> ignore
 
     interface IDisposable with
 

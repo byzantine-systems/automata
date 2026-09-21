@@ -161,6 +161,12 @@ let configurationTests =
               match RetryPolicy.validate RetryPolicy.defaults with
               | Ok _ -> ()
               | Error errors -> failtestf "default policy should validate: %A" errors
+          }
+
+          test "event envelope validation reports an empty idempotency key as data" {
+              match EventEnvelope.tryCreate "   " (Start 1) with
+              | Error EventEnvelopeError.EmptyIdempotencyKey -> ()
+              | other -> failtestf "expected a typed envelope error, got %A" other
           } ]
 
 let lifecycleTests =
@@ -172,15 +178,19 @@ let lifecycleTests =
               let machine = buildUnstartedMachine rejectUnhandled (store :> MachineStore) time
               let entity = entityId "LIFE-1"
 
-              Expect.throwsT<MachineNotStarted>
-                  (fun () ->
-                      Machine.send machine entity (EventEnvelope.create "one" (Start 1)) noCancellation
-                      |> ignore)
-                  "send before start fails deterministically"
+              let! sendBeforeStart = Machine.send machine entity (EventEnvelope.create "one" (Start 1)) noCancellation
 
-              Expect.throwsT<MachineNotStarted>
-                  (fun () -> Machine.state machine entity noCancellation |> ignore)
-                  "state before start fails deterministically"
+              Expect.equal
+                  (Error(MachineError.Rejected MachineRejection.NotStarted))
+                  sendBeforeStart
+                  "send before start is a typed lifecycle outcome"
+
+              let! stateBeforeStart = Machine.state machine entity noCancellation
+
+              Expect.equal
+                  (Error(MachineError.Rejected MachineRejection.NotStarted))
+                  stateBeforeStart
+                  "state before start is a typed lifecycle outcome"
 
               do! Machine.startAsync machine noCancellation
               do! Machine.startAsync machine noCancellation
@@ -193,9 +203,12 @@ let lifecycleTests =
               Expect.isTrue (obj.ReferenceEquals(firstStop, secondStop)) "stop returns the same completion"
               do! firstStop
 
-              Expect.throwsT<MachineStopped>
-                  (fun () -> Machine.state machine entity noCancellation |> ignore)
-                  "state after stop fails deterministically"
+              let! stateAfterStop = Machine.state machine entity noCancellation
+
+              Expect.equal
+                  (Error(MachineError.Rejected MachineRejection.Stopped))
+                  stateAfterStop
+                  "state after stop is a typed lifecycle outcome"
           } ]
 
 let signalTests =

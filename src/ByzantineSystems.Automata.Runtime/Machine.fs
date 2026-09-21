@@ -6,12 +6,6 @@ open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
 
-/// <summary>Raised when machine work is requested before its lifecycle has started.</summary>
-exception MachineNotStarted
-
-/// <summary>Raised when machine work or startup is requested after shutdown has begun.</summary>
-exception MachineStopped
-
 type private MachineLifecycle =
     | Created
     | Running of CancellationTokenSource * Task option
@@ -46,34 +40,35 @@ type Machine<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: equality>
         (ct: CancellationToken)
         =
         task {
-            try
-                try
-                    match observerBus with
-                    | Some bus -> bus.Complete()
-                    | None -> ()
-
+            let stopComponents =
+                task {
+                    observerBus |> Option.iter _.Complete()
                     lifetime |> Option.iter _.Cancel()
 
                     match observerTask with
-                    | Some task ->
-                        try
-                            do! task.WaitAsync(ct)
-                        with :? OperationCanceledException when not ct.IsCancellationRequested ->
-                            ()
+                    | Some task -> do! task.WaitAsync(ct)
                     | None -> ()
 
                     retrySignal.Complete()
                     outboxSignal.Complete()
                     do! registry.StopAsync(ct)
-                    runCompletion.TrySetResult() |> ignore
-                    completion.TrySetResult() |> ignore
-                with error ->
-                    runCompletion.TrySetException(error) |> ignore
-                    completion.TrySetException(error) |> ignore
-            finally
-                lifetime |> Option.iter _.Dispose()
+                }
 
-                lock lifecycleGate (fun () -> lifecycle <- Stopped completion.Task)
+            let! outcome = stopComponents |> TaskOutcome.captureUnit
+
+            lifetime |> Option.iter _.Dispose()
+            lock lifecycleGate (fun () -> lifecycle <- Stopped completion.Task)
+
+            match outcome with
+            | Ok() ->
+                runCompletion.TrySetResult() |> ignore
+                completion.TrySetResult() |> ignore
+            | Error(CanceledBy ct) ->
+                runCompletion.TrySetCanceled(ct) |> ignore
+                completion.TrySetCanceled(ct) |> ignore
+            | Error error ->
+                runCompletion.TrySetException(error) |> ignore
+                completion.TrySetException(error) |> ignore
         }
 
     member internal _.RuntimeConfig = config
@@ -85,13 +80,13 @@ type Machine<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: equality>
     member _.MachineId: MachineId = config.MachineId
     member _.Completion: Task = runCompletion.Task
 
-    member internal _.EnsureRunning() =
+    member internal _.TryAcceptWork() : Result<unit, MachineError<'Err>> =
         lock lifecycleGate (fun () ->
             match lifecycle with
-            | Running _ -> ()
-            | Created -> raise MachineNotStarted
-            | Stopping _
-            | Stopped _ -> raise MachineStopped)
+            | Running _ -> Ok()
+            | Created -> Error(MachineError.Rejected MachineRejection.NotStarted)
+            | Stopping _ -> Error(MachineError.Rejected MachineRejection.Stopping)
+            | Stopped _ -> Error(MachineError.Rejected MachineRejection.Stopped))
 
     /// <summary>Starts the machine's asynchronous observer work; idempotent.</summary>
     member _.StartAsync(ct: CancellationToken) : Task =
@@ -120,7 +115,7 @@ type Machine<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: equality>
                 Task.CompletedTask
             | Running _ -> Task.CompletedTask
             | Stopping _
-            | Stopped _ -> Task.FromException(MachineStopped))
+            | Stopped _ -> Task.FromException(InvalidOperationException "A stopped machine cannot be started again."))
 
     /// <summary>Stops observer work, both wake signals, and every entity actor; idempotent.</summary>
     member _.StopAsync(ct: CancellationToken) : Task =
@@ -159,8 +154,9 @@ module Machine =
 
     /// <summary>
     /// Sends one event to an entity. The result distinguishes a fresh commit, an already
-    /// applied idempotency key, a durable deferral, and an explicit ignore. Cancellation
-    /// before mailbox admission never enqueues the event.
+    /// applied idempotency key, a durable deferral, and an explicit ignore. A machine that
+    /// is not running returns a typed <c>MachineError.Rejected</c>. Cancellation before
+    /// mailbox admission never enqueues the event.
     /// </summary>
     let send
         (machine: Machine<'EntityId, 'State, 'Event, 'Action, 'Err>)
@@ -168,17 +164,22 @@ module Machine =
         (envelope: EventEnvelope<'Event>)
         (ct: CancellationToken)
         : Task<Result<SendOutcome, MachineError<'Err>>> =
-        machine.EnsureRunning()
-        machine.RegistryValue.Send(entityId, envelope, ct)
+        match machine.TryAcceptWork() with
+        | Ok() -> machine.RegistryValue.Send(entityId, envelope, ct)
+        | Error error -> Task.FromResult(Error error)
 
-    /// <summary>Returns the latest committed snapshot for an entity, or <c>None</c>.</summary>
+    /// <summary>
+    /// Returns the latest committed snapshot for an entity, or <c>None</c>. A machine that
+    /// is not running returns a typed <c>MachineError.Rejected</c>.
+    /// </summary>
     let state
         (machine: Machine<'EntityId, 'State, 'Event, 'Action, 'Err>)
         (entityId: 'EntityId)
         (ct: CancellationToken)
         : Task<Result<Snapshot<'State> option, MachineError<'Err>>> =
-        machine.EnsureRunning()
-        machine.RegistryValue.State(entityId, ct)
+        match machine.TryAcceptWork() with
+        | Ok() -> machine.RegistryValue.State(entityId, ct)
+        | Error error -> Task.FromResult(Error error)
 
     /// <summary>The logical machine name the chart and store are keyed by.</summary>
     let machineId (machine: Machine<'EntityId, 'State, 'Event, 'Action, 'Err>) : MachineId = machine.MachineId

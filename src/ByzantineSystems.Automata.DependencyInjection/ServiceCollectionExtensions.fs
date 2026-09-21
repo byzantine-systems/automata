@@ -6,7 +6,9 @@ open ByzantineSystems.Automata.Resilience
 open ByzantineSystems.Automata.Runtime
 open Microsoft.Extensions.DependencyInjection
 open Microsoft.Extensions.Hosting
+open Microsoft.Extensions.Logging
 open Polly
+open Polly.DependencyInjection
 open Polly.Registry
 
 [<Extension>]
@@ -23,10 +25,21 @@ type ServiceCollectionExtensions =
         if isNull options.MachineKey || String.IsNullOrWhiteSpace options.MachineKey then
             invalidArg (nameof options) "MachineKey must be non-empty."
 
+        // A Generic Host already supplies logging. AddLogging also makes this extension safe
+        // in a plain service collection, where the default is a no-op logger until configured.
+        services.AddLogging() |> ignore
+
         services.AddResiliencePipeline<string, PipelineResult<'Err>>(
             options.MachineKey,
-            fun builder ->
-                let configured = RetryConfig.toPipeline options.Retry ignore
+            fun builder (context: AddResiliencePipelineContext<string>) ->
+                let logger =
+                    context.ServiceProvider
+                        .GetRequiredService<ILoggerFactory>()
+                        .CreateLogger(AutomataLog.PipelineCategory)
+
+                let configured =
+                    RetryConfig.toPipeline options.Retry (AutomataLog.pipelineEvent logger options.MachineKey)
+
                 ResiliencePipelineBuilderExtensions.AddPipeline(builder, configured) |> ignore
         )
         |> ignore
@@ -39,6 +52,11 @@ type ServiceCollectionExtensions =
                 let pipeline = pipelines.GetPipeline<PipelineResult<'Err>>(options.MachineKey)
                 let scopeFactory = provider.GetRequiredService<IServiceScopeFactory>()
 
+                let logger =
+                    provider.GetRequiredService<
+                        ILogger<AutomataHostedService<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectError>>
+                     >()
+
                 let auditStore =
                     provider.GetRequiredService<ByzantineSystems.Automata.Storage.ISupervisionEventStore>()
 
@@ -47,7 +65,8 @@ type ServiceCollectionExtensions =
                     scopeFactory,
                     auditStore,
                     pipeline,
-                    options
+                    options,
+                    logger
                 )
                 :> IHostedService)
         )

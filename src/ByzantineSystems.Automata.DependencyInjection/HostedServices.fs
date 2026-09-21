@@ -9,6 +9,7 @@ open ByzantineSystems.Automata.Runtime
 open ByzantineSystems.Automata.Storage
 open Microsoft.Extensions.DependencyInjection
 open Microsoft.Extensions.Hosting
+open Microsoft.Extensions.Logging
 open Polly
 
 /// Handles one durable action. Register implementations as scoped when they own scoped dependencies.
@@ -48,6 +49,48 @@ exception AutomataWorkerException of WorkerError
 /// Raised when supervision audit persistence fails.
 exception AutomataAuditException of StoreError
 
+/// Completion captured temporarily by a host-owned task boundary so cleanup and startup
+/// notifications happen before an unexpected exception is propagated.
+type private HostedTaskCompletion<'T> =
+    | Completed of 'T
+    | Faulted of exn
+
+/// Host lifecycle task helpers. This is the only general exception-capture boundary in
+/// the DI assembly; workflow and worker code continue to use their typed Result values.
+[<RequireQualifiedAccess>]
+module private HostedTask =
+
+    let (|CanceledBy|_|) (ct: CancellationToken) (error: exn) =
+        match error with
+        | :? OperationCanceledException when ct.IsCancellationRequested -> Some()
+        | _ -> None
+
+    let capture (work: Task<'T>) : Task<HostedTaskCompletion<'T>> =
+        task {
+            try
+                let! value = work
+                return Completed value
+            with error ->
+                return Faulted error
+        }
+
+    let captureUnit (work: Task) : Task<HostedTaskCompletion<unit>> =
+        task {
+            do! work
+            return ()
+        }
+        |> capture
+
+    let awaitOwnedCancellation (owner: CancellationToken) (work: Task) : Task =
+        task {
+            let! outcome = captureUnit work
+
+            match outcome with
+            | Completed() -> return ()
+            | Faulted(CanceledBy owner) -> return ()
+            | Faulted error -> return raise error
+        }
+
 type internal GenerationChild<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectError when 'EntityId: equality>
     (
         machine: Machine<'EntityId, 'State, 'Event, 'Action, 'Err>,
@@ -76,23 +119,20 @@ type internal GenerationChild<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectE
 
                     let! outcome =
                         task {
-                            try
-                                let service =
-                                    scope.ServiceProvider.GetRequiredService<
-                                        IActionHandler<'EntityId, 'Action, 'EffectError>
-                                     >()
+                            let service =
+                                scope.ServiceProvider.GetRequiredService<
+                                    IActionHandler<'EntityId, 'Action, 'EffectError>
+                                 >()
 
-                                let! result = service.HandleAsync(key, action, ct)
-                                return Choice1Of2 result
-                            with error ->
-                                return Choice2Of2 error
+                            return! service.HandleAsync(key, action, ct)
                         }
+                        |> HostedTask.capture
 
                     do! scope.DisposeAsync().AsTask()
 
                     match outcome with
-                    | Choice1Of2 result -> return result
-                    | Choice2Of2 error -> return raise error
+                    | Completed result -> return result
+                    | Faulted error -> return raise error
                 }
 
             task {
@@ -124,18 +164,10 @@ type internal GenerationChild<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectE
                 Interlocked.Exchange(&stopping, 1) |> ignore
 
                 actionCancellation.Cancel()
-
-                try
-                    do! actionTask.WaitAsync(ct)
-                with :? OperationCanceledException when actionCancellation.IsCancellationRequested ->
-                    ()
+                do! HostedTask.awaitOwnedCancellation actionCancellation.Token (actionTask.WaitAsync(ct))
 
                 retryCancellation.Cancel()
-
-                try
-                    do! retryTask.WaitAsync(ct)
-                with :? OperationCanceledException when retryCancellation.IsCancellationRequested ->
-                    ()
+                do! HostedTask.awaitOwnedCancellation retryCancellation.Token (retryTask.WaitAsync(ct))
 
                 do! Machine.stopAsync machine ct
             }
@@ -146,7 +178,8 @@ type internal AutomataHostedService<'EntityId, 'State, 'Event, 'Action, 'Err, 'E
         scopeFactory: IServiceScopeFactory,
         auditStore: ISupervisionEventStore,
         pipeline: ResiliencePipeline<PipelineResult<'Err>>,
-        options: AutomataOptions<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectError>
+        options: AutomataOptions<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectError>,
+        logger: ILogger<AutomataHostedService<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectError>>
     ) =
     inherit BackgroundService()
 
@@ -224,7 +257,7 @@ type internal AutomataHostedService<'EntityId, 'State, 'Event, 'Action, 'Err, 'E
                 let! stored = auditStore.Record(record, ct)
 
                 match stored with
-                | Ok() -> ()
+                | Ok() -> AutomataLog.supervisionEvent logger options.MachineKey event
                 | Error error -> raise (AutomataAuditException error)
 
             return events.Length
@@ -241,27 +274,35 @@ type internal AutomataHostedService<'EntityId, 'State, 'Event, 'Action, 'Err, 'E
 
     override _.ExecuteAsync(stoppingToken: CancellationToken) =
         task {
-            try
-                let! root = Supervisor.start spec stoppingToken options.TimeProvider
-                supervisor <- Some root
-                started.TrySetResult() |> ignore
+            let run =
+                task {
+                    let! root = Supervisor.start spec stoppingToken options.TimeProvider
+                    supervisor <- Some root
+                    started.TrySetResult() |> ignore
 
-                let mutable observing = true
+                    let mutable observing = true
 
-                while observing do
-                    let! next = persistNewEvents root persistedEvents stoppingToken
-                    persistedEvents <- next
+                    while observing do
+                        let! next = persistNewEvents root persistedEvents stoppingToken
+                        persistedEvents <- next
 
-                    if root.Completion.IsCompleted then
-                        observing <- false
-                    else
-                        do! Task.Delay(TimeSpan.FromMilliseconds 10., options.TimeProvider, stoppingToken)
+                        if root.Completion.IsCompleted then
+                            observing <- false
+                        else
+                            do! Task.Delay(TimeSpan.FromMilliseconds 10., options.TimeProvider, stoppingToken)
 
-                do! root.Completion
-                let! finalCount = persistNewEvents root persistedEvents stoppingToken
-                persistedEvents <- finalCount
-            with error ->
+                    let! finalCount = persistNewEvents root persistedEvents stoppingToken
+                    persistedEvents <- finalCount
+                    do! root.Completion
+                }
+
+            let! outcome = run |> HostedTask.captureUnit
+
+            match outcome with
+            | Completed() -> return ()
+            | Faulted error ->
                 started.TrySetException(error) |> ignore
+                AutomataLog.hostedServiceFailed logger options.MachineKey error
                 return raise error
         }
 

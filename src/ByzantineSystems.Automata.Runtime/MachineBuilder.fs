@@ -21,6 +21,15 @@ type MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err> =
     | MachineIdleTimeout of TimeSpan
     | MachineTimeProvider of TimeProvider
 
+/// <summary>
+/// The two deliberate ways a machine receives short-horizon resilience. Named cases keep
+/// validation and construction explicit; the generic <c>Choice</c> type conveyed neither
+/// why the alternatives exist nor what selecting one means.
+/// </summary>
+type private RetrySource<'Err> =
+    | RetryConfiguration of RetryConfig<'Err>
+    | PrebuiltPipeline of ResiliencePipeline<PipelineResult<'Err>> * (MachineError<'Err> -> Disposition)
+
 /// <summary>Shared assembly step behind the builder: accumulate defects, then construct.</summary>
 module private MachineBuild =
 
@@ -71,8 +80,8 @@ module private MachineBuild =
         let retry =
             parts
             |> List.tryPick (function
-                | MachineRetry config -> Some(Choice1Of2 config)
-                | MachinePipeline(pipeline, classify) -> Some(Choice2Of2(pipeline, classify))
+                | MachineRetry config -> Some(RetryConfiguration config)
+                | MachinePipeline(pipeline, classify) -> Some(PrebuiltPipeline(pipeline, classify))
                 | _ -> None)
 
         let retryPolicy =
@@ -140,11 +149,11 @@ module private MachineBuild =
 
         let retryErrors =
             match retry with
-            | Some(Choice1Of2 r) ->
+            | Some(RetryConfiguration r) ->
                 match RetryConfig.validate r with
                 | Ok _ -> []
                 | Error errors -> [ MachineConfigError.InvalidRetry errors ]
-            | Some(Choice2Of2 _) -> []
+            | Some(PrebuiltPipeline _) -> []
             | None -> []
 
         let validatedRetryPolicy, retryPolicyErrors =
@@ -163,8 +172,8 @@ module private MachineBuild =
         | [], Some c, Some s, Some st, Some configuredRetry, Some policy ->
             let pipeline, classify =
                 match configuredRetry with
-                | Choice1Of2 retry -> RetryConfig.toPipeline retry ignore, retry.Classify
-                | Choice2Of2(pipeline, classify) -> pipeline, classify
+                | RetryConfiguration retry -> RetryConfig.toPipeline retry ignore, retry.Classify
+                | PrebuiltPipeline(pipeline, classify) -> pipeline, classify
 
             let config =
                 { MachineId = machineId

@@ -118,11 +118,12 @@ type RetryPump<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: equality
             let run (item: RetryItem<'EntityId, 'Event>) =
                 task {
                     do! semaphore.WaitAsync(ct)
+                    let! outcome = processItem item ct |> TaskOutcome.capture
+                    semaphore.Release() |> ignore
 
-                    try
-                        return! processItem item ct
-                    finally
-                        semaphore.Release() |> ignore
+                    match outcome with
+                    | Ok result -> return result
+                    | Error error -> return raise error
                 }
 
             let! outcomes = items |> List.map run |> Task.WhenAll

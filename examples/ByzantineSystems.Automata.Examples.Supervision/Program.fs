@@ -4,6 +4,9 @@ open System
 open System.Threading
 open System.Threading.Tasks
 open ByzantineSystems.Automata.Resilience
+open Microsoft.Extensions.DependencyInjection
+open Microsoft.Extensions.Hosting
+open Microsoft.Extensions.Logging
 
 /// A supervised child that crashes after a short delay, to show restart behaviour.
 /// Its <see cref="T:ByzantineSystems.Automata.Resilience.ISupervisedChild.Completion" />
@@ -61,30 +64,50 @@ let private spec =
       Period = TimeSpan.FromMinutes 1.
       Children = [ flakySpec ] }
 
-let private run () : Task =
+let private run (logger: ILogger) : Task =
     task {
         let! supervisor = Supervisor.start spec CancellationToken.None TimeProvider.System
-        printfn "supervisor started; the child crashes every 60ms"
+
+        logger.LogInformation(
+            "Supervisor started; child crash interval is {CrashInterval}",
+            TimeSpan.FromMilliseconds 60.
+        )
 
         try
             do! supervisor.Completion.WaitAsync(TimeSpan.FromSeconds 10.)
         with :? SupervisorEscalated as escalated ->
-            printfn "escalated: %s (%s)" escalated.childId escalated.reason
+            logger.LogWarning(
+                "Supervisor escalated child {ChildId}: {EscalationReason}",
+                escalated.childId,
+                escalated.reason
+            )
 
-        printfn ""
-        printfn "supervision events (occurrence order):"
+        logger.LogInformation("Supervision events in occurrence order")
 
         for event in supervisor.Events() do
-            printfn "  %-10A %-20s %s" event.Kind event.ChildId event.Reason
+            logger.LogInformation(
+                "Supervision event {EventKind} for child {ChildId}: {EventReason}",
+                event.Kind,
+                event.ChildId,
+                event.Reason
+            )
 
         do! supervisor.StopAsync CancellationToken.None
     }
 
 [<EntryPoint>]
-let main _ =
+let main args =
+    let builder = Host.CreateApplicationBuilder(args)
+    use host = builder.Build()
+
+    let logger =
+        host.Services
+            .GetRequiredService<ILoggerFactory>()
+            .CreateLogger("ByzantineSystems.Automata.Examples.Supervision")
+
     try
-        (run ()).GetAwaiter().GetResult()
+        (run logger).GetAwaiter().GetResult()
         0
     with ex ->
-        eprintfn "error: %s" ex.Message
+        logger.LogError(ex, "Supervision example failed")
         1
