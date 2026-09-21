@@ -10,8 +10,8 @@
         <!-- Test -->
         <PackageVersion Include="Expecto" Version="11.1.0" />
         <PackageVersion Include="FsCheck" Version="3.4.0" />
-        <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.4.0" />
-        <PackageVersion Include="YoloDev.Expecto.TestSdk" Version="0.15.6" />
+        <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.10.1" />
+        <PackageVersion Include="YoloDev.Expecto.TestSdk" Version="0.16.1" />
         <PackageVersion Include="coverlet.msbuild" Version="10.0.1" />
 
         <!-- Resilience (Polly v8) -->
@@ -19,9 +19,9 @@
         <PackageVersion Include="Polly.Extensions" Version="8.8.0" />
 
         <!-- Host integration -->
-        <PackageVersion Include="Microsoft.Extensions.Hosting" Version="10.0.0" />
+        <PackageVersion Include="Microsoft.Extensions.Hosting" Version="10.0.12" />
         <PackageVersion Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.12" />
-        <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.0" />
+        <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.12" />
 
         <!-- Persistence: raw Npgsql instead of Npgsql.FSharp (avoids the 8.x/9.x version skew) -->
         <PackageVersion Include="Npgsql" Version="10.0.3" />
@@ -29,7 +29,7 @@
         <PackageVersion Include="FSharp.SystemTextJson" Version="1.4.36" />
 
         <!-- Optional, package-edge ergonomics only; never referenced by Core -->
-        <PackageVersion Include="FsToolkit.ErrorHandling" Version="5.1.0" />
+        <PackageVersion Include="FsToolkit.ErrorHandling" Version="5.2.0" />
     </ItemGroup>
 
 </Project>
