@@ -29,7 +29,7 @@
         <PackageVersion Include="FSharp.SystemTextJson" Version="1.4.36" />
 
         <!-- Optional, package-edge ergonomics only; never referenced by Core -->
-        <PackageVersion Include="FsToolkit.ErrorHandling" Version="5.1.0" />
+        <PackageVersion Include="FsToolkit.ErrorHandling" Version="5.2.0" />
     </ItemGroup>
 
 </Project>
