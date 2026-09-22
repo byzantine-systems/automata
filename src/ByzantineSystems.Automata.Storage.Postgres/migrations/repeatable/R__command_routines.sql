@@ -437,9 +437,8 @@ $$;
 -- Detection runs by default on the maintenance tick, from
 -- sql/command/blocked_drift.sql. Repair does not, and must be invoked
 -- deliberately. Silently rewriting derived state hides whatever caused it to
--- drift, and the cause is the interesting part: a wrong blocked flag is a
--- symptom of a bug in submission or acknowledgement, not something that happens
--- on its own.
+-- drift: a wrong blocked flag is a symptom of a bug in submission or
+-- acknowledgement, not something that happens on its own.
 --
 -- The expected CTE reads the table this statement also updates. That is safe
 -- and intended: a data-modifying statement and its CTEs share one snapshot, so

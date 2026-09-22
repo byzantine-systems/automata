@@ -327,8 +327,8 @@ let tests =
               | None -> failtest "the command should exist"
           }
 
-          // Concurrency is the whole point of this table, and a serial test cannot prove it.
-          // Many submitters race on a handful of entities while many workers claim and finish.
+          // A serial test cannot prove ordering holds under contention. Many submitters race on
+          // a handful of entities while many workers claim and finish.
           testTask "a concurrent workload keeps every entity ordered and leaves no drift" {
               do! reset ()
               let inbox = newInbox ()

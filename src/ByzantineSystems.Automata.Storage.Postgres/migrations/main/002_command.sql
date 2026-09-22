@@ -10,8 +10,6 @@
 -- Everything downstream assumes this. The transition log, corrections and the
 -- command processor all take the inbox as the thing that decides order.
 -- ---------------------------------------------------------------------------
-CREATE SCHEMA fsm;
-
 -- A checked text domain, not an enum, and the difference is operational.
 -- Migrations run one transaction per script, and a future script that does
 -- ALTER TYPE ... ADD VALUE and then *uses* the new value in that same
@@ -101,20 +99,37 @@ CREATE TABLE fsm.command (
     -- lease", rather than only "is there a result".
     --
     -- Every operand is NOT NULL, so this is two-valued and cannot pass by being
-    -- unknown. That is the reason the no-nullable-column rule is worth keeping: a
-    -- CHECK succeeds when its expression is TRUE *or* NULL, and a nullable column
-    -- quietly turns a constraint into a suggestion.
+    -- unknown. That is why no column here is nullable: a CHECK succeeds when its
+    -- expression is TRUE *or* NULL, and a nullable column quietly turns a
+    -- constraint into a suggestion.
     CONSTRAINT command_lease_token_matches_status CHECK ((lease_token = 0) = (status = 'ready')),
     -- The non-clamped check. blocked is derived state, and derived state drifts.
     -- This makes drift fail loudly at the moment of the bad write, rather than
     -- surfacing weeks later as an entity that mysteriously stopped progressing.
     -- A blocked command has by definition never been claimed, so it is 'ready'.
-    CONSTRAINT command_blocked_is_ready CHECK (NOT blocked OR status = 'ready')
+    CONSTRAINT command_blocked_is_ready CHECK (NOT blocked OR status = 'ready'),
+    -- A command may only pin a chart version some chart declared. Without this,
+    -- chart_version is an integer nobody validates, and the first time anyone
+    -- finds out that a command references a version that never existed is
+    -- during a replay that cannot proceed.
+    --
+    -- No ON DELETE clause, so NO ACTION: a version that commands still
+    -- reference cannot be deleted. There is no routine for forgetting a
+    -- registration either, because forgetting one disarms the fingerprint
+    -- check. A developer iterating on a chart locally either bumps the version
+    -- or runs make db-reset.
+    --
+    -- No index on the referencing side. PostgreSQL scans the child table when a
+    -- parent key is deleted or updated, and neither happens here: versions are
+    -- appended and then kept. An index for it would put a fourth write on every
+    -- insert into the busiest table in the schema to serve an operation the
+    -- constraint forbids.
+    CONSTRAINT command_chart_version_fkey FOREIGN KEY (machine_id, chart_version) REFERENCES fsm.machine_chart_version (machine_id, version)
 );
 
 COMMENT ON COLUMN fsm.command.seq IS 'Gapless per-entity submission counter, computed under the advisory lock taken by fsm.submit_command and enforced by command_unique_seq. Not an identity column: identity values are allocated outside the transaction and would leave gaps on rollback.';
 
-COMMENT ON COLUMN fsm.command.chart_version IS 'The chart version this command was resolved under, pinned at submission so that replay decides it the same way twice. The foreign key to fsm.machine_chart_version arrives with chart identity.';
+COMMENT ON COLUMN fsm.command.chart_version IS 'The chart version this command was resolved under, pinned at submission so that replay decides it the same way twice. Held to a version some chart declared by command_chart_version_fkey.';
 
 COMMENT ON COLUMN fsm.command.blocked IS 'TRUE when an earlier non-terminal sibling exists for this entity. Derived, denormalised, and deliberately so: the alternative is an anti-join in the claim path. Measured on a comparable queue at 200k jobs with 50k blocked at the head, a live anti-join in checkout took 237 ms over 253k buffers, an anti-join against a materialised set took 42 ms over 102k buffers, and this column inside the index took 0.14 ms over 9 buffers. It ships with the discipline that buys: a non-clamped CHECK, a drift query that runs by default, and a repair that does not.';
 
@@ -173,14 +188,7 @@ WHERE
 -- ---------------------------------------------------------------------------
 -- Storage
 -- ---------------------------------------------------------------------------
--- Tuned for churn, not for size. Dead tuples here are proportional to
--- throughput rather than to row count, and the claim is a partial index scan
--- that must step over every one of them, which is work LIMIT does not bound.
--- The defaults (20%) would let a busy machine accumulate dead tuples for hours.
---
--- Deliberately no fillfactor. The claim writes status, visible_at and
--- lease_token, all of them indexed, so the update can never be HOT no matter
--- how much free space the page has. Setting one would cost storage and buy
--- nothing.
-ALTER TABLE fsm.command SET (autovacuum_vacuum_scale_factor = 0.02, autovacuum_vacuum_threshold = 100, autovacuum_analyze_scale_factor = 0.02, autovacuum_analyze_threshold = 100);
-
+-- TODO: no autovacuum or fillfactor settings. This table churns and will
+-- probably want tuning, but nothing here has been measured yet. Set them with a
+-- benchmark in hand, and record what it measured.
+-- ---------------------------------------------------------------------------

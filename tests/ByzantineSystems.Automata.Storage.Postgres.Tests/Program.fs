@@ -17,6 +17,7 @@ let tests =
                   "integration"
                   [ CommandInboxTests.tests
                     ChartRegistryTests.tests
+                    TemporalTests.tests
                     SchemaContractTests.tests
                     PostgresSupervisionStoreTests.tests ]
               |> testSequenced

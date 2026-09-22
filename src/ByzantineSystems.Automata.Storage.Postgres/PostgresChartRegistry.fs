@@ -22,8 +22,8 @@ type PostgresChartRegistry(options: ChartRegistryOptions) =
 
     /// A stored fingerprint that no longer parses is a corrupt row, reported as the contract's
     /// serialization failure rather than as an exception out of the store. The shape constraint
-    /// on the column means this should be unreachable, which is the reason it is worth checking:
-    /// the two disagreeing is exactly the case nothing else would report.
+    /// on the column should make this unreachable; if the two ever disagree, nothing else
+    /// reports it.
     let parse (value: string) : Result<ChartFingerprint, StoreError> =
         // A string literal rather than nameof: the type has a private single case of the same
         // name, and nameof binds to the constructor, which is not accessible here.

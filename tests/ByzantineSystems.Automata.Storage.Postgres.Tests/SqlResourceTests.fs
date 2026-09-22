@@ -17,6 +17,8 @@ let private expected =
       "command", "blocked_drift"
       "chart", "register"
       "chart", "by_version"
+      "belief", "live"
+      "belief", "as_of"
       "system", "command_metrics"
       "supervision", "record"
       "supervision", "list_recent" ]

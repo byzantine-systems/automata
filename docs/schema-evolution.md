@@ -1,25 +1,30 @@
 # PostgreSQL schema evolution
 
 `ByzantineSystems.Automata.Storage.Postgres` embeds its SQL and applies it through
-`Migrator.migrate`. The schema requires PostgreSQL 18 and, as it stands, no extensions at all.
+`Migrator.migrate`. The schema requires PostgreSQL 18 and one extension, `btree_gist`, for the
+temporal keys. `btree_gist` is trusted, so a role with `CREATE` on the database can install it
+without superuser. The command inbox on its own still needs no extension.
 
 ## Where SQL lives
 
 Two embedded trees, with different lifecycles and different jobs.
 
-- `migrations/main/*.sql` are ordered and journaled. Each script runs once.
-  - `000_extensions.sql` is the superuser step, kept separate so a DBA can run it alone. It
-    currently installs nothing: the command inbox uses a bigint identity column and a sequence
-    rather than uuid generation, so neither `pgcrypto` nor a uuid extension is needed, and
-    `btree_gist` only becomes necessary when temporal belief tables arrive.
-  - `001_command.sql` is `fsm.command`, its domains, constraints, indexes and storage settings.
-  - `002_supervision.sql` is the supervision audit log.
-  - `003_chart_version.sql` is `fsm.machine_chart_version` and the foreign key that holds a
-    command's `chart_version` to a version some chart declared.
+- `migrations/main/*.sql` are ordered and journaled. Each script runs once. They are numbered in
+  **dependency order**, which is why no script contains an `ALTER TABLE`: every table is created
+  complete, so its definition is the whole truth about it.
+  - `000_bootstrap.sql` holds what needs a right on the database rather than on a schema:
+    `btree_gist` and `CREATE SCHEMA fsm`.
+  - `001_chart_version.sql` is `fsm.machine_chart_version`. It precedes the inbox because
+    `fsm.command` references it.
+  - `002_command.sql` is `fsm.command`, its domains, constraints and indexes.
+  - `003_instance_state.sql` is the bitemporal belief table and its history twin.
+  - `004_supervision.sql` is the supervision audit log.
 - `migrations/repeatable/*.sql` are reapplied whenever their content changes. Routines live in
-  `R__command_routines.sql` and `R__chart_routines.sql`, one file per domain, as
-  `CREATE OR REPLACE`, so editing a routine body is an edit to its own migration rather than a
-  new file.
+  `R__command_routines.sql`, `R__chart_routines.sql` and `R__temporal_routines.sql`, one file per
+  domain, as `CREATE OR REPLACE`, so editing a routine body is an edit to its own migration
+  rather than a new file. `R__temporal_routines.sql` also carries a `CREATE OR REPLACE TRIGGER`,
+  because `main` runs before `repeatable` and a trigger declared beside its table would reference
+  a function that does not exist yet.
 - `sql/<domain>/<operation>.sql` are the statements the application sends, loaded by
   `SqlResources` into a map keyed by domain and operation. They are not migrations. Putting them
   in files rather than F# string literals is what lets `pg_format` reach them through `nix fmt`,
@@ -46,15 +51,37 @@ nothing fails to tell you. The plan test in `SchemaContractTests` is what notice
 column name, and `SchemaContractTests` asserts the exact column list each query returns. Adding a
 column to `fsm.command` is therefore a failing test rather than a runtime surprise.
 
+## Temporal tables
+
+A table opts into system-time versioning by having a `system_time tstzrange` column, a twin named
+`<table>_history`, and the shared trigger attached:
+
+```sql
+CREATE TABLE fsm.<t>_history (LIKE fsm.<t> INCLUDING DEFAULTS INCLUDING CONSTRAINTS);
+
+CREATE OR REPLACE TRIGGER <t>_versioning_trigger
+    BEFORE INSERT OR UPDATE OR DELETE ON fsm.<t>
+    FOR EACH ROW EXECUTE FUNCTION fsm.temporal_versioning ();
+```
+
+`fsm.temporal_versioning` reads the table name at fire time and finds the twin by that naming
+convention, so one function serves every temporal table.
+
+The two omissions from `LIKE` are deliberate. **Not `INCLUDING INDEXES`**, because a history twin
+exists to hold superseded and therefore overlapping rows, and a temporal key would reject them.
+**Not `INCLUDING GENERATED`**, because the trigger writes rows verbatim through
+`INSERT … SELECT ($1).*`, which a generated column cannot accept. `INCLUDING CONSTRAINTS` is
+wanted: the twin has neither the temporal key nor the trigger, so the `CHECK` constraints are its
+only defence against a zero-width row.
+
+Valid-time mutations go through `fsm.close_and_open`, never through a direct `UPDATE` of
+`valid_during`, so the close-then-insert split exists in one place.
+
 ## Adding a change
 
-`003_chart_version.sql` is the worked example. It needed a new table *and* a constraint on
-`fsm.command`, and neither was written by editing `001_command.sql`: a journaled script that may
-already have run somewhere is never touched, so the `ALTER TABLE` lives in the new file beside
-the table it references.
-
 1. Add a new zero-padded script under `migrations/main`. Never edit a numbered migration that may
-   already have shipped.
+   already have shipped. Until 1.0 the schema is still being cut, and renumbering the set is
+   allowed while nothing is deployed; after that it is not.
 2. Edit the matching `R__*_routines.sql` in place when a routine changes; it is reapplied on
    content change. Keep its result shape compatible with the reader, or change both in the same
    release. A new domain of routines gets its own repeatable file.

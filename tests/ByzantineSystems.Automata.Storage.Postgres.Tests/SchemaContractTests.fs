@@ -101,6 +101,75 @@ let tests =
               Expect.equal columns [ "fingerprint" ] "the registry reads this column by name"
           }
 
+          testTask "the belief reads return exactly the columns they promise" {
+              do! reset ()
+
+              let expected = [ "machine_id"; "entity_id"; "state"; "valid_during"; "system_time" ]
+
+              Expect.equal
+                  (columnsOf (SqlResources.get "belief" "live") [ "machine_id", box "none"; "entity_id", box "none" ])
+                  expected
+                  "the live read"
+
+              Expect.equal
+                  (columnsOf
+                      (SqlResources.get "belief" "as_of")
+                      [ "machine_id", box "none"
+                        "entity_id", box "none"
+                        "valid_at", box DateTime.UtcNow
+                        "known_at", box DateTime.UtcNow ])
+                  expected
+                  "the as-of read returns the same shape, so one reader can serve both"
+          }
+
+          testTask "the live belief read uses its partial index" {
+              do! reset ()
+
+              // Ten superseded valid-time versions per entity plus one live one, which is what
+              // this table looks like in use. The shape matters: with a single version per
+              // entity the temporal key is the same size as the partial index and the planner
+              // reasonably picks either. Once history accumulates, the partial index stays
+              // proportional to the live frontier while the key grows with every version.
+              exec
+                  """INSERT INTO fsm.instance_state (machine_id, entity_id, state, valid_during)
+                     SELECT 'plan-probe', 'e' || e, '{}'::jsonb,
+                            tstzrange('2026-01-01'::timestamptz + (v || ' days')::interval,
+                                      '2026-01-01'::timestamptz + ((v + 1) || ' days')::interval, '[)')
+                     FROM generate_series(1, 2000) e, generate_series(0, 9) v;
+
+                     INSERT INTO fsm.instance_state (machine_id, entity_id, state, valid_during)
+                     SELECT 'plan-probe', 'e' || e, '{}'::jsonb, tstzrange('2026-03-01', 'infinity', '[)')
+                     FROM generate_series(1, 2000) e"""
+              |> function
+                  | Ok() -> ()
+                  | Error error -> failtestf "seeding failed: %s" error.Message
+
+              exec "ANALYZE fsm.instance_state"
+              |> function
+                  | Ok() -> ()
+                  | Error error -> failtestf "analyze failed: %s" error.Message
+
+              let plan =
+                  use conn = (dataSource ()).OpenConnection()
+
+                  use cmd =
+                      new NpgsqlCommand(
+                          "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "
+                          + (SqlResources.get "belief" "live")
+                              .Replace("@machine_id", "'plan-probe'")
+                              .Replace("@entity_id", "'e1234'"),
+                          conn
+                      )
+
+                  cmd.ExecuteScalar() |> string
+
+              Expect.stringContains plan "instance_state_live_idx" "the current-state read must use the partial index"
+
+              Expect.isFalse
+                  (plan.Contains "Seq Scan")
+                  "a sequential scan means the predicate drifted from the index predicate"
+          }
+
           testTask "a chart version below one is refused" {
               do! reset ()
 

@@ -27,10 +27,9 @@ let private register (registry: IChartRegistry) version fingerprint : Task<Chart
 
 /// Waits until a registration is actually blocked on a lock, and fails if none ever is.
 ///
-/// This is what makes the race test below a test. Firing N registrations in parallel and hoping
-/// they overlap does not work: an earlier version of that test passed against a deliberately
-/// broken routine, because the first call finished before the others reached the server. Proving
-/// the block happened is the difference between exercising the race and hoping for it.
+/// Firing N registrations in parallel and hoping they overlap does not work: an earlier version
+/// of the test below passed against a deliberately broken routine, because the first call
+/// finished before the others reached the server.
 let private waitForBlockedRegistration () : Task =
     task {
         let deadline = DateTime.UtcNow.AddSeconds 10.0

@@ -12,6 +12,7 @@
         <Compile Include="SqlResourceTests.fs" />
         <Compile Include="CommandInboxTests.fs" />
         <Compile Include="ChartRegistryTests.fs" />
+        <Compile Include="TemporalTests.fs" />
         <Compile Include="SchemaContractTests.fs" />
         <Compile Include="PostgresSupervisionStoreTests.fs" />
         <Compile Include="Program.fs" />

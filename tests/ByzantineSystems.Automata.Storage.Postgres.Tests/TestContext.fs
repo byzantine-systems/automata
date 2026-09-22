@@ -76,7 +76,8 @@ let reset () : Task =
 
         use cmd =
             new NpgsqlCommand(
-                "TRUNCATE fsm.command, fsm.machine_chart_version, fsm.supervision_event RESTART IDENTITY;
+                "TRUNCATE fsm.command, fsm.machine_chart_version, fsm.supervision_event,
+                          fsm.instance_state, fsm.instance_state_history RESTART IDENTITY;
                  INSERT INTO fsm.machine_chart_version (machine_id, version, fingerprint)
                  VALUES (@machine_id, @version, @fingerprint);",
                 conn
@@ -186,6 +187,27 @@ let blockedDriftRows () : string list =
                 $"command {reader.GetInt64 0} of {reader.GetString 2}: blocked={reader.GetBoolean 4}, expected={reader.GetBoolean 5}"
 
             go (description :: acc)
+        else
+            List.rev acc
+
+    go []
+
+/// Runs a shipped statement with named parameters, projecting each row.
+///
+/// Lets a test execute the file the library actually embeds rather than a restatement of it, the
+/// way blockedDriftRows does, without having to rewrite the statement to fit the test.
+let rows (sql: string) (parameters: (string * obj) list) (project: NpgsqlDataReader -> 'T) : 'T list =
+    use conn = (dataSource ()).OpenConnection()
+    use cmd = new NpgsqlCommand(sql, conn)
+
+    for name, value in parameters do
+        cmd.Parameters.AddWithValue(name, value) |> ignore
+
+    use reader = cmd.ExecuteReader()
+
+    let rec go acc =
+        if reader.Read() then
+            go (project (reader :?> NpgsqlDataReader) :: acc)
         else
             List.rev acc
 
