@@ -205,6 +205,7 @@
               package = pkgs.postgresql_18;
               extensions = ext: [
                 ext.pg_cron
+                ext.pgmq
               ];
               initdbArgs = [
                 "--locale=C"
