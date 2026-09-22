@@ -5,9 +5,10 @@ open System.Reflection
 open DbUp
 
 /// <summary>
-/// Applies the embedded migrations: <c>main</c> scripts run once, journaled;
-/// <c>repeatable</c> scripts (the lease-claim functions) re-run whenever their content
-/// changes.
+/// Applies the embedded migrations. <c>main</c> scripts run once and are journaled;
+/// <c>repeatable</c> scripts hold the routines, which are <c>CREATE OR REPLACE</c> and reapplied
+/// whenever their content changes, so editing a routine body is an edit to its own migration
+/// rather than a new file.
 /// </summary>
 [<RequireQualifiedAccess>]
 module Migrator =

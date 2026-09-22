@@ -1,22 +1,78 @@
 # PostgreSQL schema evolution
 
-`ByzantineSystems.Automata.Storage.Postgres` embeds its SQL migrations and applies them through `Migrator.migrate`. The current schema requires PostgreSQL 18 because chart-version validity uses `WITHOUT OVERLAPS`.
+`ByzantineSystems.Automata.Storage.Postgres` embeds its SQL and applies it through
+`Migrator.migrate`. The schema requires PostgreSQL 18 and, as it stands, no extensions at all.
 
-## Migration sets
+## Where SQL lives
 
-The embedded scripts have two lifecycles:
+Two embedded trees, with different lifecycles and different jobs.
 
-- `migrations/main/*.sql` are ordered, journaled migrations. Each script runs once.
-- `migrations/repeatable/*.sql` are reapplied by DbUp. They contain replaceable database objects such as the leased claim functions.
+- `migrations/main/*.sql` are ordered and journaled. Each script runs once.
+  - `000_extensions.sql` is the superuser step, kept separate so a DBA can run it alone. It
+    currently installs nothing: the command inbox uses a bigint identity column and a sequence
+    rather than uuid generation, so neither `pgcrypto` nor a uuid extension is needed, and
+    `btree_gist` only becomes necessary when temporal belief tables arrive.
+  - `001_command.sql` is `fsm.command`, its domains, constraints, indexes and storage settings.
+  - `002_supervision.sql` is the supervision audit log.
+- `migrations/repeatable/*.sql` are reapplied whenever their content changes. Every routine lives
+  in `R__command_routines.sql` as `CREATE OR REPLACE`, so editing a routine body is an edit to
+  its own migration rather than a new file.
+- `sql/<domain>/<operation>.sql` are the statements the application sends, loaded by
+  `SqlResources` into a map keyed by domain and operation. They are not migrations. Putting them
+  in files rather than F# string literals is what lets `pg_format` reach them through `nix fmt`,
+  and what gives a `WHERE` clause that must not drift from an index predicate somewhere to say
+  so at length.
 
-The initial schema defines machine and chart-version metadata, entity snapshots, append-only transition history, the action outbox, durable retries, dead letters, and supervision events. Queue and outbox claims use leases with `FOR UPDATE SKIP LOCKED`, allowing multiple workers to claim work without selecting the same row.
+## Rules the schema keeps
+
+**Routines are the only mutation surface.** Nothing writes `fsm.command` directly. That is what
+lets the per-entity head invariant, the gapless sequence and the lease fence be reasoned about in
+one place rather than at every call site.
+
+**No column is nullable.** Absence always has a value: `'-infinity'` for an unset instant,
+`'infinity'` for an open upper bound, the empty string for unsupplied text, `0` for no lease. A
+`CHECK` constraint passes when its expression is true *or* null, so a nullable column quietly
+turns a constraint into a suggestion. `SchemaContractTests` fails if a nullable column appears.
+
+**Three predicates must not drift apart.** `command_claim_idx`, `fsm.claim_commands` and the
+`runnable` bucket of `fsm.command_metrics` all state the same condition. A claim whose `WHERE`
+clause has drifted from its index still returns correct rows; it just stops using the index, and
+nothing fails to tell you. The plan test in `SchemaContractTests` is what notices.
+
+**The reader's column contract is a test, not a generator.** `PostgresCommandInbox` reads by
+column name, and `SchemaContractTests` asserts the exact column list each query returns. Adding a
+column to `fsm.command` is therefore a failing test rather than a runtime surprise.
 
 ## Adding a change
 
-1. Add a new zero-padded script under `migrations/main` for table, column, constraint, or index changes. Never edit a numbered migration that may already have shipped.
-2. Update `R__claim_functions.sql` when a replaceable claim function changes. Keep its result shape compatible with the store reader, or update the application in the same release.
-3. Keep schema values non-null where the current model expects sentinels. In particular, unlocked leases use `-infinity`, open range bounds use `infinity`, and a missing retry error uses an empty string.
-4. Run `make migrate` against a disposable PostgreSQL 18 database, then run the integration suite with `AUTOMATA_TEST_DB` set.
-5. Test both a fresh database and an upgrade from the latest released schema before publishing.
+1. Add a new zero-padded script under `migrations/main`. Never edit a numbered migration that may
+   already have shipped.
+2. Edit `R__command_routines.sql` in place when a routine changes; it is reapplied on content
+   change. Keep its result shape compatible with the reader, or change both in the same release.
+3. Declare volatility, parallel safety and `search_path` on every new routine. The first two are
+   promises the planner acts on. The third stops an unqualified function resolving through the
+   connecting role's `search_path`.
+4. Return a value from every routine, never `void`. Npgsql has no codec claiming `void`'s
+   typsend, so the decoder receives an unknown OID carrying an empty payload.
+5. Run `make db-reset` against a disposable database, then `make test-integration` with
+   `AUTOMATA_TEST_DB` set.
 
-`make db-reset` is destructive: it drops the `fsm` schema and DbUp journal before rerunning migrations. Use it only for local disposable databases.
+`make db-reset` is destructive: it drops the `fsm` schema and the DbUp journal before rerunning
+migrations. Use it only on local disposable databases.
+
+## Deferred: partitioning `fsm.command`
+
+`fsm.command` is deliberately not partitioned, and that is a decision with a price attached.
+
+Adding `PARTITION BY RANGE (received_at)` later is a table rewrite, and it is not only a
+rewrite: a partitioned table's unique constraints must contain every partition-key column, so
+`command_unique_idem` and `command_unique_seq` would both have to gain `received_at`. That
+changes what "unique" means. An idempotency key would become unique per key *and arrival time*
+rather than outright, which is not the invariant the inbox needs, so partitioning would require
+rethinking deduplication rather than just adding a clause.
+
+Deferring is cheap only while retention keeps the table small, which is an assumption a
+benchmark should test rather than a fact. The partition-lifecycle shape to adopt, if it comes to
+that, is a creation call in the migration, a recurring job that creates future partitions, and a
+*blocking* boot check: a dead scheduler or a restored old backup otherwise leaves ingestion
+facing a table that cannot accept inserts.

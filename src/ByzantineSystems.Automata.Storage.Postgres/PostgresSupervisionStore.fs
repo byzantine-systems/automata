@@ -66,7 +66,7 @@ type PostgresSupervisionStore(dataSource: NpgsqlDataSource) =
                 (fun token ->
                     task {
                         use! conn = dataSource.OpenConnectionAsync(token).AsTask()
-                        use cmd = new NpgsqlCommand(Sql.recordSupervisionEvent, conn)
+                        use cmd = new NpgsqlCommand(SqlResources.get "supervision" "record", conn)
 
                         cmd.Parameters.AddWithValue("supervisor", SupervisorName.value record.Supervisor)
                         |> ignore
@@ -106,7 +106,7 @@ module PostgresSupervisionQueries =
             (fun token ->
                 task {
                     use! conn = dataSource.OpenConnectionAsync(token).AsTask()
-                    use cmd = new NpgsqlCommand(Sql.listRecentSupervisionEvents, conn)
+                    use cmd = new NpgsqlCommand(SqlResources.get "supervision" "list_recent", conn)
                     cmd.Parameters.AddWithValue("limit", limit) |> ignore
                     use! reader = cmd.ExecuteReaderAsync(token)
 
@@ -118,18 +118,18 @@ module PostgresSupervisionQueries =
                                 return Ok(List.rev records)
                             else
                                 match
-                                    SupervisionMapping.kindFromString (reader.GetString 2),
-                                    SupervisionMapping.strategyFromString (reader.GetString 3),
-                                    SupervisionMapping.reasonFromJson (reader.GetString 4)
+                                    SupervisionMapping.kindFromString (Row.string reader "kind"),
+                                    SupervisionMapping.strategyFromString (Row.string reader "strategy"),
+                                    SupervisionMapping.reasonFromJson (Row.string reader "reason")
                                 with
                                 | Ok kind, Ok strategy, Ok reason ->
                                     let record =
-                                        { Supervisor = SupervisorName.create (reader.GetString 0)
-                                          ChildId = SupervisedChildId.create (reader.GetString 1)
+                                        { Supervisor = SupervisorName.create (Row.string reader "supervisor")
+                                          ChildId = SupervisedChildId.create (Row.string reader "child_id")
                                           Kind = kind
                                           Strategy = strategy
                                           Reason = reason
-                                          At = Db.fromTimestamp (reader.GetDateTime 5) }
+                                          At = Row.timestamp reader "at" }
 
                                     return! read (record :: records)
                                 | Error error, _, _

@@ -217,35 +217,28 @@ let private readConnectionString () : string option =
     |> List.map Environment.GetEnvironmentVariable
     |> List.tryFind (String.IsNullOrWhiteSpace >> not)
 
-let private buildPostgres () : IMachineStore<Entity, PaymentState, PaymentEvent, PaymentAction> =
-    let connectionString =
-        match readConnectionString () with
-        | Some value -> value
-        | None -> failwith "the --postgres flag requires BS_AUTOMATA_CONN to be set"
-
-    Migrator.migrate connectionString
-
-    let dataSource = PostgresStore.dataSource connectionString
-    let encode, decode = EntityKey.forEntityId<Payment>
-
-    PostgresStore<Entity, PaymentState, PaymentEvent, PaymentAction>(
-        { DataSource = dataSource
-          StateCodec = Serialization.systemTextJson<PaymentState> ()
-          EventCodec = Serialization.systemTextJson<PaymentEvent> ()
-          ActionCodec = Serialization.systemTextJson<PaymentAction> ()
-          ActionListCodec = Serialization.systemTextJsonList<PaymentAction> ()
-          EntityIdEncode = encode
-          EntityIdDecode = decode
-          StatePath = StatePath.ofChart paymentChartValue
-          TimeProvider = TimeProvider.System }
-    )
-    :> IMachineStore<Entity, PaymentState, PaymentEvent, PaymentAction>
+/// <summary>
+/// Applies the schema and reports what it built.
+///
+/// The PostgreSQL implementation of <c>IMachineStore</c> was removed with the v1 schema: the
+/// durable authority is being rebuilt around <c>fsm.command</c>, and the pieces that satisfy
+/// this interface arrive with the command processor. Until then <c>--postgres</c> proves the
+/// migrations apply and the example runs its chart against the in-memory store, which is the
+/// point the README makes anyway: swapping stores does not change the chart above them.
+/// </summary>
+let private migrateOnly (logger: ILogger) () =
+    match readConnectionString () with
+    | None -> failwith "the --postgres flag requires BS_AUTOMATA_CONN to be set"
+    | Some connectionString ->
+        Migrator.migrate connectionString
+        logger.LogInformation("Applied the fsm schema; running the chart on the in-memory store")
 
 let private run (logger: ILogger) argv =
     task {
-        let usePostgres = argv |> Array.contains "--postgres"
-        let store = if usePostgres then buildPostgres () else buildInMemory ()
-        do! runPayment logger store
+        if argv |> Array.contains "--postgres" then
+            migrateOnly logger ()
+
+        do! runPayment logger (buildInMemory ())
     }
 
 [<EntryPoint>]

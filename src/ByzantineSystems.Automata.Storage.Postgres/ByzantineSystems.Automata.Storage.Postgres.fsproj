@@ -6,9 +6,11 @@
     </PropertyGroup>
 
     <ItemGroup>
+        <Compile Include="DataSource.fs" />
         <Compile Include="Serialization.fs" />
-        <Compile Include="Sql.fs" />
-        <Compile Include="PostgresStore.fs" />
+        <Compile Include="Db.fs" />
+        <Compile Include="SqlResources.fs" />
+        <Compile Include="PostgresCommandInbox.fs" />
         <Compile Include="PostgresSupervisionStore.fs" />
         <Compile Include="Migrator.fs" />
     </ItemGroup>
@@ -16,6 +18,14 @@
     <ItemGroup>
         <EmbeddedResource Include="migrations/main/*.sql" />
         <EmbeddedResource Include="migrations/repeatable/*.sql" />
+        <!-- Queries, keyed by SqlResources as sql/<domain>/<operation>.sql. -->
+        <EmbeddedResource Include="sql/**/*.sql" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <!-- The SQL loader and the column readers are internal, and their tests assert the
+             embedded keys resolve and the column contracts match the live schema. -->
+        <InternalsVisibleTo Include="ByzantineSystems.Automata.Storage.Postgres.Tests" />
     </ItemGroup>
 
     <ItemGroup>

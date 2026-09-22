@@ -42,43 +42,23 @@ module Serialization =
     /// <summary>Builds a codec for a list of values.</summary>
     let systemTextJsonList<'T> () : Codec<'T list> = systemTextJson<'T list> ()
 
-/// <summary>
-/// Options for a PostgreSQL-backed store: connection, codecs, and the key/state
-/// projections that bridge the generic domain types to text columns.
-/// </summary>
-type StoreOptions<'EntityId, 'State, 'Event, 'Action> =
-    {
-        DataSource: NpgsqlDataSource
-        StateCodec: Codec<'State>
-        EventCodec: Codec<'Event>
-        ActionCodec: Codec<'Action>
-        ActionListCodec: Codec<'Action list>
-        EntityIdEncode: 'EntityId -> string
-        EntityIdDecode: string -> 'EntityId
-        /// <summary>Root-to-leaf state ids for the current state, feeding the state_path GIN index.</summary>
-        StatePath: 'State -> string[]
-        TimeProvider: TimeProvider
-    }
-
-/// <summary>Builds a state-path projection (root-to-leaf state ids) from a chart.</summary>
-[<RequireQualifiedAccess>]
-module StatePath =
-
-    let ofChart (chart: Chart<'State, 'Event, 'Action, 'Err>) : ('State -> string[]) =
-        fun state ->
-            let leaf = Chart.classifyOf chart state
-
-            let parentOf (id: StateId) =
-                Chart.tryNode chart id |> Option.bind (fun node -> node.Parent)
-
-            Hierarchy.chain parentOf leaf
-            |> List.rev
-            |> List.map StateId.value
-            |> List.toArray
-
 /// <summary>Entity-key projections for the common <see cref="T:ByzantineSystems.Automata.Core.EntityId`1" /> case.</summary>
 [<RequireQualifiedAccess>]
 module EntityKey =
 
-    let forEntityId<'entity> : (EntityId<'entity> -> string) * (string -> EntityId<'entity>) =
-        EntityId.value, EntityId.create
+    /// <summary>
+    /// Decoding returns a result rather than raising. <c>EntityId.create</c> rejects a blank id
+    /// with <c>invalidArg</c>, which is right for application code constructing an id and wrong
+    /// for a store reading a row: a corrupt row must surface as
+    /// <c>StoreError.Serialization</c>, not as an <c>ArgumentException</c> thrown out of a store
+    /// method that promised a result.
+    /// </summary>
+    let tryDecode<'entity> (value: string) : Result<EntityId<'entity>, string> =
+        if String.IsNullOrWhiteSpace value then
+            Error "An entity id read from storage was empty."
+        else
+            Ok(EntityId.create value)
+
+    /// <summary>The encode and decode pair for an entity keyed by <c>EntityId</c>.</summary>
+    let forEntityId<'entity> : (EntityId<'entity> -> string) * (string -> Result<EntityId<'entity>, string>) =
+        EntityId.value, tryDecode<'entity>

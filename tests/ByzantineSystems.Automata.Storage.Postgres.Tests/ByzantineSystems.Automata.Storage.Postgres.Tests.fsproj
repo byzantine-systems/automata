@@ -9,12 +9,10 @@
 
     <ItemGroup>
         <Compile Include="TestContext.fs" />
-        <Compile Include="PostgresStoreTests.fs" />
-        <Compile Include="PostgresRetryQueueTests.fs" />
-        <Compile Include="PostgresOutboxTests.fs" />
-        <Compile Include="PostgresDeadLetterTests.fs" />
+        <Compile Include="SqlResourceTests.fs" />
+        <Compile Include="CommandInboxTests.fs" />
+        <Compile Include="SchemaContractTests.fs" />
         <Compile Include="PostgresSupervisionStoreTests.fs" />
-        <Compile Include="PostgresAcceptanceTests.fs" />
         <Compile Include="Program.fs" />
     </ItemGroup>
 
