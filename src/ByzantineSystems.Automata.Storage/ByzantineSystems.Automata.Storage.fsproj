@@ -9,6 +9,7 @@
         <Compile Include="Envelope.fs" />
         <Compile Include="Store.fs" />
         <Compile Include="Command.fs" />
+        <Compile Include="ChartRegistry.fs" />
         <Compile Include="Supervision.fs" />
     </ItemGroup>
 

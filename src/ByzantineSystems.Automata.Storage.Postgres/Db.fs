@@ -26,6 +26,17 @@ module internal Db =
             Some()
         | _ -> None
 
+    /// Recognises the named PostgreSQL foreign-key constraint, for a reference that was never
+    /// registered rather than a transient failure.
+    let (|ForeignKeyViolation|_|) (constraintName: string) (error: exn) =
+        match error with
+        | :? PostgresException as postgresError when
+            postgresError.SqlState = PostgresErrorCodes.ForeignKeyViolation
+            && postgresError.ConstraintName = constraintName
+            ->
+            Some()
+        | _ -> None
+
     /// <summary>
     /// PostgreSQL adapter boundary. Caller cancellation remains task cancellation, known
     /// driver failures become <c>StoreError.Unavailable</c>, and every unrelated exception

@@ -4,7 +4,12 @@ open Expecto
 
 [<Tests>]
 let tests =
-    testList "ByzantineSystems.Automata.Core" [ CoreTypeTests.tests; ChartTests.tests; ChartPropertyTests.tests ]
+    testList
+        "ByzantineSystems.Automata.Core"
+        [ CoreTypeTests.tests
+          ChartTests.tests
+          ChartPropertyTests.tests
+          ChartFingerprintTests.tests ]
 
 [<EntryPoint>]
 let main argv = runTestsWithCLIArgs [] argv tests

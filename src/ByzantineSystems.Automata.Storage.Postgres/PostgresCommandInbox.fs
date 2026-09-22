@@ -257,7 +257,18 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
                         | Ok encodedEvent ->
                             try
                                 return! submitOnce submission encodedEvent entityId token
-                            with Db.UniqueViolation "command_unique_idem" ->
+                            with
+                            | Db.ForeignKeyViolation "command_chart_version_fkey" ->
+                                // The version this command pins was never registered, so nothing
+                                // records which chart it refers to and a replay could not resolve
+                                // it. Caught here so the caller gets the contract's error rather
+                                // than a PostgresException crossing the store boundary.
+                                return
+                                    Error(
+                                        StoreError.NotFound
+                                            $"chart version %d{ChartVersion.value submission.ChartVersion} of machine %s{MachineId.value submission.MachineId}"
+                                    )
+                            | Db.UniqueViolation "command_unique_idem" ->
                                 // fsm.submit_command serialises submissions per entity, so this
                                 // is unreachable through the routine. It stays because the
                                 // constraint, not the advisory lock, is the integrity boundary:

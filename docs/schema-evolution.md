@@ -14,9 +14,12 @@ Two embedded trees, with different lifecycles and different jobs.
     `btree_gist` only becomes necessary when temporal belief tables arrive.
   - `001_command.sql` is `fsm.command`, its domains, constraints, indexes and storage settings.
   - `002_supervision.sql` is the supervision audit log.
-- `migrations/repeatable/*.sql` are reapplied whenever their content changes. Every routine lives
-  in `R__command_routines.sql` as `CREATE OR REPLACE`, so editing a routine body is an edit to
-  its own migration rather than a new file.
+  - `003_chart_version.sql` is `fsm.machine_chart_version` and the foreign key that holds a
+    command's `chart_version` to a version some chart declared.
+- `migrations/repeatable/*.sql` are reapplied whenever their content changes. Routines live in
+  `R__command_routines.sql` and `R__chart_routines.sql`, one file per domain, as
+  `CREATE OR REPLACE`, so editing a routine body is an edit to its own migration rather than a
+  new file.
 - `sql/<domain>/<operation>.sql` are the statements the application sends, loaded by
   `SqlResources` into a map keyed by domain and operation. They are not migrations. Putting them
   in files rather than F# string literals is what lets `pg_format` reach them through `nix fmt`,
@@ -45,10 +48,16 @@ column to `fsm.command` is therefore a failing test rather than a runtime surpri
 
 ## Adding a change
 
+`003_chart_version.sql` is the worked example. It needed a new table *and* a constraint on
+`fsm.command`, and neither was written by editing `001_command.sql`: a journaled script that may
+already have run somewhere is never touched, so the `ALTER TABLE` lives in the new file beside
+the table it references.
+
 1. Add a new zero-padded script under `migrations/main`. Never edit a numbered migration that may
    already have shipped.
-2. Edit `R__command_routines.sql` in place when a routine changes; it is reapplied on content
-   change. Keep its result shape compatible with the reader, or change both in the same release.
+2. Edit the matching `R__*_routines.sql` in place when a routine changes; it is reapplied on
+   content change. Keep its result shape compatible with the reader, or change both in the same
+   release. A new domain of routines gets its own repeatable file.
 3. Declare volatility, parallel safety and `search_path` on every new routine. The first two are
    promises the planner acts on. The third stops an unqualified function resolving through the
    connecting role's `search_path`.
@@ -59,6 +68,17 @@ column to `fsm.command` is therefore a failing test rather than a runtime surpri
 
 `make db-reset` is destructive: it drops the `fsm` schema and the DbUp journal before rerunning
 migrations. Use it only on local disposable databases.
+
+## Chart versions while iterating
+
+`fsm.machine_chart_version` records the fingerprint of the chart that first claimed each declared
+version, and never overwrites it. Editing a chart's structure without bumping its `ChartVersion`
+therefore reports a mismatch, which is the point.
+
+While iterating locally that will happen often, and the remedy is deliberately manual: bump the
+version, or run `make db-reset`. No routine forgets a registration. One would be reached for by
+habit, and the tripwire only works if disarming it is inconvenient. The foreign key also refuses
+to delete a version that any command still references, so there is no quiet way around it.
 
 ## Deferred: partitioning `fsm.command`
 

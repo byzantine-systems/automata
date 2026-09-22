@@ -22,6 +22,13 @@ let machine = machineId "pg-tests"
 let noCancellation = CancellationToken.None
 let version = ChartVersion.create 1
 
+/// A syntactically valid fingerprint for the test machine's version 1.
+///
+/// The registry suite computes real ones from real charts. Everything else only needs the version
+/// to exist, because the foreign key now insists that a command pins a version some chart
+/// declared, so registering one is part of a usable empty database.
+let fingerprint = String.replicate 64 "a"
+
 let connectionString =
     match Environment.GetEnvironmentVariable "AUTOMATA_TEST_DB" with
     | null -> ""
@@ -48,11 +55,19 @@ let migrate () : unit =
 
 let private migrateOnce = lazy (migrate ())
 
-/// Truncates every table for per-test isolation.
+/// Truncates every table for per-test isolation, then re-declares the test machine's chart
+/// version.
 ///
 /// Identities restart so that command ids are predictable within a test, but fsm.lease_token is
 /// deliberately left alone: tokens should keep climbing across tests, and a test that passes only
 /// because the token counter was reset is a test that is not exercising the fence.
+///
+/// fsm.command and fsm.machine_chart_version are truncated in one statement because they are
+/// related by a foreign key, and PostgreSQL refuses to truncate one without the other unless
+/// asked to CASCADE. Listing both says which tables are being emptied; CASCADE would not.
+///
+/// The registration is a plain insert rather than a call to the registry. A fixture that fails
+/// should point at the fixture.
 let reset () : Task =
     task {
         migrateOnce.Force()
@@ -60,7 +75,16 @@ let reset () : Task =
         use! conn = (dataSource ()).OpenConnectionAsync(noCancellation).AsTask()
 
         use cmd =
-            new NpgsqlCommand("TRUNCATE fsm.command, fsm.supervision_event RESTART IDENTITY", conn)
+            new NpgsqlCommand(
+                "TRUNCATE fsm.command, fsm.machine_chart_version, fsm.supervision_event RESTART IDENTITY;
+                 INSERT INTO fsm.machine_chart_version (machine_id, version, fingerprint)
+                 VALUES (@machine_id, @version, @fingerprint);",
+                conn
+            )
+
+        cmd.Parameters.AddWithValue("machine_id", MachineId.value machine) |> ignore
+        cmd.Parameters.AddWithValue("version", ChartVersion.value version) |> ignore
+        cmd.Parameters.AddWithValue("fingerprint", fingerprint) |> ignore
 
         do! (cmd.ExecuteNonQueryAsync(noCancellation) :> Task)
     }
@@ -75,6 +99,9 @@ let newInbox () : Inbox =
           EntityIdDecode = decode }
     )
     :> Inbox
+
+let newRegistry () : IChartRegistry =
+    PostgresChartRegistry({ DataSource = dataSource () }) :> IChartRegistry
 
 let submission (entity: Entity) (key: string) (event: TestEvent) : CommandSubmission<Entity, TestEvent> =
     { MachineId = machine

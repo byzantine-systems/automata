@@ -92,6 +92,49 @@ let tests =
               Expect.equal columns commandColumns "the single-command read is the same contract"
           }
 
+          testTask "the chart version read returns exactly the column the reader expects" {
+              do! reset ()
+
+              let columns =
+                  columnsOf (SqlResources.get "chart" "by_version") [ "machine_id", box "none"; "version", box 1 ]
+
+              Expect.equal columns [ "fingerprint" ] "the registry reads this column by name"
+          }
+
+          testTask "a chart version below one is refused" {
+              do! reset ()
+
+              match
+                  exec
+                      "INSERT INTO fsm.machine_chart_version (machine_id, version, fingerprint) VALUES ('m', 0, repeat('a', 64))"
+              with
+              | Ok() -> failtest "version 0 should be impossible"
+              | Error error ->
+                  Expect.stringContains
+                      error.Message
+                      "machine_chart_version_positive"
+                      "versions are declared from one upwards"
+          }
+
+          testTask "a fingerprint that is not a digest is refused" {
+              do! reset ()
+
+              // Accepting a truncated or upper-cased hash would store something that mismatches
+              // every chart forever, and an operator reading that mismatch could not tell it from
+              // a chart somebody really did edit.
+              for bad in [ "abc"; String.replicate 64 "A"; String.replicate 63 "a"; "" ] do
+                  match
+                      exec
+                          $"INSERT INTO fsm.machine_chart_version (machine_id, version, fingerprint) VALUES ('m-{bad.Length}', 1, '{bad}')"
+                  with
+                  | Ok() -> failtestf "'%s' should not be a valid fingerprint" bad
+                  | Error error ->
+                      Expect.stringContains
+                          error.Message
+                          "machine_chart_version_fingerprint_shape"
+                          "the shape check is what names the actual fault"
+          }
+
           testTask "a blocked command can never be leased" {
               do! reset ()
               let inbox = newInbox ()
@@ -138,9 +181,14 @@ let tests =
               do! reset ()
 
               // Enough rows that a sequential scan would be the cheaper plan if the index were
-              // unusable, so this fails if the predicate ever drifts from command_claim_idx.
+              // unusable, so this fails if the predicate ever drifts from command_claim_idx. The
+              // probe machine declares a chart version of its own because a command may only pin
+              // one that exists.
               exec
-                  """INSERT INTO fsm.command (machine_id, entity_id, seq, idempotency_key, chart_version, event, blocked)
+                  """INSERT INTO fsm.machine_chart_version (machine_id, version, fingerprint)
+                     VALUES ('plan-probe', 1, repeat('a', 64));
+
+                     INSERT INTO fsm.command (machine_id, entity_id, seq, idempotency_key, chart_version, event, blocked)
                      SELECT 'plan-probe', 'e' || g, 1, 'k' || g, 1, '{}'::jsonb, false FROM generate_series(1, 20000) g"""
               |> function
                   | Ok() -> ()

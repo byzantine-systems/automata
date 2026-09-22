@@ -15,6 +15,8 @@ let private expected =
       "command", "by_id"
       "command", "by_idempotency_key"
       "command", "blocked_drift"
+      "chart", "register"
+      "chart", "by_version"
       "system", "command_metrics"
       "supervision", "record"
       "supervision", "list_recent" ]
