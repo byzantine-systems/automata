@@ -11,15 +11,15 @@
 
 - Model states, events, actions, and domain errors with ordinary F# types.
 - Validate the statechart once.
-- Resolve transitions with a pure core and execute the same model through isolated per-entity actors.
+- Resolve transitions with a pure core and execute the same model through a durable command inbox that orders work across processes.
 
 This library is designed to keep domain behavior independent from runtime and infrastructure concerns:
 
 - **Typed and validated charts**: hierarchical and terminal states, guarded transitions, entry and exit actions, event bubbling, and accumulated construction errors.
 - **Deterministic core**: `Chart.resolve` is a pure function, so transition behavior can be tested without actors, databases, clocks, or dependency injection.
-- **Entity-level concurrency**: each entity has a serialized mailbox while unrelated entities can make progress concurrently; idempotency keys and optimistic epochs protect committed transitions.
-- **Composable durability**: storage contracts cover state, transition history, durable retries, dead letters, and a transactional action outbox, with in-memory and PostgreSQL implementations.
-- **Operational resilience**: Polly pipelines handle short-lived failures, durable retry handles longer delays, and supervision policies manage machine restarts and escalation.
+- **Entity-level ordering, across processes**: at most one command per entity is claimable, so claiming it excludes that entity on every host, not only in one; unrelated entities still make progress concurrently. Idempotency keys and a gapless epoch protect committed transitions.
+- **Composable durability**: storage contracts cover the command inbox, the current snapshot, the atomic end of processing a command, and action delivery. A commit appends the transition, advances the belief and queues its actions in one transaction.
+- **Operational resilience**: a Polly pipeline handles short-lived driver failures inside the store, the inbox handles longer delays with a database-computed backoff, and supervision policies manage machine restarts and escalation.
 
 Use only the pure chart library, assemble a custom runtime from the smaller packages, or host a complete supervised machine with PostgreSQL persistence and .NET dependency injection.
 
@@ -31,11 +31,11 @@ Install only the layers your application needs. For pure chart construction and 
 dotnet add package ByzantineSystems.Automata.Core
 ```
 
-To execute charts with the in-memory store:
+To execute charts against the PostgreSQL authority:
 
 ```shell
 dotnet add package ByzantineSystems.Automata.Runtime
-dotnet add package ByzantineSystems.Automata.Storage.InMemory
+dotnet add package ByzantineSystems.Automata.Storage.Postgres
 ```
 
 ## Example
@@ -93,21 +93,34 @@ open System.Threading
 open ByzantineSystems.Automata.Resilience
 open ByzantineSystems.Automata.Runtime
 open ByzantineSystems.Automata.Storage
-open ByzantineSystems.Automata.Storage.InMemory
+open ByzantineSystems.Automata.Storage.Postgres
 
 type LightSwitch = class end
 type SwitchId = EntityId<LightSwitch>
 
+let context = PostgresContext.ofConnectionString connectionString
+let encode, decode = EntityKey.forEntityId<LightSwitch>
+
 let machineStore =
-    InMemoryStore<SwitchId, SwitchState, SwitchEvent, SwitchAction>()
-    :> IMachineStore<SwitchId, SwitchState, SwitchEvent, SwitchAction>
+    PostgresMachineStore<SwitchId, SwitchState, SwitchEvent, SwitchAction, string>(
+        { Context = context
+          ActionQueue = "switch_actions"
+          StateCodec = Serialization.systemTextJson<SwitchState> ()
+          EventCodec = Serialization.systemTextJson<SwitchEvent> ()
+          ActionCodec = Serialization.systemTextJson<SwitchAction> ()
+          ErrorCodec = Serialization.systemTextJson<string> ()
+          EntityIdEncode = encode
+          EntityIdDecode = decode }
+    )
 
 let switchMachine =
     machine<SwitchId, SwitchState, SwitchEvent, SwitchAction, string> (machineId "light-switches") {
         chart switchChart
+        // Declared, never inferred: every command records the version it was resolved under.
+        chartVersion 1
         initialState Off
         store machineStore
-        retry RetryConfig.defaults<string>
+        actionQueue "switch_actions"
     }
     |> function
         | Ok machine -> machine
@@ -118,8 +131,15 @@ let flickSwitch () =
         let cancellation = CancellationToken.None
         let hallway: SwitchId = entityId "hallway"
 
-        do! Machine.startAsync switchMachine cancellation
+        let! _ = machineStore.EnsureQueueAsync cancellation
+        let! _ = Machine.startAsync switchMachine (PostgresChartRegistry { Context = context }) cancellation
 
+        // A worker. In a host this is a BackgroundService under supervision.
+        use worker = new CancellationTokenSource()
+        let draining = (Machine.processor switchMachine).RunAsync worker.Token
+
+        // send is enqueue plus a wait for the durable outcome. Callers that care more about
+        // throughput use Machine.enqueue and read the result later with Machine.commandResult.
         let! outcome =
             Machine.send
                 switchMachine
@@ -128,6 +148,9 @@ let flickSwitch () =
                 cancellation
 
         let! current = Machine.state switchMachine hallway cancellation
+
+        worker.Cancel()
+        let! _ = draining
         do! Machine.stopAsync switchMachine cancellation
 
         return outcome, current
@@ -143,12 +166,11 @@ The toolkit is published as focused building blocks. Start with `Core` for pure 
 | Package | Implemented surface |
 | --- | --- |
 | `ByzantineSystems.Automata.Core` | Typed identifiers, transition rules, validated hierarchical charts, and pure event resolution |
-| `ByzantineSystems.Automata.Resilience` | Polly retry, timeout, and circuit-breaker configuration plus final failure dispositions |
-| `ByzantineSystems.Automata.Storage` | State, history, retry queue, dead-letter, and action-outbox contracts |
-| `ByzantineSystems.Automata.Storage.InMemory` | Thread-safe in-memory implementation of the storage contracts |
-| `ByzantineSystems.Automata.Storage.Postgres` | PostgreSQL-backed storage, JSON codecs, state-path projection, and embedded DbUp migrations |
-| `ByzantineSystems.Automata.Runtime` | Per-entity actor execution, idempotent sends, durable retry and outbox pumps, observers, and machine lifecycle |
-| `ByzantineSystems.Automata.DependencyInjection` | Hosted `BackgroundService` supervision with keyed Polly pipelines, scoped action handlers, and audit persistence |
+| `ByzantineSystems.Automata.Resilience` | Polly retry, timeout, and circuit-breaker policy for a store's own I/O, plus Erlang-style supervision |
+| `ByzantineSystems.Automata.Storage` | The command inbox, state reader, command processor store, and action queue contracts |
+| `ByzantineSystems.Automata.Storage.Postgres` | The PostgreSQL authority: inbox, bitemporal beliefs, transition log, pgmq action delivery, JSON codecs, and embedded DbUp migrations |
+| `ByzantineSystems.Automata.Runtime` | The command processor, the `enqueue`/`send`/`commandResult` surface, action dispatch, observers, and machine lifecycle |
+| `ByzantineSystems.Automata.DependencyInjection` | Hosted `BackgroundService` supervision with scoped action handlers and audit persistence |
 
 ## Development
 

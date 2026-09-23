@@ -14,6 +14,8 @@
         <Compile Include="ChartRegistryTests.fs" />
         <Compile Include="TemporalTests.fs" />
         <Compile Include="FinalizeTests.fs" />
+        <Compile Include="ActionQueueTests.fs" />
+        <Compile Include="ProcessorIntegrationTests.fs" />
         <Compile Include="SchemaContractTests.fs" />
         <Compile Include="PostgresSupervisionStoreTests.fs" />
         <Compile Include="Program.fs" />
@@ -25,6 +27,9 @@
         <PackageReference Include="YoloDev.Expecto.TestSdk" PrivateAssets="all" />
         <PackageReference Include="coverlet.msbuild" PrivateAssets="all" />
         <ProjectReference Include="..\..\src\ByzantineSystems.Automata.Storage.Postgres\ByzantineSystems.Automata.Storage.Postgres.fsproj" />
+        <!-- The processor is exercised here rather than in the runtime suite, because what it
+             claims to do is only true of a real database. -->
+        <ProjectReference Include="..\..\src\ByzantineSystems.Automata.Runtime\ByzantineSystems.Automata.Runtime.fsproj" />
     </ItemGroup>
 
 </Project>

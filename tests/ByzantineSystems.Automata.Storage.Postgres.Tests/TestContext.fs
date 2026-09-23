@@ -6,6 +6,7 @@ open System.Threading.Tasks
 open Npgsql
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
+open ByzantineSystems.Automata.Resilience
 open ByzantineSystems.Automata.Storage.Postgres
 open Expecto
 
@@ -39,6 +40,9 @@ let version = ChartVersion.create 1
 /// declared, so registering one is part of a usable empty database.
 let fingerprint = String.replicate 64 "a"
 
+/// The queue a commit enqueues its actions into, shared by every test in this suite.
+let actionQueue = "automata_test_actions"
+
 let connectionString =
     match Environment.GetEnvironmentVariable "AUTOMATA_TEST_DB" with
     | null -> ""
@@ -52,6 +56,13 @@ let private dataSourceHolder = lazy (DataSource.create connectionString)
 
 let dataSource () : NpgsqlDataSource = dataSourceHolder.Force()
 
+/// The data source paired with the resilience every call through it runs under. Tests share one,
+/// so the circuit breaker sees the whole suite's traffic exactly as an application's would.
+let private contextHolder =
+    lazy (PostgresContext.create (dataSource ()) TransientPolicy.defaults ignore)
+
+let context () : PostgresContext = contextHolder.Force()
+
 /// Drops the schema and journal and re-applies migrations, for a clean slate.
 let migrate () : unit =
     use conn = (dataSource ()).OpenConnection()
@@ -62,6 +73,13 @@ let migrate () : unit =
     cmd.ExecuteNonQuery() |> ignore
 
     Migrator.migrate connectionString
+
+    // The action queue is the application's to create, not the migration's: its name is
+    // configuration, and one machine's queue is not another's. An application calls this once at
+    // startup; here the fixture stands in for that startup.
+    use ensure = new NpgsqlCommand("SELECT fsm.ensure_action_queue(@queue);", conn)
+    ensure.Parameters.AddWithValue("queue", actionQueue) |> ignore
+    ensure.ExecuteNonQuery() |> ignore
 
 let private migrateOnce = lazy (migrate ())
 
@@ -86,15 +104,23 @@ let reset () : Task =
 
         use cmd =
             new NpgsqlCommand(
+                // action_dead_letter references fsm.command, and TRUNCATE refuses to leave a
+                // foreign key dangling, so it is truncated in the same statement rather than
+                // separately.
                 "TRUNCATE fsm.command, fsm.command_error, fsm.transition, fsm.machine_chart_version,
-                          fsm.supervision_event, fsm.instance_state, fsm.instance_state_history
+                          fsm.supervision_event, fsm.instance_state, fsm.instance_state_history,
+                          fsm.action_dead_letter
                           RESTART IDENTITY;
                  INSERT INTO fsm.machine_chart_version (machine_id, version, fingerprint)
-                 VALUES (@machine_id, @version, @fingerprint);",
+                 VALUES (@machine_id, @version, @fingerprint);
+                 -- The queue survives the truncate because it is pgmq's table, not ours.
+                 -- Emptying it keeps one test's undelivered actions out of the next one.
+                 SELECT pgmq.purge_queue(@queue);",
                 conn
             )
 
         cmd.Parameters.AddWithValue("machine_id", MachineId.value machine) |> ignore
+        cmd.Parameters.AddWithValue("queue", actionQueue) |> ignore
         cmd.Parameters.AddWithValue("version", ChartVersion.value version) |> ignore
         cmd.Parameters.AddWithValue("fingerprint", fingerprint) |> ignore
 
@@ -105,7 +131,7 @@ let newInbox () : Inbox =
     let encode, decode = EntityKey.forEntityId<TestEntity>
 
     PostgresCommandInbox<Entity, TestEvent>(
-        { DataSource = dataSource ()
+        { Context = context ()
           EventCodec = Serialization.systemTextJson<TestEvent> ()
           EntityIdEncode = encode
           EntityIdDecode = decode }
@@ -116,7 +142,8 @@ let private processorStore () =
     let encode, decode = EntityKey.forEntityId<TestEntity>
 
     PostgresCommandProcessorStore<Entity, TestState, TestEvent, TestAction, TestError>(
-        { DataSource = dataSource ()
+        { Context = context ()
+          ActionQueue = actionQueue
           StateCodec = Serialization.systemTextJson<TestState> ()
           EventCodec = Serialization.systemTextJson<TestEvent> ()
           ActionCodec = Serialization.systemTextJson<TestAction list> ()
@@ -144,8 +171,23 @@ let draft (entity: Entity) (fromState: TestState) (toState: TestState) (effectiv
       Status = Running
       EffectiveAt = effectiveAt }
 
+type Actions = IActionQueue<Entity, TestAction>
+
+let private actionQueueStore () =
+    let encode, decode = EntityKey.forEntityId<TestEntity>
+
+    PostgresActionQueue<Entity, TestAction>(
+        { Context = context ()
+          Queue = actionQueue
+          ActionCodec = Serialization.systemTextJson<TestAction> ()
+          EntityIdEncode = encode
+          EntityIdDecode = decode }
+    )
+
+let newActionQueue () : Actions = actionQueueStore () :> Actions
+
 let newRegistry () : IChartRegistry =
-    PostgresChartRegistry({ DataSource = dataSource () }) :> IChartRegistry
+    PostgresChartRegistry({ Context = context () }) :> IChartRegistry
 
 let submission (entity: Entity) (key: string) (event: TestEvent) : CommandSubmission<Entity, TestEvent> =
     { MachineId = machine
@@ -266,3 +308,11 @@ let columnsOf (sql: string) (parameters: (string * obj) list) : string list =
 
     use reader = cmd.ExecuteReader()
     [ for ordinal in 0 .. reader.FieldCount - 1 -> reader.GetName ordinal ]
+
+/// <summary>
+/// A clock fixed at a chosen instant, for proving that the application's clock decides nothing
+/// about durable order. Every timestamp that matters is stamped by the database.
+/// </summary>
+type FakeClock(at: DateTimeOffset) =
+    inherit TimeProvider()
+    override _.GetUtcNow() = at

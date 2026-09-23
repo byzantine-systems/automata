@@ -22,7 +22,12 @@ let private expected =
       "belief", "as_of"
       "system", "command_metrics"
       "supervision", "record"
-      "supervision", "list_recent" ]
+      "supervision", "list_recent"
+      "action", "ensure_queue"
+      "action", "claim"
+      "action", "complete"
+      "action", "reschedule"
+      "action", "abandon" ]
 
 /// These run without a database: they are about what is embedded in the assembly, not about what
 /// PostgreSQL does with it.

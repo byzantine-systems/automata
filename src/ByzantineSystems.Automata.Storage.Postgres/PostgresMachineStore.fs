@@ -91,7 +91,9 @@ type PostgresMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     interface ICommandInbox<'EntityId, 'Event> with
 
         member _.Submit(submission, ct) = inbox.Submit(submission, ct)
-        member _.Claim(machineId, batch, lease, ct) = inbox.Claim(machineId, batch, lease, ct)
+
+        member _.Claim(machineId, batch, lease, ct) =
+            inbox.Claim(machineId, batch, lease, ct)
 
         member _.Reschedule(commandId, token, backoff, ct) =
             inbox.Reschedule(commandId, token, backoff, ct)
@@ -120,7 +122,8 @@ type PostgresMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
         member _.DeadLetter(commandId, token, failure, ct) =
             processorStore.DeadLetter(commandId, token, failure, ct)
 
-        member _.TryGetResult(commandId, ct) = processorStore.TryGetResult(commandId, ct)
+        member _.TryGetResult(commandId, ct) =
+            processorStore.TryGetResult(commandId, ct)
 
     interface IActionQueue<'EntityId, 'Action> with
 
@@ -128,7 +131,10 @@ type PostgresMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
             actionQueue.Claim(machineId, batch, lease, ct)
 
         member _.Complete(action, ct) = actionQueue.Complete(action, ct)
-        member _.Reschedule(action, backoff, ct) = actionQueue.Reschedule(action, backoff, ct)
+
+        member _.Reschedule(action, backoff, ct) =
+            actionQueue.Reschedule(action, backoff, ct)
+
         member _.Abandon(action, reason, ct) = actionQueue.Abandon(action, reason, ct)
 
     interface IMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>

@@ -102,7 +102,8 @@ CREATE OR REPLACE FUNCTION fsm.claim_actions (p_queue text, p_batch integer, p_l
         message jsonb)
     LANGUAGE plpgsql
     VOLATILE PARALLEL UNSAFE
-    SET search_path = pg_catalog, pg_temp
+    SET search_path = pg_catalog,
+    pg_temp
     AS $$
 BEGIN
     PERFORM
@@ -141,7 +142,7 @@ DECLARE
 BEGIN
     PERFORM
         fsm.assert_queue_name (p_queue);
-    EXECUTE format('SELECT read_ct FROM pgmq.%I WHERE msg_id = $1 FOR UPDATE', 'q_' || p_queue) INTO v_read_ct
+    EXECUTE FORMAT('SELECT read_ct FROM pgmq.%I WHERE msg_id = $1 FOR UPDATE', 'q_' || p_queue) INTO v_read_ct
     USING p_msg_id;
     -- Absent means somebody already archived it; a different count means
     -- somebody else holds the lease now. Neither is ours to finish.
@@ -169,7 +170,8 @@ CREATE OR REPLACE FUNCTION fsm.reschedule_action (p_queue text, p_msg_id bigint,
         visible_at timestamptz)
     LANGUAGE plpgsql
     VOLATILE PARALLEL UNSAFE
-    SET search_path = pg_catalog, pg_temp
+    SET search_path = pg_catalog,
+    pg_temp
     AS $$
 DECLARE
     v_read_ct integer;
@@ -177,7 +179,7 @@ DECLARE
 BEGIN
     PERFORM
         fsm.assert_queue_name (p_queue);
-    EXECUTE format('SELECT read_ct FROM pgmq.%I WHERE msg_id = $1 FOR UPDATE', 'q_' || p_queue) INTO v_read_ct
+    EXECUTE FORMAT('SELECT read_ct FROM pgmq.%I WHERE msg_id = $1 FOR UPDATE', 'q_' || p_queue) INTO v_read_ct
     USING p_msg_id;
     IF v_read_ct IS NULL OR v_read_ct <> p_read_ct THEN
         RETURN QUERY
@@ -193,7 +195,7 @@ BEGIN
     RETURN QUERY
     SELECT
         'updated'::fsm.lease_outcome,
-        clock_timestamp() + v_delay;
+        CLOCK_TIMESTAMP() + v_delay;
 END
 $$;
 
@@ -219,14 +221,17 @@ DECLARE
 BEGIN
     PERFORM
         fsm.assert_queue_name (p_queue);
-    EXECUTE format('SELECT read_ct, message FROM pgmq.%I WHERE msg_id = $1 FOR UPDATE', 'q_' || p_queue) INTO v_read_ct,
+    EXECUTE FORMAT('SELECT read_ct, message FROM pgmq.%I WHERE msg_id = $1 FOR UPDATE', 'q_' || p_queue) INTO v_read_ct,
     v_message
     USING p_msg_id;
     IF v_read_ct IS NULL OR v_read_ct <> p_read_ct THEN
         RETURN 'lease_lost';
     END IF;
     INSERT INTO fsm.action_dead_letter (machine_id, entity_id, command_id, epoch, ordinal, action, reason, deliveries)
-        VALUES ((v_message ->> 'machine_id'), (v_message ->> 'entity_id'), (v_message ->> 'command_id')::bigint, (v_message ->> 'epoch')::bigint, (v_message ->> 'ordinal')::integer, (v_message -> 'action'), p_reason, v_read_ct)
+    VALUES
+        ((v_message ->> 'machine_id'),
+            (v_message ->> 'entity_id'),
+            (v_message ->> 'command_id')::bigint, (v_message ->> 'epoch')::bigint, (v_message ->> 'ordinal')::integer, (v_message -> 'action'), p_reason, v_read_ct)
     ON CONFLICT (command_id, ordinal)
         DO NOTHING;
     PERFORM
@@ -234,3 +239,4 @@ BEGIN
     RETURN 'updated';
 END
 $$;
+

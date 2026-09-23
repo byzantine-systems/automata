@@ -38,7 +38,9 @@ type ActionQueueOptions<'EntityId, 'Action> =
 type PostgresActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'EntityId, 'Action>) =
 
     let dataSource = options.Context.DataSource
-    let protect work ct = Db.protect options.Context.Resilience work ct
+
+    let protect work ct =
+        Db.protect options.Context.Resilience work ct
 
     let addText (name: string) (value: string) (cmd: NpgsqlCommand) =
         cmd.Parameters.AddWithValue(name, value) |> ignore
@@ -88,7 +90,9 @@ type PostgresActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'Entity
         let action =
             field "action"
             |> Result.bind (fun value ->
-                value.GetRawText() |> options.ActionCodec.Decode |> Result.mapError Db.toStoreError)
+                value.GetRawText()
+                |> options.ActionCodec.Decode
+                |> Result.mapError Db.toStoreError)
 
         match text "machine_id", entityId, number "command_id", number "epoch", number "ordinal", action with
         | Ok machineId, Ok entityId, Ok commandId, Ok epoch, Ok ordinal, Ok action ->
@@ -229,7 +233,8 @@ type PostgresActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'Entity
                         let! hasRow = reader.ReadAsync token
 
                         if not hasRow then
-                            return Error(Db.decodeFailure (nameof LeaseUpdateOutcome) "reschedule_action returned no row")
+                            return
+                                Error(Db.decodeFailure (nameof LeaseUpdateOutcome) "reschedule_action returned no row")
                         else
                             return outcomeFromString (Row.string reader "outcome")
                     })

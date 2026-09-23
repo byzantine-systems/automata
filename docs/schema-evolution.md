@@ -1,9 +1,15 @@
 # PostgreSQL schema evolution
 
 `ByzantineSystems.Automata.Storage.Postgres` embeds its SQL and applies it through
-`Migrator.migrate`. The schema requires PostgreSQL 19 and one extension, `btree_gist`, for the
-temporal keys. `btree_gist` is trusted, so a role with `CREATE` on the database can install it
-without superuser. The command inbox on its own still needs no extension.
+`Migrator.migrate`. The schema requires PostgreSQL 19 and two extensions.
+
+- **`btree_gist`**, for the temporal keys. It is trusted, so a role with `CREATE` on the database
+  can install it without superuser.
+- **`pgmq`**, for action delivery. It is **not** trusted and needs a superuser, which makes
+  `000_bootstrap.sql` a genuine DBA step rather than one only in principle.
+
+The command inbox on its own still needs no extension. A deployment that only submits and claims
+commands runs on a host where nobody may install anything.
 
 ## Where SQL lives
 
@@ -13,16 +19,17 @@ Two embedded trees, with different lifecycles and different jobs.
   **dependency order**, which is why no script contains an `ALTER TABLE`: every table is created
   complete, so its definition is the whole truth about it.
   - `000_bootstrap.sql` holds what needs a right on the database rather than on a schema:
-    `btree_gist` and `CREATE SCHEMA fsm`.
+    `btree_gist`, `pgmq` and `CREATE SCHEMA fsm`.
   - `001_chart_version.sql` is `fsm.machine_chart_version`. It precedes the inbox because
     `fsm.command` references it.
   - `002_command.sql` is `fsm.command`, its domains, constraints and indexes.
   - `003_instance_state.sql` is the bitemporal belief table and its history twin.
   - `004_transition.sql` is the append-only transition log.
   - `005_supervision.sql` is the supervision audit log.
+  - `006_action.sql` is `fsm.action_dead_letter`, the record of effects that never happened.
 - `migrations/repeatable/*.sql` are reapplied whenever their content changes. Routines live in
-  `R__command_routines.sql`, `R__chart_routines.sql`, `R__temporal_routines.sql` and
-  `R__finalize_routines.sql`, one file per domain, as `CREATE OR REPLACE`, so editing a routine body is an edit to its own migration
+  `R__command_routines.sql`, `R__chart_routines.sql`, `R__temporal_routines.sql`,
+  `R__finalize_routines.sql` and `R__action_routines.sql`, one file per domain, as `CREATE OR REPLACE`, so editing a routine body is an edit to its own migration
   rather than a new file. `R__temporal_routines.sql` also carries a `CREATE OR REPLACE TRIGGER`,
   because `main` runs before `repeatable` and a trigger declared beside its table would reference
   a function that does not exist yet.
@@ -43,6 +50,11 @@ one place rather than at every call site.
 `CHECK` constraint passes when its expression is true *or* null, so a nullable column quietly
 turns a constraint into a suggestion. `SchemaContractTests` fails if a nullable column appears.
 
+**The action queue is the application's to create.** `fsm.ensure_action_queue` is called once at
+startup, not by a migration: a queue's name is configuration, and one machine's queue is not
+another's. It has to happen before any command commits, because a commit enqueues into it inside
+its own transaction and a missing queue would fail the commit rather than only the delivery.
+
 **Three predicates must not drift apart.** `command_claim_idx`, `fsm.claim_commands` and the
 `runnable` bucket of `fsm.command_metrics` all state the same condition. A claim whose `WHERE`
 clause has drifted from its index still returns correct rows; it just stops using the index, and
@@ -51,6 +63,31 @@ nothing fails to tell you. The plan test in `SchemaContractTests` is what notice
 **The reader's column contract is a test, not a generator.** `PostgresCommandInbox` reads by
 column name, and `SchemaContractTests` asserts the exact column list each query returns. Adding a
 column to `fsm.command` is therefore a failing test rather than a runtime surprise.
+
+## Action delivery, and why pgmq is wrapped
+
+A commit enqueues its actions through `pgmq.send`, inside `fsm.finalize_command`, in the same
+transaction as the transition and the belief. That is the whole transactional-outbox property
+with no outbox table: `pgmq.send` is an ordinary insert into an ordinary table, so it commits or
+rolls back with the transition it belongs to. A commit whose effects were not queued, and queued
+effects for a commit that did not happen, are both unrepresentable.
+
+**Nothing in F# calls `pgmq.archive` or `pgmq.set_vt`.** Those two take a `msg_id` and ignore
+`read_ct`, so they cannot tell the lease holder from a worker that stalled past its visibility
+timeout and woke up after somebody else reclaimed the message. The effect is delivered twice and
+acknowledged once.
+
+`read_ct` is the fencing token the design needs and pgmq already maintains: every read increments
+it, so the value a worker was handed at claim time is stale the moment anyone else reads the
+message. `fsm.complete_action`, `fsm.reschedule_action` and `fsm.abandon_action` each take the row
+lock first and compare it second, in one transaction, so the comparison cannot be overtaken
+between checking and acting. That comparison is the only reason these routines exist.
+
+A queue belongs to one machine. Sharing one between machines would need a predicate on the claim,
+and pgmq cannot express one without scanning the queue. The name reaches dynamic SQL as an
+identifier rather than a parameter, so `fsm.assert_queue_name` applies the `^[a-z_][a-z0-9_]*$`
+allowlist in the database as well as in the machine builder: the layer that does the interpolating
+is the layer that cannot afford to assume.
 
 ## Temporal tables
 

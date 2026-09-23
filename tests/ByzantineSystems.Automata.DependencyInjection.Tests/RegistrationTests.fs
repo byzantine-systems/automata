@@ -1,59 +1,67 @@
 module ByzantineSystems.Automata.DependencyInjection.Tests.RegistrationTests
 
-open System
 open System.Threading.Tasks
-open ByzantineSystems.Automata.Resilience
+open ByzantineSystems.Automata.Core
+open ByzantineSystems.Automata.Runtime
 open ByzantineSystems.Automata.Storage
-open ByzantineSystems.Automata.Storage.InMemory
 open ByzantineSystems.Automata.DependencyInjection
 open Expecto
 open Microsoft.Extensions.DependencyInjection
-open Polly
-open Polly.Registry
 open TestSupport
 
 let registrationTests =
     testList
         "registration"
-        [ testTask "AddAutomataMachine feeds the keyed provider pipeline to the machine factory" {
-              let machineKey = "pipeline-machine"
+        [ testTask "the machine factory runs once per supervised generation" {
               let store = TestStore()
               let audit = InMemorySupervisionStore()
 
-              let captured =
-                  TaskCompletionSource<ResiliencePipeline<PipelineResult<string>>>(
-                      TaskCreationOptions.RunContinuationsAsynchronously
-                  )
+              let built =
+                  TaskCompletionSource<TestMachine>(TaskCreationOptions.RunContinuationsAsynchronously)
 
-              let options = testOptions machineKey store ignore
+              let options =
+                  testOptions "factory-machine" store (fun machine -> built.TrySetResult machine |> ignore)
 
               let provider =
                   ServiceCollection()
                       .AddSingleton<ISupervisionEventStore>(audit)
-                      .AddAutomataMachine(
-                          options,
-                          fun _ pipeline ->
-                              captured.TrySetResult pipeline |> ignore
-                              expectMachine (testMachineWithPipeline pipeline (store :> MachineStore))
-                      )
+                      .AddAutomata(options)
                       .BuildServiceProvider()
 
               let hosted, _ = resolveHostedService provider
               do! hosted.StartAsync(noCancellation)
 
-              let! factoryPipeline = captured.Task.WaitAsync(waitTimeout)
-
-              let pipelines = provider.GetRequiredService<ResiliencePipelineProvider<string>>()
-
-              let expected = pipelines.GetPipeline<PipelineResult<string>>(machineKey)
-
-              Expect.isTrue
-                  (obj.ReferenceEquals(factoryPipeline, expected))
-                  "the factory received the exact keyed pipeline instance"
-
-              Expect.isTrue
-                  (obj.ReferenceEquals(pipelines.GetPipeline<PipelineResult<string>>(machineKey), expected))
-                  "the keyed pipeline is cached by the provider"
+              let! machine = built.Task.WaitAsync(waitTimeout)
+              Expect.equal (machineId "di-tests") (Machine.machineId machine) "the machine the factory produced"
 
               do! hosted.StopAsync(noCancellation)
+          }
+
+          testTask "AddAutomataMachine wraps a factory that cannot fail" {
+              let store = TestStore()
+              let audit = InMemorySupervisionStore()
+              let options = testOptions "total-factory-machine" store ignore
+
+              let provider =
+                  ServiceCollection()
+                      .AddSingleton<ISupervisionEventStore>(audit)
+                      .AddAutomataMachine(options, fun _ -> expectMachine (testMachineOver (store :> MachineStore)))
+                      .BuildServiceProvider()
+
+              let hosted, _ = resolveHostedService provider
+              do! hosted.StartAsync(noCancellation)
+
+              do!
+                  pollUntil "the Started audit record" (fun () ->
+                      audit.Recorded() |> List.exists (fun r -> r.Kind = SupervisionAuditKind.Started))
+
+              do! hosted.StopAsync(noCancellation)
+          }
+
+          test "an empty machine key is refused at registration" {
+              let store = TestStore()
+
+              Expect.throws
+                  (fun () -> ServiceCollection().AddAutomata(testOptions "" store ignore) |> ignore)
+                  "a machine key is what the registration is identified by"
           } ]

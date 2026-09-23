@@ -28,11 +28,11 @@ CREATE TABLE fsm.action_dead_letter (
     -- given up on.
     reason text NOT NULL,
     deliveries integer NOT NULL,
-    recorded_at timestamptz NOT NULL DEFAULT statement_timestamp(),
+    recorded_at timestamptz NOT NULL DEFAULT STATEMENT_TIMESTAMP(),
     CONSTRAINT action_dead_letter_pkey PRIMARY KEY (command_id, ordinal),
     CONSTRAINT action_dead_letter_ordinal_not_negative CHECK (ordinal >= 0),
     CONSTRAINT action_dead_letter_deliveries_positive CHECK (deliveries > 0),
-    CONSTRAINT action_dead_letter_reason_not_blank CHECK (length(btrim(reason)) > 0),
+    CONSTRAINT action_dead_letter_reason_not_blank CHECK (LENGTH(BTRIM(reason)) > 0),
     CONSTRAINT action_dead_letter_command_fkey FOREIGN KEY (command_id) REFERENCES fsm.command (command_id)
 );
 

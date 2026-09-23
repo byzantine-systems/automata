@@ -73,7 +73,8 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
 
     /// Every statement goes through the context's pipeline, which is where transient driver
     /// failures are retried and classified. Bound once here so no call site can forget it.
-    let protect work ct = Db.protect options.Context.Resilience work ct
+    let protect work ct =
+        Db.protect options.Context.Resilience work ct
 
     let addText (name: string) (value: string) (cmd: NpgsqlCommand) =
         cmd.Parameters.AddWithValue(name, value) |> ignore
@@ -206,7 +207,9 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                 Ok(CommandFailure.Machine(machine.GetString()))
             | _ ->
                 Error(
-                    Db.decodeFailure (nameof CommandFailure) "a command error carried neither a domain nor a machine tag"
+                    Db.decodeFailure
+                        (nameof CommandFailure)
+                        "a command error carried neither a domain nor a machine tag"
                 )
 
     let failWith (status: string) (commandId: CommandId) token (failure: CommandFailure<'Err>) ct =

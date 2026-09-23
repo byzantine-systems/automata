@@ -142,7 +142,8 @@ type internal GenerationChild<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectE
         task {
             match! Machine.processor(machine).RunAsync(processorCancellation.Token) with
             | ProcessorStop.Drained _ -> return ()
-            | ProcessorStop.Escalated(commandId, reason, _) -> return raise (AutomataEscalationException(commandId, reason))
+            | ProcessorStop.Escalated(commandId, reason, _) ->
+                return raise (AutomataEscalationException(commandId, reason))
         }
 
     let actionTask =

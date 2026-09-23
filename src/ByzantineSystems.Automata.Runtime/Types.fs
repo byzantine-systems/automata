@@ -178,13 +178,15 @@ module ValidatedProcessorPolicy =
 
 /// <summary>What one poll of the command processor did.</summary>
 type PollSummary =
-    { Claimed: int
-      Committed: int
-      Rejected: int
-      Rescheduled: int
-      DeadLettered: int
-      /// <summary>Claims another worker had taken over before this one finished with them.</summary>
-      LeaseLost: int }
+    {
+        Claimed: int
+        Committed: int
+        Rejected: int
+        Rescheduled: int
+        DeadLettered: int
+        /// <summary>Claims another worker had taken over before this one finished with them.</summary>
+        LeaseLost: int
+    }
 
 /// <summary>Operations on <see cref="T:ByzantineSystems.Automata.Runtime.PollSummary" />.</summary>
 [<RequireQualifiedAccess>]

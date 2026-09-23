@@ -7,7 +7,6 @@ open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Resilience
 open ByzantineSystems.Automata.Runtime
 open ByzantineSystems.Automata.Storage
-open ByzantineSystems.Automata.Storage.InMemory
 open ByzantineSystems.Automata.Storage.Postgres
 open Microsoft.Extensions.DependencyInjection
 open Microsoft.Extensions.Hosting
@@ -124,46 +123,104 @@ let private paymentChartValue =
 /// Logs each committed transition with structured state, event, and action properties.
 let private logTransition
     (logger: ILogger)
-    (transition: Transition<Entity, PaymentState, PaymentEvent, PaymentAction>)
+    (transition: CommittedTransition<Entity, PaymentState, PaymentEvent, PaymentAction>)
     (_ct: CancellationToken)
     =
     task {
         logger.LogInformation(
-            "Payment transition {FromState} --{PaymentEvent}--> {ToState}; actions={Actions}",
-            transition.FromState,
-            transition.Event,
-            transition.ToState,
-            transition.Actions
+            "Payment transition {FromState} --{PaymentEvent}--> {ToState} at epoch {Epoch}; actions={Actions}",
+            transition.Draft.FromState,
+            transition.Draft.Event,
+            transition.Draft.ToState,
+            Epoch.value transition.Epoch,
+            transition.Draft.Actions
         )
     }
 
+/// The queue this machine's actions are delivered through, one per machine.
+[<Literal>]
+let private ActionQueue = "payment_actions"
+
 let private buildMachine
-    (logger: ILogger)
-    (storeArg: IMachineStore<Entity, PaymentState, PaymentEvent, PaymentAction>)
+    (log: ILogger)
+    (storeArg: IMachineStore<Entity, PaymentState, PaymentEvent, PaymentAction, string>)
     =
     machine<Entity, PaymentState, PaymentEvent, PaymentAction, string> (machineId "payments") {
         chart paymentChartValue
+        // Declared, never inferred. Every command records the version it was resolved under, so
+        // a replay resolves it against the chart that originally decided it. Editing the chart's
+        // shape without bumping this is what the fingerprint check at startup catches.
+        chartVersion 1
         initialState Idle
         store storeArg
-        retry RetryConfig.defaults<string>
-        onTransition (logTransition logger)
+        actionQueue ActionQueue
+        onTransition (logTransition log)
+        logger log
         timeProvider TimeProvider.System
     }
 
-/// Runs a payment lifecycle against an in-memory or PostgreSQL store.
-let private runPayment
-    (logger: ILogger)
-    (storeArg: IMachineStore<Entity, PaymentState, PaymentEvent, PaymentAction>)
-    : Task =
+let private readConnectionString () : string option =
+    [ "BS_AUTOMATA_CONN"; "ConnectionStrings__BS_AUTOMATA_CONN" ]
+    |> List.map Environment.GetEnvironmentVariable
+    |> List.tryFind (String.IsNullOrWhiteSpace >> not)
+
+/// <summary>
+/// Runs one payment through the durable path.
+///
+/// Nothing here processes a command. Submitting records it in <c>fsm.command</c> and returns; a
+/// processor claims it, resolves it against the chart, and finalizes it. This example runs that
+/// processor in the background, which is what a host's worker would do, so the two halves are
+/// visible side by side.
+/// </summary>
+let private runPayment (logger: ILogger) (connectionString: string) : Task =
     task {
+        let encode, decode = EntityKey.forEntityId<Payment>
+
+        let context =
+            PostgresContext.create (DataSource.create connectionString) TransientPolicy.defaults ignore
+
+        let store =
+            PostgresMachineStore<Entity, PaymentState, PaymentEvent, PaymentAction, string>(
+                { Context = context
+                  ActionQueue = ActionQueue
+                  StateCodec = Serialization.systemTextJson<PaymentState> ()
+                  EventCodec = Serialization.systemTextJson<PaymentEvent> ()
+                  ActionCodec = Serialization.systemTextJson<PaymentAction> ()
+                  ErrorCodec = Serialization.systemTextJson<string> ()
+                  EntityIdEncode = encode
+                  EntityIdDecode = decode }
+            )
+
+        // Once at startup, before any command can commit: a commit enqueues into this queue in
+        // its own transaction, so a missing queue would fail the commit and not only the
+        // delivery.
+        match! store.EnsureQueueAsync CancellationToken.None with
+        | Ok _ -> ()
+        | Error error -> failwith $"the action queue could not be created: %A{error}"
+
         let machine =
-            match buildMachine logger storeArg with
+            match buildMachine logger (store :> IMachineStore<_, _, _, _, _>) with
             | Ok machine -> machine
             | Error errors -> failwith $"machine failed to construct: %A{errors}"
 
-        do! Machine.startAsync machine CancellationToken.None
+        let registry = PostgresChartRegistry({ Context = context })
 
-        let order: Entity = entityId "order-1001"
+        match! Machine.startAsync machine registry CancellationToken.None with
+        | Ok ChartRegistration.Registered -> logger.LogInformation "Registered this chart's structure for version 1"
+        | Ok ChartRegistration.Matched ->
+            logger.LogInformation "This chart matches the structure version 1 was registered with"
+        | Ok(ChartRegistration.Mismatched _) ->
+            failwith "this chart's shape changed without a version bump; bump chartVersion or run make db-reset"
+        | Error error -> failwith $"the chart could not be registered: %A{error}"
+
+        // The worker. In a host this is a BackgroundService under supervision; here it is one
+        // task, cancelled when the payment is done.
+        use worker = new CancellationTokenSource()
+        let processor = Machine.processor machine
+        let draining = processor.RunAsync worker.Token
+
+        let order: Entity =
+            entityId $"order-{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}"
 
         let steps =
             [ "create-1", InitiatePayment(150.00m, "alice")
@@ -171,26 +228,19 @@ let private runPayment
               "confirm-1", ConfirmationReceived "gw-42" ]
 
         for key, event in steps do
+            // send is enqueue plus a wait for the durable outcome. It costs a round trip through
+            // the database, which is the price of an order that survives this process; a caller
+            // that cares more about throughput uses enqueue and reads the result later.
             let! outcome = Machine.send machine order (EventEnvelope.create key event) CancellationToken.None
 
             match outcome with
-            | Ok Committed ->
-                logger.LogInformation("Sent payment event {PaymentEvent}; outcome={SendOutcome}", event, "Committed")
-            | Ok AlreadyApplied ->
-                logger.LogInformation(
-                    "Sent payment event {PaymentEvent}; outcome={SendOutcome}",
-                    event,
-                    "AlreadyApplied"
-                )
-            | Ok(Deferred retryId) ->
-                logger.LogInformation(
-                    "Sent payment event {PaymentEvent}; outcome={SendOutcome}; retry={RetryId}",
-                    event,
-                    "Deferred",
-                    RetryId.value retryId
-                )
-            | Ok Ignored ->
-                logger.LogInformation("Sent payment event {PaymentEvent}; outcome={SendOutcome}", event, "Ignored")
+            | Ok(CommandResult.Committed committed) ->
+                logger.LogInformation("Committed {PaymentEvent} at epoch {Epoch}", event, Epoch.value committed.Epoch)
+            | Ok(CommandResult.Rejected failure) ->
+                logger.LogWarning("Refused {PaymentEvent}: {Failure}", event, failure)
+            | Ok(CommandResult.DeadLettered failure) ->
+                logger.LogError("Gave up on {PaymentEvent}: {Failure}", event, failure)
+            | Ok CommandResult.Pending -> logger.LogWarning("{PaymentEvent} is still pending", event)
             | Error error -> logger.LogWarning("Payment event {PaymentEvent} failed: {MachineError}", event, error)
 
         let! snapshot = Machine.state machine order CancellationToken.None
@@ -205,40 +255,25 @@ let private runPayment
         | Ok None -> logger.LogWarning("Payment finished without a stored snapshot")
         | Error error -> logger.LogError("Payment state read failed: {MachineError}", error)
 
+        worker.Cancel()
+        let! _ = draining
         do! Machine.stopAsync machine CancellationToken.None
     }
 
-let private buildInMemory () : IMachineStore<Entity, PaymentState, PaymentEvent, PaymentAction> =
-    InMemoryStore<Entity, PaymentState, PaymentEvent, PaymentAction>()
-    :> IMachineStore<Entity, PaymentState, PaymentEvent, PaymentAction>
-
-let private readConnectionString () : string option =
-    [ "BS_AUTOMATA_CONN"; "ConnectionStrings__BS_AUTOMATA_CONN" ]
-    |> List.map Environment.GetEnvironmentVariable
-    |> List.tryFind (String.IsNullOrWhiteSpace >> not)
-
-/// <summary>
-/// Applies the schema and reports what it built.
-///
-/// The PostgreSQL implementation of <c>IMachineStore</c> was removed with the v1 schema: the
-/// durable authority is being rebuilt around <c>fsm.command</c>, and the pieces that satisfy
-/// this interface arrive with the command processor. Until then <c>--postgres</c> proves the
-/// migrations apply and the example runs its chart against the in-memory store, which is the
-/// point the README makes anyway: swapping stores does not change the chart above them.
-/// </summary>
-let private migrateOnly (logger: ILogger) () =
-    match readConnectionString () with
-    | None -> failwith "the --postgres flag requires BS_AUTOMATA_CONN to be set"
-    | Some connectionString ->
-        Migrator.migrate connectionString
-        logger.LogInformation("Applied the fsm schema; running the chart on the in-memory store")
-
-let private run (logger: ILogger) argv =
+let private run (logger: ILogger) (_argv: string array) =
     task {
-        if argv |> Array.contains "--postgres" then
-            migrateOnly logger ()
+        match readConnectionString () with
+        | None ->
+            // The durable authority is the point of this library, so the example needs one. It
+            // says so rather than failing somewhere inside Npgsql.
+            logger.LogError
+                "Set BS_AUTOMATA_CONN to a PostgreSQL connection string, then run `make migrate` before this example."
 
-        do! runPayment logger (buildInMemory ())
+            return 1
+        | Some connectionString ->
+            Migrator.migrate connectionString
+            do! runPayment logger connectionString
+            return 0
     }
 
 [<EntryPoint>]
@@ -253,7 +288,6 @@ let main argv =
 
     try
         (run logger argv).GetAwaiter().GetResult()
-        0
     with ex ->
         logger.LogError(ex, "Payment processor example failed")
         1

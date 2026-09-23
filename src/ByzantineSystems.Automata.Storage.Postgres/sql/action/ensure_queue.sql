@@ -4,3 +4,4 @@
 -- and indexes, which is not something a hot path should be asking about.
 SELECT
     fsm.ensure_action_queue (@queue) AS created;
+

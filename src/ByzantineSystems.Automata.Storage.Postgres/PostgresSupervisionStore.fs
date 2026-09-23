@@ -104,7 +104,8 @@ module PostgresSupervisionQueries =
         if limit < 1 then
             invalidArg (nameof limit) "The supervision query limit must be positive."
 
-        Db.protect context.Resilience
+        Db.protect
+            context.Resilience
             (fun token ->
                 task {
                     use! conn = context.DataSource.OpenConnectionAsync(token).AsTask()

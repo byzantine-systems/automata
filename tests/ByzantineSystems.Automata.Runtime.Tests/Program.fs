@@ -6,12 +6,11 @@ open Expecto
 let tests =
     testList
         "ByzantineSystems.Automata.Runtime.Tests"
-        [ InMemoryStoreTests.tests
-          MachineOutcomeTests.tests
-          RuntimeRefactorTests.tests
-          ParallelismTests.tests
-          WorkSignalsTests.tests
-          WorkerTests.tests ]
+        [ DraftTests.tests
+          DispositionTests.tests
+          ProcessorTests.tests
+          MachineTests.tests
+          WorkSignalsTests.tests ]
 
 [<EntryPoint>]
 let main argv = runTestsWithCLIArgs [] argv tests

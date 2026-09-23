@@ -69,7 +69,8 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
 
     /// Every statement goes through the context's pipeline, which is where transient driver
     /// failures are retried and classified. Bound once here so no call site can forget it.
-    let protect work ct = Db.protect options.Context.Resilience work ct
+    let protect work ct =
+        Db.protect options.Context.Resilience work ct
 
     let command (statement: string) (conn: NpgsqlConnection) = new NpgsqlCommand(statement, conn)
 

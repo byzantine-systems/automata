@@ -4,3 +4,4 @@
 -- two leaves the message in the queue rather than leaving the fact unrecorded.
 SELECT
     fsm.abandon_action (@queue, @msg_id, @read_ct, @reason) AS outcome;
+

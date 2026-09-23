@@ -5,3 +5,4 @@
 -- and woke up after somebody else reclaimed the message.
 SELECT
     fsm.complete_action (@queue, @msg_id, @read_ct) AS outcome;
+

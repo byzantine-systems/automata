@@ -165,14 +165,14 @@ BEGIN
         -- which is how a machine whose chart emits nothing avoids requiring a
         -- queue to exist. Explicit casts throughout, because pgmq.send is
         -- overloaded and overload resolution happens at prepare time.
-        IF p_action_queue <> '' AND p_actions IS NOT NULL AND jsonb_array_length(p_actions) > 0 THEN
+        IF p_action_queue <> '' AND p_actions IS NOT NULL AND JSONB_ARRAY_LENGTH(p_actions) > 0 THEN
             PERFORM
                 fsm.assert_queue_name (p_action_queue);
             PERFORM
-                pgmq.send (p_action_queue::text, jsonb_build_object('machine_id', v_machine_id, 'entity_id', v_entity_id, 'command_id', p_command_id, 'epoch', p_expected_epoch + 1, 'ordinal', a.ordinal - 1, 'action', a.value), 0::integer)
+                pgmq.send (p_action_queue::text, JSONB_BUILD_OBJECT('machine_id', v_machine_id, 'entity_id', v_entity_id, 'command_id', p_command_id, 'epoch', p_expected_epoch + 1, 'ordinal', a.ordinal - 1, 'action', a.value), 0::integer)
             FROM
-                jsonb_array_elements(p_actions) WITH ORDINALITY AS a (value,
-                    ordinal);
+                JSONB_ARRAY_ELEMENTS(p_actions)
+    WITH ORDINALITY AS a (value, ordinal);
         END IF;
     ELSE
         INSERT INTO fsm.command_error (command_id, error)

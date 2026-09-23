@@ -24,7 +24,7 @@ type InMemorySupervisionStore() =
     let records = ConcurrentQueue<SupervisionRecord>()
 
     /// <summary>Every record written so far, oldest first.</summary>
-    member _.Records: SupervisionRecord list = List.ofSeq records
+    member _.Recorded() : SupervisionRecord list = List.ofSeq records
 
     interface ISupervisionEventStore with
 

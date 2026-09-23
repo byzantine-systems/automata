@@ -135,8 +135,7 @@ module private MachineBuild =
               | Some name when not (queueNamePattern.IsMatch name) -> InvalidActionQueueName name
               | Some _ -> () ]
 
-        let policy =
-            processor |> Option.defaultValue ProcessorPolicy.defaults
+        let policy = processor |> Option.defaultValue ProcessorPolicy.defaults
 
         let policyErrors =
             match ProcessorPolicy.validate policy with
@@ -210,8 +209,7 @@ type MachineBuilder<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: equ
 
     member _.Delay(f: unit -> MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err> list) = f ()
 
-    member _.Run(parts: MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err> list) =
-        MachineBuild.build machineId parts
+    member _.Run(parts: MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err> list) = MachineBuild.build machineId parts
 
     [<CustomOperation "chart">]
     member _.Chart(parts, chart: Chart<'State, 'Event, 'Action, 'Err>) = parts @ [ MachineChart chart ]
@@ -241,7 +239,8 @@ type MachineBuilder<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: equ
     member _.Logger(parts, logger: ILogger) = parts @ [ MachineLogger logger ]
 
     [<CustomOperation "timeProvider">]
-    member _.TimeProvider(parts, provider: TimeProvider) = parts @ [ MachineTimeProvider provider ]
+    member _.TimeProvider(parts, provider: TimeProvider) =
+        parts @ [ MachineTimeProvider provider ]
 
 /// <summary>The <c>machine</c> computation expression.</summary>
 [<AutoOpen>]

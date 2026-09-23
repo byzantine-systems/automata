@@ -151,7 +151,9 @@ let tests =
               let! held = leased inbox "e1" "first"
               let! _ = inbox.Submit(submission (entity "e1") "second" Finish, noCancellation)
 
-              let! outcome = (newProcessor ()).Reject(held.Work.CommandId, held.Token, Refused "no", noCancellation)
+              let! outcome =
+                  (newProcessor ())
+                      .Reject(held.Work.CommandId, held.Token, CommandFailure.Domain(Refused "no"), noCancellation)
 
               Expect.equal (outcome |> expectOk "reject") (Finalized Epoch.initial) "the epoch does not move"
               Expect.equal (counts ()) "0/0/1" "an error, and no transition or belief"
@@ -169,7 +171,13 @@ let tests =
               let! _ = inbox.Submit(submission (entity "e1") "second" Finish, noCancellation)
 
               let! outcome =
-                  (newProcessor ()).DeadLetter(held.Work.CommandId, held.Token, Refused "poison", noCancellation)
+                  (newProcessor ())
+                      .DeadLetter(
+                          held.Work.CommandId,
+                          held.Token,
+                          CommandFailure.Domain(Refused "poison"),
+                          noCancellation
+                      )
 
               Expect.equal (outcome |> expectOk "dead letter") (Finalized Epoch.initial) "terminal, no epoch change"
               Expect.equal (counts ()) "0/0/1" "an error, and no transition or belief"
@@ -323,11 +331,19 @@ let tests =
               let! rejected = inbox.Submit(submission (entity "e2") "r1" Finish, noCancellation)
               let rejectedId = rejected |> expectOk "submit" |> commandIdOf
               let! heldTwo = claimKey inbox "r1"
-              let! _ = processor.Reject(heldTwo.Work.CommandId, heldTwo.Token, Refused "nope", noCancellation)
+
+              let! _ =
+                  processor.Reject(
+                      heldTwo.Work.CommandId,
+                      heldTwo.Token,
+                      CommandFailure.Domain(Refused "nope"),
+                      noCancellation
+                  )
+
               let! result = processor.TryGetResult(rejectedId, noCancellation)
 
               Expect.equal
                   (result |> expectOk "rejected result")
-                  (Some(CommandResult.Rejected(Refused "nope")))
+                  (Some(CommandResult.Rejected(CommandFailure.Domain(Refused "nope"))))
                   "a rejection reads back as the error that caused it"
           } ]

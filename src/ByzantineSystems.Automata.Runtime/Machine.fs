@@ -193,8 +193,7 @@ module Machine =
         machine.RuntimeConfig.Store :> ICommandInbox<'EntityId, 'Event>
 
     let private processorOf (machine: Machine<'EntityId, 'State, 'Event, 'Action, 'Err>) =
-        machine.RuntimeConfig.Store
-        :> ICommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
+        machine.RuntimeConfig.Store :> ICommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
 
     /// <summary>
     /// Records an event durably and returns as soon as it is safe: the command is in the inbox,
@@ -280,8 +279,7 @@ module Machine =
             // Registered before submission, so the window where a result is published with
             // nobody listening does not exist.
             let! commandId =
-                (inboxOf machine)
-                    .TryFind(machine.MachineId, entityId, key, ct)
+                (inboxOf machine).TryFind(machine.MachineId, entityId, key, ct)
                 |> TaskResult.mapError MachineError.Store
                 |> TaskResult.map (Option.map _.CommandId)
 
@@ -306,7 +304,9 @@ module Machine =
                         | Error error -> return Error error
                         | Ok(Some CommandResult.Pending)
                         | Ok None ->
-                            let delay = Task.Delay(machine.ResultPollInterval, machine.RuntimeConfig.TimeProvider, ct)
+                            let delay =
+                                Task.Delay(machine.ResultPollInterval, machine.RuntimeConfig.TimeProvider, ct)
+
                             let! first = Task.WhenAny(waiter.Task :> Task, delay)
 
                             if Object.ReferenceEquals(first, waiter.Task :> Task) then
@@ -328,8 +328,7 @@ module Machine =
         (entityId: 'EntityId)
         (ct: CancellationToken)
         : Task<Result<Snapshot<'State> option, MachineError<'Err>>> =
-        (machine.RuntimeConfig.Store :> IStateReader<'EntityId, 'State>)
-            .TryGetSnapshot(machine.MachineId, entityId, ct)
+        (machine.RuntimeConfig.Store :> IStateReader<'EntityId, 'State>).TryGetSnapshot(machine.MachineId, entityId, ct)
         |> TaskResult.mapError MachineError.Store
 
     /// <summary>The logical machine name the chart, inbox and store are keyed by.</summary>

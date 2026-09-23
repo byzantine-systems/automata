@@ -3,10 +3,7 @@ module ByzantineSystems.Automata.DependencyInjection.Tests.ActionDispatchTests
 open System
 open System.Collections.Concurrent
 open System.Threading.Tasks
-open ByzantineSystems.Automata.Core
-open ByzantineSystems.Automata.Runtime
 open ByzantineSystems.Automata.Storage
-open ByzantineSystems.Automata.Storage.InMemory
 open ByzantineSystems.Automata.DependencyInjection
 open Expecto
 open Microsoft.Extensions.DependencyInjection
@@ -32,8 +29,10 @@ type ScopeMarker(log: HandledLog) =
 type RecordingHandler(marker: ScopeMarker, log: HandledLog) =
     interface IActionHandler<Entity, TestAction, string> with
 
-        member _.HandleAsync(_key, action, _ct) =
-            let (Log text) = action
+        /// The whole leased action arrives, not just the payload, so a real handler could hand
+        /// its destination the (CommandId, Ordinal) pair and let it recognise a redelivery.
+        member _.HandleAsync(action, _ct) =
+            let (Log text) = action.Work.Action
             log.Add(marker.Id, text)
             Task.FromResult(Result<unit, string>.Ok())
 
@@ -44,11 +43,8 @@ let actionDispatchTests =
               let store = TestStore()
               let audit = InMemorySupervisionStore()
 
-              let machineReady =
-                  TaskCompletionSource<TestMachine>(TaskCreationOptions.RunContinuationsAsynchronously)
-
               let options =
-                  { testOptions "dispatch-machine" store (fun m -> machineReady.TrySetResult m |> ignore) with
+                  { testOptions "dispatch-machine" store ignore with
                       DispatchActions = true }
 
               let provider =
@@ -60,17 +56,14 @@ let actionDispatchTests =
                       .AddAutomata(options)
                       .BuildServiceProvider()
 
+              // Two actions waiting in the queue, as a commit would have left them.
+              store.OfferAction(leasedAction 0)
+              store.OfferAction(leasedAction 1)
+
               let hosted, background = resolveHostedService provider
               do! hosted.StartAsync(noCancellation)
 
-              let! machine = machineReady.Task.WaitAsync(waitTimeout)
               let log = provider.GetRequiredService<HandledLog>()
-
-              // One committed event enqueues both actions through the transactional outbox.
-              let! sent =
-                  Machine.send machine (entityId "ORDER-1") (EventEnvelope.create "evt-1" (Start 1)) noCancellation
-
-              Expect.equal sent (Ok SendOutcome.Committed) "the action-producing event committed"
 
               do!
                   pollUntil "both actions handled or the hosted service completed" (fun () ->
@@ -85,8 +78,8 @@ let actionDispatchTests =
 
               Expect.equal
                   (entries |> List.map snd |> List.sort)
-                  [ "first"; "second" ]
-                  "both enqueued actions were delivered"
+                  [ "effect-0"; "effect-1" ]
+                  "both queued actions were delivered"
 
               let scopeIds = entries |> List.map fst |> List.distinct
 
@@ -97,5 +90,29 @@ let actionDispatchTests =
                   (scopeIds |> List.sort)
                   "each async scope was disposed after its item"
 
+              Expect.equal [ 0; 1 ] (List.ofSeq store.Delivered |> List.sort) "both were completed, and fenced"
+
+              do! hosted.StopAsync(noCancellation)
+          }
+
+          testTask "a host that does not dispatch leaves the queue alone" {
+              // A deployment may run processors on one fleet and dispatchers on another. The
+              // queue is durable, so neither needs the other in the same process.
+              let store = TestStore()
+              let audit = InMemorySupervisionStore()
+              let options = testOptions "no-dispatch-machine" store ignore
+
+              let provider =
+                  ServiceCollection()
+                      .AddSingleton<ISupervisionEventStore>(audit)
+                      .AddAutomata(options)
+                      .BuildServiceProvider()
+
+              store.OfferAction(leasedAction 0)
+
+              let hosted, _ = resolveHostedService provider
+              do! hosted.StartAsync(noCancellation)
+              do! Task.Delay 100
+              Expect.isEmpty store.Delivered "nothing was delivered by this host"
               do! hosted.StopAsync(noCancellation)
           } ]

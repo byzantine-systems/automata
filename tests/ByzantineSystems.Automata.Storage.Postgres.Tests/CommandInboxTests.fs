@@ -151,7 +151,9 @@ let tests =
               let! (blocked: Claimed list) = claim inbox 10
               Expect.isEmpty blocked "nothing else for the entity is claimable while its head is leased"
 
-              let! outcome = (newProcessor ()).Reject(head.Work.CommandId, head.Token, Refused "done", noCancellation)
+              let! outcome =
+                  (newProcessor ())
+                      .Reject(head.Work.CommandId, head.Token, CommandFailure.Domain(Refused "done"), noCancellation)
 
               Expect.equal
                   (outcome |> expectOk "finalize")
@@ -172,7 +174,13 @@ let tests =
               let! (head: Claimed) = claimOne inbox
 
               let! outcome =
-                  (newProcessor ()).DeadLetter(head.Work.CommandId, head.Token, Refused "poison", noCancellation)
+                  (newProcessor ())
+                      .DeadLetter(
+                          head.Work.CommandId,
+                          head.Token,
+                          CommandFailure.Domain(Refused "poison"),
+                          noCancellation
+                      )
 
               Expect.equal
                   (outcome |> expectOk "dead letter")
@@ -208,7 +216,9 @@ let tests =
                   (LeaseToken.value first.Token)
                   "tokens are monotone, so a stale one is strictly lower"
 
-              let! stale = (newProcessor ()).Reject(first.Work.CommandId, first.Token, Refused "stale", noCancellation)
+              let! stale =
+                  (newProcessor ())
+                      .Reject(first.Work.CommandId, first.Token, CommandFailure.Domain(Refused "stale"), noCancellation)
 
               Expect.equal
                   (stale |> expectOk "stale finalize")
@@ -226,7 +236,9 @@ let tests =
               let stale: LeaseToken<CommandWork> =
                   LeaseToken.ofInt64 (LeaseToken.value head.Token - 1L)
 
-              let! finalized = (newProcessor ()).Reject(head.Work.CommandId, stale, Refused "stale", noCancellation)
+              let! finalized =
+                  (newProcessor ())
+                      .Reject(head.Work.CommandId, stale, CommandFailure.Domain(Refused "stale"), noCancellation)
 
               Expect.equal (finalized |> expectOk "finalize") FinalizeOutcome.LeaseLost "finishing a command is fenced"
 
@@ -376,7 +388,12 @@ let tests =
                               for leased in batch do
                                   let! outcome =
                                       (newProcessor ())
-                                          .Reject(leased.Work.CommandId, leased.Token, Refused "done", noCancellation)
+                                          .Reject(
+                                              leased.Work.CommandId,
+                                              leased.Token,
+                                              CommandFailure.Domain(Refused "done"),
+                                              noCancellation
+                                          )
 
                                   outcome |> expectOk "worker finalize" |> ignore
                   }

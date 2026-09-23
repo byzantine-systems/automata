@@ -19,6 +19,8 @@ let tests =
                     ChartRegistryTests.tests
                     TemporalTests.tests
                     FinalizeTests.tests
+                    ActionQueueTests.tests
+                    ProcessorIntegrationTests.tests
                     SchemaContractTests.tests
                     PostgresSupervisionStoreTests.tests ]
               |> testSequenced

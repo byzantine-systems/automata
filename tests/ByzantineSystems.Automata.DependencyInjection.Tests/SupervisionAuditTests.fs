@@ -6,7 +6,7 @@ open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Resilience
 open ByzantineSystems.Automata.Runtime
 open ByzantineSystems.Automata.Storage
-open ByzantineSystems.Automata.Storage.InMemory
+
 open ByzantineSystems.Automata.DependencyInjection
 open Expecto
 open Microsoft.Extensions.DependencyInjection

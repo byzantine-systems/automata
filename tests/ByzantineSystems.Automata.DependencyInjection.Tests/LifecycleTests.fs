@@ -1,7 +1,7 @@
 module ByzantineSystems.Automata.DependencyInjection.Tests.LifecycleTests
 
 open ByzantineSystems.Automata.Storage
-open ByzantineSystems.Automata.Storage.InMemory
+
 open ByzantineSystems.Automata.DependencyInjection
 open Expecto
 open Microsoft.Extensions.DependencyInjection

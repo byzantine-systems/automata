@@ -64,9 +64,7 @@ module Serialization =
             protect (fun error -> CodecError.DecodeError(typeName, error)) (fun () ->
                 use document = JsonDocument.Parse json
 
-                document.RootElement.EnumerateArray()
-                |> Seq.map _.GetRawText()
-                |> List.ofSeq)
+                document.RootElement.EnumerateArray() |> Seq.map _.GetRawText() |> List.ofSeq)
             |> Result.bind (List.traverseResultM element.Decode)
 
         Codec.create encode decode

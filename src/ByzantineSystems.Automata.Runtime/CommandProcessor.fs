@@ -47,9 +47,11 @@ type CommandOutcome =
 
 /// <summary>What one poll of the processor did.</summary>
 type PollReport =
-    { Summary: PollSummary
-      /// <summary>Set when a command in this batch escalated, which ends the loop.</summary>
-      Escalation: (CommandId * string) option }
+    {
+        Summary: PollSummary
+        /// <summary>Set when a command in this batch escalated, which ends the loop.</summary>
+        Escalation: (CommandId * string) option
+    }
 
 /// <summary>
 /// Why a processor's loop ended.
@@ -121,8 +123,7 @@ type CommandProcessor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: e
                 if work.IsCompleted then
                     return ()
                 else
-                    let! finished =
-                        Task.WhenAny(work :> Task, Task.Delay(policy.RenewAfter, config.TimeProvider, ct))
+                    let! finished = Task.WhenAny(work :> Task, Task.Delay(policy.RenewAfter, config.TimeProvider, ct))
 
                     if Object.ReferenceEquals(finished, work :> Task) then
                         return ()

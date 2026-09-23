@@ -20,8 +20,7 @@ let tests =
         "Postgres ISupervisionEventStore"
         [ testTask "record appends facts and listRecent returns the newest limited page" {
               do! reset ()
-              use dataSource = NpgsqlDataSource.Create(connectionString)
-              let store = PostgresSupervisionStore(dataSource) :> ISupervisionEventStore
+              let store = PostgresSupervisionStore(context ()) :> ISupervisionEventStore
 
               let started =
                   record
@@ -45,7 +44,7 @@ let tests =
                   store.Record(restarted, noCancellation)
                   |> mapTask (expectOkUnit "record restarted")
 
-              let! result = PostgresSupervisionQueries.listRecent dataSource 1 noCancellation
+              let! result = PostgresSupervisionQueries.listRecent (context ()) 1 noCancellation
               let actual = result |> expectOk "list recent"
 
               Expect.equal actual [ restarted ] "the query should preserve the typed record and apply its limit"
