@@ -5,6 +5,7 @@ open System.Text.Json
 open System.Text.Json.Serialization
 open Npgsql
 open ByzantineSystems.Automata.Core
+open FsToolkit.ErrorHandling
 
 /// <summary>Serialization helpers: System.Text.Json codecs and store options.</summary>
 [<RequireQualifiedAccess>]
@@ -41,6 +42,34 @@ module Serialization =
 
     /// <summary>Builds a codec for a list of values.</summary>
     let systemTextJsonList<'T> () : Codec<'T list> = systemTextJson<'T list> ()
+
+    /// <summary>
+    /// Derives a list codec from an element codec by composing raw JSON.
+    ///
+    /// The two have to agree element for element, and not by coincidence. A commit writes the
+    /// whole action list into <c>fsm.transition</c> as one document and, in the same statement,
+    /// sends each element of that document to the queue; the dispatcher then decodes an element
+    /// with the element codec. Building the list codec out of the element codec is what makes
+    /// that agreement structural rather than a convention two call sites both have to remember.
+    /// </summary>
+    let listOf (element: Codec<'T>) : Codec<'T list> =
+        let typeName = typeof<'T list>.Name
+
+        let encode (values: 'T list) =
+            values
+            |> List.traverseResultM element.Encode
+            |> Result.map (fun encoded -> "[" + String.Join(",", encoded) + "]")
+
+        let decode (json: string) =
+            protect (fun error -> CodecError.DecodeError(typeName, error)) (fun () ->
+                use document = JsonDocument.Parse json
+
+                document.RootElement.EnumerateArray()
+                |> Seq.map _.GetRawText()
+                |> List.ofSeq)
+            |> Result.bind (List.traverseResultM element.Decode)
+
+        Codec.create encode decode
 
 /// <summary>Entity-key projections for the common <see cref="T:ByzantineSystems.Automata.Core.EntityId`1" /> case.</summary>
 [<RequireQualifiedAccess>]

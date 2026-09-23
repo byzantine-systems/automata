@@ -1,6 +1,7 @@
 namespace ByzantineSystems.Automata.Storage.Postgres
 
 open System
+open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
@@ -15,6 +16,12 @@ open NpgsqlTypes
 type CommandProcessorOptions<'EntityId, 'State, 'Event, 'Action, 'Err> =
     {
         Context: PostgresContext
+        /// <summary>
+        /// The queue a commit enqueues its actions into, inside the commit's own transaction.
+        /// The empty string means this machine delivers no actions, which is how a chart that
+        /// emits none avoids requiring a queue to exist.
+        /// </summary>
+        ActionQueue: string
         StateCodec: Codec<'State>
         EventCodec: Codec<'Event>
         ActionCodec: Codec<'Action list>
@@ -121,6 +128,7 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
             cmd |> addBigint "lease_token" (LeaseToken.value token)
             cmd |> addBigint "expected_epoch" (int64 (Epoch.value expected))
             cmd |> addText "status" status
+            cmd |> addText "action_queue" options.ActionQueue
             cmd |> addNullable "error" NpgsqlDbType.Jsonb (error |> Option.map box)
 
             let jsonb name selector =
@@ -165,12 +173,48 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                     ProcessorMapping.outcomeFromString (Row.string reader "outcome") (Row.int64 reader "epoch") expected
         }
 
-    let failWith (status: string) (commandId: CommandId) token (error: 'Err) ct =
+    /// <summary>
+    /// The failure column is a tagged envelope rather than the bare domain error, because the
+    /// two cases have to be told apart on the way back out. A domain error is the
+    /// application's own value and is encoded by its codec; a machine reason is a string this
+    /// library wrote. Reading a row and guessing which one it holds is not possible once they
+    /// share a column, so the tag goes in.
+    /// </summary>
+    let encodeFailure (failure: CommandFailure<'Err>) : Result<string, StoreError> =
+        match failure with
+        | CommandFailure.Domain error ->
+            options.ErrorCodec.Encode error
+            |> Result.mapError Db.toStoreError
+            |> Result.map (fun encoded -> $"""{{"domain":%s{encoded}}}""")
+        | CommandFailure.Machine reason -> Ok $"""{{"machine":%s{JsonSerializer.Serialize reason}}}"""
+
+    let readFailure (json: string) : Result<CommandFailure<'Err>, StoreError> =
+        // The column is jsonb, so the server has already proved this parses. What it has not
+        // proved is that the shape is one this version writes.
+        use document = JsonDocument.Parse json
+        let root = document.RootElement
+
+        match root.TryGetProperty "domain" with
+        | true, domain ->
+            domain.GetRawText()
+            |> options.ErrorCodec.Decode
+            |> Result.mapError Db.toStoreError
+            |> Result.map CommandFailure.Domain
+        | _ ->
+            match root.TryGetProperty "machine" with
+            | true, machine when machine.ValueKind = JsonValueKind.String ->
+                Ok(CommandFailure.Machine(machine.GetString()))
+            | _ ->
+                Error(
+                    Db.decodeFailure (nameof CommandFailure) "a command error carried neither a domain nor a machine tag"
+                )
+
+    let failWith (status: string) (commandId: CommandId) token (failure: CommandFailure<'Err>) ct =
         protect
             (fun cancel ->
                 task {
-                    match options.ErrorCodec.Encode error with
-                    | Error failure -> return Error(Db.toStoreError failure)
+                    match encodeFailure failure with
+                    | Error error -> return Error error
                     | Ok encoded ->
                         // No expected epoch: a failure writes no state, so there is nothing for a
                         // stale epoch to conflict with, and the routine skips the check.
@@ -330,14 +374,13 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                             | ("rejected" | "dead_letter") as status ->
                                 return
                                     Row.string reader "error"
-                                    |> options.ErrorCodec.Decode
-                                    |> Result.mapError Db.toStoreError
-                                    |> Result.map (fun error ->
+                                    |> readFailure
+                                    |> Result.map (fun failure ->
                                         Some(
                                             if status = "dead_letter" then
-                                                CommandResult.DeadLettered error
+                                                CommandResult.DeadLettered failure
                                             else
-                                                CommandResult.Rejected error
+                                                CommandResult.Rejected failure
                                         ))
                             | other ->
                                 return Error(Db.decodeFailure (nameof CommandResult) $"unknown command status {other}")

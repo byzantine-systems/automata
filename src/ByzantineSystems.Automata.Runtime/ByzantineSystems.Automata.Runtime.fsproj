@@ -15,23 +15,25 @@
 
     <ItemGroup>
         <Compile Include="Types.fs" />
-        <Compile Include="TaskBoundary.fs" />
+        <Compile Include="Draft.fs" />
         <Compile Include="WorkSignals.fs" />
         <Compile Include="ObserverDispatcher.fs" />
-        <Compile Include="Envelope.fs" />
-        <Compile Include="Send.fs" />
-        <Compile Include="EntityActor.fs" />
-        <Compile Include="Registry.fs" />
+        <Compile Include="Completions.fs" />
+        <Compile Include="CommandProcessor.fs" />
+        <Compile Include="ActionDispatcher.fs" />
         <Compile Include="Machine.fs" />
         <Compile Include="MachineBuilder.fs" />
-        <Compile Include="RetryPump.fs" />
-        <Compile Include="ActionDispatcher.fs" />
     </ItemGroup>
 
     <ItemGroup>
         <ProjectReference Include="..\ByzantineSystems.Automata.Core\ByzantineSystems.Automata.Core.fsproj" />
         <ProjectReference Include="..\ByzantineSystems.Automata.Storage\ByzantineSystems.Automata.Storage.fsproj" />
         <ProjectReference Include="..\ByzantineSystems.Automata.Resilience\ByzantineSystems.Automata.Resilience.fsproj" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <PackageReference Include="FsToolkit.ErrorHandling" />
+        <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
     </ItemGroup>
 
 </Project>

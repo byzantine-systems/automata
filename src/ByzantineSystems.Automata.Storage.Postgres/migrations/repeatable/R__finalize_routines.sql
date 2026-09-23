@@ -28,13 +28,16 @@
 -- does. The order matters: the transition is appended before the belief moves,
 -- so a belief that cannot be written leaves no transition claiming it did.
 --
--- TODO: the action queue enqueue belongs between the belief write and the
--- inbox close, in this same transaction, so that delivery is atomic with the
--- commit and no outbox table is needed.
+-- The actions are enqueued between the belief write and the inbox close, in
+-- this same transaction. That is the whole transactional-outbox property with
+-- no outbox table: pgmq.send is an ordinary insert into an ordinary table, so
+-- it commits or rolls back with the transition it belongs to. A commit whose
+-- effects were not queued, or queued effects for a commit that did not happen,
+-- are both unrepresentable.
 --
 -- VOLATILE and PARALLEL UNSAFE because it writes.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fsm.finalize_command (p_command_id bigint, p_lease_token bigint, p_expected_epoch bigint, p_status fsm.command_status, p_error jsonb DEFAULT NULL, p_state jsonb DEFAULT NULL, p_instance_status fsm.instance_status DEFAULT NULL, p_effective_at timestamptz DEFAULT NULL, p_event jsonb DEFAULT NULL, p_actions jsonb DEFAULT NULL, p_from_state jsonb DEFAULT NULL, p_to_state jsonb DEFAULT NULL, p_handled_by text DEFAULT NULL, p_exited text[] DEFAULT NULL, p_entered text[] DEFAULT NULL)
+CREATE OR REPLACE FUNCTION fsm.finalize_command (p_command_id bigint, p_lease_token bigint, p_expected_epoch bigint, p_status fsm.command_status, p_action_queue text DEFAULT '', p_error jsonb DEFAULT NULL, p_state jsonb DEFAULT NULL, p_instance_status fsm.instance_status DEFAULT NULL, p_effective_at timestamptz DEFAULT NULL, p_event jsonb DEFAULT NULL, p_actions jsonb DEFAULT NULL, p_from_state jsonb DEFAULT NULL, p_to_state jsonb DEFAULT NULL, p_handled_by text DEFAULT NULL, p_exited text[] DEFAULT NULL, p_entered text[] DEFAULT NULL)
     RETURNS TABLE (
         outcome fsm.finalize_outcome,
         epoch bigint)
@@ -153,6 +156,24 @@ BEGIN
             VALUES (v_machine_id, v_entity_id, p_expected_epoch + 1, p_command_id, v_chart_version, p_event, p_actions, p_from_state, p_to_state, p_handled_by, p_exited, p_entered, p_instance_status, p_effective_at);
         PERFORM
             fsm.close_and_open (v_machine_id, v_entity_id, p_effective_at, p_state, p_instance_status, p_expected_epoch + 1, p_command_id, v_chart_version);
+        -- The actions this transition asked for, enqueued in this transaction.
+        -- Ordinal is the position in the chart's action list, and together with
+        -- the command id it is the identity a destination deduplicates on: a
+        -- redelivery carries a new msg_id and the same pair.
+        --
+        -- An empty queue name means the caller has no delivery configured,
+        -- which is how a machine whose chart emits nothing avoids requiring a
+        -- queue to exist. Explicit casts throughout, because pgmq.send is
+        -- overloaded and overload resolution happens at prepare time.
+        IF p_action_queue <> '' AND p_actions IS NOT NULL AND jsonb_array_length(p_actions) > 0 THEN
+            PERFORM
+                fsm.assert_queue_name (p_action_queue);
+            PERFORM
+                pgmq.send (p_action_queue::text, jsonb_build_object('machine_id', v_machine_id, 'entity_id', v_entity_id, 'command_id', p_command_id, 'epoch', p_expected_epoch + 1, 'ordinal', a.ordinal - 1, 'action', a.value), 0::integer)
+            FROM
+                jsonb_array_elements(p_actions) WITH ORDINALITY AS a (value,
+                    ordinal);
+        END IF;
     ELSE
         INSERT INTO fsm.command_error (command_id, error)
             VALUES (p_command_id, p_error);

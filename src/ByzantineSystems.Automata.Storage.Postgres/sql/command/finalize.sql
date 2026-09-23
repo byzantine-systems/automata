@@ -11,5 +11,5 @@ SELECT
     f.outcome,
     f.epoch
 FROM
-    fsm.finalize_command (@command_id, @lease_token, @expected_epoch, @status::fsm.command_status, @error::jsonb, @state::jsonb, @instance_status::fsm.instance_status, @effective_at, @event::jsonb, @actions::jsonb, @from_state::jsonb, @to_state::jsonb, @handled_by, @exited, @entered) f;
+    fsm.finalize_command (@command_id, @lease_token, @expected_epoch, @status::fsm.command_status, @action_queue, @error::jsonb, @state::jsonb, @instance_status::fsm.instance_status, @effective_at, @event::jsonb, @actions::jsonb, @from_state::jsonb, @to_state::jsonb, @handled_by, @exited, @entered) f;
 

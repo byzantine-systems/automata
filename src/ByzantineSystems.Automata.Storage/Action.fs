@@ -25,7 +25,15 @@ type ActionRecord<'EntityId, 'Action> =
         Action: 'Action
     }
 
-/// <summary>An action claimed for delivery.</summary>
+/// <summary>
+/// An action claimed for delivery.
+///
+/// The lease carries the queue's own transport identity, which is why it is not on the record:
+/// <c>Token</c> is the message's id and <c>DeliveryCount</c> is the count that fences it, and a
+/// store needs both to act on a claim. Keeping them here leaves
+/// <see cref="T:ByzantineSystems.Automata.Storage.ActionRecord`2" /> as what the machine
+/// decided, with nothing in it that a different queue would name differently.
+/// </summary>
 type LeasedAction<'EntityId, 'Action> = Leased<ActionWork, ActionRecord<'EntityId, 'Action>>
 
 /// <summary>

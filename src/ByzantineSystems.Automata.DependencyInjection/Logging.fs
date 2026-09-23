@@ -3,14 +3,24 @@ namespace ByzantineSystems.Automata.DependencyInjection
 open ByzantineSystems.Automata.Resilience
 open Microsoft.Extensions.Logging
 
-/// Structured logging owned by the host-integration layer. Core state transitions and
-/// storage contracts remain independent of any logging framework.
+/// <summary>
+/// Structured logging owned by the host-integration layer. Core state transitions and storage
+/// contracts remain independent of any logging framework.
+///
+/// <c>pipelineEvent</c> is public because the pipeline it describes is no longer built here: a
+/// host constructs its own store context and can hand this in as the sink, which is the only
+/// way those events reach a log now.
+/// </summary>
 [<RequireQualifiedAccess>]
-module internal AutomataLog =
+module AutomataLog =
 
     [<Literal>]
     let PipelineCategory = "ByzantineSystems.Automata.Resilience"
 
+    /// <summary>
+    /// A sink that writes resilience events to a logger, for passing to
+    /// <c>DataSource.resilience</c>.
+    /// </summary>
     let pipelineEvent (logger: ILogger) machineKey =
         function
         | RetryScheduled(attemptNumber, delay) ->
@@ -44,7 +54,7 @@ module internal AutomataLog =
                 [| box machineKey |]
             )
 
-    let supervisionEvent (logger: ILogger) machineKey (event: SupervisionEvent) =
+    let internal supervisionEvent (logger: ILogger) machineKey (event: SupervisionEvent) =
         let values = [| box machineKey; box event.ChildId; box event.Reason; box event.At |]
 
         let template =
@@ -56,7 +66,7 @@ module internal AutomataLog =
         | SupervisionEventKind.Escalated -> logger.LogError(EventId(1103, "ChildEscalated"), template, values)
         | SupervisionEventKind.Stopped -> logger.LogInformation(EventId(1104, "ChildStopped"), template, values)
 
-    let hostedServiceFailed (logger: ILogger) machineKey (error: exn) =
+    let internal hostedServiceFailed (logger: ILogger) machineKey (error: exn) =
         logger.LogError(
             EventId(1201, "HostedServiceFailed"),
             error,

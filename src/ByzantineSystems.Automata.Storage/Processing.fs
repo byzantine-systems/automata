@@ -49,6 +49,24 @@ type CommittedTransition<'EntityId, 'State, 'Event, 'Action> =
         CommittedAt: DateTimeOffset
     }
 
+/// <summary>
+/// Why a command did not commit.
+///
+/// Two cases, because there are two kinds of answer and conflating them loses the more useful
+/// one. A chart that refuses an event says so in the application's own vocabulary, and that
+/// belongs in the audit record as data the application can read back. A row that will not
+/// decode, an event the chart has no rule for, a lease that expired: those are facts about the
+/// machine, and no <c>'Err</c> exists to express them. A processor cannot invent one, and a
+/// contract that demanded it would be answered with a lie.
+/// </summary>
+[<RequireQualifiedAccess>]
+type CommandFailure<'Err> =
+    /// <summary>The chart refused the event, with the error it refused it with.</summary>
+    | Domain of 'Err
+
+    /// <summary>The machine could not process the command, with a reason meant for a human.</summary>
+    | Machine of reason: string
+
 /// <summary>What became of a submitted command.</summary>
 [<RequireQualifiedAccess>]
 type CommandResult<'EntityId, 'State, 'Event, 'Action, 'Err> =
@@ -58,11 +76,11 @@ type CommandResult<'EntityId, 'State, 'Event, 'Action, 'Err> =
     /// <summary>Applied, with the transition it produced.</summary>
     | Committed of CommittedTransition<'EntityId, 'State, 'Event, 'Action>
 
-    /// <summary>Refused by the chart, with the domain error that refused it.</summary>
-    | Rejected of rejected: 'Err
+    /// <summary>Refused, with the reason. The state did not move.</summary>
+    | Rejected of rejected: CommandFailure<'Err>
 
-    /// <summary>Given up on, with the error that ended it. Its entity has been released.</summary>
-    | DeadLettered of abandoned: 'Err
+    /// <summary>Given up on, with the reason that ended it. Its entity has been released.</summary>
+    | DeadLettered of abandoned: CommandFailure<'Err>
 
 /// <summary>
 /// What finishing a command did.
@@ -143,9 +161,9 @@ type ICommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err> =
         ct: CancellationToken ->
             Task<Result<FinalizeOutcome, StoreError>>
 
-    /// <summary>Records that the chart refused the command. No transition, and the state does not move.</summary>
+    /// <summary>Records that the command was refused. No transition, and the state does not move.</summary>
     abstract Reject:
-        commandId: CommandId * token: LeaseToken<CommandWork> * error: 'Err * ct: CancellationToken ->
+        commandId: CommandId * token: LeaseToken<CommandWork> * failure: CommandFailure<'Err> * ct: CancellationToken ->
             Task<Result<FinalizeOutcome, StoreError>>
 
     /// <summary>
@@ -153,7 +171,7 @@ type ICommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err> =
     /// a command nobody can process must not stop everything behind it.
     /// </summary>
     abstract DeadLetter:
-        commandId: CommandId * token: LeaseToken<CommandWork> * error: 'Err * ct: CancellationToken ->
+        commandId: CommandId * token: LeaseToken<CommandWork> * failure: CommandFailure<'Err> * ct: CancellationToken ->
             Task<Result<FinalizeOutcome, StoreError>>
 
     /// <summary>Reads what became of a command, without waiting for it.</summary>

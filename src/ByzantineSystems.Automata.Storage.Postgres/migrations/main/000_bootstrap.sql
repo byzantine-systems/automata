@@ -20,8 +20,23 @@
 --
 -- IF NOT EXISTS because a managed host may ship it already, and because
 -- make db-reset drops the schema while leaving extensions in place.
+--
+-- pgmq is the second extension, and unlike btree_gist it is NOT trusted: it
+-- needs a superuser to install, which makes this script a genuine DBA step
+-- rather than one only in principle. It carries the actions a commit emits,
+-- enqueued inside the same transaction as the state change, which is what
+-- makes "the transition happened and its effects were queued" a single fact
+-- and removes the need for an outbox table of our own.
+--
+-- pgmq.read is ORDER BY msg_id ... WHERE vt <= clock_timestamp() ... FOR
+-- UPDATE SKIP LOCKED against a (vt) index: unordered, at-least-once delivery,
+-- which is exactly what an action queue wants. It is deliberately not used for
+-- the command inbox, whose per-entity FIFO would cost O(queue depth) per poll
+-- through read_grouped_head.
 -- ---------------------------------------------------------------------------
 CREATE EXTENSION IF NOT EXISTS btree_gist;
+
+CREATE EXTENSION IF NOT EXISTS pgmq;
 
 CREATE SCHEMA fsm;
 

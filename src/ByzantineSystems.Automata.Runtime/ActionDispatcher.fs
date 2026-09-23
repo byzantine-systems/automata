@@ -3,171 +3,258 @@ namespace ByzantineSystems.Automata.Runtime
 open System
 open System.Threading
 open System.Threading.Tasks
+open FsToolkit.ErrorHandling
+open Microsoft.Extensions.Logging
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
 
-type private ActionItemOutcome =
-    | ActionCompleted
-    | ActionRescheduled
-    | ActionAbandoned
+/// <summary>Log event ids for action delivery.</summary>
+module internal DispatcherEvents =
 
-module private ActionDispatcherPolicy =
-
-    let validate (policy: RetryPolicy) =
-        match RetryPolicy.validate policy with
-        | Ok validated -> validated
-        | Error errors -> invalidArg (nameof policy) $"Invalid retry policy: %A{errors}"
+    let claimed = EventId(1401, "ActionsClaimed")
+    let delivered = EventId(1402, "ActionDelivered")
+    let rescheduled = EventId(1403, "ActionRescheduled")
+    let abandoned = EventId(1404, "ActionAbandoned")
+    let leaseLost = EventId(1405, "ActionLeaseLost")
+    let pollFailed = EventId(1406, "ActionPollFailed")
 
 /// <summary>
-/// A manual worker that drains the transactional action outbox. Each action is delivered
-/// through a handler that receives the stable <see cref="T:ByzantineSystems.Automata.Storage.OutboxKey`1" />,
-/// so a destination can detect at-least-once redelivery after a crash between the external
-/// effect and completion. Delivery concurrency is bounded independently of the retry pump.
+/// Delivers one action to the outside world.
+///
+/// The whole leased action is handed over, not just the payload, so a handler can pass
+/// <c>(CommandId, Ordinal)</c> to its destination and let that destination recognise a repeat.
+/// Delivery is at-least-once and a crash between the effect and the acknowledgement is normal,
+/// so a handler that cannot tolerate a duplicate has to say something to the far side.
 /// </summary>
-type ActionDispatcher<'EntityId, 'Action, 'EffectError>
+type ActionHandler<'EntityId, 'Action, 'EffectError> =
+    LeasedAction<'EntityId, 'Action> -> CancellationToken -> Task<Result<unit, 'EffectError>>
+
+/// <summary>What delivering one action did.</summary>
+type DeliveryOutcome =
+    | Delivered
+    | Retrying
+    | GaveUp
+    | Unfenced
+
+/// <summary>What one poll of the dispatcher did.</summary>
+type DeliveryReport =
+    { Claimed: int
+      Delivered: int
+      Rescheduled: int
+      Abandoned: int
+      LeaseLost: int }
+
+/// <summary>Operations on <see cref="T:ByzantineSystems.Automata.Runtime.DeliveryReport" />.</summary>
+[<RequireQualifiedAccess>]
+module DeliveryReport =
+
+    /// <summary>A poll that found nothing.</summary>
+    let empty: DeliveryReport =
+        { Claimed = 0
+          Delivered = 0
+          Rescheduled = 0
+          Abandoned = 0
+          LeaseLost = 0 }
+
+    let internal add (left: DeliveryReport) (right: DeliveryReport) : DeliveryReport =
+        { Claimed = left.Claimed + right.Claimed
+          Delivered = left.Delivered + right.Delivered
+          Rescheduled = left.Rescheduled + right.Rescheduled
+          Abandoned = left.Abandoned + right.Abandoned
+          LeaseLost = left.LeaseLost + right.LeaseLost }
+
+/// <summary>
+/// Drains the queue a commit writes into, delivering each action through an application handler.
+///
+/// Unordered by design. The order that matters was settled when the commands committed; holding
+/// one entity's actions in sequence behind a slow destination would stall every other entity for
+/// no benefit, because the audit record already says what happened and in what order.
+/// </summary>
+type ActionDispatcher<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectError when 'EntityId: equality>
+    internal
     (
-        outbox: IActionOutbox<'EntityId, 'Action>,
-        handler: OutboxKey<'EntityId> -> 'Action -> CancellationToken -> Task<Result<unit, 'EffectError>>,
-        validatedPolicy: ValidatedRetryPolicy,
-        timeProvider: TimeProvider,
+        config: RuntimeConfig<'EntityId, 'State, 'Event, 'Action, 'Err>,
+        handler: ActionHandler<'EntityId, 'Action, 'EffectError>,
         signal: WorkSignal
     ) =
 
-    let policy = ValidatedRetryPolicy.value validatedPolicy
+    let policy = ValidatedProcessorPolicy.value config.Processor
+    let queue = config.Store :> IActionQueue<'EntityId, 'Action>
+    let machineId = config.MachineId
+    let machineName = MachineId.value machineId
+    let logger = config.Logger
 
-    let storeResult (work: Task<Result<unit, StoreError>>) : Task<Result<unit, WorkerError>> =
+    let fenced (outcome: Result<LeaseUpdateOutcome, StoreError>) (settled: DeliveryOutcome) =
+        match outcome with
+        | Ok Updated -> settled
+        | Ok(LeaseUpdateOutcome.LeaseLost)
+        | Error _ -> Unfenced
+
+    let deliver (action: LeasedAction<'EntityId, 'Action>) (ct: CancellationToken) =
         task {
-            let! result = work
-            return Result.mapError StoreFailure result
+            // The user's handler is one of the four places this library catches. It is arbitrary
+            // application code reaching arbitrary external systems, and a throw from it means a
+            // failed delivery rather than a broken worker.
+            let! attempt = handler action ct |> TaskOutcome.capture
+
+            let succeeded =
+                match attempt with
+                | Ok(Ok()) -> true
+                | Ok(Error _)
+                | Error _ -> false
+
+            if succeeded then
+                let! outcome = queue.Complete(action, ct)
+                return fenced outcome Delivered
+            elif action.DeliveryCount >= policy.MaxAttempts then
+                let! outcome = queue.Abandon(action, $"undelivered after %d{action.DeliveryCount} attempts", ct)
+                return fenced outcome GaveUp
+            else
+                let! outcome = queue.Reschedule(action, policy.Backoff, ct)
+                return fenced outcome Retrying
         }
 
-    let processItem
-        (item: OutboxItem<'EntityId, 'Action>)
-        (ct: CancellationToken)
-        : Task<Result<ActionItemOutcome, WorkerError>> =
-        task {
-            let! result = handler item.ActionKey item.Action ct
+    let log (action: LeasedAction<'EntityId, 'Action>) (outcome: DeliveryOutcome) =
+        let commandId = CommandId.value action.Work.CommandId
 
-            match result with
-            | Ok() ->
-                let! completed = storeResult (outbox.Complete(item.ActionKey, ct))
-                return Result.map (fun () -> ActionCompleted) completed
-            | Error _ ->
-                if item.Attempts >= policy.MaxAttempts then
-                    let! completed = storeResult (outbox.Complete(item.ActionKey, ct))
-                    return Result.map (fun () -> ActionAbandoned) completed
+        match outcome with
+        | Delivered ->
+            logger.LogInformation(
+                DispatcherEvents.delivered,
+                "Delivered action {Ordinal} of command {CommandId} for machine {MachineId}.",
+                action.Work.Ordinal,
+                commandId,
+                machineName
+            )
+        | Retrying ->
+            logger.LogWarning(
+                DispatcherEvents.rescheduled,
+                "Rescheduled action {Ordinal} of command {CommandId} for machine {MachineId} after {Deliveries} deliveries.",
+                action.Work.Ordinal,
+                commandId,
+                machineName,
+                action.DeliveryCount
+            )
+        | GaveUp ->
+            logger.LogError(
+                DispatcherEvents.abandoned,
+                "Abandoned action {Ordinal} of command {CommandId} for machine {MachineId} after {Deliveries} deliveries.",
+                action.Work.Ordinal,
+                commandId,
+                machineName,
+                action.DeliveryCount
+            )
+        | Unfenced ->
+            logger.LogWarning(
+                DispatcherEvents.leaseLost,
+                "Lost the lease on action {Ordinal} of command {CommandId} for machine {MachineId}.",
+                action.Work.Ordinal,
+                commandId,
+                machineName
+            )
+
+    let report (outcomes: DeliveryOutcome list) : DeliveryReport =
+        outcomes
+        |> List.fold
+            (fun running outcome ->
+                match outcome with
+                | Delivered ->
+                    { running with
+                        Delivered = running.Delivered + 1 }
+                | Retrying ->
+                    { running with
+                        Rescheduled = running.Rescheduled + 1 }
+                | GaveUp ->
+                    { running with
+                        Abandoned = running.Abandoned + 1 }
+                | Unfenced ->
+                    { running with
+                        LeaseLost = running.LeaseLost + 1 })
+            { DeliveryReport.empty with
+                Claimed = List.length outcomes }
+
+    /// <summary>Claims one batch of actions and delivers them, bounded by the policy's concurrency.</summary>
+    member _.PollAsync(ct: CancellationToken) : Task<Result<DeliveryReport, MachineError<'Err>>> =
+        taskResult {
+            let! batch =
+                queue.Claim(machineId, policy.Batch, policy.Lease, ct)
+                |> TaskResult.mapError MachineError.Store
+
+            match batch with
+            | [] -> return DeliveryReport.empty
+            | claimed ->
+                logger.LogDebug(
+                    DispatcherEvents.claimed,
+                    "Claimed {Count} actions for machine {MachineId}.",
+                    List.length claimed,
+                    machineName
+                )
+
+                use gate = new SemaphoreSlim(policy.Concurrency)
+
+                let run (action: LeasedAction<'EntityId, 'Action>) =
+                    task {
+                        do! gate.WaitAsync ct
+
+                        try
+                            let! outcome = deliver action ct
+                            log action outcome
+                            return outcome
+                        finally
+                            gate.Release() |> ignore
+                    }
+
+                let! outcomes = claimed |> List.map run |> Task.WhenAll
+                return report (List.ofArray outcomes)
+        }
+
+    /// <summary>
+    /// Polls until cancelled, returning the totals for the run.
+    ///
+    /// Unlike the command processor there is no escalation: an action that cannot be delivered is
+    /// abandoned after its attempts and recorded, which is a fact about that action rather than
+    /// about this worker.
+    /// </summary>
+    member this.RunAsync(ct: CancellationToken) : Task<DeliveryReport> =
+        let waitForWork () =
+            task {
+                try
+                    let! _ = signal.WaitOrTimeoutAsync(policy.PollingInterval, config.TimeProvider, ct)
+                    return true
+                with :? OperationCanceledException when ct.IsCancellationRequested ->
+                    return false
+            }
+
+        let rec loop (totals: DeliveryReport) =
+            task {
+                if ct.IsCancellationRequested then
+                    return totals
                 else
-                    let next = timeProvider.GetUtcNow().Add policy.Delay
-                    let! failed = storeResult (outbox.Fail(item.ActionKey, next, ct))
-                    return Result.map (fun () -> ActionRescheduled) failed
-        }
+                    let! outcome = this.PollAsync ct
 
-    let processBatch
-        (items: OutboxItem<'EntityId, 'Action> list)
-        (ct: CancellationToken)
-        : Task<Result<PollSummary, WorkerError>> =
-        task {
-            use semaphore = new SemaphoreSlim(policy.Concurrency)
+                    let totals =
+                        match outcome with
+                        | Ok report -> DeliveryReport.add totals report
+                        | Error error ->
+                            logger.LogWarning(
+                                DispatcherEvents.pollFailed,
+                                "Action poll failed for machine {MachineId}: {Failure}.",
+                                machineName,
+                                (match error with
+                                 | Store _ -> "store"
+                                 | Timeout _ -> "timeout"
+                                 | CircuitOpen _ -> "circuit-open"
+                                 | _ -> "unclassified")
+                            )
 
-            let run (item: OutboxItem<'EntityId, 'Action>) =
-                task {
-                    do! semaphore.WaitAsync(ct)
-                    let! outcome = processItem item ct |> TaskOutcome.capture
-                    semaphore.Release() |> ignore
+                            totals
 
                     match outcome with
-                    | Ok result -> return result
-                    | Error error -> return raise error
-                }
+                    | Ok report when report.Claimed = policy.Batch -> return! loop totals
+                    | _ ->
+                        match! waitForWork () with
+                        | true -> return! loop totals
+                        | false -> return totals
+            }
 
-            let! outcomes = items |> List.map run |> Task.WhenAll
-
-            let folder summary outcome =
-                match summary, outcome with
-                | Error error, _ -> Error error
-                | _, Error error -> Error error
-                | Ok current, Ok ActionCompleted ->
-                    Ok
-                        { current with
-                            Completed = current.Completed + 1 }
-                | Ok current, Ok ActionRescheduled ->
-                    Ok
-                        { current with
-                            Rescheduled = current.Rescheduled + 1 }
-                | Ok current, Ok ActionAbandoned ->
-                    Ok
-                        { current with
-                            Abandoned = current.Abandoned + 1 }
-
-            return
-                outcomes
-                |> Array.fold
-                    folder
-                    (Ok
-                        { Claimed = items.Length
-                          Completed = 0
-                          Rescheduled = 0
-                          Abandoned = 0 })
-        }
-
-    /// <summary>Constructs a dispatcher after validating a raw durable retry policy.</summary>
-    new
-        (
-            outbox: IActionOutbox<'EntityId, 'Action>,
-            handler: OutboxKey<'EntityId> -> 'Action -> CancellationToken -> Task<Result<unit, 'EffectError>>,
-            policy: RetryPolicy,
-            timeProvider: TimeProvider,
-            signal: WorkSignal
-        ) =
-        ActionDispatcher<'EntityId, 'Action, 'EffectError>(
-            outbox,
-            handler,
-            ActionDispatcherPolicy.validate policy,
-            timeProvider,
-            signal
-        )
-
-    /// <summary>Claims and dispatches one batch of due actions.</summary>
-    member _.PollAsync(ct: CancellationToken) : Task<Result<PollSummary, WorkerError>> =
-        task {
-            let! claimed = outbox.Claim(policy.BatchSize, policy.Lease, ct)
-
-            match claimed with
-            | Ok items -> return! processBatch items ct
-            | Error error -> return Error(StoreFailure error)
-        }
-
-    /// <summary>Polls until the token is cancelled, waking on the signal or the poll interval.</summary>
-    member this.RunAsync(ct: CancellationToken) : Task<Result<unit, WorkerError>> =
-        task {
-            let mutable outcome: Result<unit, WorkerError> option = None
-
-            while outcome.IsNone && not ct.IsCancellationRequested do
-                let! polled = this.PollAsync ct
-
-                match polled with
-                | Error error -> outcome <- Some(Error error)
-                | Ok _ ->
-                    let! signalOpen = signal.WaitOrTimeoutAsync(policy.PollingInterval, timeProvider, ct)
-
-                    if not signalOpen then
-                        outcome <- Some(Ok())
-
-            return
-                match outcome with
-                | Some result -> result
-                | None -> Ok()
-        }
-
-/// <summary>Construction helpers for machine-bound outbox dispatchers.</summary>
-[<RequireQualifiedAccess>]
-module ActionDispatcher =
-
-    /// <summary>Creates a dispatcher that shares the machine's outbox and wake signal.</summary>
-    let forMachine
-        (handler: OutboxKey<'EntityId> -> 'Action -> CancellationToken -> Task<Result<unit, 'EffectError>>)
-        (machine: Machine<'EntityId, 'State, 'Event, 'Action, 'Err>)
-        : ActionDispatcher<'EntityId, 'Action, 'EffectError> =
-        let config = Machine.config machine
-
-        ActionDispatcher(config.Outbox, handler, config.RetryPolicy, config.TimeProvider, Machine.outboxSignal machine)
+        loop DeliveryReport.empty
