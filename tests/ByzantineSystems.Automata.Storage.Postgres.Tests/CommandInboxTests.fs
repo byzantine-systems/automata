@@ -151,10 +151,12 @@ let tests =
               let! (blocked: Claimed list) = claim inbox 10
               Expect.isEmpty blocked "nothing else for the entity is claimable while its head is leased"
 
-              let! outcome =
-                  inbox.Acknowledge(head.Work.CommandId, head.Token, TerminalStatus.Succeeded, noCancellation)
+              let! outcome = (newProcessor ()).Reject(head.Work.CommandId, head.Token, Refused "done", noCancellation)
 
-              Expect.equal (outcome |> expectOk "ack") Updated "the fenced acknowledgement should succeed"
+              Expect.equal
+                  (outcome |> expectOk "finalize")
+                  (Finalized Epoch.initial)
+                  "the fenced terminal write should succeed"
 
               let! (next: Claimed) = claimOne inbox
               Expect.equal next.Work.IdempotencyKey "second" "finishing the head releases the entity"
@@ -170,9 +172,12 @@ let tests =
               let! (head: Claimed) = claimOne inbox
 
               let! outcome =
-                  inbox.Acknowledge(head.Work.CommandId, head.Token, TerminalStatus.DeadLettered, noCancellation)
+                  (newProcessor ()).DeadLetter(head.Work.CommandId, head.Token, Refused "poison", noCancellation)
 
-              Expect.equal (outcome |> expectOk "dead letter") Updated "dead-lettering is a terminal acknowledgement"
+              Expect.equal
+                  (outcome |> expectOk "dead letter")
+                  (Finalized Epoch.initial)
+                  "dead-lettering is a terminal write"
 
               let! (next: Claimed) = claimOne inbox
               Expect.equal next.Work.IdempotencyKey "healthy" "the entity keeps moving after a command is abandoned"
@@ -203,10 +208,12 @@ let tests =
                   (LeaseToken.value first.Token)
                   "tokens are monotone, so a stale one is strictly lower"
 
-              let! stale =
-                  inbox.Acknowledge(first.Work.CommandId, first.Token, TerminalStatus.Succeeded, noCancellation)
+              let! stale = (newProcessor ()).Reject(first.Work.CommandId, first.Token, Refused "stale", noCancellation)
 
-              Expect.equal (stale |> expectOk "stale ack") LeaseLost "the reclaimed worker cannot finish the command"
+              Expect.equal
+                  (stale |> expectOk "stale finalize")
+                  FinalizeOutcome.LeaseLost
+                  "the reclaimed worker cannot finish the command"
           }
 
           testTask "a stale token cannot acknowledge, reschedule or extend" {
@@ -219,8 +226,9 @@ let tests =
               let stale: LeaseToken<CommandWork> =
                   LeaseToken.ofInt64 (LeaseToken.value head.Token - 1L)
 
-              let! acked = inbox.Acknowledge(head.Work.CommandId, stale, TerminalStatus.Succeeded, noCancellation)
-              Expect.equal (acked |> expectOk "ack") LeaseLost "acknowledging is fenced"
+              let! finalized = (newProcessor ()).Reject(head.Work.CommandId, stale, Refused "stale", noCancellation)
+
+              Expect.equal (finalized |> expectOk "finalize") FinalizeOutcome.LeaseLost "finishing a command is fenced"
 
               let! rescheduled = inbox.Reschedule(head.Work.CommandId, stale, backoff, noCancellation)
               Expect.equal (rescheduled |> expectOk "reschedule") LeaseLost "rescheduling is fenced"
@@ -367,22 +375,18 @@ let tests =
                           | batch ->
                               for leased in batch do
                                   let! outcome =
-                                      inbox.Acknowledge(
-                                          leased.Work.CommandId,
-                                          leased.Token,
-                                          TerminalStatus.Succeeded,
-                                          noCancellation
-                                      )
+                                      (newProcessor ())
+                                          .Reject(leased.Work.CommandId, leased.Token, Refused "done", noCancellation)
 
-                                  outcome |> expectOk "worker ack" |> ignore
+                                  outcome |> expectOk "worker finalize" |> ignore
                   }
 
               let! _ = Task.WhenAll [ for _ in 1..4 -> worker () ]
 
               Expect.equal
-                  (scalar<int64> "SELECT count(*) FROM fsm.command WHERE status <> 'succeeded'")
+                  (scalar<int64> "SELECT count(*) FROM fsm.command WHERE status IN ('ready', 'leased')")
                   0L
-                  "every command should have been processed exactly once"
+                  "every command should have reached a terminal state exactly once"
 
               // Per entity, the order commands reached a terminal state must be their submission
               // order. command_id is assigned at submission and seq is derived from it, so a

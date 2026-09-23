@@ -10,6 +10,7 @@
         <Compile Include="Store.fs" />
         <Compile Include="Command.fs" />
         <Compile Include="ChartRegistry.fs" />
+        <Compile Include="Processing.fs" />
         <Compile Include="Supervision.fs" />
     </ItemGroup>
 

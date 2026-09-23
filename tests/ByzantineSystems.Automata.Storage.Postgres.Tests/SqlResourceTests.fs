@@ -9,7 +9,8 @@ open Expecto
 let private expected =
     [ "command", "submit"
       "command", "claim"
-      "command", "ack"
+      "command", "finalize"
+      "command", "result"
       "command", "reschedule"
       "command", "extend_lease"
       "command", "by_id"

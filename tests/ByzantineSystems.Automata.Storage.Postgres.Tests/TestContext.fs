@@ -15,8 +15,18 @@ type TestEvent =
     | Start of int
     | Finish
 
+type TestState =
+    | Idle
+    | Active of int
+
+type TestAction = Notify of string
+
+type TestError = Refused of reason: string
+
 type Entity = EntityId<TestEntity>
 type Inbox = ICommandInbox<Entity, TestEvent>
+type Processor = ICommandProcessorStore<Entity, TestState, TestEvent, TestAction, TestError>
+type Reader = IStateReader<Entity, TestState>
 
 let machine = machineId "pg-tests"
 let noCancellation = CancellationToken.None
@@ -76,8 +86,9 @@ let reset () : Task =
 
         use cmd =
             new NpgsqlCommand(
-                "TRUNCATE fsm.command, fsm.machine_chart_version, fsm.supervision_event,
-                          fsm.instance_state, fsm.instance_state_history RESTART IDENTITY;
+                "TRUNCATE fsm.command, fsm.command_error, fsm.transition, fsm.machine_chart_version,
+                          fsm.supervision_event, fsm.instance_state, fsm.instance_state_history
+                          RESTART IDENTITY;
                  INSERT INTO fsm.machine_chart_version (machine_id, version, fingerprint)
                  VALUES (@machine_id, @version, @fingerprint);",
                 conn
@@ -100,6 +111,38 @@ let newInbox () : Inbox =
           EntityIdDecode = decode }
     )
     :> Inbox
+
+let private processorStore () =
+    let encode, decode = EntityKey.forEntityId<TestEntity>
+
+    PostgresCommandProcessorStore<Entity, TestState, TestEvent, TestAction, TestError>(
+        { DataSource = dataSource ()
+          StateCodec = Serialization.systemTextJson<TestState> ()
+          EventCodec = Serialization.systemTextJson<TestEvent> ()
+          ActionCodec = Serialization.systemTextJson<TestAction list> ()
+          ErrorCodec = Serialization.systemTextJson<TestError> ()
+          EntityIdEncode = encode
+          EntityIdDecode = decode }
+    )
+
+let newProcessor () : Processor = processorStore () :> Processor
+
+let newReader () : Reader = processorStore () :> Reader
+
+/// A minimal committed transition, for tests that care about what finalize does to the inbox and
+/// the log rather than about the chart that produced it.
+let draft (entity: Entity) (fromState: TestState) (toState: TestState) (effectiveAt: DateTimeOffset) =
+    { MachineId = machine
+      EntityId = entity
+      Event = Finish
+      Actions = [ Notify "done" ]
+      FromState = fromState
+      ToState = toState
+      HandledBy = stateId "root"
+      Exited = []
+      Entered = []
+      Status = Running
+      EffectiveAt = effectiveAt }
 
 let newRegistry () : IChartRegistry =
     PostgresChartRegistry({ DataSource = dataSource () }) :> IChartRegistry

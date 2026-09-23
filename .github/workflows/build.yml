@@ -47,8 +47,8 @@ jobs:
     runs-on: ubuntu-latest
 
     # PostgreSQL comes from the devenv shell rather than a services: container, so CI runs the
-    # same server as local development: the pinned postgresql_18 from the flake, with pgmq and
-    # pg_cron built against it and the settings in flake.nix applied. The official postgres:18
+    # same server as local development: the pinned postgresql_19 from the flake, with pgmq and
+    # pg_cron built against it and the settings in flake.nix applied. The official postgres:19
     # image ships neither extension, and the command inbox is only the first part of this schema
     # to need neither.
     env:

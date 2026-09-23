@@ -91,6 +91,9 @@ module internal Row =
     let timestamp (reader: NpgsqlDataReader) (name: string) : DateTimeOffset =
         Db.fromTimestamp (reader.GetDateTime(reader.GetOrdinal name))
 
+    let textArray (reader: NpgsqlDataReader) (name: string) : string list =
+        reader.GetFieldValue<string array>(reader.GetOrdinal name) |> List.ofArray
+
     /// <summary>
     /// Reads a text column whose empty value means "not supplied". No column in the schema is
     /// nullable, so absence is the empty string on the way out and <c>None</c> on the way in.

@@ -1,7 +1,7 @@
 # PostgreSQL schema evolution
 
 `ByzantineSystems.Automata.Storage.Postgres` embeds its SQL and applies it through
-`Migrator.migrate`. The schema requires PostgreSQL 18 and one extension, `btree_gist`, for the
+`Migrator.migrate`. The schema requires PostgreSQL 19 and one extension, `btree_gist`, for the
 temporal keys. `btree_gist` is trusted, so a role with `CREATE` on the database can install it
 without superuser. The command inbox on its own still needs no extension.
 
@@ -18,10 +18,11 @@ Two embedded trees, with different lifecycles and different jobs.
     `fsm.command` references it.
   - `002_command.sql` is `fsm.command`, its domains, constraints and indexes.
   - `003_instance_state.sql` is the bitemporal belief table and its history twin.
-  - `004_supervision.sql` is the supervision audit log.
+  - `004_transition.sql` is the append-only transition log.
+  - `005_supervision.sql` is the supervision audit log.
 - `migrations/repeatable/*.sql` are reapplied whenever their content changes. Routines live in
-  `R__command_routines.sql`, `R__chart_routines.sql` and `R__temporal_routines.sql`, one file per
-  domain, as `CREATE OR REPLACE`, so editing a routine body is an edit to its own migration
+  `R__command_routines.sql`, `R__chart_routines.sql`, `R__temporal_routines.sql` and
+  `R__finalize_routines.sql`, one file per domain, as `CREATE OR REPLACE`, so editing a routine body is an edit to its own migration
   rather than a new file. `R__temporal_routines.sql` also carries a `CREATE OR REPLACE TRIGGER`,
   because `main` runs before `repeatable` and a trigger declared beside its table would reference
   a function that does not exist yet.
@@ -75,7 +76,23 @@ wanted: the twin has neither the temporal key nor the trigger, so the `CHECK` co
 only defence against a zero-width row.
 
 Valid-time mutations go through `fsm.close_and_open`, never through a direct `UPDATE` of
-`valid_during`, so the close-then-insert split exists in one place.
+`valid_during`, so the split exists in one place. It delegates the actual
+`UPDATE … FOR PORTION OF` to `fsm.split_belief`, because that clause will not accept a plpgsql
+variable as a bound: the bound expressions are parsed without plpgsql's variable substitution, so
+a variable there reads as a column reference and the statement fails. A SQL function's parameters
+work, which is what `fsm.split_belief` is.
+
+## The transition log and the epoch
+
+`fsm.transition` is append-only, one row per finalized command that changed state. Its primary
+key `(machine_id, entity_id, epoch)` makes the epoch gapless per entity, and
+`transition_unique_command` makes one command's transition unique, so a retried finalize cannot
+append twice however the routine above it behaves.
+
+Nothing serialises finalizers explicitly. At most one command per entity is claimable, so at most
+one worker can be finalizing an entity at a time; the key is the backstop for that reasoning
+rather than the mechanism behind it. `fsm.instance_state.epoch` denormalises the same value so a
+current-state read is one lookup rather than a join.
 
 ## Adding a change
 

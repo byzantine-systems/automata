@@ -187,7 +187,7 @@
             packages = with pkgs; [
               bash
               gnumake
-              postgresql_18
+              postgresql_19
 
               # for dotnet
               netcoredbg
@@ -202,7 +202,7 @@
 
             services.postgres = {
               enable = true;
-              package = pkgs.postgresql_18;
+              package = pkgs.postgresql_19;
               extensions = ext: [
                 ext.pg_cron
                 ext.pgmq

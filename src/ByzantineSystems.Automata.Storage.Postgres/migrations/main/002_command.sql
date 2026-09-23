@@ -186,6 +186,33 @@ WHERE
     status IN ('ready', 'leased');
 
 -- ---------------------------------------------------------------------------
+-- fsm.command_error: why a command was rejected or dead-lettered.
+--
+-- A separate table rather than a column on fsm.command, for three reasons that
+-- all point the same way. The claim path scans fsm.command and never reads an
+-- error, so carrying one inline widens every row that path touches to no
+-- purpose. Most commands succeed, so the column would be empty on nearly every
+-- row. And a succeeded command's result already lives elsewhere, in
+-- fsm.transition, so keeping a failed command's result inline would make
+-- "what happened to this command" two different shapes.
+--
+-- What makes finalize idempotent stays on fsm.command regardless: status says a
+-- result exists and lease_token says who wrote it. This table holds the
+-- payload, never the fence.
+--
+-- The primary key is the command, so a command owns at most one error.
+-- ---------------------------------------------------------------------------
+CREATE TABLE fsm.command_error (
+    command_id bigint PRIMARY KEY,
+    error jsonb NOT NULL,
+    -- When we gave up: the failure path's counterpart to
+    -- fsm.transition.committed_at, which a rejected command never writes. Same
+    -- clock as that column, since they answer the same question.
+    recorded_at timestamptz NOT NULL DEFAULT STATEMENT_TIMESTAMP(),
+    CONSTRAINT command_error_command_fkey FOREIGN KEY (command_id) REFERENCES fsm.command (command_id)
+);
+
+-- ---------------------------------------------------------------------------
 -- Storage
 -- ---------------------------------------------------------------------------
 -- TODO: no autovacuum or fillfactor settings. This table churns and will

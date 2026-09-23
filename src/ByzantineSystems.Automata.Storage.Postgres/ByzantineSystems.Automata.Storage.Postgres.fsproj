@@ -12,6 +12,7 @@
         <Compile Include="SqlResources.fs" />
         <Compile Include="PostgresCommandInbox.fs" />
         <Compile Include="PostgresChartRegistry.fs" />
+        <Compile Include="PostgresCommandProcessorStore.fs" />
         <Compile Include="PostgresSupervisionStore.fs" />
         <Compile Include="Migrator.fs" />
     </ItemGroup>

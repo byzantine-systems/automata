@@ -13,11 +13,10 @@
 -- the operation genuinely needs more than one statement, LANGUAGE sql
 -- everywhere else.
 --
---   * fsm.submit_command and fsm.ack_command are plpgsql because they need
---     ordered statements. Sibling data-modifying parts of a single SQL
---     statement share one snapshot, run in no defined order, and cannot see
---     each other's effects, and both of those routines depend on seeing the
---     previous statement's effect. See fsm.ack_command.
+--   * fsm.submit_command is plpgsql because it needs ordered statements.
+--     Sibling data-modifying parts of a single SQL statement share one
+--     snapshot, run in no defined order, and cannot see each other's effects,
+--     and it depends on seeing the previous statement's effect.
 --   * Everything else is one query, so it is LANGUAGE sql: plannable, with no
 --     procedural call overhead on paths that run once per command. It also
 --     means the claim's body can be read back out of the catalog and EXPLAINed
@@ -248,89 +247,6 @@ WHERE
     c.command_id = candidate.command_id
 RETURNING
     c.*;
-$$;
-
--- ---------------------------------------------------------------------------
--- fsm.ack_command: finish a leased command and release its entity.
---
--- Fenced. The lease token the claim handed out is required, so a worker that
--- stalled past its lease and woke to find its command reclaimed gets
--- 'lease_lost' and changes nothing. That is the whole reason the token exists
--- rather than acknowledging by id alone.
---
--- 'dead_letter' is terminal and therefore unblocks the entity. A command we
--- have given up on must not wedge an entity forever, and the gap it leaves is
--- recorded in the inbox and visible in the audit trail. A dependency graph
--- would make the opposite choice, since a failed parent should block its
--- children, but this is a per-entity queue and stopping the entity is the
--- larger harm.
---
--- Two statements rather than one data-modifying CTE, deliberately. Sibling
--- modifying parts of one statement share a single snapshot and communicate only
--- through RETURNING, so a one-statement version would still see the row it had
--- just terminated as open and could re-elect it as the entity's head; and
--- command_entity_head_idx would be asked to accept the new head's entry while
--- the old head's pre-update tuple was still present in it. Sequential plpgsql
--- statements have neither problem, and the cost is one extra index lookup.
--- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fsm.ack_command (p_command_id bigint, p_lease_token bigint, p_status fsm.command_status)
-    RETURNS fsm.lease_outcome
-    LANGUAGE plpgsql
-    VOLATILE PARALLEL UNSAFE
-    SET search_path = pg_catalog, fsm
-    AS $$
-DECLARE
-    v_machine_id text;
-    v_entity_id text;
-BEGIN
-    IF p_status NOT IN ('succeeded', 'rejected', 'dead_letter') THEN
-        RAISE EXCEPTION 'fsm.ack_command: % is not a terminal status', p_status
-            USING ERRCODE = 'invalid_parameter_value';
-    END IF;
-    -- The expected prior state is encoded in the statement, so zero rows means
-    -- the precondition was false and there is no read-then-write race to lose.
-    -- status = 'leased' is not redundant with the token test: it rejects a second
-    -- acknowledgement of a command already terminated by this same token.
-    UPDATE
-        fsm.command c
-    SET
-        status = p_status
-    WHERE
-        c.command_id = p_command_id
-        AND c.lease_token = p_lease_token
-        AND c.status = 'leased'
-    RETURNING
-        c.machine_id,
-        c.entity_id
-    INTO
-        v_machine_id,
-        v_entity_id;
-    IF NOT FOUND THEN
-        RETURN 'lease_lost';
-    END IF;
-    -- Promote the entity's next command to head. This statement sees the terminal
-    -- status written above, so the row just acknowledged cannot be selected. If
-    -- nothing open remains, the subquery yields NULL and the update touches no
-    -- rows.
-    UPDATE
-        fsm.command c
-    SET
-        blocked = FALSE
-    WHERE
-        c.command_id = (
-            SELECT
-                n.command_id
-            FROM
-                fsm.command n
-            WHERE
-                n.machine_id = v_machine_id
-                AND n.entity_id = v_entity_id
-                AND n.status IN ('ready', 'leased')
-            ORDER BY
-                n.seq
-            LIMIT 1);
-    RETURN 'updated';
-END;
 $$;
 
 -- ---------------------------------------------------------------------------

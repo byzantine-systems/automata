@@ -8,6 +8,10 @@ SELECT
     s.machine_id,
     s.entity_id,
     s.state,
+    s.status,
+    s.epoch,
+    s.command_id,
+    s.chart_version,
     s.valid_during,
     s.system_time
 FROM

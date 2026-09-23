@@ -9,8 +9,8 @@ open TestContext
 /// without the split routine's behaviour mixed in.
 let private insertBelief (entity: string) (state: string) (validFrom: string) =
     exec
-        $"INSERT INTO fsm.instance_state (machine_id, entity_id, state, valid_during)
-          VALUES ('pg-tests', '{entity}', '{state}'::jsonb, tstzrange('{validFrom}', 'infinity', '[)'))"
+        $"INSERT INTO fsm.instance_state (machine_id, entity_id, state, status, epoch, command_id, chart_version, valid_during)
+          VALUES ('pg-tests', '{entity}', '{state}'::jsonb, 'running', 1, 1, 1, tstzrange('{validFrom}', 'infinity', '[)'))"
     |> function
         | Ok() -> ()
         | Error error -> failtestf "insert failed: %s" error.Message
@@ -19,7 +19,7 @@ let private closeAndOpen (entity: string) (at: string) (state: string) : Result<
     try
         Ok(
             scalar<string>
-                $"SELECT outcome FROM fsm.close_and_open('pg-tests', '{entity}', '{at}'::timestamptz, '{state}'::jsonb)"
+                $"SELECT outcome FROM fsm.close_and_open('pg-tests', '{entity}', '{at}'::timestamptz, '{state}'::jsonb, 'running', 1, 1, 1)"
         )
     with error ->
         Error error
@@ -72,8 +72,8 @@ let tests =
 
               exec
                   "BEGIN;
-                   INSERT INTO fsm.instance_state (machine_id, entity_id, state, valid_during)
-                   VALUES ('pg-tests', 'e1', '{\"v\":1}'::jsonb, tstzrange('2026-01-01', 'infinity', '[)'));
+                   INSERT INTO fsm.instance_state (machine_id, entity_id, state, status, epoch, command_id, chart_version, valid_during)
+                   VALUES ('pg-tests', 'e1', '{\"v\":1}'::jsonb, 'running', 1, 1, 1, tstzrange('2026-01-01', 'infinity', '[)'));
                    UPDATE fsm.instance_state SET state = '{\"v\":2}' WHERE entity_id = 'e1';
                    COMMIT;"
               |> function
@@ -139,8 +139,8 @@ let tests =
               for table in [ "fsm.instance_state"; "fsm.instance_state_history" ] do
                   match
                       exec
-                          $"INSERT INTO {table} (machine_id, entity_id, state, valid_during)
-                            VALUES ('pg-tests', 'e1', '{{}}'::jsonb, tstzrange('2026-01-01', '2026-01-01', '[)'))"
+                          $"INSERT INTO {table} (machine_id, entity_id, state, status, epoch, command_id, chart_version, valid_during)
+                            VALUES ('pg-tests', 'e1', '{{}}'::jsonb, 'running', 1, 1, 1, tstzrange('2026-01-01', '2026-01-01', '[)'))"
                   with
                   | Ok() -> failtestf "an empty valid-time range should be impossible in %s" table
                   | Error error -> Expect.stringContains error.Message "instance_state_valid_half_open" $"in {table}"
@@ -154,8 +154,8 @@ let tests =
               do! reset ()
 
               exec
-                  "INSERT INTO fsm.instance_state (machine_id, entity_id, state, valid_during, system_time)
-                   VALUES ('pg-tests', 'e1', '{}'::jsonb, tstzrange('2026-01-01', 'infinity', '[)'),
+                  "INSERT INTO fsm.instance_state (machine_id, entity_id, state, status, epoch, command_id, chart_version, valid_during, system_time)
+                   VALUES ('pg-tests', 'e1', '{}'::jsonb, 'running', 1, 1, 1, tstzrange('2026-01-01', 'infinity', '[)'),
                            tstzrange('2026-01-01', '2026-01-01', '[)'))"
               |> function
                   | Ok() -> ()
@@ -174,8 +174,8 @@ let tests =
 
               match
                   exec
-                      "INSERT INTO fsm.instance_state_history (machine_id, entity_id, state, valid_during, system_time)
-                       VALUES ('pg-tests', 'e1', '{}'::jsonb, tstzrange('2026-01-01', 'infinity', '[)'),
+                      "INSERT INTO fsm.instance_state_history (machine_id, entity_id, state, status, epoch, command_id, chart_version, valid_during, system_time)
+                       VALUES ('pg-tests', 'e1', '{}'::jsonb, 'running', 1, 1, 1, tstzrange('2026-01-01', 'infinity', '[)'),
                                tstzrange('2026-01-01', '2026-01-01', '[)'))"
               with
               | Ok() -> failtest "an empty belief window should be impossible"
@@ -191,8 +191,8 @@ let tests =
 
               match
                   exec
-                      "INSERT INTO fsm.instance_state (machine_id, entity_id, state, valid_during)
-                       VALUES ('pg-tests', 'e1', '{}'::jsonb, tstzrange('2026-01-01', '2026-02-01', '[]'))"
+                      "INSERT INTO fsm.instance_state (machine_id, entity_id, state, status, epoch, command_id, chart_version, valid_during)
+                       VALUES ('pg-tests', 'e1', '{}'::jsonb, 'running', 1, 1, 1, tstzrange('2026-01-01', '2026-02-01', '[]'))"
               with
               | Ok() -> failtest "only half-open ranges should be storable"
               | Error error ->
@@ -208,8 +208,8 @@ let tests =
 
               match
                   exec
-                      "INSERT INTO fsm.instance_state (machine_id, entity_id, state, valid_during)
-                       VALUES ('pg-tests', 'e1', '{}'::jsonb, tstzrange('2026-06-01', 'infinity', '[)'))"
+                      "INSERT INTO fsm.instance_state (machine_id, entity_id, state, status, epoch, command_id, chart_version, valid_during)
+                       VALUES ('pg-tests', 'e1', '{}'::jsonb, 'running', 1, 1, 1, tstzrange('2026-06-01', 'infinity', '[)'))"
               with
               | Ok() -> failtest "one entity cannot hold two beliefs about the same instant"
               | Error error ->

@@ -97,17 +97,6 @@ type CommandStatus =
     | DeadLettered
 
 /// <summary>
-/// The statuses a command may be acknowledged into. A separate type from
-/// <see cref="T:ByzantineSystems.Automata.Storage.CommandStatus" /> so that acknowledging a
-/// command back into Ready or Leased cannot be expressed at all.
-/// </summary>
-[<RequireQualifiedAccess>]
-type TerminalStatus =
-    | Succeeded
-    | Rejected
-    | DeadLettered
-
-/// <summary>
 /// Who caused a command and why, recorded beside it. Every field is the application's; nothing
 /// in the claim path reads them. Absent and blank are the same thing here, so absence is
 /// <c>None</c> and the store writes the empty string.
@@ -270,11 +259,6 @@ type ICommandInbox<'EntityId, 'Event> =
     abstract Claim:
         machineId: MachineId * batch: int * lease: TimeSpan * ct: CancellationToken ->
             Task<Result<LeasedCommand<'EntityId, 'Event> list, StoreError>>
-
-    /// <summary>Terminates a leased command and releases its entity to the next one.</summary>
-    abstract Acknowledge:
-        commandId: CommandId * token: LeaseToken<CommandWork> * status: TerminalStatus * ct: CancellationToken ->
-            Task<Result<LeaseUpdateOutcome, StoreError>>
 
     /// <summary>
     /// Returns a failed command for a later attempt. It keeps its place in the entity's order, so

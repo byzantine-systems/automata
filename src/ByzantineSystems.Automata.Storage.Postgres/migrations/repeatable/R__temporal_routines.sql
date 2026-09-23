@@ -86,41 +86,82 @@ CREATE OR REPLACE TRIGGER instance_state_versioning_trigger
     EXECUTE FUNCTION fsm.temporal_versioning ();
 
 -- ---------------------------------------------------------------------------
--- fsm.close_and_open: the one valid-time split.
+-- fsm.split_belief: the portion update, and why it is its own routine.
 --
--- Every valid-time mutation routes through here, so the close-then-insert is
--- written and tested once instead of being re-derived at each call site.
+-- UPDATE ... FOR PORTION OF will not take a plpgsql variable as a bound. On
+-- 19beta3 the bound expressions are parsed without plpgsql's variable
+-- substitution, so a variable there is read as a column reference and the
+-- statement fails with "cannot use column reference in FOR PORTION OF
+-- expression". A prepared statement's parameters work, and so do a SQL
+-- function's, which is what this is.
 --
--- TODO: PostgreSQL 19 has UPDATE ... FOR PORTION OF, which does this in one
--- statement. Our floor is 18. When the floor moves, this routine collapses and
--- its callers do not change.
+-- Positional $n rather than the parameter names, since names resolve through
+-- the same path that fails inside plpgsql.
 --
--- Four cases, which is why this is plpgsql rather than one clever statement:
+-- Returns the number of rows the portion update matched, because no routine
+-- here returns void.
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION fsm.split_belief (p_machine_id text, p_entity_id text, p_at timestamptz, p_state jsonb, p_status fsm.instance_status, p_epoch bigint, p_command_id bigint, p_chart_version integer)
+    RETURNS bigint
+    LANGUAGE sql
+    VOLATILE PARALLEL UNSAFE
+    SET search_path = pg_catalog, pg_temp
+    AS $$
+    WITH updated AS (
+        UPDATE
+            fsm.instance_state FOR PORTION OF valid_during
+        FROM
+            $3 TO 'infinity'
+        SET
+            state = $4,
+            status = $5,
+            epoch = $6,
+            command_id = $7,
+            chart_version = $8
+        WHERE
+            machine_id = $1
+            AND entity_id = $2
+            AND UPPER(valid_during) = 'infinity'
+        RETURNING
+            1
+)
+    SELECT
+        COUNT(*)
+    FROM
+        updated;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- fsm.close_and_open: the one valid-time mutation.
 --
---   no live belief          insert [p_at, infinity)            -> opened
---   live [t0, inf), p_at>t0 close live at p_at, then insert    -> split
---   live [t0, inf), p_at=t0 delete live, then insert           -> replaced
---   live [t0, inf), p_at<t0 raise                              -> no row
+-- Every valid-time write routes through here, so the split is written and
+-- tested once instead of being re-derived at each call site.
 --
--- The third case: closing [t0, infinity) at t0 would write [t0, t0), an empty
--- range that no query can return. instance_state_valid_nonempty and the
--- temporal key both reject it, so the alternative to replacing is a failed
--- write rather than a subtly wrong one. A correction effective from the exact
--- instant a belief began does not split that belief, it supersedes it whole.
+-- UPDATE ... FOR PORTION OF does the split itself: it rewrites the portion of
+-- the matched rows covered by [p_at, infinity) and re-inserts the remainder as
+-- its own row, keeping the temporal key satisfied throughout. Both the update
+-- and the re-insert fire the versioning trigger, so the superseded belief is
+-- archived rather than discarded.
 --
--- The delete goes through the versioning trigger, so the superseded belief is
--- archived rather than discarded. Beliefs are never overwritten; that is the
--- rule the whole correction story rests on.
+-- Three cases remain, which is why this is still plpgsql:
+--
+--   no live belief          insert [p_at, infinity)   -> opened
+--   live [t0, inf), p_at>t0 portion update splits it  -> split
+--   live [t0, inf), p_at=t0 portion covers it whole   -> replaced
+--   live [t0, inf), p_at<t0 raise                     -> no row
+--
+-- The read is what distinguishes them and what guards the fourth. Left to
+-- itself, a portion update starting before the live belief would rewrite every
+-- historical version it overlaps, silently rewriting settled history.
 --
 -- TODO: a p_at earlier than the live belief's start raises rather than
 -- guessing. Reconciling it means replaying the affected suffix against the
 -- chart version each command was originally resolved under, which is correction
--- replay and belongs to its own step. Guessing here would corrupt valid time
--- quietly.
+-- replay and belongs to its own step.
 --
 -- VOLATILE and PARALLEL UNSAFE because it writes.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fsm.close_and_open (p_machine_id text, p_entity_id text, p_at timestamptz, p_state jsonb)
+CREATE OR REPLACE FUNCTION fsm.close_and_open (p_machine_id text, p_entity_id text, p_at timestamptz, p_state jsonb, p_status fsm.instance_status, p_epoch bigint, p_command_id bigint, p_chart_version integer)
     RETURNS TABLE (
         outcome fsm.belief_outcome,
         valid_from timestamptz)
@@ -131,7 +172,6 @@ CREATE OR REPLACE FUNCTION fsm.close_and_open (p_machine_id text, p_entity_id te
     AS $$
 DECLARE
     v_live_from timestamptz;
-    v_outcome fsm.belief_outcome;
 BEGIN
     SELECT
         LOWER(s.valid_during)
@@ -143,33 +183,28 @@ BEGIN
         s.machine_id = p_machine_id
         AND s.entity_id = p_entity_id
         AND UPPER(s.valid_during) = 'infinity';
-    IF v_live_from IS NULL THEN
-        v_outcome := 'opened';
-    ELSIF p_at > v_live_from THEN
-        UPDATE
-            fsm.instance_state s
-        SET
-            valid_during = TSTZRANGE(v_live_from, p_at, '[)')
-        WHERE
-            s.machine_id = p_machine_id
-            AND s.entity_id = p_entity_id
-            AND UPPER(s.valid_during) = 'infinity';
-        v_outcome := 'split';
-    ELSIF p_at = v_live_from THEN
-        DELETE FROM fsm.instance_state s
-        WHERE s.machine_id = p_machine_id
-            AND s.entity_id = p_entity_id
-            AND UPPER(s.valid_during) = 'infinity';
-        v_outcome := 'replaced';
-    ELSE
+    IF v_live_from IS NOT NULL AND p_at < v_live_from THEN
         RAISE EXCEPTION 'valid-time instant % precedes the live belief, which begins at %', p_at, v_live_from
             USING ERRCODE = 'invalid_parameter_value';
     END IF;
-    INSERT INTO fsm.instance_state (machine_id, entity_id, state, valid_during)
-        VALUES (p_machine_id, p_entity_id, p_state, TSTZRANGE(p_at, 'infinity', '[)'));
+    IF v_live_from IS NULL THEN
+        INSERT INTO fsm.instance_state (machine_id, entity_id, state, status, epoch, command_id, chart_version, valid_during)
+            VALUES (p_machine_id, p_entity_id, p_state, p_status, p_epoch, p_command_id, p_chart_version, TSTZRANGE(p_at, 'infinity', '[)'));
+        RETURN QUERY
+        SELECT
+            'opened'::fsm.belief_outcome,
+            p_at;
+        RETURN;
+    END IF;
+    PERFORM
+        fsm.split_belief (p_machine_id, p_entity_id, p_at, p_state, p_status, p_epoch, p_command_id, p_chart_version);
     RETURN QUERY
     SELECT
-        v_outcome,
+        CASE WHEN p_at > v_live_from THEN
+            'split'
+        ELSE
+            'replaced'
+        END::fsm.belief_outcome,
         p_at;
 END
 $$;

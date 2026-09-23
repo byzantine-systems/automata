@@ -15,19 +15,35 @@
 --
 -- system_time is maintained entirely by the fsm.temporal_versioning trigger.
 -- Nothing else should write it.
---
--- TODO: no epoch, chart_version or command_id column yet. Each wants a writer,
--- and the writer is finalize_command, which does not exist. They arrive with it.
 -- ---------------------------------------------------------------------------
 -- What a valid-time mutation did. A checked text domain, for the reason
 -- fsm.command_status is one: adding an outcome must not be an ALTER TYPE whose
 -- new value cannot be used in the transaction that adds it.
 CREATE DOMAIN fsm.belief_outcome AS text CONSTRAINT belief_outcome_valid CHECK (VALUE IN ('opened', 'split', 'replaced'));
 
+-- An entity's lifecycle, as of a belief. Declared here rather than beside
+-- fsm.transition because this is the first table to use it.
+CREATE DOMAIN fsm.instance_status AS text CONSTRAINT instance_status_valid CHECK (VALUE IN ('running', 'suspended', 'terminated'));
+
 CREATE TABLE fsm.instance_state (
     machine_id text NOT NULL,
     entity_id text NOT NULL,
     state jsonb NOT NULL,
+    status fsm.instance_status NOT NULL,
+    -- Which transition produced this belief, and under which chart.
+    --
+    -- epoch is denormalised from fsm.transition. Unlike blocked in
+    -- fsm.command it has no independent writer to drift against: the belief and
+    -- its transition are written by the same two statements of the same routine.
+    -- Carrying it here is what makes reading an entity's current state a single
+    -- lookup on instance_state_live_idx rather than a join against a log that
+    -- grows forever.
+    --
+    -- No foreign key to fsm.transition. A correction writes a belief that no
+    -- single transition produced, and that arrives in a later step.
+    epoch bigint NOT NULL,
+    command_id bigint NOT NULL,
+    chart_version integer NOT NULL,
     -- The two defaults deliberately use different clocks.
     --
     -- Belief time has to advance *within* a transaction, because two beliefs

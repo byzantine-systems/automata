@@ -104,12 +104,21 @@ let tests =
           testTask "the belief reads return exactly the columns they promise" {
               do! reset ()
 
-              let expected = [ "machine_id"; "entity_id"; "state"; "valid_during"; "system_time" ]
-
+              // The live read carries what a snapshot needs; the as-of read is the time-travel
+              // shape and deliberately does not, because a superseded belief's epoch is not the
+              // entity's current one.
               Expect.equal
                   (columnsOf (SqlResources.get "belief" "live") [ "machine_id", box "none"; "entity_id", box "none" ])
-                  expected
-                  "the live read"
+                  [ "machine_id"
+                    "entity_id"
+                    "state"
+                    "status"
+                    "epoch"
+                    "command_id"
+                    "chart_version"
+                    "valid_during"
+                    "system_time" ]
+                  "the live read is what IStateReader.TryGetSnapshot maps"
 
               Expect.equal
                   (columnsOf
@@ -118,8 +127,8 @@ let tests =
                         "entity_id", box "none"
                         "valid_at", box DateTime.UtcNow
                         "known_at", box DateTime.UtcNow ])
-                  expected
-                  "the as-of read returns the same shape, so one reader can serve both"
+                  [ "machine_id"; "entity_id"; "state"; "valid_during"; "system_time" ]
+                  "the as-of read is the time-travel shape"
           }
 
           testTask "the live belief read uses its partial index" {
@@ -131,14 +140,14 @@ let tests =
               // reasonably picks either. Once history accumulates, the partial index stays
               // proportional to the live frontier while the key grows with every version.
               exec
-                  """INSERT INTO fsm.instance_state (machine_id, entity_id, state, valid_during)
-                     SELECT 'plan-probe', 'e' || e, '{}'::jsonb,
+                  """INSERT INTO fsm.instance_state (machine_id, entity_id, state, status, epoch, command_id, chart_version, valid_during)
+                     SELECT 'plan-probe', 'e' || e, '{}'::jsonb, 'running', 1, 1, 1,
                             tstzrange('2026-01-01'::timestamptz + (v || ' days')::interval,
                                       '2026-01-01'::timestamptz + ((v + 1) || ' days')::interval, '[)')
                      FROM generate_series(1, 2000) e, generate_series(0, 9) v;
 
-                     INSERT INTO fsm.instance_state (machine_id, entity_id, state, valid_during)
-                     SELECT 'plan-probe', 'e' || e, '{}'::jsonb, tstzrange('2026-03-01', 'infinity', '[)')
+                     INSERT INTO fsm.instance_state (machine_id, entity_id, state, status, epoch, command_id, chart_version, valid_during)
+                     SELECT 'plan-probe', 'e' || e, '{}'::jsonb, 'running', 1, 1, 1, tstzrange('2026-03-01', 'infinity', '[)')
                      FROM generate_series(1, 2000) e"""
               |> function
                   | Ok() -> ()

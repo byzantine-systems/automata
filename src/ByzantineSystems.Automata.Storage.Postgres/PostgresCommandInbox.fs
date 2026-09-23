@@ -46,12 +46,6 @@ module private CommandMapping =
         | "dead_letter" -> Ok CommandStatus.DeadLettered
         | other -> Error(Db.decodeFailure (nameof CommandStatus) $"unknown command status {other}")
 
-    let terminalToString (status: TerminalStatus) : string =
-        match status with
-        | TerminalStatus.Succeeded -> "succeeded"
-        | TerminalStatus.Rejected -> "rejected"
-        | TerminalStatus.DeadLettered -> "dead_letter"
-
     let outcomeFromString (value: string) : Result<LeaseUpdateOutcome, StoreError> =
         match value with
         | "updated" -> Ok Updated
@@ -321,19 +315,6 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
                             }
 
                         return! read []
-                    })
-                ct
-
-        member _.Acknowledge(commandId, leaseToken, status, ct) =
-            Db.protect
-                (fun token ->
-                    task {
-                        use! conn = dataSource.OpenConnectionAsync(token).AsTask()
-                        use cmd = command (SqlResources.get "command" "ack") conn
-                        cmd |> addBigint "command_id" (CommandId.value commandId)
-                        cmd |> addBigint "lease_token" (LeaseToken.value leaseToken)
-                        cmd |> addText "status" (CommandMapping.terminalToString status)
-                        return! readOutcome cmd token
                     })
                 ct
 
