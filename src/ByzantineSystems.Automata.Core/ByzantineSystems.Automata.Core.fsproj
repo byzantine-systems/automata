@@ -9,6 +9,7 @@
         <Compile Include="Identifiers.fs" />
         <Compile Include="Transition.fs" />
         <Compile Include="Errors.fs" />
+        <Compile Include="Boundary.fs" />
         <Compile Include="Codec.fs" />
         <Compile Include="Rules.fs" />
         <Compile Include="Resolution.fs" />

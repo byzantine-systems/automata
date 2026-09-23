@@ -4,17 +4,15 @@ open System
 open System.Threading
 open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
+open ByzantineSystems.Automata.Resilience
 open Npgsql
+open Polly
+open Polly.CircuitBreaker
+open Polly.Timeout
 
 /// <summary>Shared boundary helpers for the PostgreSQL stores.</summary>
 [<RequireQualifiedAccess>]
 module internal Db =
-
-    /// Recognises cancellation owned by the caller rather than by an unrelated operation.
-    let (|CanceledBy|_|) (ct: CancellationToken) (error: exn) =
-        match error with
-        | :? OperationCanceledException when ct.IsCancellationRequested -> Some()
-        | _ -> None
 
     /// Recognises the named PostgreSQL uniqueness constraint used for an idempotency race.
     let (|UniqueViolation|_|) (constraintName: string) (error: exn) =
@@ -38,21 +36,84 @@ module internal Db =
         | _ -> None
 
     /// <summary>
-    /// PostgreSQL adapter boundary. Caller cancellation remains task cancellation, known
-    /// driver failures become <c>StoreError.Unavailable</c>, and every unrelated exception
-    /// propagates to the runtime safety boundary unchanged.
+    /// Which driver failures are worth another attempt in a moment.
+    ///
+    /// A <see cref="T:Npgsql.PostgresException" /> is the server having answered, and it
+    /// answered with a reason: a constraint was violated, a value would not cast, a routine
+    /// refused its arguments. Repeating those produces the same reason. The exceptions worth
+    /// repeating are the ones where no answer arrived at all, which is every other
+    /// <see cref="T:Npgsql.NpgsqlException" />: a dropped socket, a pool timeout, a server
+    /// still coming back up.
+    ///
+    /// The one server answer that is transient is <c>57P01</c>, admin shutdown, which is what
+    /// a connection gets when the database is restarting under it.
     /// </summary>
-    let protect
-        (work: CancellationToken -> Task<Result<'T, StoreError>>)
+    let isTransient (error: exn) =
+        match error with
+        | :? PostgresException as postgresError -> postgresError.SqlState = PostgresErrorCodes.AdminShutdown
+        | :? NpgsqlException -> true
+        | _ -> false
+
+    /// <summary>
+    /// The PostgreSQL adapter boundary, and the only place resilience is applied.
+    ///
+    /// The pipeline runs <em>inside</em> this function rather than around it, because Polly
+    /// reads exceptions and everything above this line reads
+    /// <see cref="T:Microsoft.FSharp.Core.FSharpResult`2" />. Wrapped the other way round it
+    /// would retry nothing: an <c>Error</c> is a successful return to a resilience strategy.
+    ///
+    /// Afterwards the translation happens once. Caller cancellation stays cancellation, the
+    /// driver and strategy failures this layer understands become
+    /// <c>StoreError.Unavailable</c>, and anything else is left alone to reach the worker's
+    /// supervision boundary with its stack trace intact. Only what is understood is caught.
+    /// </summary>
+    let private classify
+        (work: unit -> Task<Result<'T, StoreError>>)
         (ct: CancellationToken)
         : Task<Result<'T, StoreError>> =
         task {
             try
-                return! work ct
+                return! work ()
             with
-            | CanceledBy ct -> return! Task.FromCanceled<Result<'T, StoreError>>(ct)
+            | :? OperationCanceledException when ct.IsCancellationRequested ->
+                return! Task.FromCanceled<Result<'T, StoreError>>(ct)
             | :? NpgsqlException as error -> return Error(StoreError.Unavailable error)
+            | :? TimeoutRejectedException as error -> return Error(StoreError.Unavailable error)
+            | :? BrokenCircuitException as error -> return Error(StoreError.Unavailable error)
         }
+
+    /// <summary>
+    /// Runs a statement that is safe to repeat, with the pipeline applied.
+    ///
+    /// Everything reached this way is idempotent by construction and not by hope. A read
+    /// repeats freely. <c>fsm.submit_command</c> deduplicates on its idempotency key.
+    /// <c>fsm.finalize_command</c> answers a repeat from the same lease with what that lease
+    /// already did, which is the entire reason it was written that way. The fenced lease
+    /// updates compare a token that a second attempt still carries.
+    /// </summary>
+    let protect
+        (pipeline: ResiliencePipeline)
+        (work: CancellationToken -> Task<Result<'T, StoreError>>)
+        (ct: CancellationToken)
+        : Task<Result<'T, StoreError>> =
+        classify (fun () -> ResiliencePipeline.executeTask pipeline work ct) ct
+
+    /// <summary>
+    /// Runs a statement that must not be repeated automatically, translating failures the same
+    /// way but without the pipeline.
+    ///
+    /// <c>fsm.claim_commands</c> is the reason this exists. A claim whose reply was lost has
+    /// already leased a batch, and repeating it leases a second one while the first stays
+    /// invisible until its lease lapses: no corruption, because the lease expires, but every
+    /// entity in that first batch stalls for the lease duration for nothing. A worker that
+    /// polls again in a moment recovers faster than a retry does, so the right answer to a
+    /// failed claim is to return empty and let the loop come back.
+    /// </summary>
+    let protectOnce
+        (work: CancellationToken -> Task<Result<'T, StoreError>>)
+        (ct: CancellationToken)
+        : Task<Result<'T, StoreError>> =
+        classify (fun () -> work ct) ct
 
     let timestamp (dto: DateTimeOffset) : DateTime = dto.UtcDateTime
 

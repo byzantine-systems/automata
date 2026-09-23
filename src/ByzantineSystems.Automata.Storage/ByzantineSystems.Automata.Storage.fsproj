@@ -6,11 +6,14 @@
     </PropertyGroup>
 
     <ItemGroup>
-        <Compile Include="Envelope.fs" />
-        <Compile Include="Store.fs" />
+        <!-- Command.fs precedes Envelope.fs: an envelope carries an AuditContext, which is
+             part of what the inbox records, so the inbox's vocabulary is declared first. -->
         <Compile Include="Command.fs" />
+        <Compile Include="Envelope.fs" />
         <Compile Include="ChartRegistry.fs" />
         <Compile Include="Processing.fs" />
+        <Compile Include="Action.fs" />
+        <Compile Include="MachineStore.fs" />
         <Compile Include="Supervision.fs" />
     </ItemGroup>
 

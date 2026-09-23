@@ -85,6 +85,29 @@ type FinalizeOutcome =
     | LeaseLost
 
 /// <summary>
+/// Recognisers over the two fenced-write outcomes.
+///
+/// A lost lease arrives as a case of two different unions depending on which call reported it,
+/// and every caller reacts the same way: stop, write nothing, and let whoever holds the work
+/// now do it. One pattern spares each of them a two-line match on a union it otherwise has no
+/// reason to name.
+/// </summary>
+[<AutoOpen>]
+module LeaseOutcome =
+
+    /// <summary>Matches a finalize that was fenced out.</summary>
+    let (|FinalizeFenced|_|) (outcome: FinalizeOutcome) =
+        match outcome with
+        | FinalizeOutcome.LeaseLost -> Some()
+        | _ -> None
+
+    /// <summary>Matches a lease update that was fenced out.</summary>
+    let (|LeaseFenced|_|) (outcome: LeaseUpdateOutcome) =
+        match outcome with
+        | LeaseUpdateOutcome.LeaseLost -> Some()
+        | Updated -> None
+
+/// <summary>
 /// Reads an entity's current state.
 ///
 /// A processor needs this before it can do anything: resolving a command means knowing the state

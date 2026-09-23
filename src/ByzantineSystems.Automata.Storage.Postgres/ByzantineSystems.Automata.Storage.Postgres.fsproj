@@ -6,9 +6,11 @@
     </PropertyGroup>
 
     <ItemGroup>
+        <!-- Db.fs precedes DataSource.fs: the data source's resilience is built from the
+             driver-failure classifier that lives with the rest of the adapter boundary. -->
+        <Compile Include="Db.fs" />
         <Compile Include="DataSource.fs" />
         <Compile Include="Serialization.fs" />
-        <Compile Include="Db.fs" />
         <Compile Include="SqlResources.fs" />
         <Compile Include="PostgresCommandInbox.fs" />
         <Compile Include="PostgresChartRegistry.fs" />
@@ -32,6 +34,9 @@
 
     <ItemGroup>
         <ProjectReference Include="..\ByzantineSystems.Automata.Storage\ByzantineSystems.Automata.Storage.fsproj" />
+        <!-- Resilience is applied here rather than above the store, because a pipeline reads
+             exceptions and this is the last layer that still has them. -->
+        <ProjectReference Include="..\ByzantineSystems.Automata.Resilience\ByzantineSystems.Automata.Resilience.fsproj" />
     </ItemGroup>
 
     <ItemGroup>

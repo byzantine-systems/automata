@@ -7,7 +7,7 @@ open ByzantineSystems.Automata.Storage
 open Npgsql
 
 /// <summary>What the chart registry needs. Only a data source: it reads and writes text.</summary>
-type ChartRegistryOptions = { DataSource: NpgsqlDataSource }
+type ChartRegistryOptions = { Context: PostgresContext }
 
 /// <summary>
 /// The PostgreSQL record of which chart structure each declared version belongs to.
@@ -18,7 +18,11 @@ type ChartRegistryOptions = { DataSource: NpgsqlDataSource }
 /// </summary>
 type PostgresChartRegistry(options: ChartRegistryOptions) =
 
-    let dataSource = options.DataSource
+    let dataSource = options.Context.DataSource
+
+    /// Every statement goes through the context's pipeline, which is where transient driver
+    /// failures are retried and classified. Bound once here so no call site can forget it.
+    let protect work ct = Db.protect options.Context.Resilience work ct
 
     /// A stored fingerprint that no longer parses is a corrupt row, reported as the contract's
     /// serialization failure rather than as an exception out of the store. The shape constraint
@@ -33,7 +37,7 @@ type PostgresChartRegistry(options: ChartRegistryOptions) =
     interface IChartRegistry with
 
         member _.Register(identity, ct) =
-            Db.protect
+            protect
                 (fun token ->
                     task {
                         use! conn = dataSource.OpenConnectionAsync(token).AsTask()
@@ -78,7 +82,7 @@ type PostgresChartRegistry(options: ChartRegistryOptions) =
                 ct
 
         member _.TryGet(machineId, version, ct) =
-            Db.protect
+            protect
                 (fun token ->
                     task {
                         use! conn = dataSource.OpenConnectionAsync(token).AsTask()

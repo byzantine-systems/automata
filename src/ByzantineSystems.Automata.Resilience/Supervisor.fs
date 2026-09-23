@@ -3,6 +3,7 @@ namespace ByzantineSystems.Automata.Resilience
 open System
 open System.Threading
 open System.Threading.Tasks
+open ByzantineSystems.Automata.Core
 open Polly
 open Polly.Retry
 open Polly.Timeout

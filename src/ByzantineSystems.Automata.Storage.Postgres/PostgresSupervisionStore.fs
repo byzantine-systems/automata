@@ -57,15 +57,17 @@ module private SupervisionMapping =
         reasonCodec.Decode json |> Result.mapError Db.toStoreError
 
 /// <summary>PostgreSQL append-only supervision audit writer backed by a pooled data source.</summary>
-type PostgresSupervisionStore(dataSource: NpgsqlDataSource) =
+type PostgresSupervisionStore(context: PostgresContext) =
+
+    let protect work ct = Db.protect context.Resilience work ct
 
     interface ISupervisionEventStore with
 
         member _.Record(record, ct) =
-            Db.protect
+            protect
                 (fun token ->
                     task {
-                        use! conn = dataSource.OpenConnectionAsync(token).AsTask()
+                        use! conn = context.DataSource.OpenConnectionAsync(token).AsTask()
                         use cmd = new NpgsqlCommand(SqlResources.get "supervision" "record", conn)
 
                         cmd.Parameters.AddWithValue("supervisor", SupervisorName.value record.Supervisor)
@@ -95,17 +97,17 @@ module PostgresSupervisionQueries =
 
     /// <summary>Lists the newest audit facts first.</summary>
     let listRecent
-        (dataSource: NpgsqlDataSource)
+        (context: PostgresContext)
         (limit: int)
         (ct: CancellationToken)
         : Task<Result<SupervisionRecord list, StoreError>> =
         if limit < 1 then
             invalidArg (nameof limit) "The supervision query limit must be positive."
 
-        Db.protect
+        Db.protect context.Resilience
             (fun token ->
                 task {
-                    use! conn = dataSource.OpenConnectionAsync(token).AsTask()
+                    use! conn = context.DataSource.OpenConnectionAsync(token).AsTask()
                     use cmd = new NpgsqlCommand(SqlResources.get "supervision" "list_recent", conn)
                     cmd.Parameters.AddWithValue("limit", limit) |> ignore
                     use! reader = cmd.ExecuteReaderAsync(token)

@@ -14,7 +14,7 @@ open NpgsqlTypes
 /// </summary>
 type CommandProcessorOptions<'EntityId, 'State, 'Event, 'Action, 'Err> =
     {
-        DataSource: NpgsqlDataSource
+        Context: PostgresContext
         StateCodec: Codec<'State>
         EventCodec: Codec<'Event>
         ActionCodec: Codec<'Action list>
@@ -62,7 +62,11 @@ module private ProcessorMapping =
 type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     (options: CommandProcessorOptions<'EntityId, 'State, 'Event, 'Action, 'Err>) =
 
-    let dataSource = options.DataSource
+    let dataSource = options.Context.DataSource
+
+    /// Every statement goes through the context's pipeline, which is where transient driver
+    /// failures are retried and classified. Bound once here so no call site can forget it.
+    let protect work ct = Db.protect options.Context.Resilience work ct
 
     let addText (name: string) (value: string) (cmd: NpgsqlCommand) =
         cmd.Parameters.AddWithValue(name, value) |> ignore
@@ -162,7 +166,7 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
         }
 
     let failWith (status: string) (commandId: CommandId) token (error: 'Err) ct =
-        Db.protect
+        protect
             (fun cancel ->
                 task {
                     match options.ErrorCodec.Encode error with
@@ -245,7 +249,7 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     interface IStateReader<'EntityId, 'State> with
 
         member _.TryGetSnapshot(machineId, entityId, ct) =
-            Db.protect
+            protect
                 (fun cancel ->
                     task {
                         use! conn = dataSource.OpenConnectionAsync(cancel).AsTask()
@@ -282,7 +286,7 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     interface ICommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err> with
 
         member _.Commit(commandId, token, expected, draft, ct) =
-            Db.protect
+            protect
                 (fun cancel ->
                     task {
                         match encodeDraft draft with
@@ -307,7 +311,7 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
             failWith "dead_letter" commandId token error ct
 
         member _.TryGetResult(commandId, ct) =
-            Db.protect
+            protect
                 (fun cancel ->
                     task {
                         use! conn = dataSource.OpenConnectionAsync(cancel).AsTask()

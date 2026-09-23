@@ -14,7 +14,7 @@ open NpgsqlTypes
 /// </summary>
 type CommandInboxOptions<'EntityId, 'Event> =
     {
-        DataSource: NpgsqlDataSource
+        Context: PostgresContext
         EventCodec: Codec<'Event>
         EntityIdEncode: 'EntityId -> string
         /// <summary>
@@ -65,7 +65,11 @@ module private CommandMapping =
 /// </summary>
 type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityId, 'Event>) =
 
-    let dataSource = options.DataSource
+    let dataSource = options.Context.DataSource
+
+    /// Every statement goes through the context's pipeline, which is where transient driver
+    /// failures are retried and classified. Bound once here so no call site can forget it.
+    let protect work ct = Db.protect options.Context.Resilience work ct
 
     let command (statement: string) (conn: NpgsqlConnection) = new NpgsqlCommand(statement, conn)
 
@@ -241,7 +245,7 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
     interface ICommandInbox<'EntityId, 'Event> with
 
         member _.Submit(submission, ct) =
-            Db.protect
+            protect
                 (fun token ->
                     task {
                         let entityId = options.EntityIdEncode submission.EntityId
@@ -292,7 +296,11 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
             if lease <= TimeSpan.Zero then
                 invalidArg (nameof lease) "A lease must be a positive duration."
 
-            Db.protect
+            // Claiming is the one call here that must not be repeated automatically. It is not
+            // idempotent: a claim whose reply was lost has already leased a batch, and a retry
+            // leases a second one while the first stays invisible until its lease lapses. The
+            // worker polls again in a moment, which recovers sooner than a retry would.
+            Db.protectOnce
                 (fun token ->
                     task {
                         use! conn = dataSource.OpenConnectionAsync(token).AsTask()
@@ -319,7 +327,7 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
                 ct
 
         member _.Reschedule(commandId, leaseToken, backoff, ct) =
-            Db.protect
+            protect
                 (fun token ->
                     task {
                         use! conn = dataSource.OpenConnectionAsync(token).AsTask()
@@ -342,7 +350,7 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
             if lease <= TimeSpan.Zero then
                 invalidArg (nameof lease) "A lease must be a positive duration."
 
-            Db.protect
+            protect
                 (fun token ->
                     task {
                         use! conn = dataSource.OpenConnectionAsync(token).AsTask()
@@ -355,7 +363,7 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
                 ct
 
         member _.TryGet(commandId, ct) =
-            Db.protect
+            protect
                 (fun token ->
                     task {
                         use! conn = dataSource.OpenConnectionAsync(token).AsTask()
@@ -367,4 +375,4 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
                 ct
 
         member _.TryFind(machineId, entityId, idempotencyKey, ct) =
-            Db.protect (fun token -> findExisting machineId (options.EntityIdEncode entityId) idempotencyKey token) ct
+            protect (fun token -> findExisting machineId (options.EntityIdEncode entityId) idempotencyKey token) ct
