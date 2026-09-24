@@ -73,3 +73,43 @@ type ServiceCollectionExtensions =
             { options with
                 MachineFactory = fun provider -> Ok(factory provider) }
         )
+
+    /// <summary>
+    /// Registers database maintenance: notification, lease reaping, retention and drift
+    /// reporting, run by this process or scheduled into the database, per
+    /// <see cref="T:ByzantineSystems.Automata.DependencyInjection.MaintenanceScheduler" />.
+    ///
+    /// Register it once per database, not once per machine. Every machine registers itself with
+    /// the database when it boots, and a pass covers all of them. Running it on several hosts is
+    /// safe, since a pass is single-flight in the database, and only redundant.
+    /// </summary>
+    [<Extension>]
+    static member AddAutomataMaintenance
+        (services: IServiceCollection, options: MaintenanceOptions)
+        : IServiceCollection =
+        if isNull services then
+            nullArg (nameof services)
+
+        if options.NotifyEvery <= TimeSpan.Zero then
+            invalidArg (nameof options) "NotifyEvery must be a positive duration."
+
+        if options.RunEvery <= TimeSpan.Zero then
+            invalidArg (nameof options) "RunEvery must be a positive duration."
+
+        if options.Batch < 1 then
+            invalidArg (nameof options) "Batch must be positive."
+
+        services.AddLogging() |> ignore
+
+        services.AddSingleton<IHostedService>(
+            Func<IServiceProvider, IHostedService>(fun provider ->
+                new MaintenanceService(
+                    options,
+                    options.Maintenance provider,
+                    provider.GetRequiredService<ILogger<MaintenanceService>>()
+                )
+                :> IHostedService)
+        )
+        |> ignore
+
+        services

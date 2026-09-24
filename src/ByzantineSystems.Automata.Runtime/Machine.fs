@@ -10,7 +10,7 @@ open ByzantineSystems.Automata.Storage
 
 type private MachineLifecycle =
     | Created
-    | Running of CancellationTokenSource * Task option
+    | Running of CancellationTokenSource * Task list
     | Stopping of Task
     | Stopped of Task
 
@@ -46,7 +46,7 @@ type Machine<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: equality>
     let finishStop
         (completion: TaskCompletionSource)
         (lifetime: CancellationTokenSource option)
-        (observerTask: Task option)
+        (background: Task list)
         (ct: CancellationToken)
         =
         task {
@@ -55,9 +55,7 @@ type Machine<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: equality>
                     observerBus |> Option.iter _.Complete()
                     lifetime |> Option.iter _.Cancel()
 
-                    match observerTask with
-                    | Some task -> do! task.WaitAsync(ct)
-                    | None -> ()
+                    do! (Task.WhenAll background).WaitAsync(ct)
 
                     commandSignal.Complete()
                     actionSignal.Complete()
@@ -85,6 +83,43 @@ type Machine<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: equality>
                 completion.TrySetException(error) |> ignore
         }
 
+    /// <summary>
+    /// Keeps the wake signals fed from the store's notifications, for as long as the machine runs.
+    ///
+    /// Never a fault. A listener that fails costs the polling interval and nothing else, so it is
+    /// logged, waited out for one polling interval, and started again; the machine keeps working
+    /// on its polls in the meantime.
+    /// </summary>
+    let listenerFailed (error: StoreError) =
+        config.Logger.LogWarning(
+            EventId(1312, "NotificationListenerFailed"),
+            "Listening for work on machine {MachineId} failed ({Failure}); polling alone until it is back.",
+            MachineId.value config.MachineId,
+            StoreError.caseName error
+        )
+
+    /// One listening session, and whether to start another. It ends Ok when it was cancelled or
+    /// when the store listens to nothing, and neither is a reason to go round again.
+    let listenOnce (notifications: IWorkNotifications) (ct: CancellationToken) () : Task<bool> =
+        backgroundTask {
+            match! notifications.Listen(config.MachineId, commandSignal.TrySignal, actionSignal.TrySignal, ct) with
+            | Ok() -> return false
+            | Error error ->
+                listenerFailed error
+                let policy = ValidatedProcessorPolicy.value config.Processor
+                return! Recurring.pause policy.PollingInterval config.TimeProvider ct
+        }
+
+    /// <summary>
+    /// Keeps the wake signals fed from the store's notifications, for as long as the machine runs.
+    ///
+    /// Never a fault. A listener that fails costs the polling interval and nothing else, so it is
+    /// logged, waited out for one polling interval, and started again; the machine keeps working
+    /// on its polls in the meantime.
+    /// </summary>
+    let listen (notifications: IWorkNotifications) (ct: CancellationToken) : Task =
+        Recurring.repeat (listenOnce notifications ct) ct
+
     member internal _.RuntimeConfig = config
     member internal _.Completions = completions
     member internal _.ObserverBusValue = observerBus
@@ -105,29 +140,69 @@ type Machine<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: equality>
             | Stopped _ -> Error(MachineError.Rejected MachineRejection.Stopped))
 
     /// <summary>
-    /// Registers the chart's structure against its declared version, then starts observer work.
+    /// Boots the store, registers the chart's structure against its declared version, then starts
+    /// the background work: observers, and the notification listener when the store offers one.
+    ///
+    /// The boot comes first because it is the one step allowed to say no. A refused boot starts
+    /// nothing and registers nothing, and is reported rather than raised, like a fingerprint
+    /// mismatch: the host decides what is fatal.
     ///
     /// Registration is the last chance to notice that a chart was edited without bumping its
-    /// version. A mismatch is reported rather than raised, because whether it is fatal is the
-    /// host's decision; nothing here can be submitted under an unregistered version in any case,
-    /// since the command's foreign key refuses it.
+    /// version. Nothing can be submitted under an unregistered version in any case, since the
+    /// command's foreign key refuses it.
     /// </summary>
-    member _.StartAsync(registry: IChartRegistry, ct: CancellationToken) : Task<Result<ChartRegistration, StoreError>> =
-        task {
+    member _.StartAsync(registry: IChartRegistry, ct: CancellationToken) : Task<Result<Startup, StoreError>> =
+        let boot () =
+            match Store.tryBoot config.Store with
+            | Some store -> store.Boot(config.MachineId, ct)
+            | None -> Task.FromResult(Ok BootReport.Ready)
+
+        let register () =
+            registry.Register(
+                { MachineId = config.MachineId
+                  Version = config.ChartVersion
+                  Fingerprint = Chart.fingerprint config.Chart },
+                ct
+            )
+
+        let run () =
+            lock lifecycleGate (fun () ->
+                match lifecycle with
+                | Created ->
+                    let lifetime = new CancellationTokenSource()
+
+                    let background =
+                        [ yield!
+                              observerBus
+                              |> Option.map (fun bus -> bus.RunAsync(lifetime.Token))
+                              |> Option.toList
+                          yield!
+                              Store.tryNotifications config.Store
+                              |> Option.map (fun notifications -> listen notifications lifetime.Token)
+                              |> Option.toList ]
+
+                    lifecycle <- Running(lifetime, background)
+                | Running _ -> ()
+                | Stopping _
+                | Stopped _ -> invalidOp "A stopped machine cannot be started again.")
+
+        taskResult {
             ct.ThrowIfCancellationRequested()
 
-            let! registration =
-                registry.Register(
-                    { MachineId = config.MachineId
-                      Version = config.ChartVersion
-                      Fingerprint = Chart.fingerprint config.Chart },
-                    ct
+            match! boot () with
+            | BootReport.Refused defects ->
+                config.Logger.LogError(
+                    EventId(1311, "StoreBootRefused"),
+                    "The store for machine {MachineId} refused to boot: {Defects}. Nothing was started.",
+                    MachineId.value config.MachineId,
+                    defects |> List.map string |> String.concat "; "
                 )
 
-            match registration with
-            | Error error -> return Error error
-            | Ok outcome ->
-                match outcome with
+                return Startup.Refused defects
+            | BootReport.Ready ->
+                let! registration = register ()
+
+                match registration with
                 | ChartRegistration.Mismatched stored ->
                     config.Logger.LogError(
                         EventId(1310, "ChartFingerprintMismatch"),
@@ -138,20 +213,8 @@ type Machine<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: equality>
                     )
                 | _ -> ()
 
-                lock lifecycleGate (fun () ->
-                    match lifecycle with
-                    | Created ->
-                        let lifetime = new CancellationTokenSource()
-
-                        let observerTask =
-                            observerBus |> Option.map (fun bus -> bus.RunAsync(lifetime.Token))
-
-                        lifecycle <- Running(lifetime, observerTask)
-                    | Running _ -> ()
-                    | Stopping _
-                    | Stopped _ -> invalidOp "A stopped machine cannot be started again.")
-
-                return Ok outcome
+                run ()
+                return Startup.Started registration
         }
 
     /// <summary>Stops observer work and both wake signals; idempotent.</summary>
@@ -165,14 +228,14 @@ type Machine<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: equality>
                     TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
 
                 lifecycle <- Stopping completion.Task
-                finishStop completion None None ct |> ignore
+                finishStop completion None [] ct |> ignore
                 completion.Task
-            | Running(lifetime, observerTask) ->
+            | Running(lifetime, background) ->
                 let completion =
                     TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
 
                 lifecycle <- Stopping completion.Task
-                finishStop completion (Some lifetime) observerTask ct |> ignore
+                finishStop completion (Some lifetime) background ct |> ignore
                 completion.Task)
 
     interface IAsyncDisposable with
@@ -392,12 +455,16 @@ module Machine =
     /// <summary>The chart version every command this machine submits is pinned to.</summary>
     let chartVersion (machine: Machine<'EntityId, 'State, 'Event, 'Action, 'Err>) : ChartVersion = machine.ChartVersion
 
-    /// <summary>Registers the chart and starts the machine's own work; repeated calls are harmless.</summary>
+    /// <summary>
+    /// Boots the store, registers the chart and starts the machine's own work; repeated calls
+    /// are harmless. A store that refuses to boot answers <c>Startup.Refused</c> and nothing
+    /// starts.
+    /// </summary>
     let startAsync
         (machine: Machine<'EntityId, 'State, 'Event, 'Action, 'Err>)
         (registry: IChartRegistry)
         (ct: CancellationToken)
-        : Task<Result<ChartRegistration, StoreError>> =
+        : Task<Result<Startup, StoreError>> =
         machine.StartAsync(registry, ct)
 
     /// <summary>Stops the observer and both wake signals.</summary>

@@ -9,6 +9,7 @@
         <Compile Include="SupervisionAudit.fs" />
         <Compile Include="Logging.fs" />
         <Compile Include="HostedServices.fs" />
+        <Compile Include="Maintenance.fs" />
         <Compile Include="ServiceCollectionExtensions.fs" />
     </ItemGroup>
 

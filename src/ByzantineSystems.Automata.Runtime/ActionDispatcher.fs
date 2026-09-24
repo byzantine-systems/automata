@@ -90,28 +90,40 @@ type ActionDispatcher<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectError whe
         | Ok(LeaseUpdateOutcome.LeaseLost)
         | Error _ -> Unfenced
 
+    /// A delivery that never reported an outcome, again and again. The ordinary path cannot get
+    /// here: a failed delivery at MaxAttempts is abandoned, so the count only passes it when
+    /// deliveries ended with no outcome at all, a handler that took the process down with it or
+    /// ran past its lease. Handling it again would only do that again, so it is abandoned unrun.
+    let poisoned (action: LeasedAction<'EntityId, 'Action>) =
+        action.DeliveryCount > policy.MaxAttempts
+
     let deliver (action: LeasedAction<'EntityId, 'Action>) (ct: CancellationToken) =
         task {
-            // The user's handler is one of the four places this library catches. It is arbitrary
-            // application code reaching arbitrary external systems, and a throw from it means a
-            // failed delivery rather than a broken worker.
-            let! attempt = handler action ct |> TaskOutcome.capture
+            if poisoned action then
+                let! outcome = queue.Abandon(action, $"delivered %d{action.DeliveryCount} times without an outcome", ct)
 
-            let succeeded =
-                match attempt with
-                | Ok(Ok()) -> true
-                | Ok(Error _)
-                | Error _ -> false
-
-            if succeeded then
-                let! outcome = queue.Complete(action, ct)
-                return fenced outcome Delivered
-            elif action.DeliveryCount >= policy.MaxAttempts then
-                let! outcome = queue.Abandon(action, $"undelivered after %d{action.DeliveryCount} attempts", ct)
                 return fenced outcome GaveUp
             else
-                let! outcome = queue.Reschedule(action, policy.Backoff, ct)
-                return fenced outcome Retrying
+                // The user's handler is one of the four places this library catches. It is arbitrary
+                // application code reaching arbitrary external systems, and a throw from it means a
+                // failed delivery rather than a broken worker.
+                let! attempt = handler action ct |> TaskOutcome.capture
+
+                let succeeded =
+                    match attempt with
+                    | Ok(Ok()) -> true
+                    | Ok(Error _)
+                    | Error _ -> false
+
+                if succeeded then
+                    let! outcome = queue.Complete(action, ct)
+                    return fenced outcome Delivered
+                elif action.DeliveryCount >= policy.MaxAttempts then
+                    let! outcome = queue.Abandon(action, $"undelivered after %d{action.DeliveryCount} attempts", ct)
+                    return fenced outcome GaveUp
+                else
+                    let! outcome = queue.Reschedule(action, policy.Backoff, ct)
+                    return fenced outcome Retrying
         }
 
     let log (action: LeasedAction<'EntityId, 'Action>) (outcome: DeliveryOutcome) =

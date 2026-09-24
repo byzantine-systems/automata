@@ -117,6 +117,11 @@ module internal Db =
 
     let timestamp (dto: DateTimeOffset) : DateTime = dto.UtcDateTime
 
+    /// <summary>Binds named parameters, in one call rather than one statement each.</summary>
+    let parameters (values: (string * obj) list) (cmd: NpgsqlCommand) : unit =
+        values
+        |> List.iter (fun (name, value) -> cmd.Parameters.AddWithValue(name, value) |> ignore)
+
     /// <summary>The instance lifecycle, as the fsm.instance_status domain spells it.</summary>
     let instanceStatusToString (status: InstanceStatus) : string =
         match status with
@@ -185,6 +190,17 @@ module internal Row =
 
     let textArray (reader: NpgsqlDataReader) (name: string) : string list =
         reader.GetFieldValue<string array>(reader.GetOrdinal name) |> List.ofArray
+
+    /// <summary>Reads every remaining row through <paramref name="read" />, in result order.</summary>
+    let all (read: NpgsqlDataReader -> 'T) (reader: NpgsqlDataReader) (ct: CancellationToken) : Task<'T list> =
+        let rec next (acc: 'T list) =
+            backgroundTask {
+                match! reader.ReadAsync ct with
+                | true -> return! next (read reader :: acc)
+                | false -> return List.rev acc
+            }
+
+        next []
 
     /// <summary>
     /// Reads a text column whose empty value means "not supplied". No column in the schema is

@@ -109,13 +109,15 @@ let reset () : Task =
                 // separately.
                 "TRUNCATE fsm.command, fsm.command_error, fsm.transition, fsm.machine_chart_version,
                           fsm.supervision_event, fsm.instance_state, fsm.instance_state_history,
-                          fsm.action_dead_letter
+                          fsm.action_dead_letter, fsm.machine_maintenance
                           RESTART IDENTITY;
                  INSERT INTO fsm.machine_chart_version (machine_id, version, fingerprint)
                  VALUES (@machine_id, @version, @fingerprint);
                  -- The queue survives the truncate because it is pgmq's table, not ours.
                  -- Emptying it keeps one test's undelivered actions out of the next one.
-                 SELECT pgmq.purge_queue(@queue);",
+                 SELECT pgmq.purge_queue(@queue);
+                 -- The archive too, or one test's delivered actions are the next one's purge.
+                 DELETE FROM pgmq.a_automata_test_actions;",
                 conn
             )
 
@@ -346,3 +348,41 @@ let believe (name: string) (at: DateTimeOffset) (state: TestState) (epoch: int64
     exec
         $"SELECT fsm.close_and_open('{MachineId.value machine}', '{name}', '{at:o}'::timestamptz, '{encoded}'::jsonb, 'running', {epoch}, 1, 1)"
     |> expectOkUnit "close_and_open"
+
+/// The whole store, as an application builds it, with the retention the test asks for.
+let newMachineStore (retention: RetentionPolicy) =
+    let encode, decode = EntityKey.forEntityId<TestEntity>
+
+    PostgresMachineStore<Entity, TestState, TestEvent, TestAction, TestError>(
+        { Context = context ()
+          ActionQueue = actionQueue
+          StateCodec = Serialization.systemTextJson<TestState> ()
+          EventCodec = Serialization.systemTextJson<TestEvent> ()
+          ActionCodec = Serialization.systemTextJson<TestAction> ()
+          ErrorCodec = Serialization.systemTextJson<TestError> ()
+          EntityIdEncode = encode
+          EntityIdDecode = decode
+          Retention = retention
+          ReapAfter = TimeSpan.FromMinutes 5.
+          Listener = ListenerConnection.SameDataSource }
+    )
+
+let newMaintenance () : IDatabaseMaintenance =
+    PostgresMaintenance(context ()) :> IDatabaseMaintenance
+
+/// Boots the store, which is what registers the machine for maintenance.
+let boot (retention: RetentionPolicy) : Task<unit> =
+    task {
+        let store = newMachineStore retention :> IStoreBoot
+        let! report = store.Boot(machine, noCancellation)
+
+        match report with
+        | Ok BootReport.Ready -> ()
+        | other -> failtestf "the store should have booted, but answered %A" other
+    }
+
+/// Runs a statement that must succeed, for arranging rows the contract does not let a test write.
+let arrange (sql: string) : unit =
+    match exec sql with
+    | Ok() -> ()
+    | Error error -> failtestf "arranging failed: %s" error.Message

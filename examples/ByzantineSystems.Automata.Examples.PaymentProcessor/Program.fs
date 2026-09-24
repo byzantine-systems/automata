@@ -188,15 +188,12 @@ let private runPayment (logger: ILogger) (connectionString: string) : Task =
                   ActionCodec = Serialization.systemTextJson<PaymentAction> ()
                   ErrorCodec = Serialization.systemTextJson<string> ()
                   EntityIdEncode = encode
-                  EntityIdDecode = decode }
+                  EntityIdDecode = decode
+                  // Nothing is deleted unless a retention policy says so.
+                  Retention = RetentionPolicy.keepEverything
+                  ReapAfter = TimeSpan.FromMinutes 5.
+                  Listener = ListenerConnection.SameDataSource }
             )
-
-        // Once at startup, before any command can commit: a commit enqueues into this queue in
-        // its own transaction, so a missing queue would fail the commit and not only the
-        // delivery.
-        match! store.EnsureQueueAsync CancellationToken.None with
-        | Ok _ -> ()
-        | Error error -> failwith $"the action queue could not be created: %A{error}"
 
         let machine =
             match buildMachine logger (store :> IMachineStore<_, _, _, _, _>) with
@@ -205,12 +202,17 @@ let private runPayment (logger: ILogger) (connectionString: string) : Task =
 
         let registry = PostgresChartRegistry({ Context = context })
 
+        // Starting boots the store first: it checks the schema and extensions, creates the
+        // action queue if this is its first run, and registers the machine for maintenance.
+        // Nothing starts if any of that is missing.
         match! Machine.startAsync machine registry CancellationToken.None with
-        | Ok ChartRegistration.Registered -> logger.LogInformation "Registered this chart's structure for version 1"
-        | Ok ChartRegistration.Matched ->
+        | Ok(Startup.Started ChartRegistration.Registered) ->
+            logger.LogInformation "Registered this chart's structure for version 1"
+        | Ok(Startup.Started ChartRegistration.Matched) ->
             logger.LogInformation "This chart matches the structure version 1 was registered with"
-        | Ok(ChartRegistration.Mismatched _) ->
+        | Ok(Startup.Started(ChartRegistration.Mismatched _)) ->
             failwith "this chart's shape changed without a version bump; bump chartVersion or run make db-reset"
+        | Ok(Startup.Refused defects) -> failwith $"the database is not ready: %A{defects}; run make migrate"
         | Error error -> failwith $"the chart could not be registered: %A{error}"
 
         // The worker. In a host this is a BackgroundService under supervision; here it is one

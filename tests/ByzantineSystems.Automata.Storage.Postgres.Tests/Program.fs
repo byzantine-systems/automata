@@ -11,6 +11,7 @@ let tests =
     testList
         "ByzantineSystems.Automata.Storage.Postgres.Tests"
         [ SqlResourceTests.tests
+          MaintenanceTests.pureTests
 
           if TestContext.configured then
               testList
@@ -25,6 +26,7 @@ let tests =
                     ActionQueueTests.tests
                     ProcessorIntegrationTests.tests
                     SchemaContractTests.tests
+                    MaintenanceTests.integration
                     PostgresSupervisionStoreTests.tests ]
               |> testSequenced
           else

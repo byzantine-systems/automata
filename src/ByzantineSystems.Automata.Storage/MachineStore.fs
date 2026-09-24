@@ -51,3 +51,17 @@ module Store =
         match store with
         | :? ICorrectionStore<'EntityId, 'State> as corrections -> Some corrections
         | _ -> None
+
+    /// <summary>The store's boot check, or <c>None</c> when it has none to run.</summary>
+    let tryBoot (store: IMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>) : IStoreBoot option =
+        match store with
+        | :? IStoreBoot as boot -> Some boot
+        | _ -> None
+
+    /// <summary>
+    /// The store's cross-process wake-ups, or <c>None</c> when polling is all it offers.
+    /// </summary>
+    let tryNotifications (store: IMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>) : IWorkNotifications option =
+        match store with
+        | :? IWorkNotifications as notifications -> Some notifications
+        | _ -> None

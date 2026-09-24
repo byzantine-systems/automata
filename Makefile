@@ -93,8 +93,10 @@ run-example-supervision:
 db:
 	psql '$(DB_URL)'
 
+# cron.job rows outlive DROP SCHEMA, so the pg_cron ticks are removed first; the DO block
+# makes that a no-op on a database where the routine was never installed.
 db-reset:
-	psql '$(DB_URL)' -v ON_ERROR_STOP=1 -c 'DROP SCHEMA IF EXISTS fsm CASCADE; DROP TABLE IF EXISTS public.schemaversions;'
+	psql '$(DB_URL)' -v ON_ERROR_STOP=1 -c "DO \$$\$$ BEGIN IF to_regproc('fsm.unschedule_maintenance') IS NOT NULL THEN PERFORM fsm.unschedule_maintenance(); END IF; END \$$\$$;" -c 'DROP SCHEMA IF EXISTS fsm CASCADE; DROP TABLE IF EXISTS public.schemaversions;'
 	$(MAKE) migrate DB_CONNECTION_STRING='$(DB_CONNECTION_STRING)'
 
 fmt:

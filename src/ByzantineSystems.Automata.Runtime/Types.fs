@@ -247,6 +247,24 @@ type MachineConfigError =
     | InitialStateUnknown of StateId
 
 /// <summary>
+/// How starting a machine went. Both cases are answers rather than failures: a store error is
+/// the failure, and it arrives as <c>Error</c> around this.
+/// </summary>
+[<RequireQualifiedAccess>]
+type Startup =
+    /// <summary>
+    /// The store is ready and the chart was registered, with what the registration found. A
+    /// <c>Mismatched</c> registration still started; whether that is fatal is the host's call.
+    /// </summary>
+    | Started of registration: ChartRegistration
+
+    /// <summary>
+    /// The store refused to serve. Nothing was registered and nothing was started, so fixing the
+    /// defects and starting again is safe.
+    /// </summary>
+    | Refused of defects: BootDefect list
+
+/// <summary>
 /// Everything one machine's workers share. Internal to the runtime assembly: the public surface
 /// is the <c>machine</c> expression that builds it and the functions that read it.
 /// </summary>

@@ -20,6 +20,7 @@
         <Compile Include="ActionQueueTests.fs" />
         <Compile Include="ProcessorIntegrationTests.fs" />
         <Compile Include="SchemaContractTests.fs" />
+        <Compile Include="MaintenanceTests.fs" />
         <Compile Include="PostgresSupervisionStoreTests.fs" />
         <Compile Include="Program.fs" />
     </ItemGroup>

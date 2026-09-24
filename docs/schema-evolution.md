@@ -27,10 +27,13 @@ Two embedded trees, with different lifecycles and different jobs.
   - `004_transition.sql` is the append-only transition log.
   - `005_supervision.sql` is the supervision audit log.
   - `006_action.sql` is `fsm.action_dead_letter`, the record of effects that never happened.
-- `migrations/repeatable/*.sql` are reapplied whenever their content changes. Routines live in
-  `R__command_routines.sql`, `R__chart_routines.sql`, `R__temporal_routines.sql`,
-  `R__finalize_routines.sql` and `R__action_routines.sql`, one file per domain, as `CREATE OR REPLACE`, so editing a routine body is an edit to its own migration
-  rather than a new file. `R__temporal_routines.sql` also carries a `CREATE OR REPLACE TRIGGER`,
+  - `007_maintenance.sql` is `fsm.machine_maintenance`, the registry maintenance reads.
+- `migrations/repeatable/*.sql` are reapplied on **every** migration, not only when their content
+  changes: `Migrator` runs them as `ScriptType.RunAlways`, and they leave no journal row. Routines
+  live in `R__command_routines.sql`, `R__chart_routines.sql`, `R__temporal_routines.sql`,
+  `R__finalize_routines.sql`, `R__action_routines.sql`, `R__correction_routines.sql` and
+  `R__maintenance_routines.sql`, one file per domain, as `CREATE OR REPLACE`, so editing a
+  routine body is an edit to its own migration rather than a new file. `R__temporal_routines.sql` also carries a `CREATE OR REPLACE TRIGGER`,
   because `main` runs before `repeatable` and a trigger declared beside its table would reference
   a function that does not exist yet.
 - `sql/<domain>/<operation>.sql` are the statements the application sends, loaded by
@@ -89,6 +92,51 @@ identifier rather than a parameter, so `fsm.assert_queue_name` applies the `^[a-
 allowlist in the database as well as in the machine builder: the layer that does the interpolating
 is the layer that cannot afford to assume.
 
+## Maintenance
+
+Maintenance is SQL, so that pg_cron and the application's `MaintenanceService` can run exactly the
+same thing. Each machine writes its row in `fsm.machine_maintenance` when it boots, with its
+retention and reaping grace, so the database can maintain a machine whose application is not
+running. Two routines are the whole surface a scheduler calls:
+
+- **`fsm.notify_pending()`**, one tick of wake-ups. Never called from a trigger (D9). Its command
+  probe is the claim predicate verbatim, which makes **four** places that state it:
+  `command_claim_idx`, `fsm.claim_commands`, `fsm.command_metrics` and this. A test asserts the
+  probe still uses the index.
+- **`fsm.run_maintenance(batch)`**, one pass: reap, purge, count drift. It is single-flight
+  through a *tried* advisory lock, so a second host or pg_cron gets no rows rather than a queued
+  duplicate. Every task is bounded by `batch`, so a pass is a short transaction.
+
+What retention does, and does not:
+
+- **A command is purged with everything that references it**: its transition, its error and its
+  undelivered actions, in one statement. They are one account of one decision.
+- **Open commands and each entity's newest command are never purged.** The first is work; the
+  second keeps `seq` monotone, since `max(seq) + 1` over an emptied entity would restart at 1.
+- **The clock is `received_at`**, the only one every command has. A succeeded command that changed
+  nothing has no transition.
+- **A purged idempotency key is forgotten.** A client retrying after the retention period is
+  accepted as new, so retention must exceed any client's retry horizon.
+- **Purging belief history bounds `AsOf`.** A question asked with a `known_at` before the cutoff
+  is answered as though the older opinion had never been held.
+- **Nothing is deleted by default.** Every period defaults to `'infinity'`.
+
+Lease reaping hands leases expired by more than `reap_after` back to `ready`. It is cosmetic for
+progress, because an expired lease is already claimable, and it waits out a grace period because
+`fsm.extend_lease` accepts an expired lease nobody reclaimed. Poison is not handled here: the
+processor and the dispatcher refuse work delivered more often than it may be attempted, which is
+where a crash loop is visible.
+
+Drift is counted and never repaired by a pass. `fsm.repair_blocked` is opt-in, through
+`MaintenanceOptions.RepairDrift`.
+
+**pg_cron is installed only when everything allows it**, in `000_bootstrap.sql`: a superuser, in
+the database `cron.database_name` names, with the extension available. The privilege test comes
+first, because a role that is not superuser cannot read that setting. Jobs are asserted on every
+boot by `fsm.schedule_maintenance`, never by a migration, because their intervals are
+configuration. `cron.job` rows outlive `DROP SCHEMA`, so anything tearing the schema down calls
+`fsm.unschedule_maintenance()` first; `make db-reset` does.
+
 ## Temporal tables
 
 A table opts into system-time versioning by having a `system_time tstzrange` column, a twin named
@@ -112,12 +160,36 @@ exists to hold superseded and therefore overlapping rows, and a temporal key wou
 wanted: the twin has neither the temporal key nor the trigger, so the `CHECK` constraints are its
 only defence against a zero-width row.
 
-Valid-time mutations go through `fsm.close_and_open`, never through a direct `UPDATE` of
+Forward valid-time mutations go through `fsm.close_and_open`, never through a direct `UPDATE` of
 `valid_during`, so the split exists in one place. It delegates the actual
 `UPDATE … FOR PORTION OF` to `fsm.split_belief`, because that clause will not accept a plpgsql
 variable as a bound: the bound expressions are parsed without plpgsql's variable substitution, so
 a variable there reads as a column reference and the statement fails. A SQL function's parameters
 work, which is what `fsm.split_belief` is.
+
+## Corrections, and the one routine allowed to write behind the live belief
+
+`fsm.close_and_open` **raises** when the instant precedes the live belief's start, and keeps
+raising. A forward commit landing behind the current belief is a bug, not a change of mind, and a
+routine that quietly accepted both could not tell them apart.
+
+`fsm.correct_beliefs` is the one that may. It says so by being a different routine: a caller
+reaches it only by deciding to correct something. It truncates a belief that starts before the
+corrected instant and runs past it, deletes the ones at or after, and writes the supplied timeline
+with each belief ending where the next begins. Both removals archive, because
+`fsm.temporal_versioning` closes `system_time` and copies the row on `UPDATE` **and** on `DELETE`,
+so the superseded opinion stays answerable at a `known_at` before the correction. That is the
+entire point: a correction that erased what it replaced would leave an audit record claiming the
+new answer had always been the answer.
+
+It decides nothing. Which chart would have decided a state, whether replaying a command against
+it still resolves, and what to do when it does not are questions the caller has already answered.
+Keeping the policy out is what let the routine be written at all, because those questions have no
+settled answers yet and this one does.
+
+The upper bounds are derived rather than accepted, and ordering is checked before anything is
+written. A caller cannot describe a gap or an overlap, so no as-of query can land in one, and a
+timeline that is not ascending is refused rather than half-applied.
 
 ## The transition log and the epoch
 

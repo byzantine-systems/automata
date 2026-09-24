@@ -2,6 +2,7 @@ module ByzantineSystems.Automata.Runtime.Tests.MachineTests
 
 open System
 open System.Threading
+open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
 open ByzantineSystems.Automata.Runtime
@@ -173,7 +174,7 @@ let lifecycleTests =
               match!
                   Machine.startAsync built (StubRegistry(ChartRegistration.Mismatched stored)) CancellationToken.None
               with
-              | Ok(ChartRegistration.Mismatched _) -> ()
+              | Ok(Startup.Started(ChartRegistration.Mismatched _)) -> ()
               | other -> failtestf "expected a reported mismatch, got %A" other
           } ]
 
@@ -301,5 +302,108 @@ let capabilityTests =
               | Error error -> failtestf "history should have succeeded, got %A" error
           } ]
 
+/// Waits for a condition a background task will make true, failing rather than hanging.
+let private eventually (label: string) (condition: unit -> bool) =
+    task {
+        let deadline = DateTime.UtcNow.AddSeconds 5.
+
+        while not (condition ()) && DateTime.UtcNow < deadline do
+            do! Task.Delay 10
+
+        Expect.isTrue (condition ()) label
+    }
+
+let bootTests =
+    testList
+        "boot"
+        [ testTask "a store that refuses to boot starts nothing and registers nothing" {
+              let stub =
+                  BootingStubStore<TestError>(BootReport.Refused [ BootDefect.SchemaMissing ])
+
+              let registry = StubRegistry()
+              let built = buildMachine stub (newTime ()) id |> expectMachine
+
+              match! Machine.startAsync built registry CancellationToken.None with
+              | Ok(Startup.Refused [ BootDefect.SchemaMissing ]) -> ()
+              | other -> failtestf "expected the refusal to be reported, got %A" other
+
+              Expect.equal registry.Registrations 0 "a refused boot registers no chart"
+
+              match!
+                  Machine.enqueue built (entityId "E-1") (EventEnvelope.create "k1" (Start 1)) CancellationToken.None
+              with
+              | Error(MachineError.Rejected MachineRejection.NotStarted) -> ()
+              | other -> failtestf "a machine that never started should refuse work, got %A" other
+          }
+
+          testTask "a store without a boot check starts as before" {
+              // The optional-capability promise: a provider that implements only the required
+              // four is still a complete provider.
+              let registry = StubRegistry()
+              let built = buildMachine (StubStore<TestError>()) (newTime ()) id |> expectMachine
+
+              match! Machine.startAsync built registry CancellationToken.None with
+              | Ok(Startup.Started ChartRegistration.Registered) -> ()
+              | other -> failtestf "expected an ordinary start, got %A" other
+
+              Expect.equal registry.Registrations 1 "and the chart was registered"
+          } ]
+
+let listenerTests =
+    testList
+        "listener"
+        [ testTask "an announcement wakes the processor before its polling interval" {
+              let stub = NotifyingStubStore<TestError>(0)
+
+              // An interval no test would wait out, so only the announcement can explain a commit.
+              let built =
+                  buildMachine stub (newTime ()) (fun policy ->
+                      { policy with
+                          PollingInterval = TimeSpan.FromMinutes 10. })
+                  |> expectMachine
+
+              let! _ = Machine.startAsync built (StubRegistry()) CancellationToken.None
+              let stop = new CancellationTokenSource()
+              let running = (Machine.processor built).RunAsync stop.Token
+
+              do! eventually "the listener subscribed" (fun () -> stub.Listens = 1)
+              // Let the processor's first, empty poll finish and start waiting.
+              do! Task.Delay 100
+              stub.Offer(leasedCommand 1L "E-1" (Start 5) 0)
+              stub.Announce()
+
+              do! eventually "the command was processed" (fun () -> stub.Commits.Count = 1)
+
+              stop.Cancel()
+              let! _ = running
+              do! Machine.stopAsync built CancellationToken.None
+              stop.Dispose()
+          }
+
+          testTask "a listener that fails is started again and faults nothing" {
+              let stub = NotifyingStubStore<TestError>(2)
+
+              let built =
+                  buildMachine stub (newTime ()) (fun policy ->
+                      { policy with
+                          PollingInterval = TimeSpan.FromMilliseconds 10. })
+                  |> expectMachine
+
+              let! _ = Machine.startAsync built (StubRegistry()) CancellationToken.None
+
+              do! eventually "listened again after each failure" (fun () -> stub.Listens = 3)
+              Expect.isFalse built.Completion.IsCompleted "a lost listener costs latency, never the machine"
+
+              do! Machine.stopAsync built CancellationToken.None
+              Expect.isFalse built.Completion.IsFaulted "and it stops cleanly"
+          } ]
+
 let tests =
-    testList "machine" [ configurationTests; lifecycleTests; submissionTests; capabilityTests ]
+    testList
+        "machine"
+        [ configurationTests
+          lifecycleTests
+          submissionTests
+          capabilityTests
+          bootTests
+          listenerTests ]

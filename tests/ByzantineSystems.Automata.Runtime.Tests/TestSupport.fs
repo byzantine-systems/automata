@@ -116,6 +116,7 @@ type StubStore<'Err>() =
     member val Reschedules = ResizeArray<CommandId>() with get
     member val Extensions = ResizeArray<CommandId>() with get
     member val Deliveries = ResizeArray<CommandId * int>() with get
+    member val Abandonments = ResizeArray<CommandId * string>() with get
 
     /// Scripts one command for the next claim.
     member _.Offer(leased) = pending.Enqueue leased
@@ -190,7 +191,10 @@ type StubStore<'Err>() =
             Task.FromResult(Ok Updated)
 
         member _.Reschedule(_, _, _) = Task.FromResult(Ok Updated)
-        member _.Abandon(_, _, _) = Task.FromResult(Ok Updated)
+
+        member this.Abandon(action, reason, _) =
+            lock this.Abandonments (fun () -> this.Abandonments.Add(action.Work.CommandId, reason))
+            Task.FromResult(Ok Updated)
 
     interface IMachineStore<EntityId<TestEntity>, TestState, TestEvent, TestAction, 'Err>
 
@@ -213,12 +217,59 @@ type TemporalStubStore<'Err>() =
     interface ICorrectionStore<EntityId<TestEntity>, TestState> with
         member _.Correct(_, _, _, _, _) = Task.FromResult(Ok NothingSuperseded)
 
+/// <summary>A store with a boot check that answers whatever the test scripted.</summary>
+type BootingStubStore<'Err>(report: BootReport) =
+    inherit StubStore<'Err>()
+
+    interface IStoreBoot with
+        member _.Boot(_, _) = Task.FromResult(Ok report)
+
+/// <summary>
+/// A store that can announce work. <c>Announce</c> calls the listener's command callback, the way
+/// a notification from another process would; a scripted failure makes <c>Listen</c> fail that
+/// many times before it listens properly.
+/// </summary>
+type NotifyingStubStore<'Err>(failures: int) =
+    inherit StubStore<'Err>()
+
+    let mutable remainingFailures = failures
+    let mutable onCommands: (unit -> unit) option = None
+
+    member val Listens = 0 with get, set
+
+    member _.Announce() =
+        onCommands |> Option.iter (fun signal -> signal ())
+
+    interface IWorkNotifications with
+        member this.Listen(_, commands, _, ct) =
+            this.Listens <- this.Listens + 1
+
+            if remainingFailures > 0 then
+                remainingFailures <- remainingFailures - 1
+                Task.FromResult(Error(StoreError.Unavailable(InvalidOperationException "scripted")))
+            else
+                onCommands <- Some commands
+
+                task {
+                    try
+                        do! Task.Delay(Timeout.InfiniteTimeSpan, ct)
+                    with :? OperationCanceledException ->
+                        ()
+
+                    return Ok()
+                }
+
 /// <summary>A chart registry that always agrees, for tests that are not about registration.</summary>
 type StubRegistry(?outcome: ChartRegistration) =
     let answer = defaultArg outcome ChartRegistration.Registered
 
+    member val Registrations = 0 with get, set
+
     interface IChartRegistry with
-        member _.Register(_, _) = Task.FromResult(Ok answer)
+        member this.Register(_, _) =
+            this.Registrations <- this.Registrations + 1
+            Task.FromResult(Ok answer)
+
         member _.TryGet(_, _, _) = Task.FromResult(Ok None)
 
 /// <summary>Builds one leased command for a stub to hand out.</summary>

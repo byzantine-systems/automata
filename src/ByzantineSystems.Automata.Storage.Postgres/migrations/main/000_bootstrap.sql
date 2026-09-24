@@ -38,5 +38,39 @@ CREATE EXTENSION IF NOT EXISTS btree_gist;
 
 CREATE EXTENSION IF NOT EXISTS pgmq;
 
+-- pg_cron is optional, and arrives only when every condition for it holds.
+-- It needs superuser, a shared_preload_libraries entry, and it installs only
+-- in the one database its worker runs in (cron.database_name). Anyone else
+-- skips it silently: maintenance is not optional, but pg_cron is only one of
+-- the two things that can run it, and MaintenanceService is the other.
+--
+-- The IFs nest because plpgsql does not promise to short-circuit an AND, and
+-- the order matters: a role that is not superuser cannot even read
+-- cron.database_name ("permission denied to examine"), so the privilege test
+-- has to come first.
+DO $$
+BEGIN
+    IF (
+        SELECT
+            r.rolsuper
+        FROM
+            pg_roles r
+        WHERE
+            r.rolname = CURRENT_USER) THEN
+        IF CURRENT_DATABASE() = CURRENT_SETTING('cron.database_name', TRUE) THEN
+            IF EXISTS (
+                SELECT
+                    1
+                FROM
+                    pg_available_extensions a
+                WHERE
+                    a.name = 'pg_cron') THEN
+            CREATE EXTENSION IF NOT EXISTS pg_cron;
+        END IF;
+    END IF;
+END IF;
+END
+$$;
+
 CREATE SCHEMA fsm;
 

@@ -75,6 +75,12 @@ exception AutomataEscalationException of commandId: CommandId * reason: string
 /// <summary>Raised when the chart registration could not be read or written.</summary>
 exception AutomataChartRegistrationException of StoreError
 
+/// <summary>
+/// Raised when the store refused to boot. Nothing was started, so the defects can be fixed and
+/// the host started again.
+/// </summary>
+exception AutomataBootRefusedException of BootDefect list
+
 /// <summary>Raised when supervision audit persistence fails.</summary>
 exception AutomataAuditException of StoreError
 
@@ -185,14 +191,16 @@ type internal GenerationChild<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectE
                 do! completed
         }
 
-    /// Registers the chart before any work starts. A mismatch is reported by the store and is
-    /// the host's call; this one treats it as fatal, because a fleet that boots with a chart its
-    /// version no longer describes will write history nobody can replay.
+    /// Boots the store and registers the chart before any work starts. Both answers that are
+    /// not failures are still the host's call, and this host treats both as fatal: a refused
+    /// boot means every write would fail, and a fleet that boots with a chart its version no
+    /// longer describes will write history nobody can replay.
     member _.StartAsync(ct: CancellationToken) : Task =
         task {
             match! Machine.startAsync machine registry ct with
             | Error error -> return raise (AutomataChartRegistrationException error)
-            | Ok(ChartRegistration.Mismatched stored) ->
+            | Ok(Startup.Refused defects) -> return raise (AutomataBootRefusedException defects)
+            | Ok(Startup.Started(ChartRegistration.Mismatched stored)) ->
                 return
                     raise (
                         AutomataChartRegistrationException(

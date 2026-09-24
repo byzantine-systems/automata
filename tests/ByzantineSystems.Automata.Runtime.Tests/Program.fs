@@ -9,6 +9,7 @@ let tests =
         [ DraftTests.tests
           DispositionTests.tests
           ProcessorTests.tests
+          ProcessorTests.poisonTests
           MachineTests.tests
           WorkSignalsTests.tests ]
 

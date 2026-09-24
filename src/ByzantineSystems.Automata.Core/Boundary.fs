@@ -59,3 +59,61 @@ module TaskOutcome =
             Ok(work ())
         with error ->
             Error error
+
+/// <summary>
+/// Long-running loops whose normal end is cancellation.
+///
+/// Every background loop in this library has the same shape: do one step, maybe wait, go again,
+/// and stop when the owner cancels. Written out each time, that shape buries the step under a
+/// try/with for the one cancellation it may consume and a recursion to go round again. These
+/// hold the shape once, so each loop is only its step.
+///
+/// Cancellation by the supplied token ends a loop normally. Any other exception, including a
+/// cancellation somebody else requested, propagates to the owner, as everywhere else.
+/// </summary>
+[<RequireQualifiedAccess>]
+module Recurring =
+
+    /// <summary>Awaits the work, or answers <c>None</c> when this token cancelled it.</summary>
+    let unlessCanceled (ct: CancellationToken) (work: unit -> Task<'T>) : Task<'T option> =
+        backgroundTask {
+            try
+                let! value = work ()
+                return Some value
+            with CanceledBy ct ->
+                return None
+        }
+
+    /// <summary>Waits the interval on the given clock. Answers <c>false</c> when cancelled first.</summary>
+    let pause (interval: TimeSpan) (time: TimeProvider) (ct: CancellationToken) : Task<bool> =
+        backgroundTask {
+            let! waited = unlessCanceled ct (fun () -> backgroundTask { do! Task.Delay(interval, time, ct) })
+            return Option.isSome waited
+        }
+
+    /// <summary>Runs the step for as long as it answers <c>true</c> and nobody cancels.</summary>
+    let repeat (step: unit -> Task<bool>) (ct: CancellationToken) : Task<unit> =
+        let rec loop () =
+            backgroundTask {
+                match! unlessCanceled ct step with
+                | Some true -> return! loop ()
+                | Some false
+                | None -> return ()
+            }
+
+        loop ()
+
+    /// <summary>Runs the tick, then waits the interval, until cancelled.</summary>
+    let every
+        (interval: TimeSpan)
+        (time: TimeProvider)
+        (tick: CancellationToken -> Task)
+        (ct: CancellationToken)
+        : Task<unit> =
+        repeat
+            (fun () ->
+                backgroundTask {
+                    do! tick ct
+                    return! pause interval time ct
+                })
+            ct

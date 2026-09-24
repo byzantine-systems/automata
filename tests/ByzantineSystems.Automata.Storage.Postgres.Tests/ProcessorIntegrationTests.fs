@@ -72,7 +72,10 @@ let private ownStore () =
           ActionCodec = Serialization.systemTextJson<TestAction> ()
           ErrorCodec = Serialization.systemTextJson<TestError> ()
           EntityIdEncode = encode
-          EntityIdDecode = decode }
+          EntityIdDecode = decode
+          Retention = RetentionPolicy.keepEverything
+          ReapAfter = TimeSpan.FromMinutes 5.
+          Listener = ListenerConnection.SameDataSource }
     )
 
 let private buildMachine

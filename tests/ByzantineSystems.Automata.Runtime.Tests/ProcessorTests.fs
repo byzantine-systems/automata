@@ -2,6 +2,7 @@ module ByzantineSystems.Automata.Runtime.Tests.ProcessorTests
 
 open System
 open System.Threading
+open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
 open ByzantineSystems.Automata.Runtime
@@ -186,4 +187,66 @@ let tests =
               match! (processorOver store).RunAsync cancellation.Token with
               | ProcessorStop.Drained totals -> Expect.equal 0 totals.Claimed "nothing was claimed"
               | ProcessorStop.Escalated _ -> failtest "cancellation is not an escalation"
+          } ]
+
+/// A claim that ended with no outcome, delivered this many times. The helper's default is the
+/// ordinary path, one delivery more than the attempts recorded.
+let private redelivered (deliveries: int) =
+    { leasedCommand 1L "E-1" (Start 5) 0 with
+        DeliveryCount = deliveries }
+
+/// The machine under test allows three attempts; see buildMachine.
+let private maxAttempts = 3
+
+let poisonTests =
+    testList
+        "poison"
+        [ testTask "a command claimed more often than it may be attempted is dead-lettered unresolved" {
+              // Its workers kept dying before they could report anything, so nothing raised its
+              // attempt count and nothing would ever have stopped it.
+              let store = StubStore<TestError>()
+              store.Offer(redelivered (maxAttempts + 1))
+              let! report = poll store
+
+              Expect.equal report.Summary.DeadLettered 1 "given up on"
+              Expect.isEmpty store.Commits "and never resolved, since resolving it is what kept failing"
+
+              match List.ofSeq store.DeadLetters with
+              | [ _, CommandFailure.Machine reason ] ->
+                  Expect.stringContains reason "without an outcome" "the reason says why"
+              | other -> failtestf "expected one machine dead letter, got %A" other
+          }
+
+          testTask "a command at exactly its attempt limit is still processed" {
+              // The ordinary retry path reaches MaxAttempts deliveries and no further, so this
+              // is a legitimate last attempt and not poison.
+              let store = StubStore<TestError>()
+              store.Offer(redelivered maxAttempts)
+              let! report = poll store
+
+              Expect.equal report.Summary.Committed 1 "processed normally"
+          }
+
+          testTask "an action delivered more often than it may be attempted is abandoned unrun" {
+              let store = StubStore<TestError>()
+              let calls = ref 0
+
+              let handler _ _ =
+                  calls.Value <- calls.Value + 1
+                  Task.FromResult(Ok())
+
+              store.OfferAction(leasedAction 1L 1L 0 (maxAttempts + 1))
+
+              let machine = buildMachine store (newTime ()) id |> expectMachine
+              let! report = (Machine.dispatcher machine handler).PollAsync CancellationToken.None
+
+              match report with
+              | Ok report -> Expect.equal report.Abandoned 1 "abandoned"
+              | Error error -> failtestf "the poll failed: %A" error
+
+              Expect.equal calls.Value 0 "the handler that kept failing is not run again"
+
+              match List.ofSeq store.Abandonments with
+              | [ _, reason ] -> Expect.stringContains reason "without an outcome" "the reason says why"
+              | other -> failtestf "expected one abandonment, got %A" other
           } ]

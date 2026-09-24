@@ -1,9 +1,11 @@
 namespace ByzantineSystems.Automata.Storage.Postgres
 
+open System
 open System.Threading
 open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
+open FsToolkit.ErrorHandling
 
 /// <summary>
 /// Everything one machine's PostgreSQL store needs, in one place.
@@ -24,6 +26,25 @@ type MachineStoreOptions<'EntityId, 'State, 'Event, 'Action, 'Err> =
         EntityIdEncode: 'EntityId -> string
         /// <summary>Decoding returns a result, so a corrupt row is a typed failure rather than an exception.</summary>
         EntityIdDecode: string -> Result<'EntityId, string>
+        /// <summary>
+        /// How long this machine's history is kept. Written to the database on boot, so the
+        /// database can apply it without the application present. Nothing is deleted unless this
+        /// says so: <c>RetentionPolicy.keepEverything</c> keeps it all.
+        /// </summary>
+        Retention: RetentionPolicy
+        /// <summary>
+        /// How long past its expiry a lease is left alone before maintenance hands it back to
+        /// ready. It must exceed the processor's lease renewal margin, because a lease that
+        /// expired and was not reclaimed may still be extended by its holder, and reaping takes
+        /// that away. Minutes, not seconds.
+        /// </summary>
+        ReapAfter: TimeSpan
+        /// <summary>
+        /// Where this machine listens for work announced by other processes.
+        /// <c>SameDataSource</c> unless the data source goes through a transaction-mode pooler,
+        /// where <c>LISTEN</c> does not survive.
+        /// </summary>
+        Listener: ListenerConnection
     }
 
 /// <summary>
@@ -82,6 +103,9 @@ type PostgresMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
               EntityIdEncode = options.EntityIdEncode
               EntityIdDecode = options.EntityIdDecode }
         )
+
+    let notifications =
+        PostgresWorkNotifications(options.Context, options.ActionQueue, options.Listener) :> IWorkNotifications
 
     let actionQueue = actions :> IActionQueue<'EntityId, 'Action>
     let reader = processor :> IStateReader<'EntityId, 'State, 'Event, 'Action>
@@ -165,5 +189,34 @@ type PostgresMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
 
         member _.Correct(machineId, entityId, validFrom, beliefs, ct) =
             corrections.Correct(machineId, entityId, validFrom, beliefs, ct)
+
+    /// The boot check. Every precondition is read before anything is written, so a refused boot
+    /// leaves the database as it found it; the two writes after it are idempotent, which is what
+    /// makes booting every generation of a supervised machine safe.
+    interface IStoreBoot with
+
+        member _.Boot(machineId, ct) =
+            taskResult {
+                match! Boot.inspect options.Context ct with
+                | [] ->
+                    let! _ = actions.EnsureQueueAsync ct
+
+                    do!
+                        Boot.register
+                            options.Context
+                            machineId
+                            options.ActionQueue
+                            options.Retention
+                            options.ReapAfter
+                            ct
+
+                    return BootReport.Ready
+                | defects -> return BootReport.Refused defects
+            }
+
+    interface IWorkNotifications with
+
+        member _.Listen(machineId, onCommands, onActions, ct) =
+            notifications.Listen(machineId, onCommands, onActions, ct)
 
     interface IMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>

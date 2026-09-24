@@ -14,6 +14,7 @@
         <Compile Include="Processing.fs" />
         <Compile Include="Action.fs" />
         <Compile Include="Temporal.fs" />
+        <Compile Include="Maintenance.fs" />
         <Compile Include="MachineStore.fs" />
         <Compile Include="Supervision.fs" />
     </ItemGroup>

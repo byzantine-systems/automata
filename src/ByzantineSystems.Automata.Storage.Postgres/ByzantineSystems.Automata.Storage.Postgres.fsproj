@@ -17,6 +17,8 @@
         <Compile Include="PostgresCommandProcessorStore.fs" />
         <Compile Include="PostgresActionQueue.fs" />
         <Compile Include="PostgresTemporalStore.fs" />
+        <Compile Include="PostgresMaintenance.fs" />
+        <Compile Include="PostgresWorkNotifications.fs" />
         <Compile Include="PostgresMachineStore.fs" />
         <Compile Include="PostgresSupervisionStore.fs" />
         <Compile Include="Migrator.fs" />

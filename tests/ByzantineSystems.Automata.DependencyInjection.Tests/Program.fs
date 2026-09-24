@@ -10,7 +10,8 @@ let tests =
           ActionDispatchTests.actionDispatchTests
           SupervisionAuditTests.supervisionAuditTests
           ValidationTests.validationTests
-          LifecycleTests.lifecycleTests ]
+          LifecycleTests.lifecycleTests
+          MaintenanceServiceTests.tests ]
 
 [<EntryPoint>]
 let main argv = runTestsWithCLIArgs [] argv tests

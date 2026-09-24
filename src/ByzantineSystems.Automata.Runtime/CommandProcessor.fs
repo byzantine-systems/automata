@@ -343,12 +343,24 @@ type CommandProcessor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: e
                     return draft, outcome
                 }
 
-            let! decision = renewWhile leased (decide ()) ct
-
             let! outcome =
-                match decision with
-                | Ok(draft, outcome) -> interpretCommit leased draft outcome ct
-                | Error error -> applyDisposition leased (policy.Classify error) ct
+                // Claimed more often than it may be attempted. A reported failure raises the
+                // attempt count as well as the claim count, so the ordinary retry path keeps
+                // DeliveryCount at Attempts + 1 and gives up at MaxAttempts; only claims that
+                // ended with no outcome at all push it past, a worker killed mid-command or one
+                // that ran past its lease. Deciding it again would end the same way, and without
+                // this nothing ever stops it, so it is dead-lettered unresolved.
+                if leased.DeliveryCount > policy.MaxAttempts then
+                    applyDisposition
+                        leased
+                        (DeadLetter(CommandFailure.Machine $"claimed %d{leased.DeliveryCount} times without an outcome"))
+                        ct
+                else
+                    task {
+                        match! renewWhile leased (decide ()) ct with
+                        | Ok(draft, outcome) -> return! interpretCommit leased draft outcome ct
+                        | Error error -> return! applyDisposition leased (policy.Classify error) ct
+                    }
 
             logOutcome record outcome (config.TimeProvider.GetElapsedTime started)
             return outcome
