@@ -192,6 +192,9 @@ module Machine =
     let private inboxOf (machine: Machine<'EntityId, 'State, 'Event, 'Action, 'Err>) =
         machine.RuntimeConfig.Store :> ICommandInbox<'EntityId, 'Event>
 
+    let private stateReaderOf (machine: Machine<'EntityId, 'State, 'Event, 'Action, 'Err>) =
+        machine.RuntimeConfig.Store :> IStateReader<'EntityId, 'State, 'Event, 'Action>
+
     let private processorOf (machine: Machine<'EntityId, 'State, 'Event, 'Action, 'Err>) =
         machine.RuntimeConfig.Store :> ICommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
 
@@ -328,8 +331,60 @@ module Machine =
         (entityId: 'EntityId)
         (ct: CancellationToken)
         : Task<Result<Snapshot<'State> option, MachineError<'Err>>> =
-        (machine.RuntimeConfig.Store :> IStateReader<'EntityId, 'State>).TryGetSnapshot(machine.MachineId, entityId, ct)
+        (stateReaderOf machine).TryGetSnapshot(machine.MachineId, entityId, ct)
         |> TaskResult.mapError MachineError.Store
+
+    /// <summary>
+    /// One ascending page of an entity's transition log, oldest first.
+    ///
+    /// Always available, because history is a required capability rather than an optional one:
+    /// any store that can append a log can page it.
+    /// </summary>
+    /// <example>
+    /// <code lang="fsharp">
+    /// let! firstPage = Machine.history machine orderId (Page.create 50) ct
+    /// </code>
+    /// </example>
+    let history
+        (machine: Machine<'EntityId, 'State, 'Event, 'Action, 'Err>)
+        (entityId: 'EntityId)
+        (paging: Page)
+        (ct: CancellationToken)
+        : Task<Result<CommittedTransition<'EntityId, 'State, 'Event, 'Action> list, MachineError<'Err>>> =
+        (stateReaderOf machine).History(machine.MachineId, entityId, paging, ct)
+        |> TaskResult.mapError MachineError.Store
+
+    /// <summary>
+    /// The store's ability to read the past, or <c>None</c> when this store does not offer one.
+    ///
+    /// An option rather than more functions on <c>Machine</c>. Mirroring the readers here would
+    /// need a "capability unavailable" case on
+    /// <see cref="T:ByzantineSystems.Automata.Core.MachineError`1" />, which every caller of every
+    /// other machine function would then have to handle for a condition none of them can reach.
+    /// Matching this once says exactly what is true.
+    /// </summary>
+    /// <example>
+    /// <code lang="fsharp">
+    /// match Machine.temporal machine with
+    /// | Some reader -> reader.AsOf(Machine.machineId machine, orderId, validAt, knownAt, ct)
+    /// | None -> failwith "this store does not keep history"
+    /// </code>
+    /// </example>
+    let temporal
+        (machine: Machine<'EntityId, 'State, 'Event, 'Action, 'Err>)
+        : ITemporalReader<'EntityId, 'State> option =
+        Store.tryTemporal machine.RuntimeConfig.Store
+
+    /// <summary>
+    /// The store's ability to change the past, or <c>None</c> when it does not offer one.
+    ///
+    /// Separate from <c>temporal</c> because reading what was believed and rewriting it are
+    /// different rights, and a deployment may want one reachable where the other is not.
+    /// </summary>
+    let corrections
+        (machine: Machine<'EntityId, 'State, 'Event, 'Action, 'Err>)
+        : ICorrectionStore<'EntityId, 'State> option =
+        Store.tryCorrections machine.RuntimeConfig.Store
 
     /// <summary>The logical machine name the chart, inbox and store are keyed by.</summary>
     let machineId (machine: Machine<'EntityId, 'State, 'Event, 'Action, 'Err>) : MachineId = machine.MachineId

@@ -124,7 +124,9 @@ let private drainUntil
 
 let private stateOf (store: PostgresMachineStore<Entity, TestState, TestEvent, TestAction, TestError>) name =
     task {
-        let! snapshot = (store :> IStateReader<Entity, TestState>).TryGetSnapshot(machine, entity name, noCancellation)
+        let! snapshot =
+            (store :> IStateReader<Entity, TestState, TestEvent, TestAction>)
+                .TryGetSnapshot(machine, entity name, noCancellation)
 
         return snapshot |> expectOk "snapshot"
     }

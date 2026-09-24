@@ -27,7 +27,7 @@ type TestError = Refused of reason: string
 type Entity = EntityId<TestEntity>
 type Inbox = ICommandInbox<Entity, TestEvent>
 type Processor = ICommandProcessorStore<Entity, TestState, TestEvent, TestAction, TestError>
-type Reader = IStateReader<Entity, TestState>
+type Reader = IStateReader<Entity, TestState, TestEvent, TestAction>
 
 let machine = machineId "pg-tests"
 let noCancellation = CancellationToken.None
@@ -186,6 +186,23 @@ let private actionQueueStore () =
 
 let newActionQueue () : Actions = actionQueueStore () :> Actions
 
+type Temporal = ITemporalReader<Entity, TestState>
+type Corrections = ICorrectionStore<Entity, TestState>
+
+let private temporalStore () =
+    let encode, decode = EntityKey.forEntityId<TestEntity>
+
+    PostgresTemporalStore<Entity, TestState>(
+        { Context = context ()
+          StateCodec = Serialization.systemTextJson<TestState> ()
+          EntityIdEncode = encode
+          EntityIdDecode = decode }
+    )
+
+let newTemporalReader () : Temporal = temporalStore () :> Temporal
+
+let newCorrections () : Corrections = temporalStore () :> Corrections
+
 let newRegistry () : IChartRegistry =
     PostgresChartRegistry({ Context = context () }) :> IChartRegistry
 
@@ -316,3 +333,16 @@ let columnsOf (sql: string) (parameters: (string * obj) list) : string list =
 type FakeClock(at: DateTimeOffset) =
     inherit TimeProvider()
     override _.GetUtcNow() = at
+
+/// Lays a belief down through the ordinary forward path, which is the only writer that exists
+/// outside a correction. The fixture calls the routine rather than the store, so a reader test
+/// fails on the reader rather than on whatever wrote the row.
+let believe (name: string) (at: DateTimeOffset) (state: TestState) (epoch: int64) : unit =
+    let encoded =
+        match (Serialization.systemTextJson<TestState> ()).Encode state with
+        | Ok json -> json
+        | Error error -> failtestf "the fixture could not encode a state: %A" error
+
+    exec
+        $"SELECT fsm.close_and_open('{MachineId.value machine}', '{name}', '{at:o}'::timestamptz, '{encoded}'::jsonb, 'running', {epoch}, 1, 1)"
+    |> expectOkUnit "close_and_open"

@@ -18,6 +18,9 @@ let tests =
                   [ CommandInboxTests.tests
                     ChartRegistryTests.tests
                     TemporalTests.tests
+                    TemporalReaderTests.tests
+                    CorrectionTests.tests
+                    HistoryTests.tests
                     FinalizeTests.tests
                     ActionQueueTests.tests
                     ProcessorIntegrationTests.tests

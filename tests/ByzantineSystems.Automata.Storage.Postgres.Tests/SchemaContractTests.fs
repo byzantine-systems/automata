@@ -104,9 +104,11 @@ let tests =
           testTask "the belief reads return exactly the columns they promise" {
               do! reset ()
 
-              // The live read carries what a snapshot needs; the as-of read is the time-travel
-              // shape and deliberately does not, because a superseded belief's epoch is not the
-              // entity's current one.
+              // Both reads carry the same columns, for different reasons. The live read is what
+              // a snapshot needs; the as-of read is a Belief, which carries its own two windows
+              // and says which transition produced it. An earlier as-of shape omitted the epoch
+              // on the grounds that a superseded belief's epoch is not the entity's current one,
+              // which is true and is exactly why the windows travel beside it.
               Expect.equal
                   (columnsOf (SqlResources.get "belief" "live") [ "machine_id", box "none"; "entity_id", box "none" ])
                   [ "machine_id"
@@ -127,8 +129,47 @@ let tests =
                         "entity_id", box "none"
                         "valid_at", box DateTime.UtcNow
                         "known_at", box DateTime.UtcNow ])
-                  [ "machine_id"; "entity_id"; "state"; "valid_during"; "system_time" ]
-                  "the as-of read is the time-travel shape"
+                  [ "machine_id"
+                    "entity_id"
+                    "state"
+                    "status"
+                    "epoch"
+                    "command_id"
+                    "chart_version"
+                    "valid_during"
+                    "system_time" ]
+                  "the as-of read is what ITemporalReader maps into a Belief"
+          }
+
+          testTask "the history read returns exactly the columns the decoder maps" {
+              do! reset ()
+
+              // Deliberately the same shape sql/command/result.sql returns for a committed
+              // command, because one decoder serves both. Two decoders for one row shape would
+              // be two places for it to drift.
+              Expect.equal
+                  (columnsOf
+                      (SqlResources.get "transition" "history")
+                      [ "machine_id", box "none"
+                        "entity_id", box "none"
+                        "after_epoch", box 0L
+                        "limit", box 1 ])
+                  [ "machine_id"
+                    "entity_id"
+                    "epoch"
+                    "command_id"
+                    "chart_version"
+                    "event"
+                    "actions"
+                    "from_state"
+                    "to_state"
+                    "handled_by"
+                    "exited"
+                    "entered"
+                    "instance_status"
+                    "effective_at"
+                    "committed_at" ]
+                  "the history page is what readTransition maps"
           }
 
           testTask "the live belief read uses its partial index" {

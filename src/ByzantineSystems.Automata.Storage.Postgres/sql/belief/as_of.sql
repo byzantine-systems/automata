@@ -16,10 +16,22 @@
 -- The temporal key guarantees at most one live belief covers @valid_at, and the
 -- system_time windows of one entity's versions are disjoint by construction, so
 -- this returns at most one row without needing DISTINCT or a LIMIT to say so.
+--
+-- epoch, command_id and chart_version are selected, which an earlier version of
+-- this query deliberately omitted on the grounds that a superseded belief's
+-- epoch is not the entity's current one. That was the right caution while the
+-- only consumer wanted a snapshot. It is the wrong one for a Belief, which
+-- carries its own two windows and exists to say which transition produced this
+-- belief and under which chart. Read with the windows beside them, they are
+-- unambiguous; read as if they were the entity's current epoch, they never were.
 SELECT
     s.machine_id,
     s.entity_id,
     s.state,
+    s.status,
+    s.epoch,
+    s.command_id,
+    s.chart_version,
     s.valid_during,
     s.system_time
 FROM (

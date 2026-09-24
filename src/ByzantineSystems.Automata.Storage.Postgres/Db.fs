@@ -117,7 +117,30 @@ module internal Db =
 
     let timestamp (dto: DateTimeOffset) : DateTime = dto.UtcDateTime
 
+    /// <summary>The instance lifecycle, as the fsm.instance_status domain spells it.</summary>
+    let instanceStatusToString (status: InstanceStatus) : string =
+        match status with
+        | Running -> "running"
+        | Suspended -> "suspended"
+        | Terminated -> "terminated"
+
+    let epochOf (value: int64) : Epoch = Epoch.ofUInt64 (uint64 value)
+
     let fromTimestamp (dt: DateTime) : DateTimeOffset = DateTimeOffset(dt, TimeSpan.Zero)
+
+    /// <summary>
+    /// Reads one bound of a range as an instant, or <c>None</c> when it is open.
+    ///
+    /// The schema's rule that absence always has a value, <c>'infinity'</c>, is a storage rule:
+    /// it stops a <c>CHECK</c> passing by accident on a null. Above this line an open bound is
+    /// better said as <c>None</c>, and Npgsql surfaces <c>'infinity'</c> as
+    /// <see cref="F:System.DateTime.MaxValue" />, so the translation happens once, here.
+    /// </summary>
+    let openEnded (bound: DateTime) : DateTimeOffset option =
+        if bound = DateTime.MaxValue then
+            None
+        else
+            Some(fromTimestamp bound)
 
     let toStoreError (error: CodecError) : StoreError =
         match error with
@@ -128,6 +151,14 @@ module internal Db =
     /// projection reports, as the serialization error the contract promises.</summary>
     let decodeFailure (typeName: string) (message: string) : StoreError =
         StoreError.Serialization(typeName, FormatException message)
+
+    /// <summary>The instance lifecycle, read back from the fsm.instance_status domain.</summary>
+    let instanceStatusFromString (value: string) : Result<InstanceStatus, StoreError> =
+        match value with
+        | "running" -> Ok Running
+        | "suspended" -> Ok Suspended
+        | "terminated" -> Ok Terminated
+        | other -> Error(decodeFailure (nameof InstanceStatus) $"unknown instance status {other}")
 
 /// <summary>
 /// Column access by name.

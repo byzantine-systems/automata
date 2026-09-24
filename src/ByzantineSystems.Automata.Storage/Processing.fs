@@ -126,18 +126,69 @@ module LeaseOutcome =
         | Updated -> None
 
 /// <summary>
-/// Reads an entity's current state.
+/// One ascending page of an entity's transition log, bounded by an exclusive epoch cursor and a
+/// row limit.
 ///
-/// A processor needs this before it can do anything: resolving a command means knowing the state
-/// it starts from, and finishing one means knowing the epoch it expects. History reads arrive
-/// with the rest of the read path.
+/// The cursor is an epoch rather than an offset, and that is what makes a page deterministic. An
+/// offset shifts as rows arrive; an epoch does not, so a page pinned to one returns the same rows
+/// however much has been committed since.
 /// </summary>
-type IStateReader<'EntityId, 'State> =
+type Page =
+    private
+        { AfterEpoch: Epoch option
+          Limit: int }
+
+/// <summary>Operations on <see cref="T:ByzantineSystems.Automata.Storage.Page" />.</summary>
+[<RequireQualifiedAccess>]
+module Page =
+
+    /// <summary>The first page of a history query, with the given row limit.</summary>
+    /// <exception cref="T:System.ArgumentException">The limit is below 1.</exception>
+    let create (limit: int) : Page =
+        if limit < 1 then
+            invalidArg (nameof limit) "A page must request at least one row."
+
+        { AfterEpoch = None; Limit = limit }
+
+    /// <summary>A page continuing strictly after the given epoch.</summary>
+    /// <exception cref="T:System.ArgumentException">The limit is below 1.</exception>
+    let after (epoch: Epoch) (limit: int) : Page =
+        if limit < 1 then
+            invalidArg (nameof limit) "A page must request at least one row."
+
+        { AfterEpoch = Some epoch
+          Limit = limit }
+
+    /// <summary>The exclusive lower epoch bound; <c>None</c> reads from the start of the log.</summary>
+    let cursor (page: Page) : Epoch option = page.AfterEpoch
+
+    /// <summary>The maximum number of rows the page requests.</summary>
+    let limit (page: Page) : int = page.Limit
+
+/// <summary>
+/// Reads what an entity is and what it has been.
+///
+/// A processor needs the snapshot before it can do anything: resolving a command means knowing
+/// the state it starts from, and finishing one means knowing the epoch it expects. The history
+/// is the other half of the same question, and it is required rather than optional because an
+/// append-only log is something any store can page.
+/// </summary>
+type IStateReader<'EntityId, 'State, 'Event, 'Action> =
 
     /// <summary>The entity's current belief, or <c>None</c> when it has never committed.</summary>
     abstract TryGetSnapshot:
         machineId: MachineId * entityId: 'EntityId * ct: CancellationToken ->
             Task<Result<Snapshot<'State> option, StoreError>>
+
+    /// <summary>
+    /// One ascending page of the entity's transition log.
+    ///
+    /// Ascending because this is a log rather than a feed: it is read to follow what happened in
+    /// the order it happened, and the epoch that orders it is gapless.
+    /// </summary>
+    abstract History:
+        machineId: MachineId * entityId: 'EntityId * paging: Page * ct: CancellationToken ->
+            Task<Result<CommittedTransition<'EntityId, 'State, 'Event, 'Action> list, StoreError>>
 
 /// <summary>
 /// The atomic end of processing a command.

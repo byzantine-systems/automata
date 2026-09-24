@@ -75,8 +75,18 @@ type PostgresMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
               EntityIdDecode = options.EntityIdDecode }
         )
 
+    let temporalStore =
+        PostgresTemporalStore<'EntityId, 'State>(
+            { Context = options.Context
+              StateCodec = options.StateCodec
+              EntityIdEncode = options.EntityIdEncode
+              EntityIdDecode = options.EntityIdDecode }
+        )
+
     let actionQueue = actions :> IActionQueue<'EntityId, 'Action>
-    let reader = processor :> IStateReader<'EntityId, 'State>
+    let reader = processor :> IStateReader<'EntityId, 'State, 'Event, 'Action>
+    let temporal = temporalStore :> ITemporalReader<'EntityId, 'State>
+    let corrections = temporalStore :> ICorrectionStore<'EntityId, 'State>
 
     let processorStore =
         processor :> ICommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
@@ -106,10 +116,13 @@ type PostgresMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
         member _.TryFind(machineId, entityId, key, ct) =
             inbox.TryFind(machineId, entityId, key, ct)
 
-    interface IStateReader<'EntityId, 'State> with
+    interface IStateReader<'EntityId, 'State, 'Event, 'Action> with
 
         member _.TryGetSnapshot(machineId, entityId, ct) =
             reader.TryGetSnapshot(machineId, entityId, ct)
+
+        member _.History(machineId, entityId, paging, ct) =
+            reader.History(machineId, entityId, paging, ct)
 
     interface ICommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err> with
 
@@ -136,5 +149,21 @@ type PostgresMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
             actionQueue.Reschedule(action, backoff, ct)
 
         member _.Abandon(action, reason, ct) = actionQueue.Abandon(action, reason, ct)
+
+    // The two optional capabilities. Declaring them is what makes Store.tryTemporal and
+    // Store.tryCorrections answer Some for this store, and a provider that omits them is still a
+    // complete provider.
+    interface ITemporalReader<'EntityId, 'State> with
+
+        member _.ValidAt(machineId, entityId, validAt, ct) =
+            temporal.ValidAt(machineId, entityId, validAt, ct)
+
+        member _.AsOf(machineId, entityId, validAt, knownAt, ct) =
+            temporal.AsOf(machineId, entityId, validAt, knownAt, ct)
+
+    interface ICorrectionStore<'EntityId, 'State> with
+
+        member _.Correct(machineId, entityId, validFrom, beliefs, ct) =
+            corrections.Correct(machineId, entityId, validFrom, beliefs, ct)
 
     interface IMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>

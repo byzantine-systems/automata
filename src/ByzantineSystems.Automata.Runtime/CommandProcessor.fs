@@ -99,7 +99,7 @@ type CommandProcessor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: e
     // call on the aggregate is genuinely ambiguous, and naming the capability is what says
     // which one a line means.
     let inbox = config.Store :> ICommandInbox<'EntityId, 'Event>
-    let reader = config.Store :> IStateReader<'EntityId, 'State>
+    let reader = config.Store :> IStateReader<'EntityId, 'State, 'Event, 'Action>
 
     let processor =
         config.Store :> ICommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>

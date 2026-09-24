@@ -20,6 +20,8 @@ let private expected =
       "chart", "by_version"
       "belief", "live"
       "belief", "as_of"
+      "belief", "correct"
+      "transition", "history"
       "system", "command_metrics"
       "supervision", "record"
       "supervision", "list_recent"

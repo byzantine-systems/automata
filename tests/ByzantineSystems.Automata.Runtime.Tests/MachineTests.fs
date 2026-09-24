@@ -251,5 +251,55 @@ let submissionTests =
               | other -> failtestf "expected the submission to succeed, got %A" other
           } ]
 
+
+let capabilityTests =
+    testList
+        "optional capabilities"
+        [ test "a store offering only the required four has no temporal capability" {
+              // The D12 promise under test: a third-party store that skips a capability is still
+              // a complete provider, and the type system says so rather than a runtime error
+              // saying it later.
+              let built = buildMachine (StubStore<TestError>()) (newTime ()) id |> expectMachine
+
+              Expect.isNone (Machine.temporal built) "no reader"
+              Expect.isNone (Machine.corrections built) "no corrections"
+          }
+
+          test "a store offering them is discovered" {
+              let built =
+                  buildMachine (TemporalStubStore<TestError>()) (newTime ()) id |> expectMachine
+
+              Expect.isSome (Machine.temporal built) "the reader is found"
+              Expect.isSome (Machine.corrections built) "the corrections are found"
+          }
+
+          testTask "history is always available, because it is required rather than optional" {
+              let stub = StubStore<TestError>()
+
+              stub.Log <-
+                  [ { Draft =
+                        { MachineId = testMachine
+                          EntityId = entityId "E-1"
+                          Event = Start 1
+                          Actions = []
+                          FromState = Idle
+                          ToState = Active 1
+                          HandledBy = stateId "idle"
+                          Exited = []
+                          Entered = []
+                          Status = InstanceStatus.Running
+                          EffectiveAt = startTime }
+                      Epoch = Epoch.ofUInt64 1UL
+                      CommandId = CommandId.ofInt64 1L
+                      ChartVersion = ChartVersion.create 1
+                      CommittedAt = startTime } ]
+
+              let! built = started stub
+
+              match! Machine.history built (entityId "E-1") (Page.create 10) CancellationToken.None with
+              | Ok page -> Expect.equal 1 (List.length page) "the page the store returned"
+              | Error error -> failtestf "history should have succeeded, got %A" error
+          } ]
+
 let tests =
-    testList "machine" [ configurationTests; lifecycleTests; submissionTests ]
+    testList "machine" [ configurationTests; lifecycleTests; submissionTests; capabilityTests ]

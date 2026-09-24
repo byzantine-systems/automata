@@ -82,8 +82,9 @@ type TestStore() =
         member _.TryGet(_, _) = Task.FromResult(Ok None)
         member _.TryFind(_, _, _, _) = Task.FromResult(Ok None)
 
-    interface IStateReader<Entity, TestState> with
+    interface IStateReader<Entity, TestState, TestEvent, TestAction> with
         member _.TryGetSnapshot(_, _, _) = Task.FromResult(Ok None)
+        member _.History(_, _, _, _) = Task.FromResult(Ok [])
 
     interface ICommandProcessorStore<Entity, TestState, TestEvent, TestAction, string> with
         member _.Commit(_, _, _, _, _) =

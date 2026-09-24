@@ -13,6 +13,9 @@
         <Compile Include="CommandInboxTests.fs" />
         <Compile Include="ChartRegistryTests.fs" />
         <Compile Include="TemporalTests.fs" />
+        <Compile Include="TemporalReaderTests.fs" />
+        <Compile Include="CorrectionTests.fs" />
+        <Compile Include="HistoryTests.fs" />
         <Compile Include="FinalizeTests.fs" />
         <Compile Include="ActionQueueTests.fs" />
         <Compile Include="ProcessorIntegrationTests.fs" />

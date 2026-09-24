@@ -87,6 +87,9 @@ type StubStore<'Err>() =
 
     member val Snapshot: Snapshot<TestState> option = None with get, set
 
+    /// What History hands back. Scripted, like everything else here: this stub orders nothing.
+    member val Log: CommittedTransition<EntityId<TestEntity>, TestState, TestEvent, TestAction> list = [] with get, set
+
     /// What the next Commit answers with.
     member val CommitOutcome: Result<FinalizeOutcome, StoreError> = Ok(Finalized(Epoch.ofUInt64 1UL)) with get, set
 
@@ -149,8 +152,9 @@ type StubStore<'Err>() =
         member _.TryGet(_, _) = Task.FromResult(Ok None)
         member _.TryFind(_, _, _, _) = Task.FromResult(Ok None)
 
-    interface IStateReader<EntityId<TestEntity>, TestState> with
+    interface IStateReader<EntityId<TestEntity>, TestState, TestEvent, TestAction> with
         member this.TryGetSnapshot(_, _, _) = Task.FromResult(Ok this.Snapshot)
+        member this.History(_, _, _, _) = Task.FromResult(Ok this.Log)
 
     interface ICommandProcessorStore<EntityId<TestEntity>, TestState, TestEvent, TestAction, 'Err> with
 
@@ -189,6 +193,25 @@ type StubStore<'Err>() =
         member _.Abandon(_, _, _) = Task.FromResult(Ok Updated)
 
     interface IMachineStore<EntityId<TestEntity>, TestState, TestEvent, TestAction, 'Err>
+
+/// <summary>
+/// A store that also offers the two temporal capabilities.
+///
+/// A separate type rather than a flag on StubStore, so both answers to "does this store offer
+/// time travel" are reachable: the D12 promise is that a provider implementing only the required
+/// four still works, and a test that could not construct such a provider would not be testing it.
+/// </summary>
+type TemporalStubStore<'Err>() =
+    inherit StubStore<'Err>()
+
+    member val Beliefs: Belief<EntityId<TestEntity>, TestState> option = None with get, set
+
+    interface ITemporalReader<EntityId<TestEntity>, TestState> with
+        member this.ValidAt(_, _, _, _) = Task.FromResult(Ok this.Beliefs)
+        member this.AsOf(_, _, _, _, _) = Task.FromResult(Ok this.Beliefs)
+
+    interface ICorrectionStore<EntityId<TestEntity>, TestState> with
+        member _.Correct(_, _, _, _, _) = Task.FromResult(Ok NothingSuperseded)
 
 /// <summary>A chart registry that always agrees, for tests that are not about registration.</summary>
 type StubRegistry(?outcome: ChartRegistration) =

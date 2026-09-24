@@ -35,26 +35,11 @@ type CommandProcessorOptions<'EntityId, 'State, 'Event, 'Action, 'Err> =
 [<RequireQualifiedAccess>]
 module private ProcessorMapping =
 
-    let instanceStatusToString (status: InstanceStatus) : string =
-        match status with
-        | Running -> "running"
-        | Suspended -> "suspended"
-        | Terminated -> "terminated"
-
-    let instanceStatusFromString (value: string) : Result<InstanceStatus, StoreError> =
-        match value with
-        | "running" -> Ok Running
-        | "suspended" -> Ok Suspended
-        | "terminated" -> Ok Terminated
-        | other -> Error(Db.decodeFailure (nameof InstanceStatus) $"unknown instance status {other}")
-
-    let epochOf (value: int64) : Epoch = Epoch.ofUInt64 (uint64 value)
-
     let outcomeFromString (value: string) (epoch: int64) (expected: Epoch) : Result<FinalizeOutcome, StoreError> =
         match value with
-        | "finalized" -> Ok(Finalized(epochOf epoch))
-        | "already_finalized" -> Ok(AlreadyFinalized(epochOf epoch))
-        | "conflict" -> Ok(Conflict(expected, epochOf epoch))
+        | "finalized" -> Ok(Finalized(Db.epochOf epoch))
+        | "already_finalized" -> Ok(AlreadyFinalized(Db.epochOf epoch))
+        | "conflict" -> Ok(Conflict(expected, Db.epochOf epoch))
         | "lease_lost" -> Ok FinalizeOutcome.LeaseLost
         | other -> Error(Db.decodeFailure (nameof FinalizeOutcome) $"unknown finalize outcome {other}")
 
@@ -146,8 +131,7 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                 cmd
                 |> addNullable name dbType (committed |> Option.map (fun (draft, _, _, _, _) -> selector draft))
 
-            fromDraft "instance_status" NpgsqlDbType.Text (fun d ->
-                box (ProcessorMapping.instanceStatusToString d.Status))
+            fromDraft "instance_status" NpgsqlDbType.Text (fun d -> box (Db.instanceStatusToString d.Status))
 
             fromDraft "effective_at" NpgsqlDbType.TimestampTz (fun d -> box (Db.timestamp d.EffectiveAt))
             fromDraft "handled_by" NpgsqlDbType.Text (fun d -> box (StateId.value d.HandledBy))
@@ -225,12 +209,17 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                 })
             ct
 
-    /// Rebuilds a committed transition from the result row. Five decodes can fail independently,
-    /// and none of them is expected: each means the row is not what this code was compiled for.
-    let readCommitted
+    /// Rebuilds a committed transition from a row of fsm.transition. Seven decodes can fail
+    /// independently, and none of them is expected: each means the row is not what this code was
+    /// compiled for.
+    ///
+    /// Shared by the command-result read and the history page, which is why sql/transition/history.sql
+    /// returns the same column names sql/command/result.sql does. Two decoders for one row shape
+    /// would be two places for it to drift.
+    let readTransition
         (reader: NpgsqlDataReader)
         (commandId: CommandId)
-        : Result<CommandResult<'EntityId, 'State, 'Event, 'Action, 'Err>, StoreError> =
+        : Result<CommittedTransition<'EntityId, 'State, 'Event, 'Action>, StoreError> =
         let entityId =
             Row.string reader "entity_id"
             |> options.EntityIdDecode
@@ -256,8 +245,7 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
             |> options.StateCodec.Decode
             |> Result.mapError Db.toStoreError
 
-        let status =
-            Row.string reader "instance_status" |> ProcessorMapping.instanceStatusFromString
+        let status = Row.string reader "instance_status" |> Db.instanceStatusFromString
 
         let chartVersion =
             Row.int32 reader "chart_version"
@@ -266,25 +254,23 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
 
         match entityId, event, actions, fromState, toState, status, chartVersion with
         | Ok entityId, Ok event, Ok actions, Ok fromState, Ok toState, Ok status, Ok chartVersion ->
-            Ok(
-                CommandResult.Committed
-                    { Draft =
-                        { MachineId = Row.string reader "machine_id" |> MachineId.create
-                          EntityId = entityId
-                          Event = event
-                          Actions = actions
-                          FromState = fromState
-                          ToState = toState
-                          HandledBy = Row.string reader "handled_by" |> StateId.create
-                          Exited = Row.textArray reader "exited" |> List.map StateId.create
-                          Entered = Row.textArray reader "entered" |> List.map StateId.create
-                          Status = status
-                          EffectiveAt = Row.timestamp reader "effective_at" }
-                      Epoch = Row.int64 reader "epoch" |> ProcessorMapping.epochOf
-                      CommandId = commandId
-                      ChartVersion = chartVersion
-                      CommittedAt = Row.timestamp reader "committed_at" }
-            )
+            Ok
+                { Draft =
+                    { MachineId = Row.string reader "machine_id" |> MachineId.create
+                      EntityId = entityId
+                      Event = event
+                      Actions = actions
+                      FromState = fromState
+                      ToState = toState
+                      HandledBy = Row.string reader "handled_by" |> StateId.create
+                      Exited = Row.textArray reader "exited" |> List.map StateId.create
+                      Entered = Row.textArray reader "entered" |> List.map StateId.create
+                      Status = status
+                      EffectiveAt = Row.timestamp reader "effective_at" }
+                  Epoch = Row.int64 reader "epoch" |> Db.epochOf
+                  CommandId = commandId
+                  ChartVersion = chartVersion
+                  CommittedAt = Row.timestamp reader "committed_at" }
         | Error error, _, _, _, _, _, _
         | _, Error error, _, _, _, _, _
         | _, _, Error error, _, _, _, _
@@ -293,7 +279,10 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
         | _, _, _, _, _, Error error, _
         | _, _, _, _, _, _, Error error -> Error error
 
-    interface IStateReader<'EntityId, 'State> with
+    let readCommitted (reader: NpgsqlDataReader) (commandId: CommandId) =
+        readTransition reader commandId |> Result.map CommandResult.Committed
+
+    interface IStateReader<'EntityId, 'State, 'Event, 'Action> with
 
         member _.TryGetSnapshot(machineId, entityId, ct) =
             protect
@@ -314,7 +303,7 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                                 |> options.StateCodec.Decode
                                 |> Result.mapError Db.toStoreError
 
-                            let status = Row.string reader "status" |> ProcessorMapping.instanceStatusFromString
+                            let status = Row.string reader "status" |> Db.instanceStatusFromString
 
                             match state, status with
                             | Ok state, Ok status ->
@@ -322,11 +311,57 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                                     Ok(
                                         Some
                                             { State = state
-                                              Epoch = Row.int64 reader "epoch" |> ProcessorMapping.epochOf
+                                              Epoch = Row.int64 reader "epoch" |> Db.epochOf
                                               Status = status }
                                     )
                             | Error error, _
                             | _, Error error -> return Error error
+                    })
+                ct
+
+        member _.History(machineId, entityId, paging, ct) =
+            protect
+                (fun cancel ->
+                    task {
+                        use! conn = dataSource.OpenConnectionAsync(cancel).AsTask()
+                        use cmd = new NpgsqlCommand(SqlResources.get "transition" "history", conn)
+                        cmd |> addText "machine_id" (MachineId.value machineId)
+                        cmd |> addText "entity_id" (options.EntityIdEncode entityId)
+
+                        // An absent cursor is zero rather than a null, because
+                        // transition_epoch_positive forbids a stored epoch of zero. One query
+                        // shape then serves the first page and every later one.
+                        cmd
+                        |> addBigint
+                            "after_epoch"
+                            (Page.cursor paging
+                             |> Option.map (Epoch.value >> int64)
+                             |> Option.defaultValue 0L)
+
+                        cmd.Parameters.AddWithValue("limit", Page.limit paging) |> ignore
+                        use! reader = cmd.ExecuteReaderAsync cancel
+
+                        let page = ResizeArray()
+                        let mutable failure = None
+                        let mutable reading = true
+
+                        while reading do
+                            let! hasRow = reader.ReadAsync cancel
+
+                            if not hasRow then
+                                reading <- false
+                            else
+                                let commandId = Row.int64 reader "command_id" |> CommandId.ofInt64
+
+                                match readTransition reader commandId with
+                                | Error error ->
+                                    failure <- Some error
+                                    reading <- false
+                                | Ok transition -> page.Add transition
+
+                        match failure with
+                        | Some error -> return Error error
+                        | None -> return Ok(List.ofSeq page)
                     })
                 ct
 
