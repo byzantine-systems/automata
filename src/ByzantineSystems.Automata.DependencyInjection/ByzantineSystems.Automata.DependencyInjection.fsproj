@@ -3,6 +3,8 @@
     <PropertyGroup>
         <GenerateDocumentationFile>true</GenerateDocumentationFile>
         <IsPackable>true</IsPackable>
+        <Description>Generic Host integration for ByzantineSystems.Automata.</Description>
+        <PackageTags>fsharp;statechart;dependency-injection;hosting</PackageTags>
     </PropertyGroup>
 
     <ItemGroup>

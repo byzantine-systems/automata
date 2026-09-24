@@ -15,6 +15,13 @@
         "reportgenerator"
       ],
       "rollForward": false
+    },
+    "sqlhydra.cli": {
+      "version": "5.0.0",
+      "commands": [
+        "sqlhydra"
+      ],
+      "rollForward": false
     }
   }
 }

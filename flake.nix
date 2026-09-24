@@ -170,6 +170,8 @@
               buildInputs = [
                 net10
                 pkgs.gnumake
+                # make schema-check formats the regenerated types before diffing them.
+                pkgs.fantomas
               ];
 
               shellHook = ''

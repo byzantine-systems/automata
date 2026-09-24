@@ -4,10 +4,13 @@
 PROJECT_NAME ?= bs-automata
 DOTNET ?= dotnet
 NIX ?= nix
+FANTOMAS ?= fantomas
 DB_CONNECTION_STRING ?= Host=127.0.0.1;Port=5432;Database=$(PROJECT_NAME);Username=$(PROJECT_NAME);Password=$(PROJECT_NAME)
 DB_URL ?= postgresql://$(PROJECT_NAME):$(PROJECT_NAME)@127.0.0.1:5432/$(PROJECT_NAME)
 
 SOLUTION := bs-automata.slnx
+POSTGRES_PROJECT := src/ByzantineSystems.Automata.Storage.Postgres/ByzantineSystems.Automata.Storage.Postgres.fsproj
+SQLHYDRA_CONFIG := sqlhydra-npgsql.toml
 MIGRATE_PROJECT := tools/ByzantineSystems.Automata.Migrate/ByzantineSystems.Automata.Migrate.fsproj
 EXAMPLE_PAYMENT_PROJECT := examples/ByzantineSystems.Automata.Examples.PaymentProcessor/ByzantineSystems.Automata.Examples.PaymentProcessor.fsproj
 EXAMPLE_SUPERVISION_PROJECT := examples/ByzantineSystems.Automata.Examples.Supervision/ByzantineSystems.Automata.Examples.Supervision.fsproj
@@ -34,13 +37,16 @@ COVERAGE_DIR := $(CURDIR)/coverage
 COVERAGE_RAW_DIR := $(COVERAGE_DIR)/raw
 
 release := $(shell git tag -l --sort=-creatordate | head -n 1)
-VERSION ?= $(if $(release),$(patsubst v%,%,$(release)),0.1.0)
+# Untagged builds take the version Directory.Build.props declares, which is also what the flake
+# reads, so a local pack and a Nix build agree on what they are building.
+declared := $(shell sed -n 's:.*<Version>\(.*\)</Version>.*:\1:p' Directory.Build.props | head -n 1)
+VERSION ?= $(if $(release),$(patsubst v%,%,$(release)),$(declared))
 
 PROJECT_FILES := $(wildcard src/*/*.fsproj tests/*/*.fsproj tools/*/*.fsproj examples/*/*.fsproj)
 RESTORE_INPUTS := Makefile $(SOLUTION) global.json nuget.config $(PROJECT_FILES) \
 	$(wildcard Directory.Build.* Directory.Packages.*)
 
-.PHONY: build test test-unit test-integration coverage migrate run-example run-example-supervision run-example-hosted db db-reset fmt docs nix-lock pack package-smoke push
+.PHONY: build test test-unit test-integration coverage migrate schema-generate schema-check run-example run-example-supervision run-example-hosted db db-reset fmt docs nix-lock pack package-smoke push
 
 build:
 	$(DOTNET) build $(SOLUTION) -m:1
@@ -84,6 +90,18 @@ coverage:
 
 migrate:
 	BS_AUTOMATA_CONN='$(DB_CONNECTION_STRING)' $(DOTNET) run --project $(MIGRATE_PROJECT)
+
+# The generated schema types come from the migrated database, so both targets migrate first.
+# Regenerate after any migration that changes a table or view the stores read.
+schema-generate: migrate
+	$(DOTNET) tool restore
+	$(DOTNET) sqlhydra npgsql -t $(SQLHYDRA_CONFIG) -p $(POSTGRES_PROJECT)
+	$(FANTOMAS) src/ByzantineSystems.Automata.Storage.Postgres/Schema.Generated.fs
+
+# Fails when the committed types and the schema disagree. CI runs it after migrating.
+schema-check: migrate
+	$(DOTNET) tool restore
+	DOTNET='$(DOTNET)' FANTOMAS='$(FANTOMAS)' bash scripts/verify-sqlhydra.sh
 
 run-example:
 	$(DOTNET) run --project $(EXAMPLE_PAYMENT_PROJECT)
@@ -134,15 +152,11 @@ pack:
 		$(DOTNET) pack "$$project" -c Release /p:Version=$(VERSION) /p:PackageOutputPath=$(CURDIR)/$(PACKAGE_OUTPUT) || exit 1; \
 	done
 
-# Restores every locally packed library into a clean F# consumer and compiles it.
+# Restores every locally packed library into a clean F# consumer and compiles the README's code
+# against them, so the documented API is proven to be the packed API.
 package-smoke: pack
-	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
-		$(DOTNET) new classlib --language F# --framework net10.0 --output "$$tmp" --no-restore; \
-		for package in $(notdir $(basename $(SRC_PROJECTS))); do \
-			$(DOTNET) add "$$tmp" package "$$package" --version "$(VERSION)" --no-restore || exit 1; \
-		done; \
-		$(DOTNET) restore "$$tmp" --source "$(CURDIR)/$(PACKAGE_OUTPUT)" --source "$(NUGET_SOURCE)" || exit 1; \
-		$(DOTNET) build "$$tmp" --no-restore
+	DOTNET='$(DOTNET)' bash scripts/package-smoke.sh "$(VERSION)" "$(CURDIR)/$(PACKAGE_OUTPUT)" "$(NUGET_SOURCE)" \
+		$(notdir $(basename $(SRC_PROJECTS)))
 
 # Pushes the packed release to NuGet
 push:

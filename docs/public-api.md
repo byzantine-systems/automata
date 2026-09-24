@@ -103,4 +103,4 @@ Reading the past and changing it are two interfaces rather than one because they
 
 `PostgresTemporalStore` implements both optional capabilities and is composed into `PostgresMachineStore`, so both discoveries answer `Some` for the PostgreSQL store.
 
-`Migrator.migrate` applies the embedded migrations; see [schema evolution](schema-evolution.md) for how the schema and its statements are organised, and for why nothing in F# calls `pgmq.archive` or `pgmq.set_vt` directly.
+`Migrator.migrate logger connectionString` returns `Result<MigrationReport, MigrationError>`. `…Storage.Postgres.Schema` is generated and unsupported. See [schema evolution](schema-evolution.md) for how the schema and its statements are organised, and for why nothing in F# calls `pgmq.archive` or `pgmq.set_vt` directly.

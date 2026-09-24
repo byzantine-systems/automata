@@ -20,6 +20,11 @@
     "hash": "sha256-b5tnJIQ5lu4ynpjdCOr/U8QWEhyAIVzDaLdUmQOMf0g="
   },
   {
+    "pname": "FastExpressionCompiler",
+    "version": "5.1.1",
+    "hash": "sha256-58mSrlp08akN145R3f+MV71REvjrajf1LRQX9g7QWog="
+  },
+  {
     "pname": "FsCheck",
     "version": "3.4.0",
     "hash": "sha256-absipRfuHzCFiQgfNKTZ65qO5mzbd7ixTpCjbvZjd7Q="
@@ -248,6 +253,11 @@
     "pname": "Polly.Extensions",
     "version": "8.8.0",
     "hash": "sha256-Sjkpju0SvLM4Cm845yGMBKT8G5vV4C/4EwhiZLluevQ="
+  },
+  {
+    "pname": "SqlHydra.Query",
+    "version": "5.0.0",
+    "hash": "sha256-ScIRL5PoGAaGcUbOyoM7NAolWrCaQAtoSw1xZ9mtwRo="
   },
   {
     "pname": "System.Diagnostics.EventLog",

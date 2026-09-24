@@ -202,7 +202,7 @@ type StubStore<'Err>() =
 /// A store that also offers the two temporal capabilities.
 ///
 /// A separate type rather than a flag on StubStore, so both answers to "does this store offer
-/// time travel" are reachable: A provider implementing only the required four still works, and 
+/// time travel" are reachable: A provider implementing only the required four still works, and
 /// a test that could not construct such a provider would not be testing it.
 /// </summary>
 type TemporalStubStore<'Err>() =

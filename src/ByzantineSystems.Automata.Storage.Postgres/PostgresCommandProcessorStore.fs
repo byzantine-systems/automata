@@ -6,8 +6,11 @@ open System.Threading
 open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
+open ByzantineSystems.Automata.Storage.Postgres.Schema
+open FsToolkit.ErrorHandling
 open Npgsql
 open NpgsqlTypes
+open SqlHydra.Query
 
 /// <summary>
 /// Everything the processor needs to bridge the generic domain types to the columns of
@@ -209,68 +212,53 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                 })
             ct
 
-    /// Rebuilds a committed transition from a row of fsm.transition. Seven decodes can fail
+    /// Rebuilds a committed transition from its generated row. Seven decodes can fail
     /// independently, and none of them is expected: each means the row is not what this code was
-    /// compiled for.
-    ///
-    /// Shared by the command-result read and the history page, which is why sql/transition/history.sql
-    /// returns the same column names sql/command/result.sql does. Two decoders for one row shape
-    /// would be two places for it to drift.
-    let readTransition
-        (reader: NpgsqlDataReader)
-        (commandId: CommandId)
+    /// compiled for. Shared by the command-result read and the history page, so one row shape
+    /// has one decoder.
+    let toTransition
+        (row: fsm.transition)
         : Result<CommittedTransition<'EntityId, 'State, 'Event, 'Action>, StoreError> =
         let entityId =
-            Row.string reader "entity_id"
+            row.entity_id
             |> options.EntityIdDecode
             |> Result.mapError (Db.decodeFailure "EntityId")
 
-        let event =
-            Row.string reader "event"
-            |> options.EventCodec.Decode
-            |> Result.mapError Db.toStoreError
-
-        let actions =
-            Row.string reader "actions"
-            |> options.ActionCodec.Decode
-            |> Result.mapError Db.toStoreError
-
-        let fromState =
-            Row.string reader "from_state"
-            |> options.StateCodec.Decode
-            |> Result.mapError Db.toStoreError
-
-        let toState =
-            Row.string reader "to_state"
-            |> options.StateCodec.Decode
-            |> Result.mapError Db.toStoreError
-
-        let status = Row.string reader "instance_status" |> Db.instanceStatusFromString
+        let decode (codec: Codec<'T>) (json: string) =
+            codec.Decode json |> Result.mapError Db.toStoreError
 
         let chartVersion =
-            Row.int32 reader "chart_version"
+            row.chart_version
             |> ChartVersion.tryCreate
             |> Result.mapError (Db.decodeFailure "ChartVersion")
 
-        match entityId, event, actions, fromState, toState, status, chartVersion with
+        match
+            entityId,
+            decode options.EventCodec row.event,
+            decode options.ActionCodec row.actions,
+            decode options.StateCodec row.from_state,
+            decode options.StateCodec row.to_state,
+            Db.instanceStatusFromString row.status,
+            chartVersion
+        with
         | Ok entityId, Ok event, Ok actions, Ok fromState, Ok toState, Ok status, Ok chartVersion ->
             Ok
                 { Draft =
-                    { MachineId = Row.string reader "machine_id" |> MachineId.create
+                    { MachineId = MachineId.create row.machine_id
                       EntityId = entityId
                       Event = event
                       Actions = actions
                       FromState = fromState
                       ToState = toState
-                      HandledBy = Row.string reader "handled_by" |> StateId.create
-                      Exited = Row.textArray reader "exited" |> List.map StateId.create
-                      Entered = Row.textArray reader "entered" |> List.map StateId.create
+                      HandledBy = StateId.create row.handled_by
+                      Exited = row.exited |> Array.map StateId.create |> List.ofArray
+                      Entered = row.entered |> Array.map StateId.create |> List.ofArray
                       Status = status
-                      EffectiveAt = Row.timestamp reader "effective_at" }
-                  Epoch = Row.int64 reader "epoch" |> Db.epochOf
-                  CommandId = commandId
+                      EffectiveAt = Db.fromTimestamp row.effective_at }
+                  Epoch = Db.epochOf row.epoch
+                  CommandId = CommandId.ofInt64 row.command_id
                   ChartVersion = chartVersion
-                  CommittedAt = Row.timestamp reader "committed_at" }
+                  CommittedAt = Db.fromTimestamp row.committed_at }
         | Error error, _, _, _, _, _, _
         | _, Error error, _, _, _, _, _
         | _, _, Error error, _, _, _, _
@@ -279,90 +267,88 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
         | _, _, _, _, _, Error error, _
         | _, _, _, _, _, _, Error error -> Error error
 
-    let readCommitted (reader: NpgsqlDataReader) (commandId: CommandId) =
-        readTransition reader commandId |> Result.map CommandResult.Committed
+    /// The current belief, from the view's nullable columns. The view cannot carry NOT NULL, so
+    /// each column is required here instead of assumed.
+    let toSnapshot (row: fsm.current_belief) : Result<Snapshot<'State>, StoreError> =
+        let column name value = Db.required "Snapshot" name value
+
+        result {
+            let! state = column "state" row.state
+            let! status = column "status" row.status
+            let! epoch = column "epoch" row.epoch
+            let! state = options.StateCodec.Decode state |> Result.mapError Db.toStoreError
+            let! status = Db.instanceStatusFromString status
+
+            return
+                { State = state
+                  Epoch = Db.epochOf epoch
+                  Status = status }
+        }
+
+    /// What became of one command, from the command, its transition if it committed, and its
+    /// error if it failed.
+    let toResult
+        (command: fsm.command, transition: fsm.transition option, error: fsm.command_error option)
+        : Result<CommandResult<'EntityId, 'State, 'Event, 'Action, 'Err>, StoreError> =
+        let failure () =
+            match error with
+            | Some error -> readFailure error.error
+            | None -> Error(Db.decodeFailure (nameof CommandResult) "a failed command has no recorded error")
+
+        match command.status, transition with
+        | ("ready" | "leased"), _ -> Ok CommandResult.Pending
+        | "succeeded", Some transition -> toTransition transition |> Result.map CommandResult.Committed
+        | "succeeded", None -> Error(Db.decodeFailure (nameof CommandResult) "a succeeded command has no transition")
+        | "rejected", _ -> failure () |> Result.map CommandResult.Rejected
+        | "dead_letter", _ -> failure () |> Result.map CommandResult.DeadLettered
+        | other, _ -> Error(Db.decodeFailure (nameof CommandResult) $"unknown command status {other}")
+
+    let read work ct =
+        Db.query options.Context.Resilience dataSource work ct
 
     interface IStateReader<'EntityId, 'State, 'Event, 'Action> with
 
         member _.TryGetSnapshot(machineId, entityId, ct) =
-            protect
-                (fun cancel ->
-                    task {
-                        use! conn = dataSource.OpenConnectionAsync(cancel).AsTask()
-                        use cmd = new NpgsqlCommand(SqlResources.get "belief" "live", conn)
-                        cmd |> addText "machine_id" (MachineId.value machineId)
-                        cmd |> addText "entity_id" (options.EntityIdEncode entityId)
-                        use! reader = cmd.ExecuteReaderAsync cancel
-                        let! hasRow = reader.ReadAsync cancel
+            let machine = Some(MachineId.value machineId)
+            let entity = Some(options.EntityIdEncode entityId)
 
-                        if not hasRow then
-                            return Ok None
-                        else
-                            let state =
-                                Row.string reader "state"
-                                |> options.StateCodec.Decode
-                                |> Result.mapError Db.toStoreError
-
-                            let status = Row.string reader "status" |> Db.instanceStatusFromString
-
-                            match state, status with
-                            | Ok state, Ok status ->
-                                return
-                                    Ok(
-                                        Some
-                                            { State = state
-                                              Epoch = Row.int64 reader "epoch" |> Db.epochOf
-                                              Status = status }
-                                    )
-                            | Error error, _
-                            | _, Error error -> return Error error
-                    })
+            read
+                (fun context token ->
+                    selectTask context {
+                        for b in fsm.current_belief do
+                            where (b.machine_id = machine && b.entity_id = entity)
+                            select b
+                            tryHead
+                            cancel token
+                    }
+                    |> Task.map (Option.traverseResult toSnapshot))
                 ct
 
         member _.History(machineId, entityId, paging, ct) =
-            protect
-                (fun cancel ->
-                    task {
-                        use! conn = dataSource.OpenConnectionAsync(cancel).AsTask()
-                        use cmd = new NpgsqlCommand(SqlResources.get "transition" "history", conn)
-                        cmd |> addText "machine_id" (MachineId.value machineId)
-                        cmd |> addText "entity_id" (options.EntityIdEncode entityId)
+            let machine = MachineId.value machineId
+            let entity = options.EntityIdEncode entityId
 
-                        // An absent cursor is zero rather than a null, because
-                        // transition_epoch_positive forbids a stored epoch of zero. One query
-                        // shape then serves the first page and every later one.
-                        cmd
-                        |> addBigint
-                            "after_epoch"
-                            (Page.cursor paging
-                             |> Option.map (Epoch.value >> int64)
-                             |> Option.defaultValue 0L)
+            // An absent cursor is zero rather than a null, because transition_epoch_positive
+            // forbids a stored epoch of zero. One query shape then serves every page.
+            let after =
+                Page.cursor paging
+                |> Option.map (Epoch.value >> int64)
+                |> Option.defaultValue 0L
 
-                        cmd.Parameters.AddWithValue("limit", Page.limit paging) |> ignore
-                        use! reader = cmd.ExecuteReaderAsync cancel
+            let limit = Page.limit paging
 
-                        let page = ResizeArray()
-                        let mutable failure = None
-                        let mutable reading = true
-
-                        while reading do
-                            let! hasRow = reader.ReadAsync cancel
-
-                            if not hasRow then
-                                reading <- false
-                            else
-                                let commandId = Row.int64 reader "command_id" |> CommandId.ofInt64
-
-                                match readTransition reader commandId with
-                                | Error error ->
-                                    failure <- Some error
-                                    reading <- false
-                                | Ok transition -> page.Add transition
-
-                        match failure with
-                        | Some error -> return Error error
-                        | None -> return Ok(List.ofSeq page)
-                    })
+            read
+                (fun context token ->
+                    selectTask context {
+                        for t in fsm.transition do
+                            where (t.machine_id = machine && t.entity_id = entity && t.epoch > after)
+                            orderBy t.epoch
+                            take limit
+                            select t
+                            toList
+                            cancel token
+                    }
+                    |> Task.map (List.traverseResultM toTransition))
                 ct
 
     interface ICommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err> with
@@ -393,34 +379,18 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
             failWith "dead_letter" commandId token error ct
 
         member _.TryGetResult(commandId, ct) =
-            protect
-                (fun cancel ->
-                    task {
-                        use! conn = dataSource.OpenConnectionAsync(cancel).AsTask()
-                        use cmd = new NpgsqlCommand(SqlResources.get "command" "result", conn)
-                        cmd |> addBigint "command_id" (CommandId.value commandId)
-                        use! reader = cmd.ExecuteReaderAsync cancel
-                        let! hasRow = reader.ReadAsync cancel
+            let id = CommandId.value commandId
 
-                        if not hasRow then
-                            return Ok None
-                        else
-                            match Row.string reader "status" with
-                            | "ready"
-                            | "leased" -> return Ok(Some CommandResult.Pending)
-                            | "succeeded" -> return readCommitted reader commandId |> Result.map Some
-                            | ("rejected" | "dead_letter") as status ->
-                                return
-                                    Row.string reader "error"
-                                    |> readFailure
-                                    |> Result.map (fun failure ->
-                                        Some(
-                                            if status = "dead_letter" then
-                                                CommandResult.DeadLettered failure
-                                            else
-                                                CommandResult.Rejected failure
-                                        ))
-                            | other ->
-                                return Error(Db.decodeFailure (nameof CommandResult) $"unknown command status {other}")
-                    })
+            read
+                (fun context token ->
+                    selectTask context {
+                        for c in fsm.command do
+                            leftJoin t in fsm.transition on (c.command_id = t.Value.command_id)
+                            leftJoin e in fsm.command_error on (c.command_id = e.Value.command_id)
+                            where (c.command_id = id)
+                            select (c, t, e)
+                            tryHead
+                            cancel token
+                    }
+                    |> Task.map (Option.traverseResult toResult))
                 ct

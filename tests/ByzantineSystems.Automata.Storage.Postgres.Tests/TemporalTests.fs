@@ -287,13 +287,16 @@ let tests =
 
               closeAndOpen "e1" "2026-01-01" "{\"v\":2}" |> ignore
 
-              // The shipped file, run as shipped. Only the parameters differ between the two
-              // readings, and one of those parameters is the whole question.
+              // The view the store reads, queried the way it queries it. Only the parameters
+              // differ between the two readings, and one of those parameters is the whole question.
               let validAt = DateTime(2026, 6, 1, 0, 0, 0, DateTimeKind.Utc)
 
               let readAsOf (knownAt: DateTime) =
                   rows
-                      (SqlResources.get "belief" "as_of")
+                      """SELECT state FROM fsm.belief
+                         WHERE machine_id = @machine_id AND entity_id = @entity_id
+                           AND valid_from <= @valid_at AND valid_to > @valid_at
+                           AND known_from <= @known_at AND known_to > @known_at"""
                       [ "machine_id", box "pg-tests"
                         "entity_id", box "e1"
                         "valid_at", box validAt

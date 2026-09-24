@@ -3,6 +3,8 @@
     <PropertyGroup>
         <GenerateDocumentationFile>true</GenerateDocumentationFile>
         <IsPackable>true</IsPackable>
+        <Description>Command processing, action dispatch and machine lifecycle for ByzantineSystems.Automata.</Description>
+        <PackageTags>fsharp;statechart;state-machine;runtime</PackageTags>
     </PropertyGroup>
 
     <!-- Runtime tests exercise actor ordering and eviction through internal seams. Keeping

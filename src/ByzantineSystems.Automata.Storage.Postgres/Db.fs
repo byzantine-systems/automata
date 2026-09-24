@@ -115,6 +115,41 @@ module internal Db =
         : Task<Result<'T, StoreError>> =
         classify (fun () -> work ct) ct
 
+    /// <summary>
+    /// Runs typed reads against the generated schema types, under the same pipeline and the same
+    /// failure classification as every hand-written statement. SqlHydra builds and runs the
+    /// query; the connection, the retries and what a failure means stay here. The context owns
+    /// the connection and disposes it.
+    /// </summary>
+    let query
+        (pipeline: ResiliencePipeline)
+        (dataSource: NpgsqlDataSource)
+        (work: SqlHydra.Query.QueryContext -> CancellationToken -> Task<Result<'T, StoreError>>)
+        (ct: CancellationToken)
+        : Task<Result<'T, StoreError>> =
+        protect
+            pipeline
+            (fun cancel ->
+                backgroundTask {
+                    let! conn = dataSource.OpenConnectionAsync(cancel).AsTask()
+
+                    use context =
+                        new SqlHydra.Query.QueryContext(conn, SqlHydra.Query.PostgresEmitter())
+
+                    return! work context cancel
+                })
+            ct
+
+    /// <summary>
+    /// A column a view reports as nullable, which the schema says never is. PostgreSQL cannot
+    /// carry NOT NULL through a view, so every view column arrives as an option; a missing one
+    /// means the view and the code disagree, and is reported as such rather than defaulted.
+    /// </summary>
+    let required (typeName: string) (column: string) (value: 'T option) : Result<'T, StoreError> =
+        match value with
+        | Some value -> Ok value
+        | None -> Error(StoreError.Serialization(typeName, FormatException $"the view returned no {column}"))
+
     let timestamp (dto: DateTimeOffset) : DateTime = dto.UtcDateTime
 
     /// <summary>Binds named parameters, in one call rather than one statement each.</summary>
@@ -188,9 +223,6 @@ module internal Row =
     let timestamp (reader: NpgsqlDataReader) (name: string) : DateTimeOffset =
         Db.fromTimestamp (reader.GetDateTime(reader.GetOrdinal name))
 
-    let textArray (reader: NpgsqlDataReader) (name: string) : string list =
-        reader.GetFieldValue<string array>(reader.GetOrdinal name) |> List.ofArray
-
     /// <summary>Reads every remaining row through <paramref name="read" />, in result order.</summary>
     let all (read: NpgsqlDataReader -> 'T) (reader: NpgsqlDataReader) (ct: CancellationToken) : Task<'T list> =
         let rec next (acc: 'T list) =
@@ -201,12 +233,3 @@ module internal Row =
             }
 
         next []
-
-    /// <summary>
-    /// Reads a text column whose empty value means "not supplied". No column in the schema is
-    /// nullable, so absence is the empty string on the way out and <c>None</c> on the way in.
-    /// </summary>
-    let optionalString (reader: NpgsqlDataReader) (name: string) : string option =
-        match reader.GetString(reader.GetOrdinal name) with
-        | "" -> None
-        | value -> Some value

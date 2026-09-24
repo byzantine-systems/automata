@@ -83,13 +83,6 @@ type Machine<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: equality>
                 completion.TrySetException(error) |> ignore
         }
 
-    /// <summary>
-    /// Keeps the wake signals fed from the store's notifications, for as long as the machine runs.
-    ///
-    /// Never a fault. A listener that fails costs the polling interval and nothing else, so it is
-    /// logged, waited out for one polling interval, and started again; the machine keeps working
-    /// on its polls in the meantime.
-    /// </summary>
     let listenerFailed (error: StoreError) =
         config.Logger.LogWarning(
             EventId(1312, "NotificationListenerFailed"),
@@ -319,6 +312,33 @@ module Machine =
         (processorOf machine).TryGetResult(commandId, ct)
         |> TaskResult.mapError MachineError.Store
 
+    /// Polls the store for a command's outcome, raced against the local notification, until it
+    /// settles. Outside send's own computation expression so the recursion does not force a
+    /// dynamic state machine on every call.
+    let rec private awaitSettled
+        (machine: Machine<'EntityId, 'State, 'Event, 'Action, 'Err>)
+        (identifier: CommandId)
+        (notified: Task<CommandResult<'EntityId, 'State, 'Event, 'Action, 'Err>>)
+        (ct: CancellationToken)
+        : Task<Result<CommandResult<'EntityId, 'State, 'Event, 'Action, 'Err>, MachineError<'Err>>> =
+        task {
+            match! commandResult machine identifier ct with
+            | Error error -> return Error error
+            | Ok(Some CommandResult.Pending)
+            | Ok None ->
+                let delay =
+                    Task.Delay(machine.ResultPollInterval, machine.RuntimeConfig.TimeProvider, ct)
+
+                let! first = Task.WhenAny(notified :> Task, delay)
+
+                if Object.ReferenceEquals(first, notified :> Task) then
+                    let! result = notified
+                    return Ok result
+                else
+                    return! awaitSettled machine identifier notified ct
+            | Ok(Some settled) -> return Ok settled
+        }
+
     /// <summary>
     /// Enqueues an event and waits for its durable outcome.
     ///
@@ -362,28 +382,7 @@ module Machine =
             let waiter = machine.Completions.Register identifier
 
             try
-                let rec await () =
-                    task {
-                        let! settled = commandResult machine identifier ct
-
-                        match settled with
-                        | Error error -> return Error error
-                        | Ok(Some CommandResult.Pending)
-                        | Ok None ->
-                            let delay =
-                                Task.Delay(machine.ResultPollInterval, machine.RuntimeConfig.TimeProvider, ct)
-
-                            let! first = Task.WhenAny(waiter.Task :> Task, delay)
-
-                            if Object.ReferenceEquals(first, waiter.Task :> Task) then
-                                let! result = waiter.Task
-                                return Ok result
-                            else
-                                return! await ()
-                        | Ok(Some settled) -> return Ok settled
-                    }
-
-                return! await ()
+                return! awaitSettled machine identifier waiter.Task ct
             finally
                 machine.Completions.Forget identifier
         }

@@ -3,6 +3,8 @@
     <PropertyGroup>
         <GenerateDocumentationFile>true</GenerateDocumentationFile>
         <IsPackable>true</IsPackable>
+        <Description>Storage contracts for ByzantineSystems.Automata.</Description>
+        <PackageTags>fsharp;statechart;state-machine;storage</PackageTags>
     </PropertyGroup>
 
     <ItemGroup>

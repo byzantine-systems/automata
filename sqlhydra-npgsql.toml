@@ -1,0 +1,30 @@
+# Types for the rows the PostgreSQL store reads, generated from the migrated schema.
+#
+#   make schema-generate   regenerate after a migration changes one of these
+#   make schema-check      fail when the committed file and the schema disagree
+#
+# Only reads are generated. Every write, and every read with logic in it, is an
+# fsm.* routine called from sql/, because SqlHydra types tables and views and
+# not function results.
+[general]
+connection = "Host=127.0.0.1;Port=5432;Database=bs-automata;Username=bs-automata;Password=bs-automata"
+output = "Schema.Generated.fs"
+namespace = "ByzantineSystems.Automata.Storage.Postgres.Schema"
+cli_mutable = false
+
+[sqlhydra_query_integration]
+provider_db_type_attributes = true
+table_declarations = true
+left_joined_views = false
+
+[filters]
+include = [
+  "fsm/command",
+  "fsm/command_error",
+  "fsm/transition",
+  "fsm/supervision_event",
+  "fsm/belief",
+  "fsm/current_belief",
+  "fsm/blocked_drift"
+]
+exclude = [ "fsm/belief_cold" ]

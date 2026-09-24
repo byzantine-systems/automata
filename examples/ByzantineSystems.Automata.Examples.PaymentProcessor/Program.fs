@@ -263,9 +263,13 @@ let private run (logger: ILogger) (_argv: string array) =
 
             return 1
         | Some connectionString ->
-            Migrator.migrate connectionString
-            do! runPayment logger connectionString
-            return 0
+            match Migrator.migrate logger connectionString with
+            | Error(MigrationError.Failed(script, error)) ->
+                logger.LogError(error, "Migration failed at {Script}", script)
+                return 1
+            | Ok _ ->
+                do! runPayment logger connectionString
+                return 0
     }
 
 [<EntryPoint>]

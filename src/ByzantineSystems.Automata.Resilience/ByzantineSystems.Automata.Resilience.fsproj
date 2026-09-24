@@ -3,6 +3,8 @@
     <PropertyGroup>
         <GenerateDocumentationFile>true</GenerateDocumentationFile>
         <IsPackable>true</IsPackable>
+        <Description>Polly transient-failure policy and supervision for ByzantineSystems.Automata.</Description>
+        <PackageTags>fsharp;statechart;polly;resilience;supervision</PackageTags>
     </PropertyGroup>
 
     <ItemGroup>

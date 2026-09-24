@@ -7,8 +7,10 @@ open System.Threading.Tasks
 open FsToolkit.ErrorHandling
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
+open ByzantineSystems.Automata.Storage.Postgres.Schema
 open Npgsql
 open NpgsqlTypes
+open SqlHydra.Query
 
 /// <summary>
 /// What a temporal store needs to bridge one machine's state to the belief tables.
@@ -46,71 +48,83 @@ type PostgresTemporalStore<'EntityId, 'State>(options: TemporalOptions<'EntityId
     let addInstant (name: string) (value: DateTimeOffset) (cmd: NpgsqlCommand) =
         cmd.Parameters.AddWithValue(name, Db.timestamp value) |> ignore
 
-    let range (reader: NpgsqlDataReader) (name: string) =
-        reader.GetFieldValue<NpgsqlRange<DateTime>>(reader.GetOrdinal name)
+    /// Rebuilds one belief from a row of fsm.belief. The view cannot carry NOT NULL, so every
+    /// column is required here rather than assumed; a row that will not decode fails on its first
+    /// reason, because the reasons are not independent complaints, they are one corrupt row.
+    let toBelief (row: fsm.belief) : Result<Belief<'EntityId, 'State>, StoreError> =
+        let column name value = Db.required (nameof Belief) name value
 
-    /// Rebuilds one belief from an as-of row. Four decodes can fail independently, and none of
-    /// them is expected: each means the row is not what this code was compiled for.
-    let readBelief (reader: NpgsqlDataReader) : Result<Belief<'EntityId, 'State>, StoreError> =
-        let validDuring = range reader "valid_during"
-        let systemTime = range reader "system_time"
+        result {
+            let! machineId = column "machine_id" row.machine_id
+            let! entity = column "entity_id" row.entity_id
+            let! state = column "state" row.state
+            let! status = column "status" row.status
+            let! epoch = column "epoch" row.epoch
+            let! commandId = column "command_id" row.command_id
+            let! chartVersion = column "chart_version" row.chart_version
+            let! validFrom = column "valid_from" row.valid_from
+            let! validTo = column "valid_to" row.valid_to
+            let! knownFrom = column "known_from" row.known_from
+            let! knownTo = column "known_to" row.known_to
 
-        validation {
-            let! entityId =
-                Row.string reader "entity_id"
-                |> options.EntityIdDecode
-                |> Result.mapError (Db.decodeFailure "EntityId")
+            let! entityId = options.EntityIdDecode entity |> Result.mapError (Db.decodeFailure "EntityId")
+            let! state = options.StateCodec.Decode state |> Result.mapError Db.toStoreError
+            let! status = Db.instanceStatusFromString status
 
-            and! state =
-                Row.string reader "state"
-                |> options.StateCodec.Decode
-                |> Result.mapError Db.toStoreError
-
-            and! status = Row.string reader "status" |> Db.instanceStatusFromString
-
-            and! chartVersion =
-                Row.int32 reader "chart_version"
-                |> ChartVersion.tryCreate
+            let! chartVersion =
+                ChartVersion.tryCreate chartVersion
                 |> Result.mapError (Db.decodeFailure "ChartVersion")
 
             return
-                { MachineId = Row.string reader "machine_id" |> MachineId.create
+                { MachineId = MachineId.create machineId
                   EntityId = entityId
                   Snapshot =
                     { State = state
                       Status = status
-                      Epoch = Row.int64 reader "epoch" |> Db.epochOf }
-                  CommandId = Row.int64 reader "command_id" |> CommandId.ofInt64
+                      Epoch = Db.epochOf epoch }
+                  CommandId = CommandId.ofInt64 commandId
                   ChartVersion = chartVersion
-                  ValidFrom = Db.fromTimestamp validDuring.LowerBound
-                  ValidTo = Db.openEnded validDuring.UpperBound
-                  KnownFrom = Db.fromTimestamp systemTime.LowerBound
-                  KnownTo = Db.openEnded systemTime.UpperBound }
+                  ValidFrom = Db.fromTimestamp validFrom
+                  ValidTo = Db.openEnded validTo
+                  KnownFrom = Db.fromTimestamp knownFrom
+                  KnownTo = Db.openEnded knownTo }
         }
-        // A row that will not decode fails on the first reason rather than all of them: they are
-        // not independent complaints a caller can act on, they are one corrupt row.
-        |> Result.mapError List.head
 
-    /// One as-of read. `ValidAt` is this with `knownAt` set to now, rather than a second query:
-    /// two queries that have to agree are two queries that can drift.
-    let asOf machineId entityId validAt knownAt ct =
-        protect
-            (fun cancel ->
-                task {
-                    use! conn = dataSource.OpenConnectionAsync(cancel).AsTask()
-                    use cmd = new NpgsqlCommand(SqlResources.get "belief" "as_of", conn)
-                    cmd |> addText "machine_id" (MachineId.value machineId)
-                    cmd |> addText "entity_id" (options.EntityIdEncode entityId)
-                    cmd |> addInstant "valid_at" validAt
-                    cmd |> addInstant "known_at" knownAt
-                    use! reader = cmd.ExecuteReaderAsync cancel
-                    let! hasRow = reader.ReadAsync cancel
+    /// <summary>
+    /// One as-of read, from fsm.belief. <c>ValidAt</c> is this with <c>knownAt</c> set to now
+    /// rather than a second query: two queries that have to agree are two queries that can drift.
+    ///
+    /// Both windows are half-open by constraint, so <c>from &lt;= t &lt; to</c> on the view's
+    /// bounds is exactly the containment the ranges state. The view serves live beliefs, recent
+    /// history and the materialized cold history as one relation, and hides beliefs past their
+    /// machine's retention.
+    /// </summary>
+    let asOf machineId entityId (validAt: DateTimeOffset) (knownAt: DateTimeOffset) ct =
+        let machine = Some(MachineId.value machineId)
+        let entity = Some(options.EntityIdEncode entityId)
+        let valid = Some(Db.timestamp validAt)
+        let known = Some(Db.timestamp knownAt)
 
-                    if not hasRow then
-                        return Ok None
-                    else
-                        return readBelief reader |> Result.map Some
-                })
+        Db.query
+            options.Context.Resilience
+            dataSource
+            (fun context token ->
+                selectTask context {
+                    for b in fsm.belief do
+                        where (
+                            b.machine_id = machine
+                            && b.entity_id = entity
+                            && b.valid_from <= valid
+                            && b.valid_to > valid
+                            && b.known_from <= known
+                            && b.known_to > known
+                        )
+
+                        select b
+                        tryHead
+                        cancel token
+                }
+                |> Task.map (Option.traverseResult toBelief))
             ct
 
     /// <summary>

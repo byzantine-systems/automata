@@ -6,7 +6,10 @@ open System.Threading
 open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
+open ByzantineSystems.Automata.Storage.Postgres.Schema
+open FsToolkit.ErrorHandling
 open Npgsql
+open SqlHydra.Query
 
 [<RequireQualifiedAccess>]
 module private SupervisionMapping =
@@ -104,42 +107,38 @@ module PostgresSupervisionQueries =
         if limit < 1 then
             invalidArg (nameof limit) "The supervision query limit must be positive."
 
-        Db.protect
+        let toRecord (row: fsm.supervision_event) : Result<SupervisionRecord, StoreError> =
+            match
+                SupervisionMapping.kindFromString row.kind,
+                SupervisionMapping.strategyFromString row.strategy,
+                SupervisionMapping.reasonFromJson row.reason
+            with
+            | Ok kind, Ok strategy, Ok reason ->
+                Ok
+                    { Supervisor = SupervisorName.create row.supervisor
+                      ChildId = SupervisedChildId.create row.child_id
+                      Kind = kind
+                      Strategy = strategy
+                      Reason = reason
+                      At = Db.fromTimestamp row.at }
+            | Error error, _, _
+            | _, Error error, _
+            | _, _, Error error -> Error error
+
+        // Newest first is the only order this table is ever read in, and it is what
+        // supervision_event_recent_idx is built for.
+        Db.query
             context.Resilience
-            (fun token ->
-                task {
-                    use! conn = context.DataSource.OpenConnectionAsync(token).AsTask()
-                    use cmd = new NpgsqlCommand(SqlResources.get "supervision" "list_recent", conn)
-                    cmd.Parameters.AddWithValue("limit", limit) |> ignore
-                    use! reader = cmd.ExecuteReaderAsync(token)
-
-                    let rec read records =
-                        task {
-                            let! more = reader.ReadAsync(token)
-
-                            if not more then
-                                return Ok(List.rev records)
-                            else
-                                match
-                                    SupervisionMapping.kindFromString (Row.string reader "kind"),
-                                    SupervisionMapping.strategyFromString (Row.string reader "strategy"),
-                                    SupervisionMapping.reasonFromJson (Row.string reader "reason")
-                                with
-                                | Ok kind, Ok strategy, Ok reason ->
-                                    let record =
-                                        { Supervisor = SupervisorName.create (Row.string reader "supervisor")
-                                          ChildId = SupervisedChildId.create (Row.string reader "child_id")
-                                          Kind = kind
-                                          Strategy = strategy
-                                          Reason = reason
-                                          At = Row.timestamp reader "at" }
-
-                                    return! read (record :: records)
-                                | Error error, _, _
-                                | _, Error error, _
-                                | _, _, Error error -> return Error error
-                        }
-
-                    return! read []
-                })
+            context.DataSource
+            (fun query token ->
+                selectTask query {
+                    for e in fsm.supervision_event do
+                        orderByDescending e.at
+                        thenByDescending e.id
+                        take limit
+                        select e
+                        toList
+                        cancel token
+                }
+                |> Task.map (List.traverseResultM toRecord))
             ct

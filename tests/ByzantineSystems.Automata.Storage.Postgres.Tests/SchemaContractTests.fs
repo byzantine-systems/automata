@@ -7,9 +7,9 @@ open Expecto
 open Npgsql
 open TestContext
 
-/// The columns PostgresCommandInbox reads by name. Without code generation, this list is the
-/// contract: if the schema drifts away from it, these tests fail here rather than at a runtime
-/// column lookup in production.
+/// The columns a claim returns. Every other read of fsm.command is typed by the generated schema,
+/// but the claim is a routine SqlHydra cannot call, so its rows are read by name into the
+/// generated record. This list is the contract for that one read.
 let private commandColumns =
     [ "command_id"
       "machine_id"
@@ -83,15 +83,6 @@ let tests =
               Expect.equal columns commandColumns "the claim result is the inbox reader's contract"
           }
 
-          testTask "the by-id read returns exactly the columns the reader expects" {
-              do! reset ()
-
-              let columns =
-                  columnsOf (SqlResources.get "command" "by_id") [ "command_id", box 0L ]
-
-              Expect.equal columns commandColumns "the single-command read is the same contract"
-          }
-
           testTask "the chart version read returns exactly the column the reader expects" {
               do! reset ()
 
@@ -101,78 +92,7 @@ let tests =
               Expect.equal columns [ "fingerprint" ] "the registry reads this column by name"
           }
 
-          testTask "the belief reads return exactly the columns they promise" {
-              do! reset ()
-
-              // Both reads carry the same columns, for different reasons. The live read is what
-              // a snapshot needs; the as-of read is a Belief, which carries its own two windows
-              // and says which transition produced it. An earlier as-of shape omitted the epoch
-              // on the grounds that a superseded belief's epoch is not the entity's current one,
-              // which is true and is exactly why the windows travel beside it.
-              Expect.equal
-                  (columnsOf (SqlResources.get "belief" "live") [ "machine_id", box "none"; "entity_id", box "none" ])
-                  [ "machine_id"
-                    "entity_id"
-                    "state"
-                    "status"
-                    "epoch"
-                    "command_id"
-                    "chart_version"
-                    "valid_during"
-                    "system_time" ]
-                  "the live read is what IStateReader.TryGetSnapshot maps"
-
-              Expect.equal
-                  (columnsOf
-                      (SqlResources.get "belief" "as_of")
-                      [ "machine_id", box "none"
-                        "entity_id", box "none"
-                        "valid_at", box DateTime.UtcNow
-                        "known_at", box DateTime.UtcNow ])
-                  [ "machine_id"
-                    "entity_id"
-                    "state"
-                    "status"
-                    "epoch"
-                    "command_id"
-                    "chart_version"
-                    "valid_during"
-                    "system_time" ]
-                  "the as-of read is what ITemporalReader maps into a Belief"
-          }
-
-          testTask "the history read returns exactly the columns the decoder maps" {
-              do! reset ()
-
-              // Deliberately the same shape sql/command/result.sql returns for a committed
-              // command, because one decoder serves both. Two decoders for one row shape would
-              // be two places for it to drift.
-              Expect.equal
-                  (columnsOf
-                      (SqlResources.get "transition" "history")
-                      [ "machine_id", box "none"
-                        "entity_id", box "none"
-                        "after_epoch", box 0L
-                        "limit", box 1 ])
-                  [ "machine_id"
-                    "entity_id"
-                    "epoch"
-                    "command_id"
-                    "chart_version"
-                    "event"
-                    "actions"
-                    "from_state"
-                    "to_state"
-                    "handled_by"
-                    "exited"
-                    "entered"
-                    "instance_status"
-                    "effective_at"
-                    "committed_at" ]
-                  "the history page is what readTransition maps"
-          }
-
-          testTask "the live belief read uses its partial index" {
+          testTask "the current belief view uses its partial index" {
               do! reset ()
 
               // Ten superseded valid-time versions per entity plus one live one, which is what
@@ -205,9 +125,7 @@ let tests =
                   use cmd =
                       new NpgsqlCommand(
                           "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "
-                          + (SqlResources.get "belief" "live")
-                              .Replace("@machine_id", "'plan-probe'")
-                              .Replace("@entity_id", "'e1234'"),
+                          + "SELECT * FROM fsm.current_belief WHERE machine_id = 'plan-probe' AND entity_id = 'e1234'",
                           conn
                       )
 
@@ -218,6 +136,41 @@ let tests =
               Expect.isFalse
                   (plan.Contains "Seq Scan")
                   "a sequential scan means the predicate drifted from the index predicate"
+          }
+
+          testTask "every branch of the belief view is served by an index" {
+              // fsm.belief is live beliefs, recent history read live, and older history from the
+              // materialized cold layer. An as-of read names one entity, and each branch has to
+              // reach that entity through an index or the read grows with everything retained.
+              do! reset ()
+
+              exec
+                  """INSERT INTO fsm.instance_state_history (machine_id, entity_id, state, status, epoch, command_id, chart_version, valid_during, system_time)
+                     SELECT 'plan-probe', 'e' || (g % 2000), '{}'::jsonb, 'running', g, g, 1,
+                            tstzrange(now() - (g || ' hours')::interval, now() - ((g - 1) || ' hours')::interval),
+                            tstzrange(now() - (g || ' hours')::interval, now() - ((g - 1) || ' hours')::interval)
+                     FROM generate_series(1, 20000) g;
+
+                     REFRESH MATERIALIZED VIEW fsm.belief_cold;
+                     ANALYZE fsm.instance_state_history;
+                     ANALYZE fsm.belief_cold;"""
+              |> function
+                  | Ok() -> ()
+                  | Error error -> failtestf "seeding failed: %s" error.Message
+
+              let found =
+                  explain
+                      """SELECT * FROM fsm.belief
+                         WHERE machine_id = 'plan-probe' AND entity_id = 'e42'
+                           AND valid_from <= now() - interval '5 hours' AND valid_to > now() - interval '5 hours'
+                           AND known_from <= now() AND known_to > now()"""
+                  |> scans
+
+              Expect.isFalse
+                  (found |> List.contains ("Seq Scan", "instance_state_history"))
+                  "recent history is reached through its index"
+
+              Expect.isFalse (found |> List.contains ("Seq Scan", "belief_cold")) "and so is the cold layer"
           }
 
           testTask "a chart version below one is refused" {

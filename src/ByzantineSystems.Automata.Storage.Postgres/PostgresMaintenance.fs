@@ -7,8 +7,10 @@ open System.Threading
 open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
+open ByzantineSystems.Automata.Storage.Postgres.Schema
 open FsToolkit.ErrorHandling
 open Npgsql
+open SqlHydra.Query
 
 /// <summary>What the catalog says about a database, before anything in it is trusted.</summary>
 type internal CatalogCheck =
@@ -220,6 +222,35 @@ type PostgresMaintenance(context: PostgresContext) =
         | "not_permitted" -> Ok Scheduling.NotPermitted
         | other -> Error(Db.decodeFailure (nameof Scheduling) $"unknown scheduling outcome {other}")
 
+    /// <summary>
+    /// Refreshes the materialized cold layer of <c>fsm.belief</c> when a day has turned since the
+    /// last refresh, and does nothing otherwise, so a pass every minute costs one cheap check.
+    ///
+    /// Three statements on one connection rather than one routine, because
+    /// <c>REFRESH ... CONCURRENTLY</c> cannot run inside a function or a transaction. Safe to
+    /// repeat and safe to race: a second host's refresh waits for the first and finds nothing new.
+    /// </summary>
+    let refreshColdBeliefs ct : Task<Result<unit, StoreError>> =
+        protect
+            (fun token ->
+                backgroundTask {
+                    use! conn = context.DataSource.OpenConnectionAsync(token).AsTask()
+                    use check = new NpgsqlCommand(SqlResources.get "system" "belief_cold_stale", conn)
+                    let! stale = check.ExecuteScalarAsync token
+
+                    if unbox<bool> stale then
+                        use refresh =
+                            new NpgsqlCommand(SqlResources.get "system" "refresh_belief_cold", conn)
+
+                        let! _ = refresh.ExecuteNonQueryAsync token
+                        use mark = new NpgsqlCommand(SqlResources.get "system" "mark_belief_cold", conn)
+                        let! _ = mark.ExecuteScalarAsync token
+                        ()
+
+                    return Ok()
+                })
+            ct
+
     let positiveBatch (batch: int) =
         if batch < 1 then
             invalidArg (nameof batch) "A maintenance batch size must be positive."
@@ -239,31 +270,61 @@ type PostgresMaintenance(context: PostgresContext) =
         member _.Run(batch, ct) =
             positiveBatch batch
 
-            query
-                "system"
-                "run_maintenance"
-                (Db.parameters [ "batch", box batch ])
-                (fun row ->
-                    { MachineId = MachineId.create (Row.string row "machine_id")
-                      Reaped = Row.int64 row "reaped"
-                      PurgedCommands = Row.int64 row "purged_commands"
-                      PurgedBeliefs = Row.int64 row "purged_beliefs"
-                      PurgedActions = Row.int64 row "purged_actions"
-                      Drifted = Row.int64 row "drifted" })
-                ct
+            taskResult {
+                let! reports =
+                    query
+                        "system"
+                        "run_maintenance"
+                        (Db.parameters [ "batch", box batch ])
+                        (fun row ->
+                            { MachineId = MachineId.create (Row.string row "machine_id")
+                              Reaped = Row.int64 row "reaped"
+                              PurgedCommands = Row.int64 row "purged_commands"
+                              PurgedBeliefs = Row.int64 row "purged_beliefs"
+                              PurgedActions = Row.int64 row "purged_actions"
+                              Drifted = Row.int64 row "drifted" })
+                        ct
+
+                do! refreshColdBeliefs ct
+                return reports
+            }
 
         member _.DetectDrift(ct) =
-            query
-                "command"
-                "blocked_drift"
-                noParameters
-                (fun row ->
-                    { BlockedDrift.CommandId = CommandId.ofInt64 (Row.int64 row "command_id")
-                      MachineId = MachineId.create (Row.string row "machine_id")
-                      EntityId = Row.string row "entity_id"
-                      Sequence = Row.int64 row "seq"
-                      Blocked = Row.bool row "blocked"
-                      Expected = Row.bool row "expected_blocked" })
+            let toDrift (row: fsm.blocked_drift) : Result<BlockedDrift, StoreError> =
+                let column name value =
+                    Db.required (nameof BlockedDrift) name value
+
+                result {
+                    let! commandId = column "command_id" row.command_id
+                    let! machineId = column "machine_id" row.machine_id
+                    let! entityId = column "entity_id" row.entity_id
+                    let! seq = column "seq" row.seq
+                    let! blocked = column "blocked" row.blocked
+                    let! expected = column "expected_blocked" row.expected_blocked
+
+                    return
+                        { BlockedDrift.CommandId = CommandId.ofInt64 commandId
+                          MachineId = MachineId.create machineId
+                          EntityId = entityId
+                          Sequence = seq
+                          Blocked = blocked
+                          Expected = expected }
+                }
+
+            Db.query
+                context.Resilience
+                context.DataSource
+                (fun query token ->
+                    selectTask query {
+                        for d in fsm.blocked_drift do
+                            orderBy d.machine_id
+                            thenBy d.entity_id
+                            thenBy d.seq
+                            select d
+                            toList
+                            cancel token
+                    }
+                    |> Task.map (List.traverseResultM toDrift))
                 ct
 
         member _.RepairDrift(ct) =

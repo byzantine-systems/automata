@@ -431,6 +431,59 @@ ORDER BY
 $$;
 
 -- ---------------------------------------------------------------------------
+-- fsm.belief_cold_cutoff: the cutoff a refresh made now would use. The same
+-- expression as fsm.belief_cold's own, so the two cannot disagree about which
+-- day the cold layer should cover.
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION fsm.belief_cold_cutoff ()
+    RETURNS timestamptz
+    LANGUAGE sql
+    STABLE PARALLEL SAFE
+    SET search_path = pg_catalog, fsm
+    AS $$
+    SELECT
+        DATE_TRUNC('day', NOW()) - interval '1 day';
+$$;
+
+-- ---------------------------------------------------------------------------
+-- fsm.belief_cold_is_stale: whether the cold layer is a day behind.
+--
+-- Never refreshed counts as stale. The refresh itself is the caller's to
+-- issue, as its own statement, because REFRESH ... CONCURRENTLY cannot run
+-- inside a function.
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION fsm.belief_cold_is_stale ()
+    RETURNS boolean
+    LANGUAGE sql
+    STABLE PARALLEL SAFE
+    SET search_path = pg_catalog, fsm
+    AS $$
+    SELECT
+        COALESCE((
+            SELECT
+                s.refreshed_for
+            FROM fsm.belief_cold_state s), '-infinity') < fsm.belief_cold_cutoff ();
+$$;
+
+-- ---------------------------------------------------------------------------
+-- fsm.mark_belief_cold_refreshed: records the cutoff a refresh just used.
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION fsm.mark_belief_cold_refreshed ()
+    RETURNS timestamptz
+    LANGUAGE sql
+    VOLATILE PARALLEL UNSAFE
+    SET search_path = pg_catalog, fsm
+    AS $$
+    INSERT INTO fsm.belief_cold_state AS s (singleton, refreshed_for)
+        VALUES (TRUE, fsm.belief_cold_cutoff ())
+    ON CONFLICT (singleton)
+        DO UPDATE SET
+            refreshed_for = EXCLUDED.refreshed_for
+        RETURNING
+            s.refreshed_for;
+$$;
+
+-- ---------------------------------------------------------------------------
 -- fsm.cron_schedule_of: an interval, as pg_cron would write it.
 --
 -- pg_cron takes either '<n> seconds', for 1 to 59 seconds, or a cron
@@ -513,6 +566,11 @@ END IF;
             cron.schedule ('automata-notify', v_notify, 'SELECT fsm.notify_pending()');
         PERFORM
             cron.schedule ('automata-maintenance', v_run, FORMAT('SELECT count(*) FROM fsm.run_maintenance(%s)', p_batch));
+        -- Its own job, because REFRESH ... CONCURRENTLY refuses to run inside
+        -- a transaction block, and a multi-statement command is one. Half an
+        -- hour past midnight, after the cutoff has moved.
+        PERFORM
+            cron.schedule ('automata-belief-cold', '30 0 * * *', 'REFRESH MATERIALIZED VIEW CONCURRENTLY fsm.belief_cold');
     EXCEPTION
         WHEN insufficient_privilege THEN
             RETURN 'not_permitted';
@@ -522,7 +580,8 @@ END
 $$;
 
 -- ---------------------------------------------------------------------------
--- fsm.unschedule_maintenance: take both ticks out of pg_cron, by name.
+-- fsm.unschedule_maintenance: take every maintenance job out of pg_cron, by
+-- name.
 --
 -- cron.job rows live outside this schema, so DROP SCHEMA fsm CASCADE leaves
 -- them behind, calling functions that no longer exist every second. Anything
@@ -558,7 +617,7 @@ END IF;
         FROM
             cron.job j
         WHERE
-            j.jobname IN ('automata-notify', 'automata-maintenance');
+            j.jobname IN ('automata-notify', 'automata-maintenance', 'automata-belief-cold');
         GET DIAGNOSTICS v_removed = ROW_COUNT;
     EXCEPTION
         WHEN insufficient_privilege THEN

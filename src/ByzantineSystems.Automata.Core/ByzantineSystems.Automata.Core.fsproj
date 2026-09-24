@@ -3,6 +3,8 @@
     <PropertyGroup>
         <GenerateDocumentationFile>true</GenerateDocumentationFile>
         <IsPackable>true</IsPackable>
+        <Description>Typed hierarchical statecharts with pure event resolution.</Description>
+        <PackageTags>fsharp;statechart;state-machine;hierarchical</PackageTags>
     </PropertyGroup>
 
     <ItemGroup>

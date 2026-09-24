@@ -129,25 +129,6 @@ let private explainNotify () : string =
     use explain = new NpgsqlCommand("EXPLAIN (FORMAT JSON) EXECUTE notify_probe", conn)
     explain.ExecuteScalar() |> string
 
-/// Every (node type, relation) pair in a JSON plan, walked rather than string-matched, so a
-/// sequential scan of a small registry table is not mistaken for one of the inbox.
-let private scans (plan: string) : (string * string) list =
-    let rec walk (node: JsonElement) =
-        [ let kind = node.GetProperty("Node Type").GetString()
-
-          match node.TryGetProperty "Relation Name" with
-          | true, relation -> kind, relation.GetString()
-          | _ -> ()
-
-          match node.TryGetProperty "Plans" with
-          | true, children ->
-              for child in children.EnumerateArray() do
-                  yield! walk child
-          | _ -> () ]
-
-    use document = JsonDocument.Parse plan
-    walk (document.RootElement[0].GetProperty "Plan")
-
 let private cronConnectionString =
     Environment.GetEnvironmentVariable "AUTOMATA_TEST_CRON_DB"
 
@@ -214,6 +195,23 @@ let pureTests =
 
           test "a retention period is written exactly, in microseconds" {
               Expect.equal (Boot.interval (Retain.For(TimeSpan.FromSeconds 1.5))) "1500000 microseconds" "no rounding"
+          } ]
+
+let migratorTests =
+    testList
+        "Migrator"
+        [ test "a database that cannot be reached is a value, not an exception" {
+              // Nothing listens on this host, so the run fails before any script. The failure
+              // comes back as data the host can log and exit on, never as a throw.
+              match
+                  Migrator.migrate
+                      Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance
+                      "Host=unreachable.invalid;Timeout=1"
+              with
+              | Error(MigrationError.Failed(script, error)) ->
+                  Expect.equal script "" "no script had started"
+                  Expect.isNotNull error "and the cause travels with it"
+              | Ok report -> failtestf "an unreachable database should not migrate, got %A" report
           } ]
 
 let bootTests =
@@ -500,6 +498,87 @@ let driftTests =
               Expect.isEmpty (after |> expectOk "detect again") "healthy afterwards"
           } ]
 
+/// Two versions of one entity's belief, the first superseded days ago, so a refresh moves it to
+/// the cold layer. Returns the instant, in belief time, at which the first was still held.
+let private oldBelief () =
+    believe "e1" (effectiveAt.AddHours 10.) (Active 1) 1L
+    believe "e1" (effectiveAt.AddHours 14.) (Active 2) 2L
+
+    arrange
+        "UPDATE fsm.instance_state_history SET system_time = tstzrange(now() - interval '5 days', now() - interval '4 days')"
+
+    DateTimeOffset.UtcNow.AddDays -4.5
+
+let private heldAt (knownAt: DateTimeOffset) =
+    task {
+        let! belief =
+            (newTemporalReader ()).AsOf(machine, entity "e1", effectiveAt.AddHours 16., knownAt, noCancellation)
+
+        return belief |> expectOk "as of" |> Option.map (fun b -> b.Snapshot.State)
+    }
+
+let private coldRows () =
+    count "SELECT count(*) FROM fsm.belief_cold"
+
+let coldTests =
+    testList
+        "Postgres cold beliefs"
+        [ testTask "an as-of answer is the same before and after the cold layer is refreshed" {
+              // The whole correctness claim of the split: moving a belief from the live history
+              // into the materialized layer changes where it is read from and nothing else.
+              do! reset ()
+              let knownAt = oldBelief ()
+              let! before = heldAt knownAt
+
+              do! boot RetentionPolicy.keepEverything
+              let! _ = run 100
+              Expect.equal (coldRows ()) 1L "the old belief moved to the cold layer"
+
+              let! after = heldAt knownAt
+              Expect.equal after before "and reads exactly as it did"
+              Expect.equal after (Some(Active 1)) "which is the belief held at the time"
+          }
+
+          testTask "a pass refreshes the cold layer once a day, not every tick" {
+              do! reset ()
+              oldBelief () |> ignore
+              do! boot RetentionPolicy.keepEverything
+              let! _ = run 100
+              Expect.equal (coldRows ()) 1L "the first pass refreshes"
+
+              // A second old belief arrives after the refresh. Until the day turns the pass leaves
+              // it in the live history, where the view still finds it.
+              believe "e2" (effectiveAt.AddHours 10.) (Active 1) 1L
+              believe "e2" (effectiveAt.AddHours 14.) (Active 2) 2L
+
+              arrange
+                  "UPDATE fsm.instance_state_history SET system_time = tstzrange(now() - interval '5 days', now() - interval '4 days') WHERE entity_id = 'e2'"
+
+              let! _ = run 100
+              Expect.equal (coldRows ()) 1L "not refreshed again the same day"
+
+              Expect.equal
+                  (count "SELECT count(*) FROM fsm.belief WHERE entity_id = 'e2'")
+                  2L
+                  "both of its beliefs are still served: the live one, and the old one from the live history"
+          }
+
+          testTask "retention hides a cold belief without waiting for a refresh" {
+              do! reset ()
+              let knownAt = oldBelief ()
+              do! boot RetentionPolicy.keepEverything
+              let! _ = run 100
+              Expect.equal (coldRows ()) 1L "cold, and visible"
+
+              do!
+                  boot
+                      { RetentionPolicy.keepEverything with
+                          BeliefHistory = Retain.For(TimeSpan.FromDays 2.) }
+
+              let! held = heldAt knownAt
+              Expect.isNone held "past its retention the belief is gone for every reader, cold layer or not"
+          } ]
+
 let singleFlightTests =
     testList
         "Postgres single flight"
@@ -646,12 +725,22 @@ let cronTests =
               Expect.equal (removed |> expectOk "unschedule") 0 "nothing to remove"
           }
 
-          testTask "scheduling twice leaves two jobs, and unscheduling leaves none" {
+          testTask "scheduling twice leaves three jobs, and unscheduling leaves none" {
               if String.IsNullOrWhiteSpace cronConnectionString then
                   skiptest "set AUTOMATA_TEST_CRON_DB to a superuser connection on a pg_cron database"
 
               do! reset ()
               use source = DataSource.create cronConnectionString
+
+              // Migrations run as the application's role and never install pg_cron, which is
+              // superuser work; this connection is a superuser, so it does what a DBA would.
+              do!
+                  task {
+                      use conn = source.OpenConnection()
+                      use install = new NpgsqlCommand("CREATE EXTENSION IF NOT EXISTS pg_cron", conn)
+                      let! _ = install.ExecuteNonQueryAsync()
+                      return ()
+                  }
 
               let maintenance =
                   PostgresMaintenance(
@@ -673,10 +762,10 @@ let cronTests =
 
                   Expect.equal (scheduled |> expectOk "schedule") Scheduling.Scheduled "scheduled"
 
-              Expect.equal (jobs ()) 2L "asserting again updates rather than duplicating"
+              Expect.equal (jobs ()) 3L "asserting again updates rather than duplicating"
 
               let! removed = maintenance.Unschedule noCancellation
-              Expect.equal (removed |> expectOk "unschedule") 2 "both, by name"
+              Expect.equal (removed |> expectOk "unschedule") 3 "all three, by name"
               Expect.equal (jobs ()) 0L "nothing left calling a schema that may be dropped next"
           } ]
 
@@ -711,6 +800,7 @@ let integration =
         "Postgres maintenance"
         [ bootTests
           retentionTests
+          coldTests
           reaperTests
           driftTests
           singleFlightTests

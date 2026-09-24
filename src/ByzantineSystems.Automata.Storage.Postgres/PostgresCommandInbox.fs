@@ -5,8 +5,11 @@ open System.Threading
 open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
+open ByzantineSystems.Automata.Storage.Postgres.Schema
 open Npgsql
+open FsToolkit.ErrorHandling
 open NpgsqlTypes
+open SqlHydra.Query
 
 /// <summary>
 /// Everything the inbox needs to bridge the generic domain types to the columns of
@@ -98,80 +101,101 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
 
         cmd.Parameters.Add parameter |> ignore
 
-    let readAudit (reader: NpgsqlDataReader) : AuditContext =
-        { Tenant = Row.optionalString reader "tenant"
-          Principal = Row.optionalString reader "principal"
-          Source = Row.optionalString reader "source"
-          CorrelationId = Row.optionalString reader "correlation_id"
-          CausationId = Row.optionalString reader "causation_id" }
+    /// The schema stores the empty string for an unsupplied audit field.
+    let optional (value: string) : string option = if value = "" then None else Some value
 
-    /// Rebuilds one command from its row. Four decodes can fail independently, and the first
-    /// failure wins; none of them is expected, and all of them mean the row is not what this
-    /// version of the code was compiled against.
-    let readRecord (reader: NpgsqlDataReader) : Result<CommandRecord<'EntityId, 'Event>, StoreError> =
+    /// Rebuilds one command from its generated row. Three decodes can fail independently, and
+    /// the first failure wins; none of them is expected, and all of them mean the row is not what
+    /// this version of the code was compiled against.
+    let toRecord (row: fsm.command) : Result<CommandRecord<'EntityId, 'Event>, StoreError> =
         let entityId =
-            Row.string reader "entity_id"
+            row.entity_id
             |> options.EntityIdDecode
             |> Result.mapError (Db.decodeFailure "EntityId")
 
         let chartVersion =
-            Row.int32 reader "chart_version"
+            row.chart_version
             |> ChartVersion.tryCreate
             |> Result.mapError (Db.decodeFailure "ChartVersion")
 
         let event =
-            Row.string reader "event"
-            |> options.EventCodec.Decode
-            |> Result.mapError Db.toStoreError
+            row.event |> options.EventCodec.Decode |> Result.mapError Db.toStoreError
 
-        let status = Row.string reader "status" |> CommandMapping.statusFromString
+        let status = row.status |> CommandMapping.statusFromString
 
         match entityId, chartVersion, event, status with
         | Ok entityId, Ok chartVersion, Ok event, Ok status ->
             Ok
-                { CommandId = Row.int64 reader "command_id" |> CommandId.ofInt64
-                  MachineId = Row.string reader "machine_id" |> MachineId.create
+                { CommandId = CommandId.ofInt64 row.command_id
+                  MachineId = MachineId.create row.machine_id
                   EntityId = entityId
-                  Sequence = Row.int64 reader "seq"
-                  IdempotencyKey = Row.string reader "idempotency_key"
+                  Sequence = row.seq
+                  IdempotencyKey = row.idempotency_key
                   ChartVersion = chartVersion
                   Event = event
                   Status = status
-                  Blocked = Row.bool reader "blocked"
-                  VisibleAt = Row.timestamp reader "visible_at"
-                  Attempts = Row.int32 reader "attempts"
-                  ReceivedAt = Row.timestamp reader "received_at"
-                  Audit = readAudit reader }
+                  Blocked = row.blocked
+                  VisibleAt = Db.fromTimestamp row.visible_at
+                  Attempts = row.attempts
+                  ReceivedAt = Db.fromTimestamp row.received_at
+                  Audit =
+                    { Tenant = optional row.tenant
+                      Principal = optional row.principal
+                      Source = optional row.source
+                      CorrelationId = optional row.correlation_id
+                      CausationId = optional row.causation_id } }
         | Error error, _, _, _
         | _, Error error, _, _
         | _, _, Error error, _
         | _, _, _, Error error -> Error error
 
+    /// <summary>
+    /// A claimed row, read into the generated <c>fsm.command</c> type.
+    ///
+    /// The claim is a routine SqlHydra cannot call, but it returns <c>SETOF fsm.command</c>, so
+    /// its rows have the generated type's shape. Building that record here, where every field is
+    /// required, is what turns a column added to the table into a compile error in this reader
+    /// rather than a value it silently leaves out.
+    /// </summary>
+    let commandRow (reader: NpgsqlDataReader) : fsm.command =
+        { command_id = Row.int64 reader "command_id"
+          machine_id = Row.string reader "machine_id"
+          entity_id = Row.string reader "entity_id"
+          seq = Row.int64 reader "seq"
+          idempotency_key = Row.string reader "idempotency_key"
+          chart_version = Row.int32 reader "chart_version"
+          event = Row.string reader "event"
+          status = Row.string reader "status"
+          blocked = Row.bool reader "blocked"
+          visible_at = reader.GetDateTime(reader.GetOrdinal "visible_at")
+          lease_token = Row.int64 reader "lease_token"
+          read_ct = Row.int32 reader "read_ct"
+          attempts = Row.int32 reader "attempts"
+          received_at = reader.GetDateTime(reader.GetOrdinal "received_at")
+          tenant = Row.string reader "tenant"
+          principal = Row.string reader "principal"
+          source = Row.string reader "source"
+          correlation_id = Row.string reader "correlation_id"
+          causation_id = Row.string reader "causation_id" }
+
     /// A claimed row carries its own lease: the token that fences it, the delivery count, and the
     /// deadline the database assigned. visible_at means the lease deadline while a command is
     /// leased, which is the one place that dual reading of the column surfaces in F#.
     let readLeased (reader: NpgsqlDataReader) : Result<LeasedCommand<'EntityId, 'Event>, StoreError> =
-        readRecord reader
+        let row = commandRow reader
+
+        toRecord row
         |> Result.map (fun record ->
             { Work = record
-              Token = Row.int64 reader "lease_token" |> LeaseToken.ofInt64
-              DeliveryCount = Row.int32 reader "read_ct"
+              Token = LeaseToken.ofInt64 row.lease_token
+              DeliveryCount = row.read_ct
               ExpiresAt = record.VisibleAt })
 
-    /// Reads at most one row through a projection that may itself fail.
-    let readOptional
-        (project: NpgsqlDataReader -> Result<'T, StoreError>)
-        (reader: NpgsqlDataReader)
-        (ct: CancellationToken)
-        : Task<Result<'T option, StoreError>> =
-        task {
-            let! hasRow = reader.ReadAsync ct
-
-            if not hasRow then
-                return Ok None
-            else
-                return project reader |> Result.map Some
-        }
+    /// At most one command, decoded.
+    let single (rows: fsm.command option) : Result<CommandRecord<'EntityId, 'Event> option, StoreError> =
+        match rows with
+        | Some row -> toRecord row |> Result.map Some
+        | None -> Ok None
 
     let readOutcome (cmd: NpgsqlCommand) (ct: CancellationToken) : Task<Result<LeaseUpdateOutcome, StoreError>> =
         task {
@@ -192,15 +216,24 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
         (idempotencyKey: string)
         (ct: CancellationToken)
         : Task<Result<CommandRecord<'EntityId, 'Event> option, StoreError>> =
-        task {
-            use! conn = dataSource.OpenConnectionAsync(ct).AsTask()
-            use cmd = command (SqlResources.get "command" "by_idempotency_key") conn
-            cmd |> addText "machine_id" (MachineId.value machineId)
-            cmd |> addText "entity_id" entityId
-            cmd |> addText "idempotency_key" idempotencyKey
-            use! reader = cmd.ExecuteReaderAsync ct
-            return! readOptional readRecord reader ct
-        }
+        Db.query
+            options.Context.Resilience
+            dataSource
+            (fun context token ->
+                selectTask context {
+                    for c in fsm.command do
+                        where (
+                            c.machine_id = MachineId.value machineId
+                            && c.entity_id = entityId
+                            && c.idempotency_key = idempotencyKey
+                        )
+
+                        select c
+                        tryHead
+                        cancel token
+                }
+                |> Task.map single)
+            ct
 
     let submitOnce
         (submission: CommandSubmission<'EntityId, 'Event>)
@@ -311,19 +344,8 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
                         cmd |> addInterval "lease" lease
                         use! reader = cmd.ExecuteReaderAsync token
 
-                        let rec read claimed =
-                            task {
-                                let! hasRow = reader.ReadAsync token
-
-                                if not hasRow then
-                                    return Ok(List.rev claimed)
-                                else
-                                    match readLeased reader with
-                                    | Ok leased -> return! read (leased :: claimed)
-                                    | Error error -> return Error error
-                            }
-
-                        return! read []
+                        let! claimed = Row.all readLeased reader token
+                        return List.sequenceResultM claimed
                     })
                 ct
 
@@ -364,16 +386,21 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
                 ct
 
         member _.TryGet(commandId, ct) =
-            protect
-                (fun token ->
-                    task {
-                        use! conn = dataSource.OpenConnectionAsync(token).AsTask()
-                        use cmd = command (SqlResources.get "command" "by_id") conn
-                        cmd |> addBigint "command_id" (CommandId.value commandId)
-                        use! reader = cmd.ExecuteReaderAsync token
-                        return! readOptional readRecord reader token
-                    })
+            let id = CommandId.value commandId
+
+            Db.query
+                options.Context.Resilience
+                dataSource
+                (fun context token ->
+                    selectTask context {
+                        for c in fsm.command do
+                            where (c.command_id = id)
+                            select c
+                            tryHead
+                            cancel token
+                    }
+                    |> Task.map single)
                 ct
 
         member _.TryFind(machineId, entityId, idempotencyKey, ct) =
-            protect (fun token -> findExisting machineId (options.EntityIdEncode entityId) idempotencyKey token) ct
+            findExisting machineId (options.EntityIdEncode entityId) idempotencyKey ct

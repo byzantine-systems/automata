@@ -217,7 +217,7 @@ let capabilityTests =
     testList
         "optional capabilities"
         [ test "a store offering only the required four has no temporal capability" {
-              // A third-party store that skips a capability is still a complete provider, 
+              // A third-party store that skips a capability is still a complete provider,
               // and the type system says so rather than a runtime error saying it later.
               let built = buildMachine (StubStore<TestError>()) (newTime ()) id |> expectMachine
 

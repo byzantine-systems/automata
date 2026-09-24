@@ -53,6 +53,11 @@ jobs:
     # to need neither.
     env:
       AUTOMATA_TEST_DB: Host=127.0.0.1;Port=5432;Database=bs-automata;Username=bs-automata;Password=bs-automata
+      # The runner's own user is the devenv cluster's superuser, trusted over local TCP as on a
+      # development machine. The pg_cron test needs one: installing the extension and scheduling
+      # jobs are both superuser work, and running it here proves the path where the database
+      # schedules its own maintenance, not only the fallback.
+      AUTOMATA_TEST_CRON_DB: Host=127.0.0.1;Port=5432;Database=bs-automata;Username=runner
 
     permissions:
       contents: read
@@ -115,6 +120,11 @@ jobs:
           done
           echo "postgres did not become ready"; exit 1
         '
+
+    # The generated schema types must match what the migrations produce. This replaced the
+    # hand-maintained column lists, and it only protects anything if it runs on every change.
+    - name: Check generated schema types
+      run: nix develop .#ci --impure -c make schema-check
 
     - name: Run testing suite with coverage
       run: nix develop .#ci --impure -c make coverage

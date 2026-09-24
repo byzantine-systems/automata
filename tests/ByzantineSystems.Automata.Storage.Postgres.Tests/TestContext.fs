@@ -1,6 +1,7 @@
 module ByzantineSystems.Automata.Storage.Postgres.Tests.TestContext
 
 open System
+open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
 open Npgsql
@@ -72,7 +73,10 @@ let migrate () : unit =
 
     cmd.ExecuteNonQuery() |> ignore
 
-    Migrator.migrate connectionString
+    match Migrator.migrate Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance connectionString with
+    | Ok _ -> ()
+    | Error(MigrationError.Failed(script, error)) ->
+        failwithf "the fixture could not migrate at %s: %s" script error.Message
 
     // The action queue is the application's to create, not the migration's: its name is
     // configuration, and one machine's queue is not another's. An application calls this once at
@@ -109,8 +113,11 @@ let reset () : Task =
                 // separately.
                 "TRUNCATE fsm.command, fsm.command_error, fsm.transition, fsm.machine_chart_version,
                           fsm.supervision_event, fsm.instance_state, fsm.instance_state_history,
-                          fsm.action_dead_letter, fsm.machine_maintenance
+                          fsm.action_dead_letter, fsm.machine_maintenance, fsm.belief_cold_state
                           RESTART IDENTITY;
+                 -- A materialized view cannot be truncated; refreshed over the emptied history,
+                 -- it is empty too.
+                 REFRESH MATERIALIZED VIEW fsm.belief_cold;
                  INSERT INTO fsm.machine_chart_version (machine_id, version, fingerprint)
                  VALUES (@machine_id, @version, @fingerprint);
                  -- The queue survives the truncate because it is pgmq's table, not ours.
@@ -257,14 +264,16 @@ let scalar<'T> (sql: string) : 'T =
     use cmd = new NpgsqlCommand(sql, conn)
     cmd.ExecuteScalar() :?> 'T
 
-/// Every nullable column in the fsm schema. Must stay empty: absence in this schema is always a
+/// Every nullable column of a table in the fsm schema. Must stay empty: absence in this schema is always a
 /// value, never NULL, so that a CHECK constraint cannot pass by being unknown.
 let nullableColumns () : (string * string) list =
     use conn = (dataSource ()).OpenConnection()
 
     use cmd =
         new NpgsqlCommand(
-            "SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = 'fsm' AND is_nullable = 'YES' ORDER BY table_name, column_name",
+            // Base tables only. A view cannot carry NOT NULL, so every view column reports
+            // nullable whatever the tables under it say; the rule is about what is stored.
+            "SELECT c.table_name, c.column_name FROM information_schema.columns c JOIN information_schema.tables t ON t.table_schema = c.table_schema AND t.table_name = c.table_name WHERE c.table_schema = 'fsm' AND t.table_type = 'BASE TABLE' AND c.is_nullable = 'YES' ORDER BY c.table_name, c.column_name",
             conn
         )
 
@@ -278,11 +287,17 @@ let nullableColumns () : (string * string) list =
 
     go []
 
-/// Rows reported by the shipped drift-detection query. The real file is used rather than a
-/// re-statement of it, so the test cannot pass against a query the library does not ship.
+/// Rows reported by the shipped drift view. The view is read rather than a re-statement of it,
+/// so the test cannot pass against a query the library does not ship.
 let blockedDriftRows () : string list =
     use conn = (dataSource ()).OpenConnection()
-    use cmd = new NpgsqlCommand(SqlResources.get "command" "blocked_drift", conn)
+
+    use cmd =
+        new NpgsqlCommand(
+            "SELECT command_id, machine_id, entity_id, seq, blocked, expected_blocked FROM fsm.blocked_drift ORDER BY machine_id, entity_id, seq",
+            conn
+        )
+
     use reader = cmd.ExecuteReader()
 
     let rec go acc =
@@ -386,3 +401,28 @@ let arrange (sql: string) : unit =
     match exec sql with
     | Ok() -> ()
     | Error error -> failtestf "arranging failed: %s" error.Message
+
+/// The JSON plan of a statement, planned but not run.
+let explain (sql: string) : string =
+    use conn = (dataSource ()).OpenConnection()
+    use cmd = new NpgsqlCommand($"EXPLAIN (FORMAT JSON) {sql}", conn)
+    cmd.ExecuteScalar() |> string
+
+/// Every (node type, relation) pair in a JSON plan, walked rather than string-matched, so a
+/// sequential scan of a small registry table is not mistaken for one of the inbox.
+let scans (plan: string) : (string * string) list =
+    let rec walk (node: JsonElement) =
+        [ let kind = node.GetProperty("Node Type").GetString()
+
+          match node.TryGetProperty "Relation Name" with
+          | true, relation -> kind, relation.GetString()
+          | _ -> ()
+
+          match node.TryGetProperty "Plans" with
+          | true, children ->
+              for child in children.EnumerateArray() do
+                  yield! walk child
+          | _ -> () ]
+
+    use document = JsonDocument.Parse plan
+    walk (document.RootElement[0].GetProperty "Plan")

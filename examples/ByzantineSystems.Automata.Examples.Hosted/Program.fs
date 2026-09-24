@@ -229,9 +229,19 @@ let main argv =
         eprintfn "Set BS_AUTOMATA_CONN to a PostgreSQL connection string, then run `make migrate`."
         1
     | Some connectionString ->
-        Migrator.migrate connectionString
         let builder = Host.CreateApplicationBuilder(argv)
         configure builder.Services (PostgresContext.ofConnectionString connectionString)
         use host = builder.Build()
-        host.Run()
-        0
+
+        let logger =
+            host.Services.GetRequiredService<ILoggerFactory>().CreateLogger("ByzantineSystems.Automata.Migrate")
+
+        // Migrated before the host starts, through the host's own logging, so a schema that
+        // cannot be brought up to date stops everything before any worker boots against it.
+        match Migrator.migrate logger connectionString with
+        | Error(MigrationError.Failed(script, error)) ->
+            logger.LogError(error, "Migration failed at {Script}", script)
+            1
+        | Ok _ ->
+            host.Run()
+            0

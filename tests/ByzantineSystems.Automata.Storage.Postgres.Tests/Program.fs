@@ -12,6 +12,7 @@ let tests =
         "ByzantineSystems.Automata.Storage.Postgres.Tests"
         [ SqlResourceTests.tests
           MaintenanceTests.pureTests
+          MaintenanceTests.migratorTests
 
           if TestContext.configured then
               testList
