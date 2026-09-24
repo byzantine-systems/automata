@@ -34,6 +34,11 @@ type ChartError =
     | InvalidTerminal of StateId
     | MissingRoot
     | MissingClassify
+    /// <summary>
+    /// A goto rule on <paramref name="from" /> names a node the chart does not declare. Without
+    /// this the rule builds, and fails only when an event first reaches it.
+    /// </summary>
+    | UnknownGotoTarget of from: StateId * target: StateId
 
 /// <summary>
 /// A validated state chart: an invalid hierarchy cannot exist as a value. The private
@@ -156,6 +161,14 @@ module Chart =
             |> List.filter (fun n -> not (Set.contains n.Id seen))
             |> List.map (fun n -> ChartError.UnreachableState n.Id)
 
+        let unknownTargets =
+            nodes
+            |> List.collect (fun n ->
+                n.Rules
+                |> List.choose Rule.target
+                |> List.filter (fun target -> not (byId.ContainsKey target))
+                |> List.map (fun target -> ChartError.UnknownGotoTarget(n.Id, target)))
+
         let rootErrors =
             match byId.TryFind root with
             | None -> [ ChartError.MissingRoot ]
@@ -171,6 +184,7 @@ module Chart =
             @ invalidTerminal
             @ structure
             @ unreachable
+            @ unknownTargets
             @ rootErrors
 
         if errors.IsEmpty then

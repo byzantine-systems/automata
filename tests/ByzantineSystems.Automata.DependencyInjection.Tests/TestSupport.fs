@@ -69,6 +69,9 @@ type TestStore() =
 
     member val Delivered = ResizeArray<int>() with get
 
+    /// Every claim of either kind, so a test can prove no worker ran.
+    member val Claims = 0 with get, set
+
     /// Scripts one action for the dispatcher to pick up.
     member _.OfferAction(action) = actions.Enqueue action
 
@@ -76,7 +79,10 @@ type TestStore() =
         member _.Submit(_, _) =
             Task.FromResult(Ok(Accepted(CommandId.ofInt64 1L)))
 
-        member _.Claim(_, _, _, _) = Task.FromResult(Ok [])
+        member this.Claim(_, _, _, _) =
+            this.Claims <- this.Claims + 1
+            Task.FromResult(Ok [])
+
         member _.Reschedule(_, _, _, _) = Task.FromResult(Ok Updated)
         member _.ExtendLease(_, _, _, _) = Task.FromResult(Ok Updated)
         member _.TryGet(_, _) = Task.FromResult(Ok None)
@@ -100,7 +106,8 @@ type TestStore() =
 
     interface IActionQueue<Entity, TestAction> with
 
-        member _.Claim(_, batch, _, _) =
+        member this.Claim(_, batch, _, _) =
+            this.Claims <- this.Claims + 1
             let drained = ResizeArray()
             let mutable taking = true
 
@@ -119,6 +126,14 @@ type TestStore() =
         member _.Abandon(_, _, _) = Task.FromResult(Ok Updated)
 
     interface MachineStore
+
+/// <summary>A store whose boot refuses, for proving that nothing runs when it does.</summary>
+type RefusingStore() =
+    inherit TestStore()
+
+    interface IStoreBoot with
+        member _.Boot(_, _) =
+            Task.FromResult(Ok(BootReport.Refused [ BootDefect.SchemaMissing ]))
 
 /// <summary>A registry that agrees with whatever a chart claims.</summary>
 type TestRegistry() =
@@ -159,7 +174,6 @@ let testMachineOver (storeArg: MachineStore) : Result<TestMachine, MachineConfig
         chartVersion 1
         initialState Idle
         store storeArg
-        actionQueue "di_test_actions"
 
         processor
             { ProcessorPolicy.defaults with
@@ -178,7 +192,7 @@ let expectMachine (result: Result<TestMachine, MachineConfigError list>) : TestM
 let testOptions (machineKey: string) (store: TestStore) (onMachine: TestMachine -> unit) : TestOptions =
     { MachineKey = machineKey
       Supervisor = supervisorDefaults
-      DispatchActions = false
+      Actions = ActionDelivery.Elsewhere
       MachineFactory =
         fun _ ->
             match testMachineOver (store :> MachineStore) with

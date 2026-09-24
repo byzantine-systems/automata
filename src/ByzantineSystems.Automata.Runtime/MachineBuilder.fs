@@ -1,7 +1,6 @@
 namespace ByzantineSystems.Automata.Runtime
 
 open System
-open System.Text.RegularExpressions
 open Microsoft.Extensions.Logging
 open Microsoft.Extensions.Logging.Abstractions
 open ByzantineSystems.Automata.Core
@@ -14,18 +13,11 @@ type MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: equali
     | MachineInitial of 'State
     | MachineStore of IMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     | MachineProcessor of ProcessorPolicy<'Err>
-    | MachineActionQueue of string
     | MachineObserver of TransitionObserver<'EntityId, 'State, 'Event, 'Action> * capacity: int
     | MachineLogger of ILogger
     | MachineTimeProvider of TimeProvider
 
 module private MachineBuild =
-
-    /// <summary>
-    /// Stricter than PostgreSQL's own rules, and deliberately: a queue name is interpolated into
-    /// SQL rather than bound, so the only safe set is the one that never needs quoting.
-    /// </summary>
-    let queueNamePattern = Regex(@"^[a-z_][a-z0-9_]*$", RegexOptions.Compiled)
 
     /// Default: one observation channel deep enough to absorb a batch without dropping.
     let defaultObserverCapacity = 256
@@ -42,7 +34,6 @@ module private MachineBuild =
         | MachineInitial _ -> MachineDeclaration.Initial
         | MachineStore _ -> MachineDeclaration.Store
         | MachineProcessor _ -> MachineDeclaration.Processor
-        | MachineActionQueue _ -> MachineDeclaration.ActionQueue
         | MachineObserver _ -> MachineDeclaration.Observer
         | MachineLogger _ -> MachineDeclaration.Logger
         | MachineTimeProvider _ -> MachineDeclaration.TimeProvider
@@ -93,12 +84,6 @@ module private MachineBuild =
                 | MachineProcessor policy -> Some policy
                 | _ -> None)
 
-        let actionQueue =
-            parts
-            |> List.tryPick (function
-                | MachineActionQueue name -> Some name
-                | _ -> None)
-
         let observer =
             parts
             |> List.tryPick (function
@@ -128,12 +113,7 @@ module private MachineBuild =
                   MissingInitialState
 
               if Option.isNone store then
-                  MissingStore
-
-              match actionQueue with
-              | None -> MissingActionQueue
-              | Some name when not (queueNamePattern.IsMatch name) -> InvalidActionQueueName name
-              | Some _ -> () ]
+                  MissingStore ]
 
         let policy = processor |> Option.defaultValue ProcessorPolicy.defaults
 
@@ -159,8 +139,8 @@ module private MachineBuild =
 
         match duplicates @ missing @ policyErrors @ initialStateErrors with
         | [] ->
-            match chart, version, initial, store, actionQueue, ProcessorPolicy.validate policy with
-            | Some chart, Some version, Some initial, Some store, Some actionQueue, Ok validatedPolicy ->
+            match chart, version, initial, store, ProcessorPolicy.validate policy with
+            | Some chart, Some version, Some initial, Some store, Ok validatedPolicy ->
                 let config: RuntimeConfig<'EntityId, 'State, 'Event, 'Action, 'Err> =
                     { MachineId = machineId
                       Chart = chart
@@ -168,7 +148,6 @@ module private MachineBuild =
                       InitialState = initial
                       Store = store
                       Processor = validatedPolicy
-                      ActionQueue = actionQueue
                       Logger = logger |> Option.defaultValue (NullLogger.Instance :> ILogger)
                       TimeProvider = timeProvider |> Option.defaultValue TimeProvider.System }
 
@@ -228,9 +207,6 @@ type MachineBuilder<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: equ
     [<CustomOperation "processor">]
     member _.Processor(parts, policy: ProcessorPolicy<'Err>) = parts @ [ MachineProcessor policy ]
 
-    [<CustomOperation "actionQueue">]
-    member _.ActionQueue(parts, name: string) = parts @ [ MachineActionQueue name ]
-
     [<CustomOperation "onTransition">]
     member _.OnTransition(parts, observer: TransitionObserver<'EntityId, 'State, 'Event, 'Action>) =
         parts @ [ MachineObserver(observer, MachineBuild.defaultObserverCapacity) ]
@@ -248,7 +224,8 @@ module MachineCE =
 
     /// <summary>
     /// Declares one machine: a chart, the version commands pin to it, the state a new entity
-    /// starts from, the durable store, and the queue its actions are delivered through.
+    /// starts from, and the durable store. The store owns the queue the machine's actions are
+    /// delivered through, so the queue is named once, where it is created.
     /// </summary>
     /// <example>
     /// <code lang="fsharp">
@@ -258,7 +235,6 @@ module MachineCE =
     ///         chartVersion 3
     ///         initialState Pending
     ///         store        postgresStore
-    ///         actionQueue  "payment_actions"
     ///     }
     /// </code>
     /// </example>

@@ -12,6 +12,7 @@
         <Compile Include="ChartTests.fs" />
         <Compile Include="ChartPropertyTests.fs" />
         <Compile Include="ChartFingerprintTests.fs" />
+        <Compile Include="FragmentTests.fs" />
         <Compile Include="Program.fs" />
     </ItemGroup>
 

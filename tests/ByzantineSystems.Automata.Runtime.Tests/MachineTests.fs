@@ -27,48 +27,11 @@ let configurationTests =
                       chart testChart
                       initialState Idle
                       store (stub :> IMachineStore<_, _, _, _, _>)
-                      actionQueue "test_actions"
                   }
 
               match result with
               | Error errors -> Expect.contains errors MissingChartVersion "the version has to be declared"
               | Ok _ -> failtest "a machine without a declared chart version should not build"
-          }
-
-          test "a machine without an action queue does not build" {
-              let stub = StubStore<TestError>()
-
-              let result =
-                  machine<EntityId<TestEntity>, TestState, TestEvent, TestAction, TestError> testMachine {
-                      chart testChart
-                      chartVersion 1
-                      initialState Idle
-                      store (stub :> IMachineStore<_, _, _, _, _>)
-                  }
-
-              match result with
-              | Error errors -> Expect.contains errors MissingActionQueue "the queue has to be named"
-              | Ok _ -> failtest "a machine without an action queue should not build"
-          }
-
-          test "a queue name that would need quoting is refused" {
-              // The name reaches dynamic SQL as an identifier rather than a parameter, so the
-              // allowlist is narrower than PostgreSQL's own rules on purpose.
-              let stub = StubStore<TestError>()
-
-              let result =
-                  machine<EntityId<TestEntity>, TestState, TestEvent, TestAction, TestError> testMachine {
-                      chart testChart
-                      chartVersion 1
-                      initialState Idle
-                      store (stub :> IMachineStore<_, _, _, _, _>)
-                      actionQueue "Test Actions; DROP TABLE"
-                  }
-
-              match result with
-              | Error errors ->
-                  Expect.contains errors (InvalidActionQueueName "Test Actions; DROP TABLE") "refused by the allowlist"
-              | Ok _ -> failtest "an unacceptable queue name should not build"
           }
 
           test "every defect is reported, not just the first" {
@@ -82,7 +45,6 @@ let configurationTests =
               | Error errors ->
                   Expect.contains errors MissingChart "the chart"
                   Expect.contains errors MissingStore "the store"
-                  Expect.contains errors MissingActionQueue "the queue"
               | Ok _ -> failtest "an empty machine should not build"
           }
 
@@ -96,7 +58,6 @@ let configurationTests =
                       chartVersion 1
                       initialState Idle
                       store (stub :> IMachineStore<_, _, _, _, _>)
-                      actionQueue "test_actions"
                   }
 
               match result with
@@ -113,7 +74,6 @@ let configurationTests =
                       chartVersion 1
                       initialState Idle
                       store (stub :> IMachineStore<_, _, _, _, _>)
-                      actionQueue "test_actions"
 
                       processor
                           { ProcessorPolicy.defaults with
@@ -257,9 +217,8 @@ let capabilityTests =
     testList
         "optional capabilities"
         [ test "a store offering only the required four has no temporal capability" {
-              // The D12 promise under test: a third-party store that skips a capability is still
-              // a complete provider, and the type system says so rather than a runtime error
-              // saying it later.
+              // A third-party store that skips a capability is still a complete provider, 
+              // and the type system says so rather than a runtime error saying it later.
               let built = buildMachine (StubStore<TestError>()) (newTime ()) id |> expectMachine
 
               Expect.isNone (Machine.temporal built) "no reader"

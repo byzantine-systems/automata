@@ -42,6 +42,18 @@ type NodeBuilder<'State, 'Event, 'Action, 'Err>(name: string) =
     member _.Yield(draft: NodeDraft<'State, 'Event, 'Action, 'Err>) : NodePart<'State, 'Event, 'Action, 'Err> list =
         [ ChildNode draft ]
 
+    /// <summary>Several child nodes at once, as a fragment library exports them.</summary>
+    member _.Yield
+        (drafts: NodeDraft<'State, 'Event, 'Action, 'Err> list)
+        : NodePart<'State, 'Event, 'Action, 'Err> list =
+        List.map ChildNode drafts
+
+    /// <summary>The same, spliced with <c>yield!</c>.</summary>
+    member _.YieldFrom
+        (drafts: NodeDraft<'State, 'Event, 'Action, 'Err> list)
+        : NodePart<'State, 'Event, 'Action, 'Err> list =
+        List.map ChildNode drafts
+
     member _.Yield(()) : NodePart<'State, 'Event, 'Action, 'Err> list = []
 
     member _.Zero() : NodePart<'State, 'Event, 'Action, 'Err> list = []
@@ -92,6 +104,18 @@ type ChartBuilder<'State, 'Event, 'Action, 'Err>() =
 
     member _.Yield(draft: NodeDraft<'State, 'Event, 'Action, 'Err>) : ChartPart<'State, 'Event, 'Action, 'Err> list =
         [ ChartNode draft ]
+
+    /// <summary>Several top-level nodes at once, as a fragment library exports them.</summary>
+    member _.Yield
+        (drafts: NodeDraft<'State, 'Event, 'Action, 'Err> list)
+        : ChartPart<'State, 'Event, 'Action, 'Err> list =
+        List.map ChartNode drafts
+
+    /// <summary>The same, spliced with <c>yield!</c>.</summary>
+    member _.YieldFrom
+        (drafts: NodeDraft<'State, 'Event, 'Action, 'Err> list)
+        : ChartPart<'State, 'Event, 'Action, 'Err> list =
+        List.map ChartNode drafts
 
     member _.Yield(()) : ChartPart<'State, 'Event, 'Action, 'Err> list = []
 
@@ -153,6 +177,57 @@ type ChartBuilder<'State, 'Event, 'Action, 'Err>() =
             Chart.create root classify (flatten None rootDraft)
         | None, _ -> Result.Error [ ChartError.MissingRoot ]
         | Some _, None -> Result.Error [ ChartError.MissingClassify ]
+
+/// <summary>
+/// Reusing a piece of chart.
+///
+/// A fragment is an ordinary <see cref="T:ByzantineSystems.Automata.Core.NodeDraft`4" /> value:
+/// build it once with <c>state</c> or <c>compound</c>, and yield it into as many charts as need
+/// it. When one chart needs the same fragment twice, <c>prefix</c> gives each copy its own ids.
+/// </summary>
+[<RequireQualifiedAccess>]
+module Fragment =
+
+    let rec private declared (draft: NodeDraft<'State, 'Event, 'Action, 'Err>) : StateId list =
+        draft.Id :: List.collect declared draft.Children
+
+    /// <summary>
+    /// Renames every node the fragment declares to <c>"&lt;prefix&gt;.&lt;id&gt;"</c>, along with
+    /// every initial child and goto target that names one of them. A goto target the fragment
+    /// does not declare is left alone, so a fragment can still send an entity to a state its
+    /// host chart owns.
+    ///
+    /// The classifier cannot be renamed, because it is the host's own code, so it must return
+    /// the prefixed ids for states inside a prefixed fragment. A classifier that forgets is
+    /// caught rather than trusted: the machine refuses to build when its initial state
+    /// classifies to an undeclared node, and resolution reports <c>UnknownState</c> for any other.
+    /// A goto the rewrite missed is refused when the chart is built, as
+    /// <c>ChartError.UnknownGotoTarget</c>.
+    /// </summary>
+    /// <exception cref="T:System.ArgumentException">The prefix is empty or whitespace.</exception>
+    let prefix
+        (prefix: string)
+        (draft: NodeDraft<'State, 'Event, 'Action, 'Err>)
+        : NodeDraft<'State, 'Event, 'Action, 'Err> =
+        if System.String.IsNullOrWhiteSpace prefix then
+            invalidArg (nameof prefix) "A fragment prefix must be a non-empty string."
+
+        let inside = declared draft |> Set.ofList
+
+        let rename (id: StateId) =
+            if Set.contains id inside then
+                StateId.create $"{prefix.Trim()}.{StateId.value id}"
+            else
+                id
+
+        let rec rewrite (node: NodeDraft<'State, 'Event, 'Action, 'Err>) =
+            { node with
+                Id = rename node.Id
+                InitialChild = Option.map rename node.InitialChild
+                Rules = List.map (Rule.retarget rename) node.Rules
+                Children = List.map rewrite node.Children }
+
+        rewrite draft
 
 /// <summary>Syntax surface for the <c>statechart</c> computation expression.</summary>
 [<AutoOpen>]

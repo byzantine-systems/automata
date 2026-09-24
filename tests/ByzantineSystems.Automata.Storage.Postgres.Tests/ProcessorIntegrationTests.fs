@@ -89,7 +89,6 @@ let private buildMachine
         chartVersion 1
         initialState Idle
         store (machineStore :> IMachineStore<Entity, TestState, TestEvent, TestAction, TestError>)
-        actionQueue TestContext.actionQueue
 
         processor
             { ProcessorPolicy.defaults with

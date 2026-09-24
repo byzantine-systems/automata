@@ -16,10 +16,13 @@
 This library is designed to keep domain behavior independent from runtime and infrastructure concerns:
 
 - **Typed and validated charts**: hierarchical and terminal states, guarded transitions, entry and exit actions, event bubbling, and accumulated construction errors.
-- **Deterministic core**: `Chart.resolve` is a pure function, so transition behavior can be tested without actors, databases, clocks, or dependency injection.
+- **Deterministic core**: `Chart.resolve` is a pure function, so transition behavior can be tested without databases, clocks, or dependency injection.
 - **Entity-level ordering, across processes**: at most one command per entity is claimable, so claiming it excludes that entity on every host, not only in one; unrelated entities still make progress concurrently. Idempotency keys and a gapless epoch protect committed transitions.
 - **Composable durability**: storage contracts cover the command inbox, the current snapshot, the atomic end of processing a command, and action delivery. A commit appends the transition, advances the belief and queues its actions in one transaction.
-- **Operational resilience**: a Polly pipeline handles short-lived driver failures inside the store, the inbox handles longer delays with a database-computed backoff, and supervision policies manage machine restarts and escalation.
+- **Operational resilience**: a Polly pipeline handles short-lived driver failures inside the store, the inbox handles longer delays with a database-computed backoff, and supervision policies manage machine restarts and escalation. Work that keeps dying without an outcome is dead-lettered rather than retried forever.
+- **Two time axes**: every belief records when it was true and when it was held, so you can ask what was true at 14:02 and what the system thought at 14:05, and correct the past without erasing it.
+- **Maintenance included**: a blocking boot check, retention, lease reaping, drift reports and cross-process wake-ups, run by pg_cron when the database allows it and by the host when it does not.
+- **Composable charts**: chart fragments are ordinary values; splice several with `yield!`, and reuse one twice with `Fragment.prefix`.
 
 Use only the pure chart library, assemble a custom runtime from the smaller packages, or host a complete supervised machine with PostgreSQL persistence and .NET dependency injection.
 
@@ -36,6 +39,12 @@ To execute charts against the PostgreSQL authority:
 ```shell
 dotnet add package ByzantineSystems.Automata.Runtime
 dotnet add package ByzantineSystems.Automata.Storage.Postgres
+```
+
+To host them in a .NET Generic Host, with supervision and maintenance:
+
+```shell
+dotnet add package ByzantineSystems.Automata.DependencyInjection
 ```
 
 ## Example
@@ -84,80 +93,89 @@ The computation expression returns `Result<Chart<_,_,_,_>, ChartError list>` and
 
 Run the chart-only example directly from the repository with `dotnet fsi examples/readme.fsx`; the complete script is at [`examples/readme.fsx`](examples/readme.fsx).
 
+A `state` or `compound` block is an ordinary value, so a piece of chart can be written once and yielded wherever it is needed, and `yield!` splices a list of them. When one chart needs the same fragment twice, `Fragment.prefix "card"` renames every node it declares, and every goto that names one, so two copies can both declare `state "failed"`. The [fragments guide](docs/fragments.md) covers the details, including the one rule it cannot enforce for you: the classifier must return the prefixed ids.
+
 ### Run the chart
 
-Compose the validated chart with storage and resilience policy using the `machine` computation expression:
+Host it with a supervised worker, action delivery and database maintenance, then send it events from anywhere. The fuller version of this, with a chart built from fragments, is [`examples/ByzantineSystems.Automata.Examples.Hosted`](examples/ByzantineSystems.Automata.Examples.Hosted/Program.fs), and `make run-example-hosted` runs it.
 
 ```fsharp
-open System.Threading
-open ByzantineSystems.Automata.Resilience
+open System
+open System.Threading.Tasks
+open ByzantineSystems.Automata.Core
+open ByzantineSystems.Automata.DependencyInjection
 open ByzantineSystems.Automata.Runtime
 open ByzantineSystems.Automata.Storage
 open ByzantineSystems.Automata.Storage.Postgres
+open Microsoft.Extensions.DependencyInjection
+open Microsoft.Extensions.Hosting
 
 type LightSwitch = class end
 type SwitchId = EntityId<LightSwitch>
 
-let context = PostgresContext.ofConnectionString connectionString
-let encode, decode = EntityKey.forEntityId<LightSwitch>
-
-let machineStore =
-    PostgresMachineStore<SwitchId, SwitchState, SwitchEvent, SwitchAction, string>(
-        { Context = context
-          ActionQueue = "switch_actions"
-          StateCodec = Serialization.systemTextJson<SwitchState> ()
-          EventCodec = Serialization.systemTextJson<SwitchEvent> ()
-          ActionCodec = Serialization.systemTextJson<SwitchAction> ()
-          ErrorCodec = Serialization.systemTextJson<string> ()
-          EntityIdEncode = encode
-          EntityIdDecode = decode }
-    )
-
-let switchMachine =
+let switches (context: PostgresContext) =
     machine<SwitchId, SwitchState, SwitchEvent, SwitchAction, string> (machineId "light-switches") {
         chart switchChart
         // Declared, never inferred: every command records the version it was resolved under.
         chartVersion 1
         initialState Off
-        store machineStore
-        actionQueue "switch_actions"
+        // JSON codecs, entity keys and a keep-everything retention policy, overridable with
+        // { ... with }. The store owns the action queue, so this is the only place it is named.
+        store (
+            MachineStoreOptions.forEntityId<LightSwitch, SwitchState, SwitchEvent, SwitchAction, string>
+                context
+                "switch_actions"
+            |> PostgresMachineStore
+        )
     }
-    |> function
-        | Ok machine -> machine
-        | Error errors -> invalidOp $"Invalid machine configuration: %A{errors}"
 
-let flickSwitch () =
+/// Where TurnLightOn and TurnLightOff actually go. Delivery is at least once.
+type Lamp() =
+    interface IActionHandler<SwitchId, SwitchAction, string> with
+        member _.HandleAsync(action, _) =
+            printfn "%A for %s" action.Work.Action (EntityId.value action.Work.EntityId)
+            Task.FromResult(Ok())
+
+let host (connectionString: string) =
+    let context = PostgresContext.ofConnectionString connectionString
+    let builder = Host.CreateApplicationBuilder()
+
+    builder.Services
+        .AddSingleton<ISupervisionEventStore>(PostgresSupervisionStore context)
+        .AddScoped<IActionHandler<SwitchId, SwitchAction, string>, Lamp>()
+        // A supervised worker that claims, decides and delivers.
+        .AddAutomata(
+            { MachineKey = "light-switches"
+              Supervisor = AutomataSupervisorOptions.defaults "light-switches"
+              Actions = ActionDelivery.registered<SwitchId, SwitchAction, string>
+              MachineFactory = fun _ -> switches context
+              ChartRegistry = fun _ -> PostgresChartRegistry { Context = context }
+              TimeProvider = TimeProvider.System }
+        )
+        // Retention, lease reaping, drift reports and cross-process wake-ups.
+        .AddAutomataMaintenance(MaintenanceOptions.defaults (fun _ -> PostgresMaintenance context))
+    |> ignore
+
+    builder.Build()
+
+/// A caller needs the machine, not the worker: the two meet in the database, so this can run
+/// in a different process from the host above.
+let flick (context: PostgresContext) (hallway: SwitchId) ct =
     task {
-        let cancellation = CancellationToken.None
-        let hallway: SwitchId = entityId "hallway"
+        match switches context with
+        | Error errors -> return Error $"%A{errors}"
+        | Ok machine ->
+            let! _ = Machine.startAsync machine (PostgresChartRegistry { Context = context }) ct
 
-        let! _ = machineStore.EnsureQueueAsync cancellation
-        let! _ = Machine.startAsync switchMachine (PostgresChartRegistry { Context = context }) cancellation
-
-        // A worker. In a host this is a BackgroundService under supervision.
-        use worker = new CancellationTokenSource()
-        let draining = (Machine.processor switchMachine).RunAsync worker.Token
-
-        // send is enqueue plus a wait for the durable outcome. Callers that care more about
-        // throughput use Machine.enqueue and read the result later with Machine.commandResult.
-        let! outcome =
-            Machine.send
-                switchMachine
-                hallway
-                (EventEnvelope.create "hallway-flick-1" Flick)
-                cancellation
-
-        let! current = Machine.state switchMachine hallway cancellation
-
-        worker.Cancel()
-        let! _ = draining
-        do! Machine.stopAsync switchMachine cancellation
-
-        return outcome, current
+            // send is enqueue plus a wait for the durable outcome. A caller that cares more
+            // about throughput uses Machine.enqueue and reads Machine.commandResult later.
+            let! outcome = Machine.send machine hallway (EventEnvelope.create "hallway-flick-1" Flick) ct
+            do! Machine.stopAsync machine ct
+            return Ok outcome
     }
 ```
 
-See the [documentation](docs/index.md), [public API guide](docs/public-api.md), and [schema evolution guide](docs/schema-evolution.md). Runnable demonstrations live under [`examples/`](examples/).
+See the [documentation](docs/index.md), [public API guide](docs/public-api.md), [fragments guide](docs/fragments.md), and [schema evolution guide](docs/schema-evolution.md). Runnable demonstrations live under [`examples/`](examples/).
 
 ## Packages
 
@@ -167,10 +185,10 @@ The toolkit is published as focused building blocks. Start with `Core` for pure 
 | --- | --- |
 | `ByzantineSystems.Automata.Core` | Typed identifiers, transition rules, validated hierarchical charts, and pure event resolution |
 | `ByzantineSystems.Automata.Resilience` | Polly retry, timeout, and circuit-breaker policy for a store's own I/O, plus Erlang-style supervision |
-| `ByzantineSystems.Automata.Storage` | The command inbox, state reader, command processor store, and action queue contracts |
-| `ByzantineSystems.Automata.Storage.Postgres` | The PostgreSQL authority: inbox, bitemporal beliefs, transition log, pgmq action delivery, JSON codecs, and embedded DbUp migrations |
+| `ByzantineSystems.Automata.Storage` | The command inbox, state reader, command processor store, and action queue contracts, plus the optional capabilities: temporal reads, corrections, boot checks, work notifications and database maintenance |
+| `ByzantineSystems.Automata.Storage.Postgres` | The PostgreSQL authority: inbox, bitemporal beliefs and corrections, transition log, pgmq action delivery, maintenance routines, JSON codecs, and embedded DbUp migrations |
 | `ByzantineSystems.Automata.Runtime` | The command processor, the `enqueue`/`send`/`commandResult` surface, action dispatch, observers, and machine lifecycle |
-| `ByzantineSystems.Automata.DependencyInjection` | Hosted `BackgroundService` supervision with scoped action handlers and audit persistence |
+| `ByzantineSystems.Automata.DependencyInjection` | Hosted `BackgroundService` supervision with scoped action handlers and audit persistence, and `MaintenanceService` |
 
 ## Development
 

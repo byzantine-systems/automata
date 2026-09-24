@@ -17,6 +17,7 @@ module internal DispatcherEvents =
     let abandoned = EventId(1404, "ActionAbandoned")
     let leaseLost = EventId(1405, "ActionLeaseLost")
     let pollFailed = EventId(1406, "ActionPollFailed")
+    let handlerFailed = EventId(1407, "ActionHandlerFailed")
 
 /// <summary>
 /// Delivers one action to the outside world.
@@ -97,6 +98,33 @@ type ActionDispatcher<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectError whe
     let poisoned (action: LeasedAction<'EntityId, 'Action>) =
         action.DeliveryCount > policy.MaxAttempts
 
+    /// Why a delivery failed, which otherwise nothing would say. A thrown exception is logged with
+    /// its stack, the only way to see where it came from. A reported error is the application's
+    /// own value and is not written out, like every other payload; that it happened is.
+    let handlerFailed (action: LeasedAction<'EntityId, 'Action>) (attempt: Result<Result<unit, 'EffectError>, exn>) =
+        let ordinal = action.Work.Ordinal
+        let commandId = CommandId.value action.Work.CommandId
+
+        match attempt with
+        | Error thrown ->
+            logger.LogWarning(
+                DispatcherEvents.handlerFailed,
+                thrown,
+                "The handler for action {Ordinal} of command {CommandId} for machine {MachineId} threw.",
+                ordinal,
+                commandId,
+                machineName
+            )
+        | Ok(Error _) ->
+            logger.LogWarning(
+                DispatcherEvents.handlerFailed,
+                "The handler for action {Ordinal} of command {CommandId} for machine {MachineId} reported a failure.",
+                ordinal,
+                commandId,
+                machineName
+            )
+        | Ok(Ok()) -> ()
+
     let deliver (action: LeasedAction<'EntityId, 'Action>) (ct: CancellationToken) =
         task {
             if poisoned action then
@@ -114,6 +142,9 @@ type ActionDispatcher<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectError whe
                     | Ok(Ok()) -> true
                     | Ok(Error _)
                     | Error _ -> false
+
+                if not succeeded then
+                    handlerFailed action attempt
 
                 if succeeded then
                     let! outcome = queue.Complete(action, ct)

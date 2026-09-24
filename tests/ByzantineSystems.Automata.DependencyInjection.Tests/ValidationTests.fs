@@ -48,7 +48,7 @@ let validationTests =
 
               let options =
                   { testOptions "bad-machine" store ignore with
-                      MachineFactory = fun _ -> Error [ MissingActionQueue ] }
+                      MachineFactory = fun _ -> Error [ MissingStore ] }
 
               let provider =
                   ServiceCollection()

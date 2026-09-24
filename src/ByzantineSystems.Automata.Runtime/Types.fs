@@ -229,7 +229,6 @@ type MachineDeclaration =
     | Initial
     | Store
     | Processor
-    | ActionQueue
     | Observer
     | Logger
     | TimeProvider
@@ -240,8 +239,6 @@ type MachineConfigError =
     | MissingChartVersion
     | MissingInitialState
     | MissingStore
-    | MissingActionQueue
-    | InvalidActionQueueName of name: string
     | InvalidProcessorPolicy of ProcessorPolicyError list
     | DuplicateDeclaration of MachineDeclaration
     | InitialStateUnknown of StateId
@@ -275,6 +272,5 @@ type internal RuntimeConfig<'EntityId, 'State, 'Event, 'Action, 'Err when 'Entit
       InitialState: 'State
       Store: IMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
       Processor: ValidatedProcessorPolicy<'Err>
-      ActionQueue: string
       Logger: ILogger
       TimeProvider: TimeProvider }

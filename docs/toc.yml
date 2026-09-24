@@ -2,5 +2,7 @@
   href: index.md
 - name: Public API
   href: public-api.md
+- name: Chart fragments
+  href: fragments.md
 - name: Schema evolution
   href: schema-evolution.md

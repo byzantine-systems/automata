@@ -39,13 +39,13 @@ type RecordingHandler(marker: ScopeMarker, log: HandledLog) =
 let actionDispatchTests =
     testList
         "action dispatch"
-        [ testTask "DispatchActions resolves the handler through one async scope per action" {
+        [ testTask "a registered handler is resolved through one async scope per action" {
               let store = TestStore()
               let audit = InMemorySupervisionStore()
 
               let options =
                   { testOptions "dispatch-machine" store ignore with
-                      DispatchActions = true }
+                      Actions = ActionDelivery.registered<Entity, TestAction, string> }
 
               let provider =
                   ServiceCollection()

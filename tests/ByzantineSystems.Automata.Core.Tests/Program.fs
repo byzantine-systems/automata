@@ -9,7 +9,9 @@ let tests =
         [ CoreTypeTests.tests
           ChartTests.tests
           ChartPropertyTests.tests
-          ChartFingerprintTests.tests ]
+          ChartFingerprintTests.tests
+          FragmentTests.tests
+          FragmentTests.targetTests ]
 
 [<EntryPoint>]
 let main argv = runTestsWithCLIArgs [] argv tests

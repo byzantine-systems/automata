@@ -137,7 +137,8 @@ let private logTransition
         )
     }
 
-/// The queue this machine's actions are delivered through, one per machine.
+/// The queue this machine's actions are delivered through, one per machine. Named once, on the
+/// store that creates it.
 [<Literal>]
 let private ActionQueue = "payment_actions"
 
@@ -153,7 +154,6 @@ let private buildMachine
         chartVersion 1
         initialState Idle
         store storeArg
-        actionQueue ActionQueue
         onTransition (logTransition log)
         logger log
         timeProvider TimeProvider.System
@@ -174,26 +174,16 @@ let private readConnectionString () : string option =
 /// </summary>
 let private runPayment (logger: ILogger) (connectionString: string) : Task =
     task {
-        let encode, decode = EntityKey.forEntityId<Payment>
-
         let context =
             PostgresContext.create (DataSource.create connectionString) TransientPolicy.defaults ignore
 
+        // Every default spelled out in one function: JSON codecs, EntityId keys, nothing deleted,
+        // leases reaped five minutes after they expire. Override any of them with { ... with }.
         let store =
-            PostgresMachineStore<Entity, PaymentState, PaymentEvent, PaymentAction, string>(
-                { Context = context
-                  ActionQueue = ActionQueue
-                  StateCodec = Serialization.systemTextJson<PaymentState> ()
-                  EventCodec = Serialization.systemTextJson<PaymentEvent> ()
-                  ActionCodec = Serialization.systemTextJson<PaymentAction> ()
-                  ErrorCodec = Serialization.systemTextJson<string> ()
-                  EntityIdEncode = encode
-                  EntityIdDecode = decode
-                  // Nothing is deleted unless a retention policy says so.
-                  Retention = RetentionPolicy.keepEverything
-                  ReapAfter = TimeSpan.FromMinutes 5.
-                  Listener = ListenerConnection.SameDataSource }
-            )
+            MachineStoreOptions.forEntityId<Payment, PaymentState, PaymentEvent, PaymentAction, string>
+                context
+                ActionQueue
+            |> PostgresMachineStore
 
         let machine =
             match buildMachine logger (store :> IMachineStore<_, _, _, _, _>) with

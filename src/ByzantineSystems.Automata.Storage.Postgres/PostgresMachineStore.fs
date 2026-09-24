@@ -47,6 +47,42 @@ type MachineStoreOptions<'EntityId, 'State, 'Event, 'Action, 'Err> =
         Listener: ListenerConnection
     }
 
+/// <summary>Operations on <see cref="T:ByzantineSystems.Automata.Storage.Postgres.MachineStoreOptions`5" />.</summary>
+[<RequireQualifiedAccess>]
+module MachineStoreOptions =
+
+    /// <summary>
+    /// Every default a host would otherwise write out: JSON codecs for state, events, actions and
+    /// errors, <c>EntityId</c> keys, keeping everything, reaping leases five minutes after they
+    /// expire, and listening on the store's own data source. Override any of it with
+    /// <c>{ … with }</c>; nothing here is hidden behind a builder.
+    /// </summary>
+    /// <example>
+    /// <code lang="fsharp">
+    /// let store =
+    ///     MachineStoreOptions.forEntityId&lt;Payment, PaymentState, PaymentEvent, PaymentAction, PaymentError&gt;
+    ///         context "payment_actions"
+    ///     |> PostgresMachineStore
+    /// </code>
+    /// </example>
+    let forEntityId<'Tag, 'State, 'Event, 'Action, 'Err>
+        (context: PostgresContext)
+        (actionQueue: string)
+        : MachineStoreOptions<EntityId<'Tag>, 'State, 'Event, 'Action, 'Err> =
+        let encode, decode = EntityKey.forEntityId<'Tag>
+
+        { Context = context
+          ActionQueue = actionQueue
+          StateCodec = Serialization.systemTextJson<'State> ()
+          EventCodec = Serialization.systemTextJson<'Event> ()
+          ActionCodec = Serialization.systemTextJson<'Action> ()
+          ErrorCodec = Serialization.systemTextJson<'Err> ()
+          EntityIdEncode = encode
+          EntityIdDecode = decode
+          Retention = RetentionPolicy.keepEverything
+          ReapAfter = TimeSpan.FromMinutes 5.
+          Listener = ListenerConnection.SameDataSource }
+
 /// <summary>
 /// The complete PostgreSQL implementation of
 /// <see cref="T:ByzantineSystems.Automata.Storage.IMachineStore`5" />.
@@ -114,6 +150,19 @@ type PostgresMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
 
     let processorStore =
         processor :> ICommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
+
+    /// Every precondition is read before anything is written, so a refused boot leaves the
+    /// database as it found it; the two writes after it are idempotent, which is what makes
+    /// booting every generation of a supervised machine safe.
+    let boot machineId ct =
+        taskResult {
+            match! Boot.inspect options.Context ct with
+            | [] ->
+                let! _ = actions.EnsureQueueAsync ct
+                do! Boot.register options.Context machineId options.ActionQueue options.Retention options.ReapAfter ct
+                return BootReport.Ready
+            | defects -> return BootReport.Refused defects
+        }
 
     /// <summary>
     /// Creates this machine's action queue if it does not exist yet. Call once at startup,
@@ -190,29 +239,14 @@ type PostgresMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
         member _.Correct(machineId, entityId, validFrom, beliefs, ct) =
             corrections.Correct(machineId, entityId, validFrom, beliefs, ct)
 
-    /// The boot check. Every precondition is read before anything is written, so a refused boot
-    /// leaves the database as it found it; the two writes after it are idempotent, which is what
-    /// makes booting every generation of a supervised machine safe.
+    /// The boot check. A queue name the store could not use is refused before the database is
+    /// asked anything.
     interface IStoreBoot with
 
         member _.Boot(machineId, ct) =
-            taskResult {
-                match! Boot.inspect options.Context ct with
-                | [] ->
-                    let! _ = actions.EnsureQueueAsync ct
-
-                    do!
-                        Boot.register
-                            options.Context
-                            machineId
-                            options.ActionQueue
-                            options.Retention
-                            options.ReapAfter
-                            ct
-
-                    return BootReport.Ready
-                | defects -> return BootReport.Refused defects
-            }
+            match Boot.queueName options.ActionQueue with
+            | Some defect -> Task.FromResult(Ok(BootReport.Refused [ defect ]))
+            | None -> boot machineId ct
 
     interface IWorkNotifications with
 

@@ -261,7 +261,7 @@ let tests =
                   Expect.stringContains error.Message "transition_unique_command" "the constraint refuses it"
           }
 
-          // D7: the application's clock decides when an event was effective, and only the database
+          // The application's clock decides when an event was effective, and only the database
           // decides the order history is written in.
           testTask "a skewed client clock cannot reorder committed history" {
               do! reset ()

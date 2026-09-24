@@ -224,6 +224,49 @@ let bootTests =
               do! boot RetentionPolicy.keepEverything
           }
 
+          testTask "a store built from the defaults boots and round-trips a command" {
+              do! reset ()
+
+              let store =
+                  MachineStoreOptions.forEntityId<TestEntity, TestState, TestEvent, TestAction, TestError>
+                      (context ())
+                      actionQueue
+                  |> PostgresMachineStore
+
+              let! booted = (store :> IStoreBoot).Boot(machine, noCancellation)
+              Expect.equal (booted |> expectOk "boot") BootReport.Ready "the defaults are a working store"
+
+              let inbox = store :> ICommandInbox<Entity, TestEvent>
+              let! submitted = inbox.Submit(submission (entity "e1") "k1" (Start 1), noCancellation)
+              let commandId = submitted |> expectOk "submit" |> commandIdOf
+              let! found = inbox.TryGet(commandId, noCancellation)
+
+              Expect.equal
+                  (found |> expectOk "read" |> Option.map (fun record -> record.Event))
+                  (Some(Start 1))
+                  "the default codecs read back what they wrote"
+          }
+
+          testTask "a queue name the store could not use is refused before the database is asked" {
+              // Nothing is listening on this host. Asking the database would answer Unavailable;
+              // answering Misconfigured proves nobody asked.
+              use unreachable = DataSource.create "Host=unreachable.invalid;Timeout=1"
+
+              let store =
+                  MachineStoreOptions.forEntityId<TestEntity, TestState, TestEvent, TestAction, TestError>
+                      (PostgresContext.create
+                          unreachable
+                          ByzantineSystems.Automata.Resilience.TransientPolicy.defaults
+                          ignore)
+                      "Bad Queue; DROP TABLE"
+                  |> PostgresMachineStore
+
+              match! (store :> IStoreBoot).Boot(machine, noCancellation) with
+              | Ok(BootReport.Refused [ BootDefect.Misconfigured reason ]) ->
+                  Expect.stringContains reason "Bad Queue" "the reason names the queue"
+              | other -> failtestf "expected a configuration refusal, got %A" other
+          }
+
           testTask "boot creates the action queue when it is missing" {
               // Before this existed, a missing queue surfaced as a failed commit rather than a
               // failed boot, one command at a time.
@@ -585,8 +628,6 @@ let cronTests =
     testList
         "Postgres cron"
         [ testTask "without the right to use pg_cron, scheduling says so and nothing is scheduled" {
-              // The suite's role is not superuser, so this is the fallback path whether or not
-              // pg_cron is installed here: D8's promise that maintenance runs without it.
               do! reset ()
               let maintenance = newMaintenance ()
 

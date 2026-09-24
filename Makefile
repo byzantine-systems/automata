@@ -11,7 +11,8 @@ SOLUTION := bs-automata.slnx
 MIGRATE_PROJECT := tools/ByzantineSystems.Automata.Migrate/ByzantineSystems.Automata.Migrate.fsproj
 EXAMPLE_PAYMENT_PROJECT := examples/ByzantineSystems.Automata.Examples.PaymentProcessor/ByzantineSystems.Automata.Examples.PaymentProcessor.fsproj
 EXAMPLE_SUPERVISION_PROJECT := examples/ByzantineSystems.Automata.Examples.Supervision/ByzantineSystems.Automata.Examples.Supervision.fsproj
-EXAMPLE_PROJECTS := $(EXAMPLE_PAYMENT_PROJECT) $(EXAMPLE_SUPERVISION_PROJECT)
+EXAMPLE_HOSTED_PROJECT := examples/ByzantineSystems.Automata.Examples.Hosted/ByzantineSystems.Automata.Examples.Hosted.fsproj
+EXAMPLE_PROJECTS := $(EXAMPLE_PAYMENT_PROJECT) $(EXAMPLE_SUPERVISION_PROJECT) $(EXAMPLE_HOSTED_PROJECT)
 
 SRC_PROJECTS := $(wildcard src/*/*.fsproj)
 UNIT_TEST_PROJECTS := \
@@ -39,7 +40,7 @@ PROJECT_FILES := $(wildcard src/*/*.fsproj tests/*/*.fsproj tools/*/*.fsproj exa
 RESTORE_INPUTS := Makefile $(SOLUTION) global.json nuget.config $(PROJECT_FILES) \
 	$(wildcard Directory.Build.* Directory.Packages.*)
 
-.PHONY: build test test-unit test-integration coverage migrate run-example run-example-supervision db db-reset fmt docs nix-lock pack package-smoke push
+.PHONY: build test test-unit test-integration coverage migrate run-example run-example-supervision run-example-hosted db db-reset fmt docs nix-lock pack package-smoke push
 
 build:
 	$(DOTNET) build $(SOLUTION) -m:1
@@ -89,6 +90,11 @@ run-example:
 
 run-example-supervision:
 	$(DOTNET) run --project $(EXAMPLE_SUPERVISION_PROJECT)
+
+# The production shape: supervised processing and delivery, maintenance, and a caller. Needs
+# BS_AUTOMATA_CONN, like run-example.
+run-example-hosted:
+	$(DOTNET) run --project $(EXAMPLE_HOSTED_PROJECT)
 
 db:
 	psql '$(DB_URL)'

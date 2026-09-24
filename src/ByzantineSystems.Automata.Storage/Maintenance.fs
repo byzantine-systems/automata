@@ -28,6 +28,12 @@ type BootDefect =
     /// <summary>Something the schema depends on is absent: an extension, a routine.</summary>
     | MissingPrerequisite of name: string
 
+    /// <summary>
+    /// The store was configured with something it cannot use, such as a queue name it could not
+    /// safely interpolate. Found before the store is touched.
+    /// </summary>
+    | Misconfigured of reason: string
+
 /// <summary>What a store said when asked whether it can serve.</summary>
 [<RequireQualifiedAccess>]
 type BootReport =

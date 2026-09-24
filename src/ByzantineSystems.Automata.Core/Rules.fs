@@ -148,6 +148,50 @@ module Rule =
     /// </summary>
     let kind (rule: Rule<'State, 'Event, 'Action, 'Err>) : RuleKind = rule.Kind
 
+    /// <summary>
+    /// The compound node a rule sends the entity to, looking through any guards, or <c>None</c>
+    /// for a rule that does not goto anywhere. Read from the kind, so a chart can check every
+    /// target it names without firing a single rule.
+    /// </summary>
+    let target (rule: Rule<'State, 'Event, 'Action, 'Err>) : StateId option =
+        let rec targetOf kind =
+            match kind with
+            | RuleKind.Goto target -> Some target
+            | RuleKind.Guarded(_, inner) -> targetOf inner
+            | RuleKind.Transition
+            | RuleKind.Attempt
+            | RuleKind.Internal -> None
+
+        targetOf rule.Kind
+
+    /// <summary>
+    /// Renames the goto target a rule can produce, both where the chart reads it (the kind,
+    /// through any guards) and where resolution does (the outcome its closure returns). The
+    /// second is only reachable by wrapping the closure, which is why this lives beside the
+    /// private fields rather than in the fragment code that calls it. Every other verdict and
+    /// outcome passes through untouched.
+    /// </summary>
+    let retarget
+        (rename: StateId -> StateId)
+        (rule: Rule<'State, 'Event, 'Action, 'Err>)
+        : Rule<'State, 'Event, 'Action, 'Err> =
+        let rec renameKind kind =
+            match kind with
+            | RuleKind.Goto target -> RuleKind.Goto(rename target)
+            | RuleKind.Guarded(reason, inner) -> RuleKind.Guarded(reason, renameKind inner)
+            | RuleKind.Transition
+            | RuleKind.Attempt
+            | RuleKind.Internal -> kind
+
+        let renameVerdict verdict =
+            match verdict with
+            | RuleVerdict.Handled(actions, RuleOutcome.Goto(target, state)) ->
+                RuleVerdict.Handled(actions, RuleOutcome.Goto(rename target, state))
+            | other -> other
+
+        { Kind = renameKind rule.Kind
+          Invoke = rule.Invoke >> renameVerdict }
+
     /// <summary>Applies a rule to one (state, event) pair.</summary>
     let invoke
         (rule: Rule<'State, 'Event, 'Action, 'Err>)

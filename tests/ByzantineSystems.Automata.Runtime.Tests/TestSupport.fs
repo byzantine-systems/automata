@@ -202,8 +202,8 @@ type StubStore<'Err>() =
 /// A store that also offers the two temporal capabilities.
 ///
 /// A separate type rather than a flag on StubStore, so both answers to "does this store offer
-/// time travel" are reachable: the D12 promise is that a provider implementing only the required
-/// four still works, and a test that could not construct such a provider would not be testing it.
+/// time travel" are reachable: A provider implementing only the required four still works, and 
+/// a test that could not construct such a provider would not be testing it.
 /// </summary>
 type TemporalStubStore<'Err>() =
     inherit StubStore<'Err>()
@@ -327,7 +327,6 @@ let buildMachine
         initialState Idle
         store (stub :> IMachineStore<_, _, _, _, _>)
         processor policy
-        actionQueue "test_actions"
         timeProvider time
     }
 

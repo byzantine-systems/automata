@@ -70,6 +70,20 @@ module internal Boot =
                   BootDefect.MissingPrerequisite "fsm routines (the repeatable migrations)" ]
 
     /// <summary>
+    /// The queue name, checked before anything is sent. It reaches the database as an identifier
+    /// rather than a parameter, so only names that never need quoting are accepted: the same
+    /// allowlist <c>fsm.assert_queue_name</c> applies on the other side.
+    /// </summary>
+    let queueName (queue: string) : BootDefect option =
+        if
+            not (isNull queue)
+            && Text.RegularExpressions.Regex.IsMatch(queue, "^[a-z_][a-z0-9_]*$")
+        then
+            None
+        else
+            Some(BootDefect.Misconfigured $"the action queue name {queue} is not in [a-z_][a-z0-9_]*")
+
+    /// <summary>
     /// How long to keep something, as PostgreSQL reads an interval. Text rather than a
     /// <see cref="T:System.TimeSpan" />, because keeping forever is <c>'infinity'</c> and a
     /// <c>TimeSpan</c> cannot say it.

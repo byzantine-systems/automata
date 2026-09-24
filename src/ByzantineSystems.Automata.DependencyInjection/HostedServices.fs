@@ -23,6 +23,36 @@ type IActionHandler<'EntityId, 'Action, 'EffectError> =
     abstract HandleAsync:
         action: LeasedAction<'EntityId, 'Action> * ct: CancellationToken -> Task<Result<unit, 'EffectError>>
 
+/// <summary>
+/// Whether this host delivers a machine's actions, and through what.
+///
+/// A union rather than a flag, because the handler's type is what fixes <c>'EffectError</c>. With a
+/// flag nothing in the options mentions that type, so F# infers <c>obj</c> without a word, and the
+/// host then asks the container for a handler nobody registered, one delivery at a time.
+/// </summary>
+[<RequireQualifiedAccess>]
+type ActionDelivery<'EntityId, 'Action, 'EffectError> =
+    /// <summary>
+    /// Another host delivers them. The queue is durable, so processors and dispatchers can run on
+    /// different fleets and neither needs the other in the same process.
+    /// </summary>
+    | Elsewhere
+
+    /// <summary>This host delivers them, resolving the handler from a fresh scope per action.</summary>
+    | Scoped of resolve: (IServiceProvider -> IActionHandler<'EntityId, 'Action, 'EffectError>)
+
+/// <summary>Operations on <see cref="T:ByzantineSystems.Automata.DependencyInjection.ActionDelivery`3" />.</summary>
+[<RequireQualifiedAccess>]
+module ActionDelivery =
+
+    /// <summary>
+    /// Delivers through the <c>IActionHandler</c> registered in the container, resolved per action.
+    /// The type arguments are the point: they are what the container is asked for.
+    /// </summary>
+    let registered<'EntityId, 'Action, 'EffectError> : ActionDelivery<'EntityId, 'Action, 'EffectError> =
+        ActionDelivery.Scoped(fun provider ->
+            provider.GetRequiredService<IActionHandler<'EntityId, 'Action, 'EffectError>>())
+
 /// <summary>Settings for the root supervisor owned by the host.</summary>
 type AutomataSupervisorOptions =
     { Name: SupervisorName
@@ -33,6 +63,25 @@ type AutomataSupervisorOptions =
       RestartDelay: TimeSpan
       Shutdown: TimeSpan
       StartupRetry: StartupRetryConfig option }
+
+/// <summary>Operations on <see cref="T:ByzantineSystems.Automata.DependencyInjection.AutomataSupervisorOptions" />.</summary>
+[<RequireQualifiedAccess>]
+module AutomataSupervisorOptions =
+
+    /// <summary>
+    /// One-for-one and permanent: a generation that faults is restarted, up to three times a
+    /// minute, a second apart, and given five seconds to stop. Override any of it with
+    /// <c>{ … with }</c>.
+    /// </summary>
+    let defaults (name: string) : AutomataSupervisorOptions =
+        { Name = SupervisorName.create name
+          Strategy = RestartStrategy.OneForOne
+          Restart = RestartKind.Permanent
+          Intensity = 3
+          Period = TimeSpan.FromMinutes 1.
+          RestartDelay = TimeSpan.FromSeconds 1.
+          Shutdown = TimeSpan.FromSeconds 5.
+          StartupRetry = None }
 
 /// <summary>
 /// A typed machine registration. The factory runs once per supervised generation.
@@ -47,12 +96,8 @@ type AutomataOptions<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectError when
     {
         MachineKey: string
         Supervisor: AutomataSupervisorOptions
-        /// <summary>
-        /// Whether this host delivers actions. A deployment may run processors on one fleet and
-        /// dispatchers on another, because the queue is durable and neither needs the other in
-        /// the same process.
-        /// </summary>
-        DispatchActions: bool
+        /// <summary>Whether this host delivers the machine's actions, and through which handler.</summary>
+        Actions: ActionDelivery<'EntityId, 'Action, 'EffectError>
         MachineFactory:
             IServiceProvider -> Result<Machine<'EntityId, 'State, 'Event, 'Action, 'Err>, MachineConfigError list>
         /// <summary>
@@ -129,15 +174,18 @@ module private HostedTask =
 /// One supervised generation: a machine, the processor that drains its inbox, and optionally the
 /// dispatcher that delivers its actions.
 ///
+/// Constructing one starts its workers, so it is only ever constructed by <c>Generation.start</c>,
+/// after the machine has started. A worker that ran before the boot would poll a queue the boot
+/// had not created yet.
+///
 /// The processor reports why it stopped rather than throwing, so this is where that report turns
 /// into the fault a supervisor acts on. An orderly drain is not a fault; an escalation is.
 /// </summary>
 type internal GenerationChild<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectError when 'EntityId: equality>
     (
         machine: Machine<'EntityId, 'State, 'Event, 'Action, 'Err>,
-        registry: IChartRegistry,
         scopeFactory: IServiceScopeFactory,
-        dispatchActions: bool
+        delivery: ActionDelivery<'EntityId, 'Action, 'EffectError>
     ) =
 
     let processorCancellation = new CancellationTokenSource()
@@ -152,36 +200,38 @@ type internal GenerationChild<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectE
                 return raise (AutomataEscalationException(commandId, reason))
         }
 
-    let actionTask =
-        if dispatchActions then
-            let handler (action: LeasedAction<'EntityId, 'Action>) ct =
+    /// One delivery, in a scope of its own that is disposed however the handler ended.
+    let handleIn resolve (action: LeasedAction<'EntityId, 'Action>) ct =
+        task {
+            let scope = scopeFactory.CreateAsyncScope()
+
+            let! outcome =
                 task {
-                    let scope = scopeFactory.CreateAsyncScope()
+                    let handler: IActionHandler<'EntityId, 'Action, 'EffectError> =
+                        resolve scope.ServiceProvider
 
-                    let! outcome =
-                        task {
-                            let service =
-                                scope.ServiceProvider.GetRequiredService<
-                                    IActionHandler<'EntityId, 'Action, 'EffectError>
-                                 >()
-
-                            return! service.HandleAsync(action, ct)
-                        }
-                        |> HostedTask.capture
-
-                    do! scope.DisposeAsync().AsTask()
-
-                    match outcome with
-                    | Completed result -> return result
-                    | Faulted error -> return raise error
+                    return! handler.HandleAsync(action, ct)
                 }
+                |> HostedTask.capture
 
+            do! scope.DisposeAsync().AsTask()
+
+            match outcome with
+            | Completed result -> return result
+            | Faulted error -> return raise error
+        }
+
+    let actionTask =
+        match delivery with
+        | ActionDelivery.Scoped resolve ->
             task {
-                let! _ = Machine.dispatcher machine handler |> _.RunAsync(actionCancellation.Token)
+                let! _ =
+                    Machine.dispatcher machine (handleIn resolve)
+                    |> _.RunAsync(actionCancellation.Token)
+
                 return ()
             }
-        else
-            task { do! Task.Delay(Timeout.InfiniteTimeSpan, actionCancellation.Token) }
+        | ActionDelivery.Elsewhere -> task { do! Task.Delay(Timeout.InfiniteTimeSpan, actionCancellation.Token) }
 
     let completion =
         task {
@@ -189,29 +239,6 @@ type internal GenerationChild<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectE
 
             if Volatile.Read(&stopping) = 0 then
                 do! completed
-        }
-
-    /// Boots the store and registers the chart before any work starts. Both answers that are
-    /// not failures are still the host's call, and this host treats both as fatal: a refused
-    /// boot means every write would fail, and a fleet that boots with a chart its version no
-    /// longer describes will write history nobody can replay.
-    member _.StartAsync(ct: CancellationToken) : Task =
-        task {
-            match! Machine.startAsync machine registry ct with
-            | Error error -> return raise (AutomataChartRegistrationException error)
-            | Ok(Startup.Refused defects) -> return raise (AutomataBootRefusedException defects)
-            | Ok(Startup.Started(ChartRegistration.Mismatched stored)) ->
-                return
-                    raise (
-                        AutomataChartRegistrationException(
-                            StoreError.Serialization(
-                                "ChartFingerprint",
-                                InvalidOperationException
-                                    $"the declared chart version was first registered with structure {ChartFingerprint.value stored}"
-                            )
-                        )
-                    )
-            | Ok _ -> return ()
         }
 
     interface ISupervisedChild with
@@ -229,6 +256,50 @@ type internal GenerationChild<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectE
 
                 do! Machine.stopAsync machine ct
             }
+
+/// <summary>Starting a generation: the machine first, its workers only once it has started.</summary>
+[<RequireQualifiedAccess>]
+module internal Generation =
+
+    let private mismatch (stored: ChartFingerprint) =
+        AutomataChartRegistrationException(
+            StoreError.Serialization(
+                "ChartFingerprint",
+                InvalidOperationException
+                    $"the declared chart version was first registered with structure {ChartFingerprint.value stored}"
+            )
+        )
+
+    /// <summary>
+    /// Boots the store and registers the chart, then starts the workers. Both answers that are not
+    /// failures are still the host's call, and this host treats both as fatal: a refused boot
+    /// means every write would fail, and a fleet that boots with a chart its version no longer
+    /// describes will write history nobody can replay. A machine that did start before the
+    /// mismatch was found is stopped again first, so it leaves nothing running behind the fault.
+    /// </summary>
+    let start
+        (machine: Machine<'EntityId, 'State, 'Event, 'Action, 'Err>)
+        (registry: IChartRegistry)
+        (scopeFactory: IServiceScopeFactory)
+        (delivery: ActionDelivery<'EntityId, 'Action, 'EffectError>)
+        (ct: CancellationToken)
+        : Task<ISupervisedChild> =
+        task {
+            match! Machine.startAsync machine registry ct with
+            | Error error -> return raise (AutomataChartRegistrationException error)
+            | Ok(Startup.Refused defects) -> return raise (AutomataBootRefusedException defects)
+            | Ok(Startup.Started(ChartRegistration.Mismatched stored)) ->
+                do! Machine.stopAsync machine ct
+                return raise (mismatch stored)
+            | Ok(Startup.Started _) ->
+                return
+                    GenerationChild<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectError>(
+                        machine,
+                        scopeFactory,
+                        delivery
+                    )
+                    :> ISupervisedChild
+        }
 
 
 type internal AutomataHostedService<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectError when 'EntityId: equality>
@@ -269,16 +340,7 @@ type internal AutomataHostedService<'EntityId, 'State, 'Event, 'Action, 'Err, 'E
                         options.MachineFactory services
                         |> Result.defaultWith (fun errors -> raise (AutomataMachineConfigurationException errors))
 
-                    let child =
-                        GenerationChild<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectError>(
-                            machine,
-                            options.ChartRegistry services,
-                            scopeFactory,
-                            options.DispatchActions
-                        )
-
-                    do! child.StartAsync(ct)
-                    return child :> ISupervisedChild
+                    return! Generation.start machine (options.ChartRegistry services) scopeFactory options.Actions ct
                 }
           Restart = options.Supervisor.Restart
           RestartDelay = options.Supervisor.RestartDelay
@@ -336,19 +398,27 @@ type internal AutomataHostedService<'EntityId, 'State, 'Event, 'Action, 'Err, 'E
                     supervisor <- Some root
                     started.TrySetResult() |> ignore
 
-                    let mutable observing = true
+                    // Persists what the supervisor has recorded so far, and says whether to keep
+                    // watching. Stopping the host ends the watch by cancellation, which is the
+                    // ordinary way it ends and not a failure; StopAsync persists what is left.
+                    let observe () =
+                        task {
+                            let! next = persistNewEvents root persistedEvents stoppingToken
+                            persistedEvents <- next
 
-                    while observing do
-                        let! next = persistNewEvents root persistedEvents stoppingToken
-                        persistedEvents <- next
+                            if root.Completion.IsCompleted then
+                                return false
+                            else
+                                return!
+                                    Recurring.pause (TimeSpan.FromMilliseconds 10.) options.TimeProvider stoppingToken
+                        }
 
-                        if root.Completion.IsCompleted then
-                            observing <- false
-                        else
-                            do! Task.Delay(TimeSpan.FromMilliseconds 10., options.TimeProvider, stoppingToken)
+                    do! Recurring.repeat observe stoppingToken
 
-                    let! finalCount = persistNewEvents root persistedEvents stoppingToken
-                    persistedEvents <- finalCount
+                    if not stoppingToken.IsCancellationRequested then
+                        let! finalCount = persistNewEvents root persistedEvents stoppingToken
+                        persistedEvents <- finalCount
+
                     do! root.Completion
                 }
 
