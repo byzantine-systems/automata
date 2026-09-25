@@ -22,6 +22,11 @@
 -- entity forever.
 CREATE DOMAIN fsm.command_status AS text CONSTRAINT command_status_valid CHECK (VALUE IN ('ready', 'leased', 'succeeded', 'rejected', 'dead_letter'));
 
+-- What a command asks for: an ordinary event, or a correction that inserts a
+-- missed event in the past and replays what followed. A correction's own
+-- details live in fsm.command_correction.
+CREATE DOMAIN fsm.command_kind AS text CONSTRAINT command_kind_valid CHECK (VALUE IN ('event', 'correction'));
+
 -- The result of every fenced write. A domain rather than a bare text column, so
 -- that a typo in a routine is a constraint violation rather than a value the
 -- caller silently fails to match.
@@ -55,6 +60,7 @@ CREATE TABLE fsm.command (
     idempotency_key text NOT NULL,
     chart_version integer NOT NULL,
     event jsonb NOT NULL,
+    kind fsm.command_kind NOT NULL DEFAULT 'event',
     status fsm.command_status NOT NULL DEFAULT 'ready',
     blocked boolean NOT NULL DEFAULT FALSE,
     visible_at timestamptz NOT NULL DEFAULT NOW(),

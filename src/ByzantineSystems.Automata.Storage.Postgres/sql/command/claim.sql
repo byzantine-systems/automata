@@ -12,6 +12,7 @@ SELECT
     c.idempotency_key,
     c.chart_version,
     c.event,
+    c.kind,
     c.status,
     c.blocked,
     c.visible_at,

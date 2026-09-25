@@ -59,6 +59,21 @@ type CommittedTransition<'EntityId, 'State, 'Event, 'Action> =
 /// machine, and no <c>'Err</c> exists to express them. A processor cannot invent one, and a
 /// contract that demanded it would be answered with a lie.
 /// </summary>
+/// <summary>Why a correction could not be replayed. Nothing is written when one is reported.</summary>
+[<RequireQualifiedAccess>]
+type ReplayError =
+    /// <summary>A replayed event was decided under a chart version the machine's catalog lacks.</summary>
+    | UnknownChartVersion of version: ChartVersion
+    /// <summary>
+    /// The event at this epoch no longer resolves after the correction. The reason is text so
+    /// the error can be stored without the application's types.
+    /// </summary>
+    | Diverged of epoch: Epoch * reason: string
+    /// <summary>More events follow the correction than its policy allows replaying.</summary>
+    | BudgetExceeded of limit: int
+    /// <summary>Retention has purged history the replay would need.</summary>
+    | HistoryPurged
+
 [<RequireQualifiedAccess>]
 type CommandFailure<'Err> =
     /// <summary>The chart refused the event, with the error it refused it with.</summary>
@@ -66,6 +81,9 @@ type CommandFailure<'Err> =
 
     /// <summary>The machine could not process the command, with a reason meant for a human.</summary>
     | Machine of reason: string
+
+    /// <summary>A correction could not be replayed.</summary>
+    | Replay of ReplayError
 
 /// <summary>What became of a submitted command.</summary>
 [<RequireQualifiedAccess>]

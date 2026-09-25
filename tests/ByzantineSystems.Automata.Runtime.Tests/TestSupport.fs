@@ -281,6 +281,7 @@ let leasedCommand (id: int64) (entity: string) (event: TestEvent) (attempts: int
           Sequence = id
           IdempotencyKey = $"key-{id}"
           ChartVersion = ChartVersion.create 1
+          Kind = CommandKind.Event
           Event = event
           Status = CommandStatus.Leased
           Blocked = false

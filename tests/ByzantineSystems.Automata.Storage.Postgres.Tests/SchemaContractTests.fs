@@ -18,6 +18,7 @@ let private commandColumns =
       "idempotency_key"
       "chart_version"
       "event"
+      "kind"
       "status"
       "blocked"
       "visible_at"

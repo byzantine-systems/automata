@@ -18,6 +18,7 @@
              Public because SqlHydra cannot generate anything else, and outside the supported
              API for the same reason: it follows the schema, not semver. -->
         <Compile Include="Schema.Generated.fs" />
+        <Compile Include="BeliefPayload.fs" />
         <Compile Include="PostgresCommandInbox.fs" />
         <Compile Include="PostgresChartRegistry.fs" />
         <Compile Include="PostgresCommandProcessorStore.fs" />

@@ -113,7 +113,8 @@ let reset () : Task =
                 // separately.
                 "TRUNCATE fsm.command, fsm.command_error, fsm.transition, fsm.machine_chart_version,
                           fsm.supervision_event, fsm.instance_state, fsm.instance_state_history,
-                          fsm.action_dead_letter, fsm.machine_maintenance, fsm.belief_cold_state
+                          fsm.action_dead_letter, fsm.machine_maintenance, fsm.belief_cold_state,
+                          fsm.command_correction
                           RESTART IDENTITY;
                  -- A materialized view cannot be truncated; refreshed over the emptied history,
                  -- it is empty too.
@@ -220,6 +221,7 @@ let submission (entity: Entity) (key: string) (event: TestEvent) : CommandSubmis
       EntityId = entity
       IdempotencyKey = key
       ChartVersion = version
+      Kind = CommandKind.Event
       Event = event
       VisibleAt = None
       ReceivedAt = None

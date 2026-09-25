@@ -13,6 +13,8 @@ let private expected =
       "command", "reschedule"
       "command", "extend_lease"
       "command", "repair_blocked"
+      "command", "submit_correction"
+      "command", "finalize_correction"
       "chart", "register"
       "chart", "by_version"
       "belief", "correct"

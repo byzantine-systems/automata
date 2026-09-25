@@ -127,33 +127,6 @@ type PostgresTemporalStore<'EntityId, 'State>(options: TemporalOptions<'EntityId
                 |> Task.map (Option.traverseResult toBelief))
             ct
 
-    /// <summary>
-    /// One belief as the routine reads it.
-    ///
-    /// Built as a node rather than interpolated into a string. The state is already JSON that a
-    /// codec produced, so it has to be embedded as a value and not as text, and every other field
-    /// then escapes itself.
-    /// </summary>
-    let beliefNode (belief: CorrectedBelief<'State>) : Result<JsonNode, StoreError> =
-        options.StateCodec.Encode belief.Asserted.State
-        |> Result.mapError Db.toStoreError
-        |> Result.map (fun state ->
-            let node = JsonObject()
-            node["state"] <- JsonNode.Parse state
-            node["status"] <- JsonValue.Create(Db.instanceStatusToString belief.Asserted.Status)
-            node["valid_from"] <- JsonValue.Create(Db.timestamp belief.ValidFrom)
-            node["epoch"] <- JsonValue.Create(int64 (Epoch.value belief.Asserted.Epoch))
-            node["command_id"] <- JsonValue.Create(CommandId.value belief.CommandId)
-            node["chart_version"] <- JsonValue.Create(ChartVersion.value belief.ChartVersion)
-            node :> JsonNode)
-
-    /// The whole timeline is encoded before anything is sent, so a state that will not encode
-    /// fails the correction rather than half-writing it.
-    let beliefsPayload (beliefs: CorrectedBelief<'State> list) : Result<string, StoreError> =
-        beliefs
-        |> List.traverseResultM beliefNode
-        |> Result.map (Array.ofList >> JsonArray >> _.ToJsonString())
-
     let sendCorrection machineId entityId validFrom (payload: string) cancel =
         task {
             use! conn = dataSource.OpenConnectionAsync(cancel).AsTask()
@@ -197,7 +170,7 @@ type PostgresTemporalStore<'EntityId, 'State>(options: TemporalOptions<'EntityId
             protect
                 (fun cancel ->
                     taskResult {
-                        let! payload = beliefsPayload beliefs
+                        let! payload = BeliefPayload.encode options.StateCodec beliefs
                         return! sendCorrection machineId entityId validFrom payload cancel
                     })
                 ct

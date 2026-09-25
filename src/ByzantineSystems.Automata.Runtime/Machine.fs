@@ -158,6 +158,29 @@ type Machine<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: equality>
                 ct
             )
 
+        /// Each earlier chart must still be the one that first claimed its version, or a
+        /// correction would re-decide history with a chart that never decided it. A version
+        /// nothing registered is fine: no command can have pinned it.
+        let catalogDefects () =
+            ChartCatalog.entries config.Catalog
+            |> List.filter (fun (version, _) -> version <> config.ChartVersion)
+            |> List.map (fun (version, chart) ->
+                task {
+                    match! registry.TryGet(config.MachineId, version, ct) with
+                    | Ok(Some stored) when stored <> Chart.fingerprint chart ->
+                        return
+                            Ok(
+                                Some(
+                                    BootDefect.Misconfigured
+                                        $"the catalog's chart for version {ChartVersion.value version} is not the one that version was registered with"
+                                )
+                            )
+                    | Ok _ -> return Ok None
+                    | Error error -> return Error error
+                })
+            |> List.sequenceTaskResultM
+            |> TaskResult.map (List.choose id)
+
         let run () =
             lock lifecycleGate (fun () ->
                 match lifecycle with
@@ -182,7 +205,19 @@ type Machine<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: equality>
         taskResult {
             ct.ThrowIfCancellationRequested()
 
-            match! boot () with
+            // The store first, because the catalog check reads it: a schema that is missing
+            // should be reported as missing, not as a failed read.
+            let! booted =
+                boot ()
+                |> TaskResult.bind (function
+                    | BootReport.Ready ->
+                        catalogDefects ()
+                        |> TaskResult.map (function
+                            | [] -> BootReport.Ready
+                            | defects -> BootReport.Refused defects)
+                    | refused -> TaskResult.ok refused)
+
+            match booted with
             | BootReport.Refused defects ->
                 config.Logger.LogError(
                     EventId(1311, "StoreBootRefused"),
@@ -273,7 +308,8 @@ module Machine =
     ///     |> Machine.enqueue machine orderId CancellationToken.None
     /// </code>
     /// </example>
-    let enqueue
+    let private submit
+        (kind: CommandKind)
         (machine: Machine<'EntityId, 'State, 'Event, 'Action, 'Err>)
         (entityId: 'EntityId)
         (envelope: EventEnvelope<'Event>)
@@ -289,6 +325,7 @@ module Machine =
                           EntityId = entityId
                           IdempotencyKey = EventEnvelope.idempotencyKey envelope
                           ChartVersion = machine.ChartVersion
+                          Kind = kind
                           Event = EventEnvelope.event envelope
                           VisibleAt = EventEnvelope.visibleAt envelope
                           ReceivedAt = EventEnvelope.receivedAt envelope
@@ -302,6 +339,50 @@ module Machine =
             machine.CommandSignalValue.TrySignal()
             return outcome
         }
+
+    let enqueue
+        (machine: Machine<'EntityId, 'State, 'Event, 'Action, 'Err>)
+        (entityId: 'EntityId)
+        (envelope: EventEnvelope<'Event>)
+        (ct: CancellationToken)
+        : Task<Result<SubmissionOutcome, MachineError<'Err>>> =
+        submit CommandKind.Event machine entityId envelope ct
+
+    /// <summary>
+    /// Enqueues a correction: the envelope's event should have happened at
+    /// <paramref name="at" />. A worker replays it and every committed event after it, each under
+    /// the chart version that first decided it, and rewrites the entity's beliefs from that
+    /// instant. It waits its turn behind the entity's queued commands like any other command.
+    ///
+    /// Needs a store that can read and replay the past; on one that cannot, the correction is
+    /// dead-lettered with the reason. No historical action is re-emitted.
+    /// </summary>
+    let correct
+        (machine: Machine<'EntityId, 'State, 'Event, 'Action, 'Err>)
+        (entityId: 'EntityId)
+        (envelope: EventEnvelope<'Event>)
+        (at: DateTimeOffset)
+        (policy: CorrectionPolicy)
+        (ct: CancellationToken)
+        : Task<Result<SubmissionOutcome, MachineError<'Err>>> =
+        submit (CommandKind.Correction(at, policy)) machine entityId envelope ct
+
+    /// <summary>
+    /// What a correction would do, without doing it: the same reads and the same replay a worker
+    /// runs, and nothing written. The plan shows each replayed event beside how it was first
+    /// decided, including the actions replay would have emitted.
+    /// </summary>
+    let previewCorrection
+        (machine: Machine<'EntityId, 'State, 'Event, 'Action, 'Err>)
+        (entityId: 'EntityId)
+        (missed: 'Event)
+        (at: DateTimeOffset)
+        (policy: CorrectionPolicy)
+        (ct: CancellationToken)
+        : Task<Result<ReplayPlan<'EntityId, 'State, 'Event, 'Action>, CorrectionError<'Err>>> =
+        // A preview has no command, so nothing is attributed to one.
+        Correction.plan machine.RuntimeConfig entityId missed at policy (CommandId.ofInt64 0L) ct
+        |> TaskResult.map fst
 
     /// <summary>Reads what became of a command, without waiting for it.</summary>
     let commandResult

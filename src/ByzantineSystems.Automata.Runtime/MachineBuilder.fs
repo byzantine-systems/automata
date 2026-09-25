@@ -10,6 +10,7 @@ open ByzantineSystems.Automata.Storage
 type MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: equality> =
     | MachineChart of Chart<'State, 'Event, 'Action, 'Err>
     | MachineChartVersion of ChartVersion
+    | MachineChartCatalog of ChartCatalog<'State, 'Event, 'Action, 'Err>
     | MachineInitial of 'State
     | MachineStore of IMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     | MachineProcessor of ProcessorPolicy<'Err>
@@ -31,6 +32,7 @@ module private MachineBuild =
         match part with
         | MachineChart _ -> MachineDeclaration.Chart
         | MachineChartVersion _ -> MachineDeclaration.ChartVersion
+        | MachineChartCatalog _ -> MachineDeclaration.ChartCatalog
         | MachineInitial _ -> MachineDeclaration.Initial
         | MachineStore _ -> MachineDeclaration.Store
         | MachineProcessor _ -> MachineDeclaration.Processor
@@ -65,6 +67,19 @@ module private MachineBuild =
             |> List.tryPick (function
                 | MachineChartVersion version -> Some version
                 | _ -> None)
+
+        let catalog =
+            parts
+            |> List.tryPick (function
+                | MachineChartCatalog catalog -> Some catalog
+                | _ -> None)
+            |> Option.defaultValue ChartCatalog.empty
+
+        let catalogErrors =
+            match version with
+            | Some version when ChartCatalog.tryFind version catalog |> Option.isSome ->
+                [ CatalogRedeclaresCurrentVersion version ]
+            | _ -> []
 
         let initial =
             parts
@@ -137,7 +152,7 @@ module private MachineBuild =
                 if declaredLeaf then [] else [ InitialStateUnknown leaf ]
             | _ -> []
 
-        match duplicates @ missing @ policyErrors @ initialStateErrors with
+        match duplicates @ missing @ policyErrors @ initialStateErrors @ catalogErrors with
         | [] ->
             match chart, version, initial, store, ProcessorPolicy.validate policy with
             | Some chart, Some version, Some initial, Some store, Ok validatedPolicy ->
@@ -145,6 +160,7 @@ module private MachineBuild =
                     { MachineId = machineId
                       Chart = chart
                       ChartVersion = version
+                      Catalog = ChartCatalog.add version chart catalog
                       InitialState = initial
                       Store = store
                       Processor = validatedPolicy
@@ -196,6 +212,14 @@ type MachineBuilder<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: equ
     [<CustomOperation "chartVersion">]
     member _.ChartVersion(parts, version: int) =
         parts @ [ MachineChartVersion(ChartVersion.create version) ]
+
+    /// <summary>
+    /// Earlier charts, by the version they were declared with, so a correction can re-decide
+    /// events those versions decided. The current chart is always included.
+    /// </summary>
+    [<CustomOperation "chartCatalog">]
+    member _.ChartCatalog(parts, catalog: ChartCatalog<'State, 'Event, 'Action, 'Err>) =
+        parts @ [ MachineChartCatalog catalog ]
 
     [<CustomOperation "initialState">]
     member _.InitialState(parts, state: 'State) = parts @ [ MachineInitial state ]

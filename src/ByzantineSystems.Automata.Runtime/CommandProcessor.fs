@@ -302,6 +302,42 @@ type CommandProcessor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: e
         | DeadLetter failure -> terminate (fun args -> processor.DeadLetter args) failure Abandoned
         | Escalate reason -> Task.FromResult(Escalating(record.CommandId, reason))
 
+    /// <summary>
+    /// A correction, start to finish: replayed from its instant, then committed with the rewritten
+    /// timeline in one transaction.
+    ///
+    /// A history that no longer replays is dead-lettered with the reason and writes nothing; a
+    /// store read that failed is classified like any other store failure, so a transient one is
+    /// retried. A conflict at commit means the entity moved while the replay ran, which the head
+    /// invariant should prevent, and the correction is rescheduled to replay again.
+    /// </summary>
+    let correct (leased: LeasedCommand<'EntityId, 'Event>) (at: DateTimeOffset) (correction: CorrectionPolicy) ct =
+        let record = leased.Work
+
+        let deadLetter failure =
+            applyDisposition leased (DeadLetter failure) ct
+
+        let classify error =
+            applyDisposition leased (policy.Classify(MachineError.Store error)) ct
+
+        task {
+            match Store.tryReplay config.Store with
+            | None -> return! deadLetter (CommandFailure.Machine "this store cannot replay corrections")
+            | Some replay ->
+                let planned =
+                    Correction.plan config record.EntityId record.Event at correction record.CommandId ct
+
+                match! renewWhile leased planned ct with
+                | Ok(plan, expected) ->
+                    match! replay.CommitCorrection(record.CommandId, leased.Token, expected, plan.Commit, ct) with
+                    | Ok outcome -> return! interpretCommit leased plan.Commit.Transition outcome ct
+                    | Error error -> return! classify error
+                | Error(CorrectionError.Replay error) -> return! deadLetter (CommandFailure.Replay error)
+                | Error CorrectionError.Unsupported ->
+                    return! deadLetter (CommandFailure.Machine "this store cannot read or replay the past")
+                | Error(CorrectionError.Store error) -> return! classify error
+        }
+
     /// One command, start to finish.
     let processOne (leased: LeasedCommand<'EntityId, 'Event>) (ct: CancellationToken) =
         task {
@@ -356,11 +392,14 @@ type CommandProcessor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: e
                         (DeadLetter(CommandFailure.Machine $"claimed %d{leased.DeliveryCount} times without an outcome"))
                         ct
                 else
-                    task {
-                        match! renewWhile leased (decide ()) ct with
-                        | Ok(draft, outcome) -> return! interpretCommit leased draft outcome ct
-                        | Error error -> return! applyDisposition leased (policy.Classify error) ct
-                    }
+                    match record.Kind with
+                    | CommandKind.Correction(at, correction) -> correct leased at correction ct
+                    | CommandKind.Event ->
+                        task {
+                            match! renewWhile leased (decide ()) ct with
+                            | Ok(draft, outcome) -> return! interpretCommit leased draft outcome ct
+                            | Error error -> return! applyDisposition leased (policy.Classify error) ct
+                        }
 
             logOutcome record outcome (config.TimeProvider.GetElapsedTime started)
             return outcome

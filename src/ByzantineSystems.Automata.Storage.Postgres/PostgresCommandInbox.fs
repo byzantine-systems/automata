@@ -58,6 +58,17 @@ module private CommandMapping =
     /// The schema stores the empty string for an unsupplied audit field.
     let audit (value: string option) : string = defaultArg value ""
 
+    let divergenceToString (divergence: Divergence) : string =
+        match divergence with
+        | Divergence.Fail -> "fail"
+        | Divergence.Truncate -> "truncate"
+
+    let divergenceFromString (value: string) : Result<Divergence, StoreError> =
+        match value with
+        | "fail" -> Ok Divergence.Fail
+        | "truncate" -> Ok Divergence.Truncate
+        | other -> Error(Db.decodeFailure (nameof Divergence) $"unknown divergence policy {other}")
+
 /// <summary>
 /// The PostgreSQL command inbox.
 ///
@@ -107,7 +118,25 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
     /// Rebuilds one command from its generated row. Three decodes can fail independently, and
     /// the first failure wins; none of them is expected, and all of them mean the row is not what
     /// this version of the code was compiled against.
-    let toRecord (row: fsm.command) : Result<CommandRecord<'EntityId, 'Event>, StoreError> =
+    /// What the command asks for. A correction's details live beside it, and one missing is a
+    /// correction the database half-wrote, which the routine that writes it makes impossible.
+    let kindOf (row: fsm.command) (correction: fsm.command_correction option) : Result<CommandKind, StoreError> =
+        match row.kind, correction with
+        | "event", _ -> Ok CommandKind.Event
+        | "correction", Some details ->
+            CommandMapping.divergenceFromString details.on_divergence
+            |> Result.map (fun divergence ->
+                CommandKind.Correction(
+                    Db.fromTimestamp details.effective_at,
+                    { OnDivergence = divergence
+                      ReplayLimit = details.replay_limit }
+                ))
+        | "correction", None -> Error(Db.decodeFailure (nameof CommandKind) "a correction has no recorded details")
+        | other, _ -> Error(Db.decodeFailure (nameof CommandKind) $"unknown command kind {other}")
+
+    let toRecord
+        (row: fsm.command, correction: fsm.command_correction option)
+        : Result<CommandRecord<'EntityId, 'Event>, StoreError> =
         let entityId =
             row.entity_id
             |> options.EntityIdDecode
@@ -122,9 +151,10 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
             row.event |> options.EventCodec.Decode |> Result.mapError Db.toStoreError
 
         let status = row.status |> CommandMapping.statusFromString
+        let kind = kindOf row correction
 
-        match entityId, chartVersion, event, status with
-        | Ok entityId, Ok chartVersion, Ok event, Ok status ->
+        match entityId, chartVersion, event, status, kind with
+        | Ok entityId, Ok chartVersion, Ok event, Ok status, Ok kind ->
             Ok
                 { CommandId = CommandId.ofInt64 row.command_id
                   MachineId = MachineId.create row.machine_id
@@ -132,6 +162,7 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
                   Sequence = row.seq
                   IdempotencyKey = row.idempotency_key
                   ChartVersion = chartVersion
+                  Kind = kind
                   Event = event
                   Status = status
                   Blocked = row.blocked
@@ -144,10 +175,11 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
                       Source = optional row.source
                       CorrelationId = optional row.correlation_id
                       CausationId = optional row.causation_id } }
-        | Error error, _, _, _
-        | _, Error error, _, _
-        | _, _, Error error, _
-        | _, _, _, Error error -> Error error
+        | Error error, _, _, _, _
+        | _, Error error, _, _, _
+        | _, _, Error error, _, _
+        | _, _, _, Error error, _
+        | _, _, _, _, Error error -> Error error
 
     /// <summary>
     /// A claimed row, read into the generated <c>fsm.command</c> type.
@@ -165,6 +197,7 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
           idempotency_key = Row.string reader "idempotency_key"
           chart_version = Row.int32 reader "chart_version"
           event = Row.string reader "event"
+          kind = Row.string reader "kind"
           status = Row.string reader "status"
           blocked = Row.bool reader "blocked"
           visible_at = reader.GetDateTime(reader.GetOrdinal "visible_at")
@@ -181,10 +214,11 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
     /// A claimed row carries its own lease: the token that fences it, the delivery count, and the
     /// deadline the database assigned. visible_at means the lease deadline while a command is
     /// leased, which is the one place that dual reading of the column surfaces in F#.
-    let readLeased (reader: NpgsqlDataReader) : Result<LeasedCommand<'EntityId, 'Event>, StoreError> =
-        let row = commandRow reader
-
-        toRecord row
+    let toLeased
+        (corrections: Map<int64, fsm.command_correction>)
+        (row: fsm.command)
+        : Result<LeasedCommand<'EntityId, 'Event>, StoreError> =
+        toRecord (row, Map.tryFind row.command_id corrections)
         |> Result.map (fun record ->
             { Work = record
               Token = LeaseToken.ofInt64 row.lease_token
@@ -192,10 +226,32 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
               ExpiresAt = record.VisibleAt })
 
     /// At most one command, decoded.
-    let single (rows: fsm.command option) : Result<CommandRecord<'EntityId, 'Event> option, StoreError> =
+    let single
+        (rows: (fsm.command * fsm.command_correction option) option)
+        : Result<CommandRecord<'EntityId, 'Event> option, StoreError> =
         match rows with
         | Some row -> toRecord row |> Result.map Some
         | None -> Ok None
+
+    /// The details of whichever claimed commands are corrections, in one query. Most claims have
+    /// none, and ask nothing.
+    let correctionsOf (rows: fsm.command list) (context: QueryContext) (token: CancellationToken) =
+        let ids =
+            rows
+            |> List.filter (fun row -> row.kind = "correction")
+            |> List.map _.command_id
+
+        match ids with
+        | [] -> Task.FromResult Map.empty
+        | ids ->
+            selectTask context {
+                for d in fsm.command_correction do
+                    where (d.command_id |=| ids)
+                    select d
+                    toList
+                    cancel token
+            }
+            |> Task.map (List.map (fun d -> d.command_id, d) >> Map.ofList)
 
     let readOutcome (cmd: NpgsqlCommand) (ct: CancellationToken) : Task<Result<LeaseUpdateOutcome, StoreError>> =
         task {
@@ -222,13 +278,15 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
             (fun context token ->
                 selectTask context {
                     for c in fsm.command do
+                        leftJoin d in fsm.command_correction on (c.command_id = d.Value.command_id)
+
                         where (
                             c.machine_id = MachineId.value machineId
                             && c.entity_id = entityId
                             && c.idempotency_key = idempotencyKey
                         )
 
-                        select c
+                        select (c, d)
                         tryHead
                         cancel token
                 }
@@ -243,14 +301,32 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
         : Task<Result<SubmissionOutcome, StoreError>> =
         task {
             use! conn = dataSource.OpenConnectionAsync(ct).AsTask()
-            use cmd = command (SqlResources.get "command" "submit") conn
+
+            // A correction is submitted through its own routine, which records what it corrects
+            // in the same transaction. It is claimable at once and arrives now: its effective
+            // time is the instant it corrects, which the routine stores beside it.
+            use cmd =
+                match submission.Kind with
+                | CommandKind.Event ->
+                    let cmd = command (SqlResources.get "command" "submit") conn
+                    cmd |> addOptionalTimestamp "visible_at" submission.VisibleAt
+                    cmd |> addOptionalTimestamp "received_at" submission.ReceivedAt
+                    cmd
+                | CommandKind.Correction(at, policy) ->
+                    let cmd = command (SqlResources.get "command" "submit_correction") conn
+                    cmd.Parameters.AddWithValue("effective_at", Db.timestamp at) |> ignore
+
+                    cmd
+                    |> addText "on_divergence" (CommandMapping.divergenceToString policy.OnDivergence)
+
+                    cmd |> addInt "replay_limit" policy.ReplayLimit
+                    cmd
+
             cmd |> addText "machine_id" (MachineId.value submission.MachineId)
             cmd |> addText "entity_id" entityId
             cmd |> addText "idempotency_key" submission.IdempotencyKey
             cmd |> addInt "chart_version" (ChartVersion.value submission.ChartVersion)
             cmd |> addText "event" encodedEvent
-            cmd |> addOptionalTimestamp "visible_at" submission.VisibleAt
-            cmd |> addOptionalTimestamp "received_at" submission.ReceivedAt
             cmd |> addText "tenant" (CommandMapping.audit submission.Audit.Tenant)
             cmd |> addText "principal" (CommandMapping.audit submission.Audit.Principal)
             cmd |> addText "source" (CommandMapping.audit submission.Audit.Source)
@@ -334,20 +410,35 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
             // idempotent: a claim whose reply was lost has already leased a batch, and a retry
             // leases a second one while the first stays invisible until its lease lapses. The
             // worker polls again in a moment, which recovers sooner than a retry would.
-            Db.protectOnce
-                (fun token ->
-                    task {
-                        use! conn = dataSource.OpenConnectionAsync(token).AsTask()
-                        use cmd = command (SqlResources.get "command" "claim") conn
-                        cmd |> addText "machine_id" (MachineId.value machineId)
-                        cmd |> addInt "batch" batch
-                        cmd |> addInterval "lease" lease
-                        use! reader = cmd.ExecuteReaderAsync token
+            let claim =
+                Db.protectOnce
+                    (fun token ->
+                        task {
+                            use! conn = dataSource.OpenConnectionAsync(token).AsTask()
+                            use cmd = command (SqlResources.get "command" "claim") conn
+                            cmd |> addText "machine_id" (MachineId.value machineId)
+                            cmd |> addInt "batch" batch
+                            cmd |> addInterval "lease" lease
+                            use! reader = cmd.ExecuteReaderAsync token
+                            let! rows = Row.all commandRow reader token
+                            return Ok rows
+                        })
+                    ct
 
-                        let! claimed = Row.all readLeased reader token
-                        return List.sequenceResultM claimed
-                    })
-                ct
+            // The claim has already leased its rows, so reading their correction details is an
+            // ordinary read and may be retried like one.
+            taskResult {
+                let! rows = claim
+
+                let! corrections =
+                    Db.query
+                        options.Context.Resilience
+                        dataSource
+                        (fun context token -> correctionsOf rows context token |> Task.map Ok)
+                        ct
+
+                return! rows |> List.traverseResultM (toLeased corrections)
+            }
 
         member _.Reschedule(commandId, leaseToken, backoff, ct) =
             protect
@@ -394,8 +485,9 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
                 (fun context token ->
                     selectTask context {
                         for c in fsm.command do
+                            leftJoin d in fsm.command_correction on (c.command_id = d.Value.command_id)
                             where (c.command_id = id)
-                            select c
+                            select (c, d)
                             tryHead
                             cancel token
                     }

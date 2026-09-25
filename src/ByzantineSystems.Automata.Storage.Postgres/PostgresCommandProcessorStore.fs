@@ -54,6 +54,56 @@ module private ProcessorMapping =
 /// after an ambiguous failure is safe, because the routine answers a repeated call from the same
 /// lease with what that lease already did.
 /// </summary>
+/// <summary>
+/// A replay error as the error column stores it: a kind, and the fields that kind has. Written by
+/// this library alone, so every field is required on the way back.
+/// </summary>
+[<RequireQualifiedAccess>]
+module private ReplayMapping =
+
+    let toJson (error: ReplayError) : string =
+        let node = System.Text.Json.Nodes.JsonObject()
+
+        match error with
+        | ReplayError.UnknownChartVersion version ->
+            node["kind"] <- "unknown_chart_version"
+            node["version"] <- ChartVersion.value version
+        | ReplayError.Diverged(epoch, reason) ->
+            node["kind"] <- "diverged"
+            node["epoch"] <- int64 (Epoch.value epoch)
+            node["reason"] <- reason
+        | ReplayError.BudgetExceeded limit ->
+            node["kind"] <- "budget_exceeded"
+            node["limit"] <- limit
+        | ReplayError.HistoryPurged -> node["kind"] <- "history_purged"
+
+        node.ToJsonString()
+
+    let ofJson (element: JsonElement) : Result<ReplayError, StoreError> =
+        let fail () =
+            Error(Db.decodeFailure (nameof ReplayError) "an unreadable replay error")
+
+        let field (name: string) (read: JsonElement -> 'T) =
+            match element.TryGetProperty name with
+            | true, value -> Ok(read value)
+            | _ -> fail ()
+
+        match element.TryGetProperty "kind" with
+        | true, kind ->
+            match kind.GetString() with
+            | "unknown_chart_version" ->
+                field "version" _.GetInt32()
+                |> Result.map (ChartVersion.create >> ReplayError.UnknownChartVersion)
+            | "diverged" ->
+                Result.map2
+                    (fun epoch reason -> ReplayError.Diverged(Db.epochOf epoch, reason))
+                    (field "epoch" _.GetInt64())
+                    (field "reason" _.GetString())
+            | "budget_exceeded" -> field "limit" _.GetInt32() |> Result.map ReplayError.BudgetExceeded
+            | "history_purged" -> Ok ReplayError.HistoryPurged
+            | _ -> fail ()
+        | _ -> fail ()
+
 type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     (options: CommandProcessorOptions<'EntityId, 'State, 'Event, 'Action, 'Err>) =
 
@@ -175,6 +225,7 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
             |> Result.mapError Db.toStoreError
             |> Result.map (fun encoded -> $"""{{"domain":%s{encoded}}}""")
         | CommandFailure.Machine reason -> Ok $"""{{"machine":%s{JsonSerializer.Serialize reason}}}"""
+        | CommandFailure.Replay error -> Ok $"""{{"replay":%s{ReplayMapping.toJson error}}}"""
 
     let readFailure (json: string) : Result<CommandFailure<'Err>, StoreError> =
         // The column is jsonb, so the server has already proved this parses. What it has not
@@ -189,14 +240,13 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
             |> Result.mapError Db.toStoreError
             |> Result.map CommandFailure.Domain
         | _ ->
-            match root.TryGetProperty "machine" with
-            | true, machine when machine.ValueKind = JsonValueKind.String ->
+            match root.TryGetProperty "machine", root.TryGetProperty "replay" with
+            | (true, machine), _ when machine.ValueKind = JsonValueKind.String ->
                 Ok(CommandFailure.Machine(machine.GetString()))
+            | _, (true, replay) -> ReplayMapping.ofJson replay |> Result.map CommandFailure.Replay
             | _ ->
                 Error(
-                    Db.decodeFailure
-                        (nameof CommandFailure)
-                        "a command error carried neither a domain nor a machine tag"
+                    Db.decodeFailure (nameof CommandFailure) "a command error carried no domain, machine or replay tag"
                 )
 
     let failWith (status: string) (commandId: CommandId) token (failure: CommandFailure<'Err>) ct =
@@ -393,4 +443,102 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                             cancel token
                     }
                     |> Task.map (Option.traverseResult toResult))
+                ct
+
+    interface IReplayStore<'EntityId, 'State, 'Event, 'Action> with
+
+        member _.Suffix(machineId, entityId, from, limit, ct) =
+            let machine = MachineId.value machineId
+            let entity = options.EntityIdEncode entityId
+            let since = Db.timestamp from
+
+            read
+                (fun context token ->
+                    task {
+                        let! suffix =
+                            selectTask context {
+                                for t in fsm.transition do
+                                    where (t.machine_id = machine && t.entity_id = entity && t.effective_at >= since)
+                                    orderBy t.effective_at
+                                    thenBy t.epoch
+                                    take limit
+                                    select t
+                                    toList
+                                    cancel token
+                            }
+
+                        // Retention purges an entity's oldest commands with their transitions,
+                        // so a log that no longer starts at epoch 1, and whose oldest survivor is
+                        // already past the corrected instant, may have lost events after it.
+                        let! oldest =
+                            selectTask context {
+                                for t in fsm.transition do
+                                    where (t.machine_id = machine && t.entity_id = entity)
+                                    orderBy t.epoch
+                                    select t
+                                    tryHead
+                                    cancel token
+                            }
+
+                        let incomplete =
+                            match oldest with
+                            | Some first -> first.epoch > 1L && first.effective_at > since
+                            | None -> false
+
+                        return
+                            suffix
+                            |> List.traverseResultM toTransition
+                            |> Result.map (fun transitions ->
+                                { Transitions = transitions
+                                  Incomplete = incomplete })
+                    })
+                ct
+
+        member _.CommitCorrection(commandId, token, expected, commit, ct) =
+            protect
+                (fun cancel ->
+                    task {
+                        match
+                            encodeDraft commit.Transition, BeliefPayload.encode options.StateCodec commit.Beliefs
+                        with
+                        | Error error, _
+                        | _, Error error -> return Error error
+                        | Ok(event, _, fromState, toState), Ok beliefs ->
+                            use! conn = dataSource.OpenConnectionAsync(cancel).AsTask()
+                            use cmd = new NpgsqlCommand(SqlResources.get "command" "finalize_correction", conn)
+                            let draft = commit.Transition
+
+                            let states (ids: StateId list) =
+                                ids |> List.map StateId.value |> List.toArray |> box
+
+                            Db.parameters
+                                [ "command_id", box (CommandId.value commandId)
+                                  "lease_token", box (LeaseToken.value token)
+                                  "expected_epoch", box (int64 (Epoch.value expected))
+                                  "valid_from", box (Db.timestamp commit.ValidFrom)
+                                  "beliefs", box beliefs
+                                  "instance_status", box (Db.instanceStatusToString draft.Status)
+                                  "event", box event
+                                  "from_state", box fromState
+                                  "to_state", box toState
+                                  "handled_by", box (StateId.value draft.HandledBy)
+                                  "exited", states draft.Exited
+                                  "entered", states draft.Entered ]
+                                cmd
+
+                            use! reader = cmd.ExecuteReaderAsync cancel
+
+                            match! reader.ReadAsync cancel with
+                            | false ->
+                                return
+                                    Error(
+                                        Db.decodeFailure (nameof FinalizeOutcome) "finalize_correction returned no row"
+                                    )
+                            | true ->
+                                return
+                                    ProcessorMapping.outcomeFromString
+                                        (Row.string reader "outcome")
+                                        (Row.int64 reader "epoch")
+                                        expected
+                    })
                 ct

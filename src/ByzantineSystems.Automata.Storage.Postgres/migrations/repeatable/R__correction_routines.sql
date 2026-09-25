@@ -109,3 +109,195 @@ END LOOP;
 END
 $$;
 
+-- ---------------------------------------------------------------------------
+-- fsm.submit_correction: a correction enters the inbox like any command.
+--
+-- Through fsm.submit_command, so idempotency, the gapless sequence and the
+-- head invariant are exactly an ordinary command's: a correction waits behind
+-- work already queued for its entity, and nothing queued after it runs first.
+-- Only a newly accepted command is marked a correction and given its details;
+-- a repeated key returns the original, whatever it was.
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION fsm.submit_correction (p_machine_id text, p_entity_id text, p_idempotency_key text, p_chart_version integer, p_event jsonb, p_effective_at timestamptz, p_on_divergence fsm.divergence, p_replay_limit integer, p_tenant text DEFAULT '', p_principal text DEFAULT '', p_source text DEFAULT '', p_correlation_id text DEFAULT '', p_causation_id text DEFAULT '')
+    RETURNS TABLE (
+        command_id bigint,
+        seq bigint,
+        accepted boolean)
+    LANGUAGE plpgsql
+    VOLATILE PARALLEL UNSAFE
+    SET search_path = pg_catalog,
+    pg_temp
+    AS $$
+DECLARE
+    v_command_id bigint;
+    v_seq bigint;
+    v_accepted boolean;
+BEGIN
+    SELECT
+        s.command_id,
+        s.seq,
+        s.accepted
+    INTO
+        v_command_id,
+        v_seq,
+        v_accepted
+    FROM
+        fsm.submit_command (p_machine_id, p_entity_id, p_idempotency_key, p_chart_version, p_event, NULL, NULL, p_tenant, p_principal, p_source, p_correlation_id, p_causation_id) s;
+    IF v_accepted THEN
+        UPDATE
+            fsm.command c
+        SET
+            kind = 'correction'
+        WHERE
+            c.command_id = v_command_id;
+        INSERT INTO fsm.command_correction (command_id, effective_at, on_divergence, replay_limit)
+            VALUES (v_command_id, p_effective_at, p_on_divergence, p_replay_limit);
+    END IF;
+    RETURN QUERY
+    SELECT
+        v_command_id,
+        v_seq,
+        v_accepted;
+END
+$$;
+
+-- ---------------------------------------------------------------------------
+-- fsm.finalize_correction: commit a replayed correction, all or nothing.
+--
+-- The same fence and epoch check as fsm.finalize_command, then the three
+-- writes a correction is: its own transition, with no actions, because no
+-- historical action is re-emitted; the rewritten belief timeline, through
+-- fsm.correct_beliefs, which archives what it replaces; and the closed command,
+-- with the entity's next command promoted.
+--
+-- The replay ran outside this transaction. That is sound because the command
+-- was the entity's head while it ran, so nothing else for the entity could
+-- commit, and the epoch check here is the backstop that proves it.
+--
+-- The last belief carries the new epoch. fsm.finalize_command reads the live
+-- belief's epoch as the entity's, so any other attribution would leave the next
+-- ordinary command expecting an epoch that is already taken.
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION fsm.finalize_correction (p_command_id bigint, p_lease_token bigint, p_expected_epoch bigint, p_valid_from timestamptz, p_beliefs jsonb, p_instance_status fsm.instance_status, p_event jsonb, p_from_state jsonb, p_to_state jsonb, p_handled_by text, p_exited text[], p_entered text[])
+    RETURNS TABLE (
+        outcome fsm.finalize_outcome,
+        epoch bigint)
+    LANGUAGE plpgsql
+    VOLATILE PARALLEL UNSAFE
+    SET search_path = pg_catalog,
+    pg_temp
+    AS $$
+DECLARE
+    v_machine_id text;
+    v_entity_id text;
+    v_status fsm.command_status;
+    v_kind fsm.command_kind;
+    v_token bigint;
+    v_chart_version integer;
+    v_current_epoch bigint;
+BEGIN
+    SELECT
+        c.machine_id,
+        c.entity_id,
+        c.status,
+        c.kind,
+        c.lease_token,
+        c.chart_version
+    INTO
+        v_machine_id,
+        v_entity_id,
+        v_status,
+        v_kind,
+        v_token,
+        v_chart_version
+    FROM
+        fsm.command c
+    WHERE
+        c.command_id = p_command_id
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'fsm.finalize_correction: no command %', p_command_id
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF v_kind <> 'correction' THEN
+        RAISE EXCEPTION 'fsm.finalize_correction: command % is not a correction', p_command_id
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF v_status IN ('succeeded', 'rejected', 'dead_letter') THEN
+        IF v_token = p_lease_token THEN
+            RETURN QUERY
+            SELECT
+                'already_finalized'::fsm.finalize_outcome,
+                COALESCE((
+                    SELECT
+                        t.epoch
+                    FROM fsm.transition t
+                    WHERE
+                        t.command_id = p_command_id), p_expected_epoch);
+        ELSE
+            RETURN QUERY
+            SELECT
+                'lease_lost'::fsm.finalize_outcome,
+                p_expected_epoch;
+        END IF;
+        RETURN;
+    END IF;
+    IF v_token <> p_lease_token THEN
+        RETURN QUERY
+        SELECT
+            'lease_lost'::fsm.finalize_outcome,
+            p_expected_epoch;
+        RETURN;
+    END IF;
+    SELECT
+        s.epoch
+    INTO
+        v_current_epoch
+    FROM
+        fsm.instance_state s
+    WHERE
+        s.machine_id = v_machine_id
+        AND s.entity_id = v_entity_id
+        AND UPPER(s.valid_during) = 'infinity';
+    v_current_epoch := COALESCE(v_current_epoch, 0);
+    IF v_current_epoch <> p_expected_epoch THEN
+        RETURN QUERY
+        SELECT
+            'conflict'::fsm.finalize_outcome,
+            v_current_epoch;
+        RETURN;
+    END IF;
+    INSERT INTO fsm.transition (machine_id, entity_id, epoch, command_id, chart_version, event, actions, from_state, to_state, handled_by, exited, entered, status, effective_at)
+        VALUES (v_machine_id, v_entity_id, p_expected_epoch + 1, p_command_id, v_chart_version, p_event, '[]'::jsonb, p_from_state, p_to_state, p_handled_by, p_exited, p_entered, p_instance_status, p_valid_from);
+    PERFORM
+        fsm.correct_beliefs (v_machine_id, v_entity_id, p_valid_from, p_beliefs);
+    UPDATE
+        fsm.command c
+    SET
+        status = 'succeeded'
+    WHERE
+        c.command_id = p_command_id;
+    UPDATE
+        fsm.command c
+    SET
+        blocked = FALSE
+    WHERE
+        c.command_id = (
+            SELECT
+                n.command_id
+            FROM
+                fsm.command n
+            WHERE
+                n.machine_id = v_machine_id
+                AND n.entity_id = v_entity_id
+                AND n.status IN ('ready', 'leased')
+            ORDER BY
+                n.seq
+            LIMIT 1);
+    RETURN QUERY
+    SELECT
+        'finalized'::fsm.finalize_outcome,
+        p_expected_epoch + 1;
+END
+$$;
+

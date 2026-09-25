@@ -79,7 +79,9 @@ Two capabilities sit outside the required four, discovered by `Store.tryTemporal
 
 `ICorrectionStore` changes it. `Correct` supersedes an entity's belief timeline from an instant onward with a supplied list, in one transaction; superseded beliefs are archived rather than overwritten, so the previous opinion stays answerable through `AsOf`. The beliefs must be ascending and at or after the corrected instant, each runs until the next begins, and the last is left open, so a gap or an overlap is not expressible. An empty list asserts the entity had no belief from that instant onward.
 
-**It carries no policy, deliberately.** Which chart would have decided a state, whether replaying a command against it still resolves, and what to do when it does not are the caller's questions. `CorrectionPolicy` and `ReplayError` are not part of this release; keeping them out of the contract is what let the contract ship.
+**Replaying a missed event.** `Machine.correct machine entityId envelope at policy` enqueues a correction: the event should have happened at `at`. A worker replays it and every committed event after it, each under the chart version that first decided it, and writes the result through the same primitive. `CorrectionPolicy` sets `OnDivergence` (`Fail`, the default, writes nothing; `Truncate` ends the timeline where replay stopped resolving) and `ReplayLimit`. A failed replay dead-letters the correction with `CommandFailure.Replay` and a `ReplayError`. No historical action is re-emitted. `Machine.previewCorrection` runs the same replay and writes nothing.
+
+Earlier versions' charts are declared with `chartCatalog`; start refuses a catalog chart whose fingerprint differs from the registered one. Every version shares one set of types and codecs, and replay needs the history it reads to still be within retention (`ReplayError.HistoryPurged` otherwise).
 
 Reading the past and changing it are two interfaces rather than one because they are two separate rights: a store may offer time travel without offering back-dating, and a deployment may want the reader everywhere while the correction path is reachable only where an operator has a reason.
 

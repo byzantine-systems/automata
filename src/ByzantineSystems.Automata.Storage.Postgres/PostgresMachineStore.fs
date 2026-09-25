@@ -253,4 +253,13 @@ type PostgresMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
         member _.Listen(machineId, onCommands, onActions, ct) =
             notifications.Listen(machineId, onCommands, onActions, ct)
 
+    interface IReplayStore<'EntityId, 'State, 'Event, 'Action> with
+
+        member _.Suffix(machineId, entityId, from, limit, ct) =
+            (processor :> IReplayStore<'EntityId, 'State, 'Event, 'Action>).Suffix(machineId, entityId, from, limit, ct)
+
+        member _.CommitCorrection(commandId, token, expected, commit, ct) =
+            (processor :> IReplayStore<'EntityId, 'State, 'Event, 'Action>)
+                .CommitCorrection(commandId, token, expected, commit, ct)
+
     interface IMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>

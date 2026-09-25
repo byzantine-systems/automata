@@ -54,3 +54,8 @@ CREATE OR REPLACE TRIGGER <t>_versioning_trigger
 `fsm.temporal_versioning` reads the table name at fire time and finds the twin by that naming convention, so one function serves every temporal table.
 
 ## Corrections, and the one routine allowed to write behind the live belief
+
+`fsm.correct_beliefs` rewrites an entity's timeline from an instant and archives what it replaces. `fsm.finalize_correction` is its only caller on the command path: same fence and epoch check as `fsm.finalize_command`, one transition with no actions, then the new timeline.
+
+- **`fsm.command.kind`**: `'event'` or `'correction'`.
+- **`fsm.command_correction`**: a correction's instant, divergence policy and replay limit, one row per correction command.

@@ -26,6 +26,7 @@ let tests =
                     FinalizeTests.tests
                     ActionQueueTests.tests
                     ProcessorIntegrationTests.tests
+                    ReplayIntegrationTests.tests
                     SchemaContractTests.tests
                     MaintenanceTests.integration
                     PostgresSupervisionStoreTests.tests ]

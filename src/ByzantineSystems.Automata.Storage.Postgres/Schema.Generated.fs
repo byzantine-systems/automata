@@ -168,6 +168,8 @@ module fsm =
           [<ProviderDbType("Jsonb")>]
           event: string
           [<ProviderDbType("Text")>]
+          kind: string
+          [<ProviderDbType("Text")>]
           status: string
           [<ProviderDbType("Boolean")>]
           blocked: bool
@@ -201,6 +203,7 @@ module fsm =
                   idempotency_key = this.idempotency_key
                   chart_version = this.chart_version
                   event = this.event
+                  kind = this.kind
                   status = this.status
                   blocked = this.blocked
                   visible_at = this.visible_at
@@ -234,6 +237,9 @@ module fsm =
                   { WriteColumn.Name = "event"
                     Value = box this.event
                     ProviderDbType = Some "Jsonb" }
+                  { WriteColumn.Name = "kind"
+                    Value = box this.kind
+                    ProviderDbType = Some "Text" }
                   { WriteColumn.Name = "status"
                     Value = box this.status
                     ProviderDbType = Some "Text" }
@@ -286,6 +292,8 @@ module fsm =
           [<ProviderDbType("Jsonb")>]
           event: string
           [<ProviderDbType("Text")>]
+          kind: string
+          [<ProviderDbType("Text")>]
           status: string
           [<ProviderDbType("Boolean")>]
           blocked: bool
@@ -330,6 +338,9 @@ module fsm =
                   { WriteColumn.Name = "event"
                     Value = box this.event
                     ProviderDbType = Some "Jsonb" }
+                  { WriteColumn.Name = "kind"
+                    Value = box this.kind
+                    ProviderDbType = Some "Text" }
                   { WriteColumn.Name = "status"
                     Value = box this.status
                     ProviderDbType = Some "Text" }
@@ -368,6 +379,33 @@ module fsm =
                     ProviderDbType = Some "Text" } ]
 
     let command = table<command>
+
+    type command_correction =
+        { [<ProviderDbType("Bigint")>]
+          command_id: int64
+          [<ProviderDbType("TimestampTz")>]
+          effective_at: System.DateTime
+          [<ProviderDbType("Text")>]
+          on_divergence: string
+          [<ProviderDbType("Integer")>]
+          replay_limit: int }
+
+        interface IWriteColumns with
+            member this.WriteColumns =
+                [ { WriteColumn.Name = "command_id"
+                    Value = box this.command_id
+                    ProviderDbType = Some "Bigint" }
+                  { WriteColumn.Name = "effective_at"
+                    Value = box this.effective_at
+                    ProviderDbType = Some "TimestampTz" }
+                  { WriteColumn.Name = "on_divergence"
+                    Value = box this.on_divergence
+                    ProviderDbType = Some "Text" }
+                  { WriteColumn.Name = "replay_limit"
+                    Value = box this.replay_limit
+                    ProviderDbType = Some "Integer" } ]
+
+    let command_correction = table<command_correction>
 
     type command_error =
         { [<ProviderDbType("Bigint")>]

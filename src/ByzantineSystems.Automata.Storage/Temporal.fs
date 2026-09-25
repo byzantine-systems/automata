@@ -145,3 +145,65 @@ type ICorrectionStore<'EntityId, 'State> =
         beliefs: CorrectedBelief<'State> list *
         ct: CancellationToken ->
             Task<Result<CorrectionOutcome, StoreError>>
+
+/// <summary>The committed events a correction has to re-decide.</summary>
+type ReplaySuffix<'EntityId, 'State, 'Event, 'Action> =
+    {
+        /// <summary>
+        /// Every committed transition effective at or after the corrected instant, ordered by
+        /// effective time and then epoch.
+        /// </summary>
+        Transitions: CommittedTransition<'EntityId, 'State, 'Event, 'Action> list
+        /// <summary>
+        /// Retention has purged transitions that may fall in that range, so the list cannot be
+        /// trusted to be the whole story.
+        /// </summary>
+        Incomplete: bool
+    }
+
+/// <summary>What a replayed correction writes, all in one transaction.</summary>
+type CorrectionCommit<'EntityId, 'State, 'Event, 'Action> =
+    {
+        /// <summary>
+        /// The correction's own entry in the transition log: the missed event, from the entity's
+        /// state before the correction to its state after it, with no actions.
+        /// </summary>
+        Transition: TransitionDraft<'EntityId, 'State, 'Event, 'Action>
+        /// <summary>The instant the belief timeline is rewritten from.</summary>
+        ValidFrom: DateTimeOffset
+        /// <summary>
+        /// The rewritten timeline. The last belief is attributed to the correction's own epoch,
+        /// which is what the next ordinary command expects.
+        /// </summary>
+        Beliefs: CorrectedBelief<'State> list
+    }
+
+/// <summary>
+/// Replaying the past through the machine.
+///
+/// Optional, like the other temporal capabilities. A store offering it can list the events a
+/// correction has to re-decide, and commit a correction's transition, rewritten beliefs and
+/// closed command together.
+/// </summary>
+type IReplayStore<'EntityId, 'State, 'Event, 'Action> =
+
+    /// <summary>
+    /// The committed transitions effective at or after <paramref name="from" />, at most
+    /// <paramref name="limit" /> of them. Asking for one more than a budget allows is how a caller
+    /// learns the budget would be exceeded.
+    /// </summary>
+    abstract Suffix:
+        machineId: MachineId * entityId: 'EntityId * from: DateTimeOffset * limit: int * ct: CancellationToken ->
+            Task<Result<ReplaySuffix<'EntityId, 'State, 'Event, 'Action>, StoreError>>
+
+    /// <summary>
+    /// Commits a correction, fenced like any other commit: the lease must still be held and the
+    /// entity must still be at <paramref name="expected" />, or nothing is written.
+    /// </summary>
+    abstract CommitCorrection:
+        commandId: CommandId *
+        token: LeaseToken<CommandWork> *
+        expected: Epoch *
+        commit: CorrectionCommit<'EntityId, 'State, 'Event, 'Action> *
+        ct: CancellationToken ->
+            Task<Result<FinalizeOutcome, StoreError>>

@@ -10,6 +10,7 @@ let tests =
           DispositionTests.tests
           ProcessorTests.tests
           ProcessorTests.poisonTests
+          ReplayTests.tests
           MachineTests.tests
           WorkSignalsTests.tests ]
 

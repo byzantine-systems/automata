@@ -120,6 +120,44 @@ module AuditContext =
           CorrelationId = None
           CausationId = None }
 
+/// <summary>What a correction does when a replayed event no longer resolves.</summary>
+[<RequireQualifiedAccess>]
+type Divergence =
+    /// <summary>Refuse the correction and write nothing.</summary>
+    | Fail
+
+    /// <summary>Keep the timeline up to the last event that still resolves, and drop the rest.</summary>
+    | Truncate
+
+/// <summary>How a correction replays the events after it.</summary>
+type CorrectionPolicy =
+    {
+        OnDivergence: Divergence
+        /// <summary>The most events one correction may replay.</summary>
+        ReplayLimit: int
+    }
+
+/// <summary>Operations on <see cref="T:ByzantineSystems.Automata.Storage.CorrectionPolicy" />.</summary>
+[<RequireQualifiedAccess>]
+module CorrectionPolicy =
+
+    /// <summary>Fail on divergence, and replay at most a thousand events.</summary>
+    let defaults: CorrectionPolicy =
+        { OnDivergence = Divergence.Fail
+          ReplayLimit = 1000 }
+
+/// <summary>What a command asks for.</summary>
+[<RequireQualifiedAccess>]
+type CommandKind =
+    /// <summary>An ordinary event, decided now.</summary>
+    | Event
+
+    /// <summary>
+    /// A missed event that should have happened at <c>effectiveAt</c>. Every committed event after
+    /// it is re-decided, and the entity's beliefs from that instant are rewritten.
+    /// </summary>
+    | Correction of effectiveAt: DateTimeOffset * policy: CorrectionPolicy
+
 /// <summary>An event offered to the inbox, together with everything the audit record needs.</summary>
 type CommandSubmission<'EntityId, 'Event> =
     {
@@ -128,6 +166,7 @@ type CommandSubmission<'EntityId, 'Event> =
         /// <summary>Deduplicates within an entity: resubmitting a key returns the original command.</summary>
         IdempotencyKey: string
         ChartVersion: ChartVersion
+        Kind: CommandKind
         Event: 'Event
         /// <summary>Earliest instant the command may be claimed. <c>None</c> means immediately.</summary>
         VisibleAt: DateTimeOffset option
@@ -150,6 +189,7 @@ type CommandRecord<'EntityId, 'Event> =
         Sequence: int64
         IdempotencyKey: string
         ChartVersion: ChartVersion
+        Kind: CommandKind
         Event: 'Event
         Status: CommandStatus
         /// <summary>An earlier non-terminal command for this entity exists, so this one waits.</summary>

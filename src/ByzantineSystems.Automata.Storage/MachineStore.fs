@@ -65,3 +65,11 @@ module Store =
         match store with
         | :? IWorkNotifications as notifications -> Some notifications
         | _ -> None
+
+    /// <summary>The store's ability to replay a correction, or <c>None</c> when it offers none.</summary>
+    let tryReplay
+        (store: IMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>)
+        : IReplayStore<'EntityId, 'State, 'Event, 'Action> option =
+        match store with
+        | :? IReplayStore<'EntityId, 'State, 'Event, 'Action> as replay -> Some replay
+        | _ -> None

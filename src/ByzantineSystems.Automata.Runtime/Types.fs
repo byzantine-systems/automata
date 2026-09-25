@@ -226,6 +226,7 @@ type TransitionObserver<'EntityId, 'State, 'Event, 'Action> =
 type MachineDeclaration =
     | Chart
     | ChartVersion
+    | ChartCatalog
     | Initial
     | Store
     | Processor
@@ -242,6 +243,11 @@ type MachineConfigError =
     | InvalidProcessorPolicy of ProcessorPolicyError list
     | DuplicateDeclaration of MachineDeclaration
     | InitialStateUnknown of StateId
+    /// <summary>
+    /// The catalog declares the machine's current version with a different chart. The current
+    /// version's chart is the one in <c>chart</c>; the catalog is for earlier ones.
+    /// </summary>
+    | CatalogRedeclaresCurrentVersion of ChartVersion
 
 /// <summary>
 /// How starting a machine went. Both cases are answers rather than failures: a store error is
@@ -266,11 +272,15 @@ type Startup =
 /// is the <c>machine</c> expression that builds it and the functions that read it.
 /// </summary>
 type internal RuntimeConfig<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: equality> =
-    { MachineId: MachineId
-      Chart: Chart<'State, 'Event, 'Action, 'Err>
-      ChartVersion: ChartVersion
-      InitialState: 'State
-      Store: IMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
-      Processor: ValidatedProcessorPolicy<'Err>
-      Logger: ILogger
-      TimeProvider: TimeProvider }
+    {
+        MachineId: MachineId
+        Chart: Chart<'State, 'Event, 'Action, 'Err>
+        ChartVersion: ChartVersion
+        /// Every chart a correction can replay under, the current one included.
+        Catalog: ChartCatalog<'State, 'Event, 'Action, 'Err>
+        InitialState: 'State
+        Store: IMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
+        Processor: ValidatedProcessorPolicy<'Err>
+        Logger: ILogger
+        TimeProvider: TimeProvider
+    }

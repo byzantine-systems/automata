@@ -16,8 +16,11 @@
     </ItemGroup>
 
     <ItemGroup>
+        <Compile Include="Catalog.fs" />
         <Compile Include="Types.fs" />
         <Compile Include="Draft.fs" />
+        <Compile Include="Replay.fs" />
+        <Compile Include="Correction.fs" />
         <Compile Include="WorkSignals.fs" />
         <Compile Include="ObserverDispatcher.fs" />
         <Compile Include="Completions.fs" />

@@ -12,6 +12,7 @@
         <Compile Include="DraftTests.fs" />
         <Compile Include="DispositionTests.fs" />
         <Compile Include="ProcessorTests.fs" />
+        <Compile Include="ReplayTests.fs" />
         <Compile Include="MachineTests.fs" />
         <Compile Include="WorkSignalsTests.fs" />
         <Compile Include="Program.fs" />

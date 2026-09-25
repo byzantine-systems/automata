@@ -21,6 +21,7 @@ left_joined_views = false
 include = [
   "fsm/command",
   "fsm/command_error",
+  "fsm/command_correction",
   "fsm/transition",
   "fsm/supervision_event",
   "fsm/belief",
