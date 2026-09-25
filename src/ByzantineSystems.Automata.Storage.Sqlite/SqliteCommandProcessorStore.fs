@@ -1,0 +1,634 @@
+namespace ByzantineSystems.Automata.Storage.Sqlite
+
+open System
+open System.Text.Json
+open System.Threading
+open System.Threading.Tasks
+open ByzantineSystems.Automata.Core
+open ByzantineSystems.Automata.Storage
+open ByzantineSystems.Automata.Storage.Sqlite.Schema
+open FsToolkit.ErrorHandling
+open Microsoft.Data.Sqlite
+open SqlHydra.Query
+
+/// <summary>
+/// Everything the processor needs to bridge the generic domain types to the columns of
+/// <c>fsm_transition</c>, <c>fsm_entity_snapshot</c>, <c>fsm_action</c> and
+/// <c>fsm_command_error</c>.
+/// </summary>
+type CommandProcessorOptions<'EntityId, 'State, 'Event, 'Action, 'Err> =
+    {
+        Context: SqliteContext
+        StateCodec: Codec<'State>
+        EventCodec: Codec<'Event>
+        /// <summary>
+        /// The whole action list as one JSON array. The transition row stores it as it is, and the
+        /// commit fans it out into one queued row per element.
+        /// </summary>
+        ActionCodec: Codec<'Action list>
+        ErrorCodec: Codec<'Err>
+        EntityIdEncode: 'EntityId -> string
+        /// <summary>Decoding returns a result, so a corrupt row is a typed failure rather than an exception.</summary>
+        EntityIdDecode: string -> Result<'EntityId, string>
+    }
+
+/// <summary>
+/// A replay error as the error column stores it: a kind, and the fields that kind has. Written by
+/// this library alone, so every field is required on the way back.
+/// </summary>
+[<RequireQualifiedAccess>]
+module internal ReplayMapping =
+
+    let toJson (error: ReplayError) : string =
+        let node = System.Text.Json.Nodes.JsonObject()
+
+        match error with
+        | ReplayError.UnknownChartVersion version ->
+            node["kind"] <- "unknown_chart_version"
+            node["version"] <- ChartVersion.value version
+        | ReplayError.Diverged(epoch, reason) ->
+            node["kind"] <- "diverged"
+            node["epoch"] <- int64 (Epoch.value epoch)
+            node["reason"] <- reason
+        | ReplayError.BudgetExceeded limit ->
+            node["kind"] <- "budget_exceeded"
+            node["limit"] <- limit
+        | ReplayError.HistoryPurged -> node["kind"] <- "history_purged"
+
+        node.ToJsonString()
+
+    let ofJson (element: JsonElement) : Result<ReplayError, StoreError> =
+        let fail () =
+            Error(Db.decodeFailure (nameof ReplayError) "an unreadable replay error")
+
+        let field (name: string) (read: JsonElement -> 'T) =
+            match element.TryGetProperty name with
+            | true, value -> Ok(read value)
+            | _ -> fail ()
+
+        match element.TryGetProperty "kind" with
+        | true, kind ->
+            match kind.GetString() with
+            | "unknown_chart_version" ->
+                field "version" _.GetInt32()
+                |> Result.map (ChartVersion.create >> ReplayError.UnknownChartVersion)
+            | "diverged" ->
+                Result.map2
+                    (fun epoch reason -> ReplayError.Diverged(Db.epochOf epoch, reason))
+                    (field "epoch" _.GetInt64())
+                    (field "reason" _.GetString())
+            | "budget_exceeded" -> field "limit" _.GetInt32() |> Result.map ReplayError.BudgetExceeded
+            | "history_purged" -> Ok ReplayError.HistoryPurged
+            | _ -> fail ()
+        | _ -> fail ()
+
+/// <summary>What finalizing reads about a command before deciding anything.</summary>
+type internal FinalizeTarget =
+    { Machine: string
+      Entity: string
+      Status: CommandStatus
+      Holder: int64
+      Version: int64 }
+
+/// <summary>A committed draft with its four payloads already encoded, so the transaction only writes.</summary>
+type internal EncodedDraft<'EntityId, 'State, 'Event, 'Action> =
+    { Source: TransitionDraft<'EntityId, 'State, 'Event, 'Action>
+      EventJson: string
+      ActionsJson: string
+      FromJson: string
+      ToJson: string }
+
+/// <summary>How a leased command ends. Each case carries exactly what that ending writes.</summary>
+type internal Resolution<'EntityId, 'State, 'Event, 'Action> =
+    /// <summary>The chart accepted the event: a transition at the epoch after <c>expected</c>.</summary>
+    | Commit of expected: Epoch * draft: EncodedDraft<'EntityId, 'State, 'Event, 'Action>
+
+    /// <summary>The chart refused the event. The encoded failure is recorded and no state moves.</summary>
+    | Reject of error: string
+
+    /// <summary>The machine gave up on the command. The encoded failure is recorded and no state moves.</summary>
+    | DeadLetter of error: string
+
+/// <summary>Operations on <see cref="T:ByzantineSystems.Automata.Storage.Sqlite.Resolution`4" />.</summary>
+[<RequireQualifiedAccess>]
+module internal Resolution =
+
+    /// <summary>The terminal status an ending writes, as the status CHECK spells it.</summary>
+    let status (resolution: Resolution<'EntityId, 'State, 'Event, 'Action>) : string =
+        match resolution with
+        | Commit _ -> "succeeded"
+        | Reject _ -> "rejected"
+        | DeadLetter _ -> "dead_letter"
+
+    /// <summary>
+    /// The epoch an ending reports when no transition answers for it. A failure moves no state, so
+    /// it reports the initial epoch, as the PostgreSQL routine does; a commit reports the epoch it
+    /// expected.
+    /// </summary>
+    let unmoved (resolution: Resolution<'EntityId, 'State, 'Event, 'Action>) : Epoch =
+        match resolution with
+        | Commit(expected, _) -> expected
+        | Reject _
+        | DeadLetter _ -> Epoch.initial
+
+/// <summary>
+/// Where a finalizing caller stands with its command, as the command row shows it. Decided
+/// before anything is written, and the only thing that decides whether anything is.
+/// </summary>
+type internal LeaseStanding =
+    /// <summary>No command has this id.</summary>
+    | Unknown
+
+    /// <summary>The caller's own lease already finished it: a retry, answered with what it did.</summary>
+    | FinishedByCaller
+
+    /// <summary>Finished under somebody else's lease.</summary>
+    | FinishedByAnother
+
+    /// <summary>
+    /// Open, and held by somebody else. Expiry is not consulted: the token is the fence, and a
+    /// worker past its deadline whose command nobody reclaimed still holds the only token.
+    /// </summary>
+    | HeldByAnother
+
+    /// <summary>Open, and the caller holds it: the finalize writes.</summary>
+    | HeldByCaller of FinalizeTarget
+
+/// <summary>Operations on <see cref="T:ByzantineSystems.Automata.Storage.Sqlite.LeaseStanding" />.</summary>
+[<RequireQualifiedAccess>]
+module internal LeaseStanding =
+
+    let classify (held: int64) (target: FinalizeTarget option) : LeaseStanding =
+        match target with
+        | None -> Unknown
+        | Some target ->
+            let callerHolds = target.Holder = held
+
+            match target.Status with
+            | CommandStatus.Succeeded
+            | CommandStatus.Rejected
+            | CommandStatus.DeadLettered -> if callerHolds then FinishedByCaller else FinishedByAnother
+            | CommandStatus.Ready
+            | CommandStatus.Leased -> if callerHolds then HeldByCaller target else HeldByAnother
+
+/// <summary>
+/// The SQLite end of processing a command.
+///
+/// Every operation is one write transaction, and it follows <c>fsm.finalize_command</c> in the
+/// PostgreSQL store step for step: the transition, the snapshot, the queued actions, the result
+/// and the inbox row move together or not at all. Retrying after an ambiguous failure is safe,
+/// because a repeated call from the same lease is answered with what that lease already did:
+///
+/// <code>
+/// stored result | lease token | outcome
+/// none          | current     | finalized
+/// exists        | this one    | already_finalized
+/// exists        | another     | lease_lost
+/// none          | stale       | lease_lost
+/// </code>
+///
+/// Corrections and replay are not offered: this store keeps the current state rather than a
+/// bitemporal history, so there is no past to rewrite. The runtime sees the capability absent
+/// and dead-letters a correction, which still releases its entity.
+/// </summary>
+type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
+    (options: CommandProcessorOptions<'EntityId, 'State, 'Event, 'Action, 'Err>) =
+
+    let context = options.Context
+
+    let write work ct =
+        Db.protect
+            context.Resilience
+            (fun token -> Db.writeTransaction context.ConnectionString context.Clock work token)
+            ct
+
+    let read work ct =
+        Db.query context.Resilience context.ReadConnectionString work ct
+
+    let encodeDraft
+        (draft: TransitionDraft<'EntityId, 'State, 'Event, 'Action>)
+        : Result<EncodedDraft<'EntityId, 'State, 'Event, 'Action>, StoreError> =
+        match
+            options.EventCodec.Encode draft.Event,
+            options.ActionCodec.Encode draft.Actions,
+            options.StateCodec.Encode draft.FromState,
+            options.StateCodec.Encode draft.ToState
+        with
+        | Ok event, Ok actions, Ok fromState, Ok toState ->
+            Ok
+                { Source = draft
+                  EventJson = event
+                  ActionsJson = actions
+                  FromJson = fromState
+                  ToJson = toState }
+        | Error error, _, _, _
+        | _, Error error, _, _
+        | _, _, Error error, _
+        | _, _, _, Error error -> Error(Db.toStoreError error)
+
+    /// <summary>
+    /// The failure column is a tagged envelope rather than the bare domain error, because the
+    /// cases have to be told apart on the way back out. A domain error is the application's own
+    /// value, encoded by its codec; a machine reason and a replay error are this library's.
+    /// </summary>
+    let encodeFailure (failure: CommandFailure<'Err>) : Result<string, StoreError> =
+        match failure with
+        | CommandFailure.Domain error ->
+            options.ErrorCodec.Encode error
+            |> Result.mapError Db.toStoreError
+            |> Result.map (fun encoded -> $"""{{"domain":%s{encoded}}}""")
+        | CommandFailure.Machine reason -> Ok $"""{{"machine":%s{JsonSerializer.Serialize reason}}}"""
+        | CommandFailure.Replay error -> Ok $"""{{"replay":%s{ReplayMapping.toJson error}}}"""
+
+    let readFailure (json: string) : Result<CommandFailure<'Err>, StoreError> =
+        // The column's CHECK has already proved this parses. What it has not proved is that the
+        // shape is one this version writes.
+        use document = JsonDocument.Parse json
+        let root = document.RootElement
+
+        match root.TryGetProperty "domain" with
+        | true, domain ->
+            domain.GetRawText()
+            |> options.ErrorCodec.Decode
+            |> Result.mapError Db.toStoreError
+            |> Result.map CommandFailure.Domain
+        | _ ->
+            match root.TryGetProperty "machine", root.TryGetProperty "replay" with
+            | (true, machine), _ when machine.ValueKind = JsonValueKind.String ->
+                Ok(CommandFailure.Machine(machine.GetString()))
+            | _, (true, replay) -> ReplayMapping.ofJson replay |> Result.map CommandFailure.Replay
+            | _ ->
+                Error(
+                    Db.decodeFailure (nameof CommandFailure) "a command error carried no domain, machine or replay tag"
+                )
+
+    /// The exited and entered paths, stored as JSON arrays of state ids.
+    let encodePath (states: StateId list) : string =
+        states |> List.map StateId.value |> JsonSerializer.Serialize
+
+    let decodePath (column: string) (json: string) : Result<StateId list, StoreError> =
+        try
+            match JsonSerializer.Deserialize<string array> json with
+            | null -> Error(Db.decodeFailure "StateId list" $"{column} was null")
+            | ids -> Ok(ids |> Array.map StateId.create |> List.ofArray)
+        with :? JsonException as error ->
+            Error(StoreError.Serialization("StateId list", error))
+
+    let toTransition
+        (row: main.fsm_transition)
+        : Result<CommittedTransition<'EntityId, 'State, 'Event, 'Action>, StoreError> =
+        let decode (codec: Codec<'T>) (json: string) =
+            codec.Decode json |> Result.mapError Db.toStoreError
+
+        result {
+            let! entityId =
+                row.entity_id
+                |> options.EntityIdDecode
+                |> Result.mapError (Db.decodeFailure "EntityId")
+
+            let! event = decode options.EventCodec row.event
+            let! actions = decode options.ActionCodec row.actions
+            let! fromState = decode options.StateCodec row.from_state
+            let! toState = decode options.StateCodec row.to_state
+            let! status = Db.instanceStatusFromString row.status
+            let! exited = decodePath "exited" row.exited
+            let! entered = decodePath "entered" row.entered
+
+            let! chartVersion =
+                int row.chart_version
+                |> ChartVersion.tryCreate
+                |> Result.mapError (Db.decodeFailure "ChartVersion")
+
+            return
+                { Draft =
+                    { MachineId = MachineId.create row.machine_id
+                      EntityId = entityId
+                      Event = event
+                      Actions = actions
+                      FromState = fromState
+                      ToState = toState
+                      HandledBy = StateId.create row.handled_by
+                      Exited = exited
+                      Entered = entered
+                      Status = status
+                      EffectiveAt = Instant.toDateTimeOffset row.effective_at }
+                  Epoch = Db.epochOf row.epoch
+                  CommandId = CommandId.ofInt64 row.command_id
+                  ChartVersion = chartVersion
+                  CommittedAt = Instant.toDateTimeOffset row.committed_at }
+        }
+
+    let toSnapshot (row: main.fsm_entity_snapshot) : Result<Snapshot<'State>, StoreError> =
+        result {
+            let! state = options.StateCodec.Decode row.state |> Result.mapError Db.toStoreError
+            let! status = Db.instanceStatusFromString row.status
+
+            return
+                { State = state
+                  Epoch = Db.epochOf row.epoch
+                  Status = status }
+        }
+
+    let toResult
+        (command: main.fsm_command, transition: main.fsm_transition option, error: main.fsm_command_error option)
+        : Result<CommandResult<'EntityId, 'State, 'Event, 'Action, 'Err>, StoreError> =
+        let failure () =
+            match error with
+            | Some error -> readFailure error.error
+            | None -> Error(Db.decodeFailure (nameof CommandResult) "a failed command has no recorded error")
+
+        CommandMapping.statusFromString command.status
+        |> Result.bind (fun status ->
+            match status, transition with
+            | CommandStatus.Ready, _
+            | CommandStatus.Leased, _ -> Ok CommandResult.Pending
+            | CommandStatus.Succeeded, Some transition -> toTransition transition |> Result.map CommandResult.Committed
+            | CommandStatus.Succeeded, None ->
+                Error(Db.decodeFailure (nameof CommandResult) "a succeeded command has no transition")
+            | CommandStatus.Rejected, _ -> failure () |> Result.map CommandResult.Rejected
+            | CommandStatus.DeadLettered, _ -> failure () |> Result.map CommandResult.DeadLettered)
+
+    /// The entity's current epoch: the initial one when it has never committed.
+    let currentEpochIn conn transaction (target: FinalizeTarget) ct : Task<Epoch> =
+        Statement.tryOne
+            conn
+            transaction
+            (SqlResources.get "command" "current_epoch")
+            [ "@machine_id", box target.Machine; "@entity_id", box target.Entity ]
+            (fun reader -> Row.int64 reader "epoch" |> Db.epochOf)
+            ct
+        |> Task.map (Option.defaultValue Epoch.initial)
+
+    /// <summary>
+    /// A commit's writes, in order: the transition, then the snapshot, then the queued actions.
+    /// The transition goes first so a snapshot that cannot be written leaves no transition
+    /// claiming it did, and the actions share the transaction, which is the whole outbox.
+    /// </summary>
+    let appendIn
+        conn
+        transaction
+        (now: int64)
+        (commandId: int64)
+        (target: FinalizeTarget)
+        (epoch: Epoch)
+        (encoded: EncodedDraft<'EntityId, 'State, 'Event, 'Action>)
+        (ct: CancellationToken)
+        : Task<unit> =
+        backgroundTask {
+            let draft = encoded.Source
+
+            let entity = [ "@machine_id", box target.Machine; "@entity_id", box target.Entity ]
+
+            let written =
+                entity
+                @ [ "@command_id", box commandId
+                    "@epoch", box (int64 (Epoch.value epoch))
+                    "@chart_version", box target.Version
+                    "@status", box (Db.instanceStatusToString draft.Status)
+                    "@effective_at", box (Instant.ofDateTimeOffset draft.EffectiveAt)
+                    "@now", box now ]
+
+            let! _ =
+                Statement.execute
+                    conn
+                    transaction
+                    (SqlResources.get "command" "insert_transition")
+                    (written
+                     @ [ "@event", box encoded.EventJson
+                         "@actions", box encoded.ActionsJson
+                         "@from_state", box encoded.FromJson
+                         "@to_state", box encoded.ToJson
+                         "@handled_by", box (StateId.value draft.HandledBy)
+                         "@exited", box (encodePath draft.Exited)
+                         "@entered", box (encodePath draft.Entered) ])
+                    ct
+
+            let! _ =
+                Statement.execute
+                    conn
+                    transaction
+                    (SqlResources.get "command" "upsert_snapshot")
+                    (written @ [ "@state", box encoded.ToJson ])
+                    ct
+
+            let! _ =
+                Statement.execute
+                    conn
+                    transaction
+                    (SqlResources.get "action" "enqueue")
+                    (entity
+                     @ [ "@command_id", box commandId
+                         "@epoch", box (int64 (Epoch.value epoch))
+                         "@actions", box encoded.ActionsJson
+                         "@now", box now ])
+                    ct
+
+            return ()
+        }
+
+    /// The encoded failure of a rejected or dead-lettered command.
+    let recordErrorIn conn transaction (now: int64) (commandId: int64) (error: string) ct : Task<unit> =
+        Statement.execute
+            conn
+            transaction
+            (SqlResources.get "command" "insert_error")
+            [ "@command_id", box commandId; "@error", box error; "@now", box now ]
+            ct
+        |> Task.ignore
+
+    /// <summary>
+    /// Closes the command at its terminal status and promotes the entity's next command to head.
+    /// Promotion runs after the close, so the command just finished is no longer open and cannot
+    /// be re-elected.
+    /// </summary>
+    let closeIn
+        conn
+        transaction
+        (commandId: int64)
+        (target: FinalizeTarget)
+        (resolution: Resolution<'EntityId, 'State, 'Event, 'Action>)
+        ct
+        : Task<unit> =
+        backgroundTask {
+            let! _ =
+                Statement.execute
+                    conn
+                    transaction
+                    (SqlResources.get "command" "close")
+                    [ "@command_id", box commandId; "@status", box (Resolution.status resolution) ]
+                    ct
+
+            let! _ =
+                Statement.execute
+                    conn
+                    transaction
+                    (SqlResources.get "command" "promote_head")
+                    [ "@machine_id", box target.Machine; "@entity_id", box target.Entity ]
+                    ct
+
+            return ()
+        }
+
+    /// <summary>
+    /// The writes of a finalize the caller holds the lease for.
+    ///
+    /// The epoch check guards the state write, so only a commit makes it. It is a backstop rather
+    /// than the mechanism: the head invariant already stops a second command for this entity
+    /// being processed while this one is leased. What it catches is a writer outside that path.
+    /// </summary>
+    let resolveIn conn transaction (now: int64) (commandId: int64) (target: FinalizeTarget) resolution ct =
+        backgroundTask {
+            match resolution with
+            | Commit(expected, encoded) ->
+                let! current = currentEpochIn conn transaction target ct
+
+                if current <> expected then
+                    return Conflict(expected, current)
+                else
+                    let committed = Epoch.next expected
+                    do! appendIn conn transaction now commandId target committed encoded ct
+                    do! closeIn conn transaction commandId target resolution ct
+                    return Finalized committed
+            | Reject error
+            | DeadLetter error ->
+                do! recordErrorIn conn transaction now commandId error ct
+                do! closeIn conn transaction commandId target resolution ct
+                return Finalized(Resolution.unmoved resolution)
+        }
+
+    /// <summary>
+    /// One finalize: read where the caller stands, then write only if it holds the lease. Every
+    /// answer other than a missing command is an outcome rather than an error, so the transaction
+    /// commits whether or not it wrote anything.
+    /// </summary>
+    let finalize
+        (commandId: CommandId)
+        (token: LeaseToken<CommandWork>)
+        (resolution: Resolution<'EntityId, 'State, 'Event, 'Action>)
+        (ct: CancellationToken)
+        : Task<Result<FinalizeOutcome, StoreError>> =
+        let id = CommandId.value commandId
+
+        write
+            (fun conn transaction now cancel ->
+                backgroundTask {
+                    let! target =
+                        Statement.tryOne
+                            conn
+                            transaction
+                            (SqlResources.get "command" "finalize_read")
+                            [ "@command_id", box id ]
+                            (fun reader ->
+                                Row.string reader "status"
+                                |> CommandMapping.statusFromString
+                                |> Result.map (fun status ->
+                                    { Machine = Row.string reader "machine_id"
+                                      Entity = Row.string reader "entity_id"
+                                      Status = status
+                                      Holder = Row.int64 reader "lease_token"
+                                      Version = Row.int64 reader "chart_version" }))
+                            cancel
+
+                    match Option.sequenceResult target with
+                    | Error error -> return Error error
+                    | Ok target ->
+                        match LeaseStanding.classify (LeaseToken.value token) target with
+                        | Unknown -> return Error(StoreError.NotFound $"command %d{id}")
+                        | FinishedByCaller ->
+                            let! committed =
+                                Statement.tryOne
+                                    conn
+                                    transaction
+                                    (SqlResources.get "command" "committed_epoch")
+                                    [ "@command_id", box id ]
+                                    (fun reader -> Row.int64 reader "epoch" |> Db.epochOf)
+                                    cancel
+
+                            return
+                                Ok(AlreadyFinalized(committed |> Option.defaultValue (Resolution.unmoved resolution)))
+                        | FinishedByAnother
+                        | HeldByAnother -> return Ok FinalizeOutcome.LeaseLost
+                        | HeldByCaller target ->
+                            let! outcome = resolveIn conn transaction now id target resolution cancel
+                            return Ok outcome
+                })
+            ct
+
+    let fail (resolve: string -> Resolution<'EntityId, 'State, 'Event, 'Action>) commandId token failure ct =
+        match encodeFailure failure with
+        | Error error -> Task.FromResult(Error error)
+        | Ok encoded -> finalize commandId token (resolve encoded) ct
+
+    interface IStateReader<'EntityId, 'State, 'Event, 'Action> with
+
+        member _.TryGetSnapshot(machineId, entityId, ct) =
+            let machine = MachineId.value machineId
+            let entity = options.EntityIdEncode entityId
+
+            read
+                (fun query token ->
+                    selectTask query {
+                        for s in main.fsm_entity_snapshot do
+                            where (s.machine_id = machine && s.entity_id = entity)
+                            select s
+                            tryHead
+                            cancel token
+                    }
+                    |> Task.map (Option.traverseResult toSnapshot))
+                ct
+
+        member _.History(machineId, entityId, paging, ct) =
+            let machine = MachineId.value machineId
+            let entity = options.EntityIdEncode entityId
+
+            // An absent cursor is zero, which transition_epoch_positive makes smaller than any
+            // stored epoch, so one query shape serves every page.
+            let after =
+                Page.cursor paging
+                |> Option.map (Epoch.value >> int64)
+                |> Option.defaultValue 0L
+
+            let limit = Page.limit paging
+
+            read
+                (fun query token ->
+                    selectTask query {
+                        for t in main.fsm_transition do
+                            where (t.machine_id = machine && t.entity_id = entity && t.epoch > after)
+                            orderBy t.epoch
+                            take limit
+                            select t
+                            toList
+                            cancel token
+                    }
+                    |> Task.map (List.traverseResultM toTransition))
+                ct
+
+    interface ICommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err> with
+
+        member _.Commit(commandId, token, expected, draft, ct) =
+            match encodeDraft draft with
+            | Error error -> Task.FromResult(Error error)
+            | Ok encoded -> finalize commandId token (Commit(expected, encoded)) ct
+
+        member _.Reject(commandId, token, error, ct) = fail Reject commandId token error ct
+
+        member _.DeadLetter(commandId, token, error, ct) =
+            fail DeadLetter commandId token error ct
+
+        member _.TryGetResult(commandId, ct) =
+            let id = CommandId.value commandId
+
+            read
+                (fun query token ->
+                    selectTask query {
+                        for c in main.fsm_command do
+                            leftJoin t in main.fsm_transition on (c.command_id = t.Value.command_id)
+                            leftJoin e in main.fsm_command_error on (c.command_id = e.Value.command_id)
+                            where (c.command_id = id)
+                            select (c, t, e)
+                            tryHead
+                            cancel token
+                    }
+                    |> Task.map (Option.traverseResult toResult))
+                ct

@@ -1,0 +1,33 @@
+# Types for the rows the SQLite store reads, generated from the migrated schema.
+#
+#   make schema-generate-sqlite   regenerate after a migration changes one of these
+#   make schema-check-sqlite      fail when the committed file and the schema disagree
+#
+# Both targets migrate a scratch database from nothing first, so the generated file follows the
+# migrations and never a developer's local data. Only reads are generated: every write is an
+# embedded statement under sql/, run inside one write transaction.
+[general]
+connection = "Data Source=out/sqlhydra/schema.db;Mode=ReadOnly"
+output = "Schema.Generated.fs"
+namespace = "ByzantineSystems.Automata.Storage.Sqlite.Schema"
+cli_mutable = false
+
+[sqlhydra_query_integration]
+provider_db_type_attributes = true
+table_declarations = true
+left_joined_views = false
+
+# SQLite has one schema per attached database, and this one is main. The counter and DbUp's
+# journal are left out: nothing reads them through a typed query.
+[filters]
+include = [
+  "main/fsm_command",
+  "main/fsm_command_error",
+  "main/fsm_command_correction",
+  "main/fsm_entity_snapshot",
+  "main/fsm_transition",
+  "main/fsm_action",
+  "main/fsm_action_dead_letter",
+  "main/fsm_machine_chart_version"
+]
+exclude = [ "main/sqlite_sequence", "main/SchemaVersions", "main/fsm_counter" ]

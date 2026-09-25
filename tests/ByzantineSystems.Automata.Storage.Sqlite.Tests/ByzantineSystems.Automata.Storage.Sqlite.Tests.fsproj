@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <IsPackable>false</IsPackable>
+        <IsTestProject>true</IsTestProject>
+        <GenerateProgramFile>false</GenerateProgramFile>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <Compile Include="TestContext.fs" />
+        <Compile Include="SqlResourceTests.fs" />
+        <Compile Include="DbTests.fs" />
+        <Compile Include="MigrationTests.fs" />
+        <Compile Include="SchemaContractTests.fs" />
+        <Compile Include="CommandInboxTests.fs" />
+        <Compile Include="FinalizeTests.fs" />
+        <Compile Include="ActionQueueTests.fs" />
+        <Compile Include="HistoryTests.fs" />
+        <Compile Include="ChartRegistryTests.fs" />
+        <Compile Include="BootTests.fs" />
+        <Compile Include="ProcessorIntegrationTests.fs" />
+        <Compile Include="CrossProcessTests.fs" />
+        <Compile Include="Program.fs" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <PackageReference Include="Expecto" />
+        <PackageReference Include="Microsoft.NET.Test.Sdk" PrivateAssets="all" />
+        <PackageReference Include="YoloDev.Expecto.TestSdk" PrivateAssets="all" />
+        <PackageReference Include="coverlet.msbuild" PrivateAssets="all" />
+        <!-- Microsoft.Data.Sqlite arrives through the store. An embedded database needs no
+             service, so this suite runs everywhere the unit suites do. -->
+        <ProjectReference Include="..\..\src\ByzantineSystems.Automata.Storage.Sqlite\ByzantineSystems.Automata.Storage.Sqlite.fsproj" />
+        <!-- The processor runs end to end over the store here, as it does in the PostgreSQL suite. -->
+        <ProjectReference Include="..\..\src\ByzantineSystems.Automata.Runtime\ByzantineSystems.Automata.Runtime.fsproj" />
+    </ItemGroup>
+
+</Project>
