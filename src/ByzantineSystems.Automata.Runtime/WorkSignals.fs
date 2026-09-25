@@ -10,6 +10,11 @@ open System.Threading.Tasks
 /// truth; this channel only nudges a polling worker. <c>TrySignal</c> never blocks and
 /// silently coalesces when a hint is already pending, so a committed send can never stall
 /// waiting for signal capacity.
+///
+/// Hints are an optimisation and nothing more. They travel no further than this process, so a
+/// command submitted by one host is found by another host's polling interval and not by a
+/// signal. Losing every hint costs latency and never a command, which is what lets the whole
+/// mechanism stay this careless about delivery.
 /// </summary>
 type WorkSignal() =
 
@@ -43,25 +48,28 @@ type WorkSignal() =
     /// <summary>Waits for a hint, signal completion, or the polling interval.</summary>
     member this.WaitOrTimeoutAsync(interval: TimeSpan, timeProvider: TimeProvider, ct: CancellationToken) : Task<bool> =
         task {
-            use waitCancellation = CancellationTokenSource.CreateLinkedTokenSource(ct)
-            let signalWait = this.WaitAsync(waitCancellation.Token)
-            let timerWait = Task.Delay(interval, timeProvider, waitCancellation.Token)
-            let! _ = Task.WhenAny(signalWait :> Task, timerWait)
+            use waiting = CancellationTokenSource.CreateLinkedTokenSource(ct)
+            let hint = this.WaitAsync(waiting.Token)
+            let elapsed = Task.Delay(interval, timeProvider, waiting.Token)
+            let! first = Task.WhenAny(hint :> Task, elapsed)
 
-            waitCancellation.Cancel()
-
-            let! signalOutcome = signalWait |> TaskOutcome.capture
-            let! timerOutcome = timerWait |> TaskOutcome.captureUnit
-
+            // Whichever lost is cancelled, then awaited through a continuation that discards its
+            // outcome. Awaiting it directly would surface the cancellation this line just caused;
+            // leaving it unawaited would leave a task nobody ever observes.
+            waiting.Cancel()
             ct.ThrowIfCancellationRequested()
 
-            match signalOutcome, timerOutcome with
-            | Ok signalOpen, Ok()
-            | Ok signalOpen, Error(CanceledBy waitCancellation.Token) -> return signalOpen
-            | Error(CanceledBy waitCancellation.Token), Ok()
-            | Error(CanceledBy waitCancellation.Token), Error(CanceledBy waitCancellation.Token) -> return true
-            | Error error, _
-            | _, Error error -> return raise error
+            let discard (task: Task) =
+                task.ContinueWith((fun (_: Task) -> ()), TaskScheduler.Default)
+
+            if Object.ReferenceEquals(first, hint) then
+                do! discard elapsed
+                // Awaited rather than captured, so a genuine fault arrives with its own stack
+                // trace rather than one stamped here.
+                return! hint
+            else
+                do! discard hint
+                return true
         }
 
     /// <summary>Completes the channel so pending waiters finish; idempotent.</summary>

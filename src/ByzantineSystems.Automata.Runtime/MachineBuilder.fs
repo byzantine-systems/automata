@@ -1,286 +1,266 @@
 namespace ByzantineSystems.Automata.Runtime
 
 open System
-open System.Threading
-open System.Threading.Tasks
+open Microsoft.Extensions.Logging
+open Microsoft.Extensions.Logging.Abstractions
 open ByzantineSystems.Automata.Core
-open ByzantineSystems.Automata.Resilience
 open ByzantineSystems.Automata.Storage
-open Polly
 
-/// <summary>One statement inside a <c>machine { ... }</c> block.</summary>
-type MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err> =
+/// <summary>One declaration inside a <c>machine</c> expression.</summary>
+type MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: equality> =
     | MachineChart of Chart<'State, 'Event, 'Action, 'Err>
+    | MachineChartVersion of ChartVersion
+    | MachineChartCatalog of ChartCatalog<'State, 'Event, 'Action, 'Err>
     | MachineInitial of 'State
-    | MachineStore of IMachineStore<'EntityId, 'State, 'Event, 'Action>
-    | MachineRetry of RetryConfig<'Err>
-    | MachinePipeline of ResiliencePipeline<PipelineResult<'Err>> * (MachineError<'Err> -> Disposition)
-    | MachineRetryPolicy of RetryPolicy
-    | MachineObserver of TransitionObserver<'EntityId, 'State, 'Event, 'Action>
-    | MachineMailboxCapacity of int
-    | MachineIdleTimeout of TimeSpan
+    | MachineStore of IMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
+    | MachineProcessor of ProcessorPolicy<'Err>
+    | MachineObserver of TransitionObserver<'EntityId, 'State, 'Event, 'Action> * capacity: int
+    | MachineLogger of ILogger
     | MachineTimeProvider of TimeProvider
 
-/// <summary>
-/// The two deliberate ways a machine receives short-horizon resilience. Named cases keep
-/// validation and construction explicit; the generic <c>Choice</c> type conveyed neither
-/// why the alternatives exist nor what selecting one means.
-/// </summary>
-type private RetrySource<'Err> =
-    | RetryConfiguration of RetryConfig<'Err>
-    | PrebuiltPipeline of ResiliencePipeline<PipelineResult<'Err>> * (MachineError<'Err> -> Disposition)
-
-/// <summary>Shared assembly step behind the builder: accumulate defects, then construct.</summary>
 module private MachineBuild =
 
-    let private duplicateErrors parts =
-        let declaration =
-            function
-            | MachineChart _ -> MachineDeclaration.Chart
-            | MachineInitial _ -> MachineDeclaration.Initial
-            | MachineStore _ -> MachineDeclaration.Store
-            | MachineRetry _ -> MachineDeclaration.Retry
-            | MachinePipeline _ -> MachineDeclaration.Retry
-            | MachineRetryPolicy _ -> MachineDeclaration.RetryPolicy
-            | MachineObserver _ -> MachineDeclaration.Observer
-            | MachineMailboxCapacity _ -> MachineDeclaration.MailboxCapacity
-            | MachineIdleTimeout _ -> MachineDeclaration.IdleTimeout
-            | MachineTimeProvider _ -> MachineDeclaration.TimeProvider
+    /// Default: one observation channel deep enough to absorb a batch without dropping.
+    let defaultObserverCapacity = 256
 
-        parts
-        |> List.countBy declaration
-        |> List.choose (fun (name, count) ->
-            if count > 1 then
-                Some(MachineConfigError.DuplicateDeclaration name)
-            else
-                None)
+    /// Provisional, and documented as such on Machine.send. The real answer is a notification
+    /// from the database, which lands with the maintenance work.
+    let defaultResultPollInterval = TimeSpan.FromMilliseconds 50.
 
-    let internal build
+    /// Which declaration a part is, so repeats can be counted without knowing what they carry.
+    let private declarationOf part =
+        match part with
+        | MachineChart _ -> MachineDeclaration.Chart
+        | MachineChartVersion _ -> MachineDeclaration.ChartVersion
+        | MachineChartCatalog _ -> MachineDeclaration.ChartCatalog
+        | MachineInitial _ -> MachineDeclaration.Initial
+        | MachineStore _ -> MachineDeclaration.Store
+        | MachineProcessor _ -> MachineDeclaration.Processor
+        | MachineObserver _ -> MachineDeclaration.Observer
+        | MachineLogger _ -> MachineDeclaration.Logger
+        | MachineTimeProvider _ -> MachineDeclaration.TimeProvider
+
+    /// Collects every defect rather than stopping at the first, because a half-configured
+    /// machine usually has more than one thing wrong with it and reporting them one build at a
+    /// time is a poor way to find out.
+    let build
         (machineId: MachineId)
         (parts: MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err> list)
         : Result<Machine<'EntityId, 'State, 'Event, 'Action, 'Err>, MachineConfigError list> =
+
+        // Every declaration is single-valued, so a repeat is a defect regardless of which one it
+        // is. Counting says that once, rather than nine near-identical times.
+        let duplicates =
+            parts
+            |> List.countBy declarationOf
+            |> List.filter (fun (_, count) -> count > 1)
+            |> List.map (fst >> DuplicateDeclaration)
+
         let chart =
             parts
             |> List.tryPick (function
-                | MachineChart c -> Some c
+                | MachineChart chart -> Some chart
                 | _ -> None)
+
+        let version =
+            parts
+            |> List.tryPick (function
+                | MachineChartVersion version -> Some version
+                | _ -> None)
+
+        let catalog =
+            parts
+            |> List.tryPick (function
+                | MachineChartCatalog catalog -> Some catalog
+                | _ -> None)
+            |> Option.defaultValue ChartCatalog.empty
+
+        let catalogErrors =
+            match version with
+            | Some version when ChartCatalog.tryFind version catalog |> Option.isSome ->
+                [ CatalogRedeclaresCurrentVersion version ]
+            | _ -> []
 
         let initial =
             parts
             |> List.tryPick (function
-                | MachineInitial s -> Some s
+                | MachineInitial state -> Some state
                 | _ -> None)
 
         let store =
             parts
             |> List.tryPick (function
-                | MachineStore s -> Some s
+                | MachineStore store -> Some store
                 | _ -> None)
 
-        let retry =
+        let processor =
             parts
             |> List.tryPick (function
-                | MachineRetry config -> Some(RetryConfiguration config)
-                | MachinePipeline(pipeline, classify) -> Some(PrebuiltPipeline(pipeline, classify))
+                | MachineProcessor policy -> Some policy
                 | _ -> None)
-
-        let retryPolicy =
-            parts
-            |> List.tryPick (function
-                | MachineRetryPolicy p -> Some p
-                | _ -> None)
-            |> Option.defaultValue RetryPolicy.defaults
 
         let observer =
             parts
             |> List.tryPick (function
-                | MachineObserver o -> Some o
+                | MachineObserver(observer, capacity) -> Some(observer, capacity)
                 | _ -> None)
 
-        let mailboxCapacity =
+        let logger =
             parts
             |> List.tryPick (function
-                | MachineMailboxCapacity n -> Some n
+                | MachineLogger logger -> Some logger
                 | _ -> None)
-            |> Option.defaultValue 1024
-
-        let idleTimeout =
-            parts
-            |> List.tryPick (function
-                | MachineIdleTimeout t -> Some t
-                | _ -> None)
-            |> Option.defaultValue (TimeSpan.FromMinutes 5.)
 
         let timeProvider =
             parts
             |> List.tryPick (function
-                | MachineTimeProvider tp -> Some tp
+                | MachineTimeProvider provider -> Some provider
                 | _ -> None)
-            |> Option.defaultValue TimeProvider.System
 
-        let missingErrors =
-            [ if chart.IsNone then
-                  MachineConfigError.MissingChart
+        let missing =
+            [ if Option.isNone chart then
+                  MissingChart
 
-              if initial.IsNone then
-                  MachineConfigError.MissingInitialState
+              if Option.isNone version then
+                  MissingChartVersion
 
-              if store.IsNone then
-                  MachineConfigError.MissingStore
+              if Option.isNone initial then
+                  MissingInitialState
 
-              if retry.IsNone then
-                  MachineConfigError.MissingRetry
+              if Option.isNone store then
+                  MissingStore ]
 
-              if mailboxCapacity < 1 then
-                  MachineConfigError.MailboxCapacityBelowOne mailboxCapacity
+        let policy = processor |> Option.defaultValue ProcessorPolicy.defaults
 
-              if idleTimeout <= TimeSpan.Zero then
-                  MachineConfigError.IdleTimeoutNotPositive idleTimeout ]
+        let policyErrors =
+            match ProcessorPolicy.validate policy with
+            | Ok _ -> []
+            | Error errors -> [ InvalidProcessorPolicy errors ]
 
-        let initialErrors =
+        // The initial state has to classify to a declared leaf, or the machine's very first
+        // command resolves against a state the chart does not contain. Resolution starts and
+        // finishes only at a leaf, so a compound node is as wrong here as an undeclared one.
+        let initialStateErrors =
             match chart, initial with
-            | Some c, Some s ->
-                let leaf = Chart.classifyOf c s
+            | Some chart, Some initial ->
+                let leaf = Chart.classifyOf chart initial
 
-                match Chart.tryNode c leaf with
-                | Some _ when not (Chart.isCompound c leaf) -> []
-                | _ -> [ MachineConfigError.InitialStateUnknown leaf ]
+                let declaredLeaf =
+                    Chart.tryNode chart leaf |> Option.isSome
+                    && Chart.children chart leaf |> List.isEmpty
+
+                if declaredLeaf then [] else [ InitialStateUnknown leaf ]
             | _ -> []
 
-        let retryErrors =
-            match retry with
-            | Some(RetryConfiguration r) ->
-                match RetryConfig.validate r with
-                | Ok _ -> []
-                | Error errors -> [ MachineConfigError.InvalidRetry errors ]
-            | Some(PrebuiltPipeline _) -> []
-            | None -> []
+        match duplicates @ missing @ policyErrors @ initialStateErrors @ catalogErrors with
+        | [] ->
+            match chart, version, initial, store, ProcessorPolicy.validate policy with
+            | Some chart, Some version, Some initial, Some store, Ok validatedPolicy ->
+                let config: RuntimeConfig<'EntityId, 'State, 'Event, 'Action, 'Err> =
+                    { MachineId = machineId
+                      Chart = chart
+                      ChartVersion = version
+                      Catalog = ChartCatalog.add version chart catalog
+                      InitialState = initial
+                      Store = store
+                      Processor = validatedPolicy
+                      Logger = logger |> Option.defaultValue (NullLogger.Instance :> ILogger)
+                      TimeProvider = timeProvider |> Option.defaultValue TimeProvider.System }
 
-        let validatedRetryPolicy, retryPolicyErrors =
-            match RetryPolicy.validate retryPolicy with
-            | Ok validated -> Some validated, []
-            | Error errors -> None, [ MachineConfigError.InvalidRetryPolicy errors ]
+                let observerBus =
+                    observer
+                    |> Option.map (fun (observer, capacity) -> ObserverDispatcher(observer, capacity))
 
-        let errors =
-            duplicateErrors parts
-            @ missingErrors
-            @ initialErrors
-            @ retryErrors
-            @ retryPolicyErrors
+                Ok(
+                    Machine(
+                        config,
+                        Completions(),
+                        observerBus,
+                        new WorkSignal(),
+                        new WorkSignal(),
+                        defaultResultPollInterval
+                    )
+                )
+            | _ ->
+                // Unreachable: the lists above are empty only when every required part is
+                // present. Reported rather than asserted, on the principle that a machine that
+                // refuses to build is better than one that builds wrong.
+                Error [ MissingStore ]
+        | errors -> Error errors
 
-        match errors, chart, initial, store, retry, validatedRetryPolicy with
-        | [], Some c, Some s, Some st, Some configuredRetry, Some policy ->
-            let pipeline, classify =
-                match configuredRetry with
-                | RetryConfiguration retry -> RetryConfig.toPipeline retry ignore, retry.Classify
-                | PrebuiltPipeline(pipeline, classify) -> pipeline, classify
-
-            let config =
-                { MachineId = machineId
-                  Chart = c
-                  InitialState = s
-                  Store = st :> IStateStore<'EntityId, 'State, 'Event, 'Action>
-                  RetryQueue = st :> IRetryQueue<'EntityId, 'Event>
-                  DeadLetter = st :> IDeadLetterStore<'EntityId, 'Event>
-                  Outbox = st :> IActionOutbox<'EntityId, 'Action>
-                  Pipeline = pipeline
-                  Classify = classify
-                  RetryPolicy = policy
-                  TimeProvider = timeProvider
-                  MailboxCapacity = mailboxCapacity
-                  IdleTimeout = idleTimeout }
-
-            let retrySignal = new WorkSignal()
-            let outboxSignal = new WorkSignal()
-
-            let observerBus =
-                observer |> Option.map (fun o -> ObserverDispatcher(o, mailboxCapacity))
-
-            let registry = Registry(config, observerBus, retrySignal, outboxSignal)
-            Ok(Machine(config, registry, observerBus, retrySignal, outboxSignal))
-        | _ -> Error errors
-
-/// <summary>
-/// Builder for <c>machine { ... }</c>, returning
-/// <c>Result&lt;Machine, MachineConfigError list&gt;</c>. Defects accumulate instead of
-/// throwing, and the shared resilience pipeline is built exactly once.
-/// </summary>
+/// <summary>The builder behind the <c>machine</c> expression.</summary>
 type MachineBuilder<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: equality>(machineId: MachineId) =
 
-    member _.Yield
-        (part: MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err>)
-        : MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err> list =
-        [ part ]
+    member _.Yield(_: unit) : MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err> list = []
 
-    member _.Yield(()) : MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err> list = []
     member _.Zero() : MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err> list = []
 
     member _.Combine
         (
-            a: MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err> list,
-            b: MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err> list
-        ) : MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err> list =
-        a @ b
+            left: MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err> list,
+            right: MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err> list
+        ) =
+        left @ right
 
-    member _.Delay
-        (f: unit -> MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err> list)
-        : MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err> list =
-        f ()
+    member _.Delay(f: unit -> MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err> list) = f ()
 
-    member _.Run
-        (parts: MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err> list)
-        : Result<Machine<'EntityId, 'State, 'Event, 'Action, 'Err>, MachineConfigError list> =
-        MachineBuild.build machineId parts
+    member _.Run(parts: MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err> list) = MachineBuild.build machineId parts
 
-/// <summary>Syntax surface for the <c>machine</c> computation expression.</summary>
+    [<CustomOperation "chart">]
+    member _.Chart(parts, chart: Chart<'State, 'Event, 'Action, 'Err>) = parts @ [ MachineChart chart ]
+
+    [<CustomOperation "chartVersion">]
+    member _.ChartVersion(parts, version: int) =
+        parts @ [ MachineChartVersion(ChartVersion.create version) ]
+
+    /// <summary>
+    /// Earlier charts, by the version they were declared with, so a correction can re-decide
+    /// events those versions decided. The current chart is always included.
+    /// </summary>
+    [<CustomOperation "chartCatalog">]
+    member _.ChartCatalog(parts, catalog: ChartCatalog<'State, 'Event, 'Action, 'Err>) =
+        parts @ [ MachineChartCatalog catalog ]
+
+    [<CustomOperation "initialState">]
+    member _.InitialState(parts, state: 'State) = parts @ [ MachineInitial state ]
+
+    [<CustomOperation "store">]
+    member _.Store(parts, store: IMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>) =
+        parts @ [ MachineStore store ]
+
+    [<CustomOperation "processor">]
+    member _.Processor(parts, policy: ProcessorPolicy<'Err>) = parts @ [ MachineProcessor policy ]
+
+    [<CustomOperation "onTransition">]
+    member _.OnTransition(parts, observer: TransitionObserver<'EntityId, 'State, 'Event, 'Action>) =
+        parts @ [ MachineObserver(observer, MachineBuild.defaultObserverCapacity) ]
+
+    [<CustomOperation "logger">]
+    member _.Logger(parts, logger: ILogger) = parts @ [ MachineLogger logger ]
+
+    [<CustomOperation "timeProvider">]
+    member _.TimeProvider(parts, provider: TimeProvider) =
+        parts @ [ MachineTimeProvider provider ]
+
+/// <summary>The <c>machine</c> computation expression.</summary>
 [<AutoOpen>]
 module MachineCE =
 
-    /// <summary>The machine builder value: <c>machine&lt;...&gt; (machineId "name") { ... }</c>.</summary>
+    /// <summary>
+    /// Declares one machine: a chart, the version commands pin to it, the state a new entity
+    /// starts from, and the durable store. The store owns the queue the machine's actions are
+    /// delivered through, so the queue is named once, where it is created.
+    /// </summary>
+    /// <example>
+    /// <code lang="fsharp">
+    /// let payments =
+    ///     machine&lt;PaymentId, PaymentState, PaymentEvent, PaymentAction, PaymentError&gt; (machineId "payments") {
+    ///         chart        paymentChart
+    ///         chartVersion 3
+    ///         initialState Pending
+    ///         store        postgresStore
+    ///     }
+    /// </code>
+    /// </example>
     let machine<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: equality> (id: MachineId) =
         MachineBuilder<'EntityId, 'State, 'Event, 'Action, 'Err>(id)
-
-    /// <summary>Declares the validated chart the machine runs.</summary>
-    let chart (chart: Chart<'State, 'Event, 'Action, 'Err>) : MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err> =
-        MachineChart chart
-
-    /// <summary>Declares the state a brand-new entity starts from.</summary>
-    let initialState (state: 'State) : MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err> = MachineInitial state
-
-    /// <summary>Declares the durable store backing state, retry, dead-letter, and outbox.</summary>
-    let store
-        (store: IMachineStore<'EntityId, 'State, 'Event, 'Action>)
-        : MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err> =
-        MachineStore store
-
-    /// <summary>Declares the short-horizon Polly resilience policy.</summary>
-    let retry (retry: RetryConfig<'Err>) : MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err> = MachineRetry retry
-
-    /// <summary>Uses a pre-built shared resilience pipeline, such as a keyed DI registration.</summary>
-    let resiliencePipeline
-        (pipeline: ResiliencePipeline<PipelineResult<'Err>>)
-        (classify: MachineError<'Err> -> Disposition)
-        : MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err> =
-        MachinePipeline(pipeline, classify)
-
-    /// <summary>Declares the durable retry-queue policy.</summary>
-    let retryPolicy (policy: RetryPolicy) : MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err> =
-        MachineRetryPolicy policy
-
-    /// <summary>Declares a best-effort, post-commit transition observer.</summary>
-    let onTransition
-        (observer: TransitionObserver<'EntityId, 'State, 'Event, 'Action>)
-        : MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err> =
-        MachineObserver observer
-
-    /// <summary>Declares the per-entity mailbox capacity.</summary>
-    let mailboxCapacity (capacity: int) : MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err> =
-        MachineMailboxCapacity capacity
-
-    /// <summary>Declares how long an actor may sit idle before eviction.</summary>
-    let idleTimeout (timeout: TimeSpan) : MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err> =
-        MachineIdleTimeout timeout
-
-    /// <summary>Declares the clock the runtime uses for leases and stamps.</summary>
-    let timeProvider (provider: TimeProvider) : MachinePart<'EntityId, 'State, 'Event, 'Action, 'Err> =
-        MachineTimeProvider provider

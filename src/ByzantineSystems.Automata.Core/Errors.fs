@@ -39,6 +39,21 @@ type StoreError =
     /// <summary>The referenced entity does not exist.</summary>
     | NotFound of entity: string
 
+/// <summary>Operations on <see cref="T:ByzantineSystems.Automata.Core.StoreError" />.</summary>
+[<RequireQualifiedAccess>]
+module StoreError =
+
+    /// <summary>
+    /// The case, never the payload, for a log line. A store error can carry a driver message,
+    /// and driver messages carry connection details.
+    /// </summary>
+    let caseName (error: StoreError) : string =
+        match error with
+        | Concurrency _ -> "concurrency"
+        | Serialization _ -> "serialization"
+        | Unavailable _ -> "unavailable"
+        | NotFound _ -> "not-found"
+
 /// <summary>
 /// A machine lifecycle state that prevents new work from being accepted. These are
 /// expected, caller-actionable outcomes, so the public API reports them as data rather

@@ -114,6 +114,11 @@
             projectFile = "examples/ByzantineSystems.Automata.Examples.Supervision/ByzantineSystems.Automata.Examples.Supervision.fsproj";
             executable = "ByzantineSystems.Automata.Examples.Supervision";
           };
+          hosted = mkExample {
+            pname = "byzantine-systems-automata-hosted";
+            projectFile = "examples/ByzantineSystems.Automata.Examples.Hosted/ByzantineSystems.Automata.Examples.Hosted.fsproj";
+            executable = "ByzantineSystems.Automata.Examples.Hosted";
+          };
         in
         {
           # This sets `pkgs` to a nixpkgs with allowUnfree option set.
@@ -124,14 +129,15 @@
 
           packages = {
             payment-processor = paymentProcessor;
-            inherit supervision;
+            inherit supervision hosted;
 
-            # `nix build` builds and exposes both example executables.
+            # `nix build` builds and exposes every example executable.
             default = pkgs.symlinkJoin {
               name = "${app_name}-examples-${version}";
               paths = [
                 paymentProcessor
                 supervision
+                hosted
               ];
             };
           };
@@ -164,6 +170,8 @@
               buildInputs = [
                 net10
                 pkgs.gnumake
+                # make schema-check formats the regenerated types before diffing them.
+                pkgs.fantomas
               ];
 
               shellHook = ''
@@ -187,7 +195,7 @@
             packages = with pkgs; [
               bash
               gnumake
-              postgresql_18
+              postgresql_19
 
               # for dotnet
               netcoredbg
@@ -202,9 +210,10 @@
 
             services.postgres = {
               enable = true;
-              package = pkgs.postgresql_18;
+              package = pkgs.postgresql_19;
               extensions = ext: [
                 ext.pg_cron
+                ext.pgmq
               ];
               initdbArgs = [
                 "--locale=C"

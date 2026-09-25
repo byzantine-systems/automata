@@ -42,8 +42,38 @@ jobs:
           purge-last-accessed: P1DT12H
           purge-primary-key: never
 
+      # devenv's own binary cache. Without it the shell is built from source on every cold runner.
+      - uses: cachix/cachix-action@v16
+        with:
+          name: devenv
+
+      # The integration suite is where ordering, fencing and atomicity are actually proven, so
+      # nothing is published without it. PostgreSQL comes from the devenv shell, exactly as in
+      # build.yml; see the comments there for --detached and for polling rather than sleeping.
+      - name: Start PostgreSQL
+        run: nix develop --impure --command devenv up --detached
+
+      - name: Wait for PostgreSQL
+        run: |
+          # shellcheck disable=SC2016 # the loop is expanded by the inner shell, not this one
+          nix develop --impure --command bash -c '
+            for attempt in $(seq 1 60); do
+              if pg_isready -h 127.0.0.1 -p 5432 -q; then
+                echo "ready after ${attempt}s"; exit 0
+              fi
+              sleep 1
+            done
+            echo "postgres did not become ready"; exit 1
+          '
+
+      - name: Check generated schema types
+        run: nix develop .#ci --impure -c make schema-check
+
       - name: Test before releasing
-        run: nix develop .#ci --impure -c make test
+        run: nix develop .#ci --impure -c make test test-integration
+        env:
+          AUTOMATA_TEST_DB: Host=127.0.0.1;Port=5432;Database=bs-automata;Username=bs-automata;Password=bs-automata
+          AUTOMATA_TEST_CRON_DB: Host=127.0.0.1;Port=5432;Database=bs-automata;Username=runner
       - name: Pack and smoke-test release
         run: nix develop .#ci --impure -c make package-smoke
       - name: Publish the packages to nuget.org

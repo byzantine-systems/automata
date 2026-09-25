@@ -1,5 +1,9 @@
 namespace ByzantineSystems.Automata.Core
 
+open System
+open System.Security.Cryptography
+open System.Text
+
 /// <summary>
 /// One node of a state chart. A node with children (some other node declares it as
 /// <c>Parent</c>) is compound and must declare <c>InitialChild</c>. Build nodes with the
@@ -30,6 +34,11 @@ type ChartError =
     | InvalidTerminal of StateId
     | MissingRoot
     | MissingClassify
+    /// <summary>
+    /// A goto rule on <paramref name="from" /> names a node the chart does not declare. Without
+    /// this the rule builds, and fails only when an event first reaches it.
+    /// </summary>
+    | UnknownGotoTarget of from: StateId * target: StateId
 
 /// <summary>
 /// A validated state chart: an invalid hierarchy cannot exist as a value. The private
@@ -152,6 +161,14 @@ module Chart =
             |> List.filter (fun n -> not (Set.contains n.Id seen))
             |> List.map (fun n -> ChartError.UnreachableState n.Id)
 
+        let unknownTargets =
+            nodes
+            |> List.collect (fun n ->
+                n.Rules
+                |> List.choose Rule.target
+                |> List.filter (fun target -> not (byId.ContainsKey target))
+                |> List.map (fun target -> ChartError.UnknownGotoTarget(n.Id, target)))
+
         let rootErrors =
             match byId.TryFind root with
             | None -> [ ChartError.MissingRoot ]
@@ -167,6 +184,7 @@ module Chart =
             @ invalidTerminal
             @ structure
             @ unreachable
+            @ unknownTargets
             @ rootErrors
 
         if errors.IsEmpty then
@@ -177,6 +195,84 @@ module Chart =
                   Children = children }
         else
             Result.Error errors
+
+    /// The canonicalisation this fingerprint scheme describes. It is hashed along with the chart,
+    /// so a future scheme cannot produce the same digest as this one for a different structure.
+    /// Bump it in the same commit that changes what is hashed below.
+    let private fingerprintScheme = "automata.chart.fingerprint/1"
+
+    /// Appends a length-prefixed field. Length prefixes rather than a delimiter with escaping:
+    /// the encoding stays injective without having to defend against a state id that happens to
+    /// contain whatever the delimiter is.
+    let private appendField (builder: StringBuilder) (value: string) =
+        builder.Append(value.Length).Append(':').Append(value) |> ignore
+
+    let rec private appendKind (builder: StringBuilder) (kind: RuleKind) =
+        match kind with
+        | RuleKind.Transition -> builder.Append 't' |> ignore
+        | RuleKind.Attempt -> builder.Append 'a' |> ignore
+        | RuleKind.Internal -> builder.Append 'i' |> ignore
+        | RuleKind.Goto target ->
+            builder.Append 'g' |> ignore
+            appendField builder (StateId.value target)
+        | RuleKind.Guarded(reason, inner) ->
+            builder.Append 'u' |> ignore
+            appendField builder reason
+            appendKind builder inner
+
+    /// <summary>
+    /// Hashes the chart's structure: the root, and for every node its id, parent, initial child,
+    /// terminal flag and the kind of each of its rules.
+    ///
+    /// Two things about the ordering carry the meaning. Nodes are sorted by id, because sibling
+    /// declaration order decides nothing at resolution time (the walk follows parent links, and
+    /// an initial child is named explicitly), so two spellings of one chart must agree. Rules are
+    /// left in declaration order, because first-match-wins makes their order part of what the
+    /// chart does.
+    ///
+    /// What is deliberately invisible: the classifier, every predicate and transform, and entry
+    /// and exit actions. All are closures. The builder has also already composed several
+    /// <c>onEntry</c> declarations into one function by the time a chart exists, so not even
+    /// their number survives. This is why the fingerprint is a tripwire against editing a chart
+    /// without bumping its version, and not a proof that two charts decide alike.
+    /// </summary>
+    let fingerprint (chart: Chart<'State, 'Event, 'Action, 'Err>) : ChartFingerprint =
+        let builder = StringBuilder()
+        builder.Append(fingerprintScheme).Append('\n').Append('r') |> ignore
+        appendField builder (StateId.value chart.Root)
+        builder.Append '\n' |> ignore
+
+        chart.Nodes
+        |> Map.toList
+        |> List.map snd
+        |> List.sortWith (fun left right -> String.CompareOrdinal(StateId.value left.Id, StateId.value right.Id))
+        |> List.iter (fun node ->
+            builder.Append 'n' |> ignore
+            appendField builder (StateId.value node.Id)
+
+            match node.Parent with
+            | Some parent ->
+                builder.Append 'p' |> ignore
+                appendField builder (StateId.value parent)
+            | None -> builder.Append '-' |> ignore
+
+            match node.InitialChild with
+            | Some child ->
+                builder.Append 'i' |> ignore
+                appendField builder (StateId.value child)
+            | None -> builder.Append '-' |> ignore
+
+            builder.Append(if node.Terminal then '1' else '0') |> ignore
+            builder.Append('k').Append(node.Rules.Length).Append(':') |> ignore
+            node.Rules |> List.iter (fun rule -> appendKind builder (Rule.kind rule))
+            builder.Append '\n' |> ignore)
+
+        // Hashed explicitly rather than through GetHashCode, which .NET randomises per process:
+        // two pods running one chart have to agree, and so does a value stored last week.
+        Encoding.UTF8.GetBytes(builder.ToString())
+        |> SHA256.HashData
+        |> Convert.ToHexStringLower
+        |> ChartFingerprint.create
 
     /// <summary>The chart's root node id.</summary>
     let root (chart: Chart<'State, 'Event, 'Action, 'Err>) : StateId = chart.Root

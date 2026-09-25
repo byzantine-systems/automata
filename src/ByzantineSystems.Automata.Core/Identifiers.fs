@@ -20,6 +20,18 @@ type MachineId = private MachineId of string
 [<Struct>]
 type EntityId<'entity> = private EntityId of string
 
+/// <summary>
+/// A hash of a chart's structure: the node graph, the terminal and initial-child markers, and
+/// the kind of every rule, in the order the rules were declared. Rendered as 64 lowercase hex
+/// digits.
+///
+/// This is a tripwire, not a proof of equivalence: guards, transforms, entry and exit actions and
+/// the classifier are closures, and nothing can see inside them. It catches a chart edited
+/// without a version bump; it cannot catch a behaviour change that leaves the structure alone.
+/// </summary>
+[<Struct>]
+type ChartFingerprint = private ChartFingerprint of string
+
 /// <summary>Operations on <see cref="T:ByzantineSystems.Automata.Core.StateId" />.</summary>
 [<RequireQualifiedAccess>]
 module StateId =
@@ -64,6 +76,31 @@ module EntityId =
 
     /// <summary>Returns the underlying string.</summary>
     let value (EntityId value) : string = value
+
+/// <summary>Operations on <see cref="T:ByzantineSystems.Automata.Core.ChartFingerprint" />.</summary>
+[<RequireQualifiedAccess>]
+module ChartFingerprint =
+
+    /// <summary>
+    /// Parses a fingerprint read back out of storage. Returns the reason rather than raising, so
+    /// a corrupt row becomes a typed serialization failure at the store boundary instead of an
+    /// exception escaping it.
+    /// </summary>
+    let tryCreate (value: string) : Result<ChartFingerprint, string> =
+        if value.Length = 64 && value |> Seq.forall Char.IsAsciiHexDigitLower then
+            Ok(ChartFingerprint value)
+        else
+            Error $"A chart fingerprint must be 64 lowercase hex digits, but was '%s{value}'."
+
+    /// <summary>Parses a fingerprint.</summary>
+    /// <exception cref="T:System.ArgumentException">The value is not a well-formed fingerprint.</exception>
+    let create (value: string) : ChartFingerprint =
+        match tryCreate value with
+        | Ok fingerprint -> fingerprint
+        | Error message -> invalidArg (nameof value) message
+
+    /// <summary>Returns the underlying digest text.</summary>
+    let value (ChartFingerprint value) : string = value
 
 /// <summary>Shorthand constructors used by the chart and machine computation expressions.</summary>
 [<AutoOpen>]

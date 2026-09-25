@@ -8,13 +8,13 @@
     </PropertyGroup>
 
     <ItemGroup>
-        <Compile Include="InMemoryStoreTests.fs" />
         <Compile Include="TestSupport.fs" />
-        <Compile Include="RuntimeRefactorTests.fs" />
-        <Compile Include="MachineOutcomeTests.fs" />
-        <Compile Include="ParallelismTests.fs" />
+        <Compile Include="DraftTests.fs" />
+        <Compile Include="DispositionTests.fs" />
+        <Compile Include="ProcessorTests.fs" />
+        <Compile Include="ReplayTests.fs" />
+        <Compile Include="MachineTests.fs" />
         <Compile Include="WorkSignalsTests.fs" />
-        <Compile Include="WorkerTests.fs" />
         <Compile Include="Program.fs" />
     </ItemGroup>
 
@@ -24,7 +24,6 @@
         <PackageReference Include="YoloDev.Expecto.TestSdk" PrivateAssets="all" />
         <PackageReference Include="coverlet.msbuild" PrivateAssets="all" />
         <ProjectReference Include="..\..\src\ByzantineSystems.Automata.Runtime\ByzantineSystems.Automata.Runtime.fsproj" />
-        <ProjectReference Include="..\..\src\ByzantineSystems.Automata.Storage.InMemory\ByzantineSystems.Automata.Storage.InMemory.fsproj" />
     </ItemGroup>
 
 </Project>

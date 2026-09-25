@@ -1,7 +1,5 @@
 namespace ByzantineSystems.Automata.Core
 
-open System
-
 /// <summary>
 /// Optimistic-concurrency token. Epochs are gapless per entity: a commit that advances the
 /// epoch must also append exactly one transition at that epoch, which makes the log both
@@ -50,38 +48,10 @@ type Snapshot<'State> =
       Epoch: Epoch
       Status: InstanceStatus }
 
-/// <summary>
-/// Proof of a committed (or already-applied) transition. A send that repeats an idempotency
-/// key receives the original receipt: the epoch did not advance and no duplicate work was
-/// created, which is how a lost response or a client retry is recognised after the fact.
-/// </summary>
-type CommitReceipt =
-    { IdempotencyKey: string
-      Epoch: Epoch
-      OccurredAt: DateTimeOffset }
-
-/// <summary>
-/// An applied transition: the append-only history entry for one event. Values exist only
-/// after a successful commit. The runtime stamps <c>OccurredAt</c> from the injected
-/// <c>TimeProvider</c>; nothing in this project reads the system clock.
-/// </summary>
-type Transition<'EntityId, 'State, 'Event, 'Action> =
-    {
-        MachineId: MachineId
-        EntityId: 'EntityId
-        IdempotencyKey: string
-        OccurredAt: DateTimeOffset
-        Epoch: Epoch
-        Event: 'Event
-        Actions: 'Action list
-        FromState: 'State
-        ToState: 'State
-        /// <summary>Lifecycle status of the instance after this transition; the store persists it with the snapshot.</summary>
-        Status: InstanceStatus
-        /// <summary>Which node in the chain actually handled the event (bubbling result).</summary>
-        HandledBy: StateId
-        /// <summary>States exited on the way to the least common ancestor, innermost first.</summary>
-        Exited: StateId list
-        /// <summary>States entered from the least common ancestor down to the target, outermost first.</summary>
-        Entered: StateId list
-    }
+// A committed transition is no longer declared here. It is the store's answer rather than
+// the runtime's, so it lives beside the contract that produces it:
+// `ByzantineSystems.Automata.Storage.TransitionDraft` is what pure resolution decides, and
+// `CommittedTransition` is that draft plus the epoch, command id, chart version and commit
+// instant that only the database can supply. `CommitReceipt` went with them: a receipt was a
+// proxy for "this command already happened", and `CommandResult` answers that question with
+// the outcome itself.

@@ -1,0 +1,368 @@
+module ByzantineSystems.Automata.Runtime.Tests.MachineTests
+
+open System
+open System.Threading
+open System.Threading.Tasks
+open ByzantineSystems.Automata.Core
+open ByzantineSystems.Automata.Storage
+open ByzantineSystems.Automata.Runtime
+open ByzantineSystems.Automata.Runtime.Tests.TestSupport
+open Expecto
+
+let private started (stub: StubStore<TestError>) =
+    task {
+        let built = buildMachine stub (newTime ()) id |> expectMachine
+        let! _ = Machine.startAsync built (StubRegistry()) CancellationToken.None
+        return built
+    }
+
+let configurationTests =
+    testList
+        "configuration"
+        [ test "a machine without a chart version does not build" {
+              let stub = StubStore<TestError>()
+
+              let result =
+                  machine<EntityId<TestEntity>, TestState, TestEvent, TestAction, TestError> testMachine {
+                      chart testChart
+                      initialState Idle
+                      store (stub :> IMachineStore<_, _, _, _, _>)
+                  }
+
+              match result with
+              | Error errors -> Expect.contains errors MissingChartVersion "the version has to be declared"
+              | Ok _ -> failtest "a machine without a declared chart version should not build"
+          }
+
+          test "every defect is reported, not just the first" {
+              let result =
+                  machine<EntityId<TestEntity>, TestState, TestEvent, TestAction, TestError> testMachine {
+                      chartVersion 1
+                      initialState Idle
+                  }
+
+              match result with
+              | Error errors ->
+                  Expect.contains errors MissingChart "the chart"
+                  Expect.contains errors MissingStore "the store"
+              | Ok _ -> failtest "an empty machine should not build"
+          }
+
+          test "a declaration made twice is a defect" {
+              let stub = StubStore<TestError>()
+
+              let result =
+                  machine<EntityId<TestEntity>, TestState, TestEvent, TestAction, TestError> testMachine {
+                      chart testChart
+                      chart testChart
+                      chartVersion 1
+                      initialState Idle
+                      store (stub :> IMachineStore<_, _, _, _, _>)
+                  }
+
+              match result with
+              | Error errors -> Expect.contains errors (DuplicateDeclaration MachineDeclaration.Chart) "declared twice"
+              | Ok _ -> failtest "a duplicate declaration should not build"
+          }
+
+          test "an invalid processor policy is reported with its own defects" {
+              let stub = StubStore<TestError>()
+
+              let result =
+                  machine<EntityId<TestEntity>, TestState, TestEvent, TestAction, TestError> testMachine {
+                      chart testChart
+                      chartVersion 1
+                      initialState Idle
+                      store (stub :> IMachineStore<_, _, _, _, _>)
+
+                      processor
+                          { ProcessorPolicy.defaults with
+                              RenewAfter = TimeSpan.FromSeconds 60.
+                              Lease = TimeSpan.FromSeconds 30. }
+                  }
+
+              match result with
+              | Error [ InvalidProcessorPolicy defects ] ->
+                  // Renewing after the lease has already lapsed protects nothing.
+                  Expect.contains
+                      defects
+                      (RenewAfterNotBelowLease(TimeSpan.FromSeconds 60., TimeSpan.FromSeconds 30.))
+                      "the renewal has to happen inside the lease"
+              | other -> failtestf "expected one policy defect, got %A" other
+          } ]
+
+let lifecycleTests =
+    testList
+        "lifecycle"
+        [ testTask "a machine that has not started refuses work" {
+              let stub = StubStore<TestError>()
+              let built = buildMachine stub (newTime ()) id |> expectMachine
+
+              match!
+                  Machine.enqueue built (entityId "E-1") (EventEnvelope.create "k1" (Start 1)) CancellationToken.None
+              with
+              | Error(MachineError.Rejected MachineRejection.NotStarted) -> ()
+              | other -> failtestf "expected a not-started rejection, got %A" other
+          }
+
+          testTask "a stopped machine refuses work" {
+              let stub = StubStore<TestError>()
+              let! built = started stub
+              do! Machine.stopAsync built CancellationToken.None
+
+              match!
+                  Machine.enqueue built (entityId "E-1") (EventEnvelope.create "k1" (Start 1)) CancellationToken.None
+              with
+              | Error(MachineError.Rejected _) -> ()
+              | other -> failtestf "expected a lifecycle rejection, got %A" other
+          }
+
+          testTask "starting twice is harmless" {
+              let stub = StubStore<TestError>()
+              let! built = started stub
+              let! _ = Machine.startAsync built (StubRegistry()) CancellationToken.None
+              ()
+          }
+
+          testTask "a fingerprint mismatch is reported rather than raised" {
+              // Whether a mismatch is fatal is the host's decision, so the store reports it and
+              // the host decides. Making it fatal at boot belongs with the maintenance work.
+              let stub = StubStore<TestError>()
+              let built = buildMachine stub (newTime ()) id |> expectMachine
+              let stored = Chart.fingerprint testChart
+
+              match!
+                  Machine.startAsync built (StubRegistry(ChartRegistration.Mismatched stored)) CancellationToken.None
+              with
+              | Ok(Startup.Started(ChartRegistration.Mismatched _)) -> ()
+              | other -> failtestf "expected a reported mismatch, got %A" other
+          } ]
+
+let submissionTests =
+    testList
+        "submission"
+        [ testTask "enqueue pins the machine's declared chart version" {
+              let stub = StubStore<TestError>()
+              let! built = started stub
+              Expect.equal (ChartVersion.create 1) (Machine.chartVersion built) "the declared version"
+          }
+
+          testTask "enqueue returns the submission outcome" {
+              let stub = StubStore<TestError>()
+              stub.SubmitOutcome <- Ok(Accepted(CommandId.ofInt64 42L))
+              let! built = started stub
+
+              match!
+                  Machine.enqueue built (entityId "E-1") (EventEnvelope.create "k1" (Start 1)) CancellationToken.None
+              with
+              | Ok(Accepted commandId) -> Expect.equal (CommandId.ofInt64 42L) commandId "the id the inbox assigned"
+              | other -> failtestf "expected an acceptance, got %A" other
+          }
+
+          testTask "a repeated idempotency key is success, carrying the original id" {
+              let stub = StubStore<TestError>()
+              stub.SubmitOutcome <- Ok(AlreadySubmitted(CommandId.ofInt64 7L))
+              let! built = started stub
+
+              match!
+                  Machine.enqueue built (entityId "E-1") (EventEnvelope.create "k1" (Start 1)) CancellationToken.None
+              with
+              | Ok(AlreadySubmitted commandId) -> Expect.equal (CommandId.ofInt64 7L) commandId "the original command"
+              | other -> failtestf "expected an already-submitted outcome, got %A" other
+          }
+
+          testTask "commandResult reads what became of a command without waiting" {
+              let stub = StubStore<TestError>()
+              stub.ResultOutcome <- Ok(Some CommandResult.Pending)
+              let! built = started stub
+
+              match! Machine.commandResult built (CommandId.ofInt64 1L) CancellationToken.None with
+              | Ok(Some CommandResult.Pending) -> ()
+              | other -> failtestf "expected a pending result, got %A" other
+          }
+
+          testTask "send returns once the store reports a durable outcome" {
+              let stub = StubStore<TestError>()
+              stub.SubmitOutcome <- Ok(Accepted(CommandId.ofInt64 3L))
+              stub.ResultOutcome <- Ok(Some(CommandResult.Rejected(CommandFailure.Machine "refused")))
+              let! built = started stub
+
+              match!
+                  Machine.send built (entityId "E-1") (EventEnvelope.create "k1" (Start 1)) CancellationToken.None
+              with
+              | Ok(CommandResult.Rejected(CommandFailure.Machine reason)) ->
+                  Expect.equal "refused" reason "the durable outcome, read back from the store"
+              | other -> failtestf "expected a rejection, got %A" other
+          }
+
+          testTask "an envelope carries its audit context to the inbox" {
+              let stub = StubStore<TestError>()
+              let! built = started stub
+
+              let envelope =
+                  EventEnvelope.create "k1" (Start 1)
+                  |> EventEnvelope.withCorrelation "trace-1"
+                  |> EventEnvelope.withCausation "cause-1"
+
+              Expect.equal (Some "trace-1") (EventEnvelope.correlationId envelope) "correlation survives"
+              Expect.equal (Some "cause-1") (EventEnvelope.causationId envelope) "causation survives"
+
+              match! Machine.enqueue built (entityId "E-1") envelope CancellationToken.None with
+              | Ok _ -> ()
+              | other -> failtestf "expected the submission to succeed, got %A" other
+          } ]
+
+
+let capabilityTests =
+    testList
+        "optional capabilities"
+        [ test "a store offering only the required four has no temporal capability" {
+              // A third-party store that skips a capability is still a complete provider,
+              // and the type system says so rather than a runtime error saying it later.
+              let built = buildMachine (StubStore<TestError>()) (newTime ()) id |> expectMachine
+
+              Expect.isNone (Machine.temporal built) "no reader"
+              Expect.isNone (Machine.corrections built) "no corrections"
+          }
+
+          test "a store offering them is discovered" {
+              let built =
+                  buildMachine (TemporalStubStore<TestError>()) (newTime ()) id |> expectMachine
+
+              Expect.isSome (Machine.temporal built) "the reader is found"
+              Expect.isSome (Machine.corrections built) "the corrections are found"
+          }
+
+          testTask "history is always available, because it is required rather than optional" {
+              let stub = StubStore<TestError>()
+
+              stub.Log <-
+                  [ { Draft =
+                        { MachineId = testMachine
+                          EntityId = entityId "E-1"
+                          Event = Start 1
+                          Actions = []
+                          FromState = Idle
+                          ToState = Active 1
+                          HandledBy = stateId "idle"
+                          Exited = []
+                          Entered = []
+                          Status = InstanceStatus.Running
+                          EffectiveAt = startTime }
+                      Epoch = Epoch.ofUInt64 1UL
+                      CommandId = CommandId.ofInt64 1L
+                      ChartVersion = ChartVersion.create 1
+                      CommittedAt = startTime } ]
+
+              let! built = started stub
+
+              match! Machine.history built (entityId "E-1") (Page.create 10) CancellationToken.None with
+              | Ok page -> Expect.equal 1 (List.length page) "the page the store returned"
+              | Error error -> failtestf "history should have succeeded, got %A" error
+          } ]
+
+/// Waits for a condition a background task will make true, failing rather than hanging.
+let private eventually (label: string) (condition: unit -> bool) =
+    task {
+        let deadline = DateTime.UtcNow.AddSeconds 5.
+
+        while not (condition ()) && DateTime.UtcNow < deadline do
+            do! Task.Delay 10
+
+        Expect.isTrue (condition ()) label
+    }
+
+let bootTests =
+    testList
+        "boot"
+        [ testTask "a store that refuses to boot starts nothing and registers nothing" {
+              let stub =
+                  BootingStubStore<TestError>(BootReport.Refused [ BootDefect.SchemaMissing ])
+
+              let registry = StubRegistry()
+              let built = buildMachine stub (newTime ()) id |> expectMachine
+
+              match! Machine.startAsync built registry CancellationToken.None with
+              | Ok(Startup.Refused [ BootDefect.SchemaMissing ]) -> ()
+              | other -> failtestf "expected the refusal to be reported, got %A" other
+
+              Expect.equal registry.Registrations 0 "a refused boot registers no chart"
+
+              match!
+                  Machine.enqueue built (entityId "E-1") (EventEnvelope.create "k1" (Start 1)) CancellationToken.None
+              with
+              | Error(MachineError.Rejected MachineRejection.NotStarted) -> ()
+              | other -> failtestf "a machine that never started should refuse work, got %A" other
+          }
+
+          testTask "a store without a boot check starts as before" {
+              // The optional-capability promise: a provider that implements only the required
+              // four is still a complete provider.
+              let registry = StubRegistry()
+              let built = buildMachine (StubStore<TestError>()) (newTime ()) id |> expectMachine
+
+              match! Machine.startAsync built registry CancellationToken.None with
+              | Ok(Startup.Started ChartRegistration.Registered) -> ()
+              | other -> failtestf "expected an ordinary start, got %A" other
+
+              Expect.equal registry.Registrations 1 "and the chart was registered"
+          } ]
+
+let listenerTests =
+    testList
+        "listener"
+        [ testTask "an announcement wakes the processor before its polling interval" {
+              let stub = NotifyingStubStore<TestError>(0)
+
+              // An interval no test would wait out, so only the announcement can explain a commit.
+              let built =
+                  buildMachine stub (newTime ()) (fun policy ->
+                      { policy with
+                          PollingInterval = TimeSpan.FromMinutes 10. })
+                  |> expectMachine
+
+              let! _ = Machine.startAsync built (StubRegistry()) CancellationToken.None
+              let stop = new CancellationTokenSource()
+              let running = (Machine.processor built).RunAsync stop.Token
+
+              do! eventually "the listener subscribed" (fun () -> stub.Listens = 1)
+              // Let the processor's first, empty poll finish and start waiting.
+              do! Task.Delay 100
+              stub.Offer(leasedCommand 1L "E-1" (Start 5) 0)
+              stub.Announce()
+
+              do! eventually "the command was processed" (fun () -> stub.Commits.Count = 1)
+
+              stop.Cancel()
+              let! _ = running
+              do! Machine.stopAsync built CancellationToken.None
+              stop.Dispose()
+          }
+
+          testTask "a listener that fails is started again and faults nothing" {
+              let stub = NotifyingStubStore<TestError>(2)
+
+              let built =
+                  buildMachine stub (newTime ()) (fun policy ->
+                      { policy with
+                          PollingInterval = TimeSpan.FromMilliseconds 10. })
+                  |> expectMachine
+
+              let! _ = Machine.startAsync built (StubRegistry()) CancellationToken.None
+
+              do! eventually "listened again after each failure" (fun () -> stub.Listens = 3)
+              Expect.isFalse built.Completion.IsCompleted "a lost listener costs latency, never the machine"
+
+              do! Machine.stopAsync built CancellationToken.None
+              Expect.isFalse built.Completion.IsFaulted "and it stops cleanly"
+          } ]
+
+let tests =
+    testList
+        "machine"
+        [ configurationTests
+          lifecycleTests
+          submissionTests
+          capabilityTests
+          bootTests
+          listenerTests ]

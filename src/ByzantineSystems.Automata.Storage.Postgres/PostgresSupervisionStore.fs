@@ -6,7 +6,10 @@ open System.Threading
 open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
+open ByzantineSystems.Automata.Storage.Postgres.Schema
+open FsToolkit.ErrorHandling
 open Npgsql
+open SqlHydra.Query
 
 [<RequireQualifiedAccess>]
 module private SupervisionMapping =
@@ -57,16 +60,18 @@ module private SupervisionMapping =
         reasonCodec.Decode json |> Result.mapError Db.toStoreError
 
 /// <summary>PostgreSQL append-only supervision audit writer backed by a pooled data source.</summary>
-type PostgresSupervisionStore(dataSource: NpgsqlDataSource) =
+type PostgresSupervisionStore(context: PostgresContext) =
+
+    let protect work ct = Db.protect context.Resilience work ct
 
     interface ISupervisionEventStore with
 
         member _.Record(record, ct) =
-            Db.protect
+            protect
                 (fun token ->
                     task {
-                        use! conn = dataSource.OpenConnectionAsync(token).AsTask()
-                        use cmd = new NpgsqlCommand(Sql.recordSupervisionEvent, conn)
+                        use! conn = context.DataSource.OpenConnectionAsync(token).AsTask()
+                        use cmd = new NpgsqlCommand(SqlResources.get "supervision" "record", conn)
 
                         cmd.Parameters.AddWithValue("supervisor", SupervisorName.value record.Supervisor)
                         |> ignore
@@ -95,48 +100,45 @@ module PostgresSupervisionQueries =
 
     /// <summary>Lists the newest audit facts first.</summary>
     let listRecent
-        (dataSource: NpgsqlDataSource)
+        (context: PostgresContext)
         (limit: int)
         (ct: CancellationToken)
         : Task<Result<SupervisionRecord list, StoreError>> =
         if limit < 1 then
             invalidArg (nameof limit) "The supervision query limit must be positive."
 
-        Db.protect
-            (fun token ->
-                task {
-                    use! conn = dataSource.OpenConnectionAsync(token).AsTask()
-                    use cmd = new NpgsqlCommand(Sql.listRecentSupervisionEvents, conn)
-                    cmd.Parameters.AddWithValue("limit", limit) |> ignore
-                    use! reader = cmd.ExecuteReaderAsync(token)
+        let toRecord (row: fsm.supervision_event) : Result<SupervisionRecord, StoreError> =
+            match
+                SupervisionMapping.kindFromString row.kind,
+                SupervisionMapping.strategyFromString row.strategy,
+                SupervisionMapping.reasonFromJson row.reason
+            with
+            | Ok kind, Ok strategy, Ok reason ->
+                Ok
+                    { Supervisor = SupervisorName.create row.supervisor
+                      ChildId = SupervisedChildId.create row.child_id
+                      Kind = kind
+                      Strategy = strategy
+                      Reason = reason
+                      At = Db.fromTimestamp row.at }
+            | Error error, _, _
+            | _, Error error, _
+            | _, _, Error error -> Error error
 
-                    let rec read records =
-                        task {
-                            let! more = reader.ReadAsync(token)
-
-                            if not more then
-                                return Ok(List.rev records)
-                            else
-                                match
-                                    SupervisionMapping.kindFromString (reader.GetString 2),
-                                    SupervisionMapping.strategyFromString (reader.GetString 3),
-                                    SupervisionMapping.reasonFromJson (reader.GetString 4)
-                                with
-                                | Ok kind, Ok strategy, Ok reason ->
-                                    let record =
-                                        { Supervisor = SupervisorName.create (reader.GetString 0)
-                                          ChildId = SupervisedChildId.create (reader.GetString 1)
-                                          Kind = kind
-                                          Strategy = strategy
-                                          Reason = reason
-                                          At = Db.fromTimestamp (reader.GetDateTime 5) }
-
-                                    return! read (record :: records)
-                                | Error error, _, _
-                                | _, Error error, _
-                                | _, _, Error error -> return Error error
-                        }
-
-                    return! read []
-                })
+        // Newest first is the only order this table is ever read in, and it is what
+        // supervision_event_recent_idx is built for.
+        Db.query
+            context.Resilience
+            context.DataSource
+            (fun query token ->
+                selectTask query {
+                    for e in fsm.supervision_event do
+                        orderByDescending e.at
+                        thenByDescending e.id
+                        take limit
+                        select e
+                        toList
+                        cancel token
+                }
+                |> Task.map (List.traverseResultM toRecord))
             ct

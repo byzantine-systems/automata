@@ -4,7 +4,6 @@
         <Project Path="src/ByzantineSystems.Automata.Storage/ByzantineSystems.Automata.Storage.fsproj" />
         <Project Path="src/ByzantineSystems.Automata.Resilience/ByzantineSystems.Automata.Resilience.fsproj" />
         <Project Path="src/ByzantineSystems.Automata.Runtime/ByzantineSystems.Automata.Runtime.fsproj" />
-        <Project Path="src/ByzantineSystems.Automata.Storage.InMemory/ByzantineSystems.Automata.Storage.InMemory.fsproj" />
         <Project Path="src/ByzantineSystems.Automata.Storage.Postgres/ByzantineSystems.Automata.Storage.Postgres.fsproj" />
         <Project Path="src/ByzantineSystems.Automata.DependencyInjection/ByzantineSystems.Automata.DependencyInjection.fsproj" />
     </Folder>

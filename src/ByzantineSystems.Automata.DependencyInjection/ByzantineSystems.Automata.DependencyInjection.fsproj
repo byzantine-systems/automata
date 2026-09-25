@@ -3,17 +3,20 @@
     <PropertyGroup>
         <GenerateDocumentationFile>true</GenerateDocumentationFile>
         <IsPackable>true</IsPackable>
+        <Description>Generic Host integration for ByzantineSystems.Automata.</Description>
+        <PackageTags>fsharp;statechart;dependency-injection;hosting</PackageTags>
     </PropertyGroup>
 
     <ItemGroup>
+        <Compile Include="SupervisionAudit.fs" />
         <Compile Include="Logging.fs" />
         <Compile Include="HostedServices.fs" />
+        <Compile Include="Maintenance.fs" />
         <Compile Include="ServiceCollectionExtensions.fs" />
     </ItemGroup>
 
     <ItemGroup>
         <ProjectReference Include="..\ByzantineSystems.Automata.Storage\ByzantineSystems.Automata.Storage.fsproj" />
-        <ProjectReference Include="..\ByzantineSystems.Automata.Storage.InMemory\ByzantineSystems.Automata.Storage.InMemory.fsproj" />
         <ProjectReference Include="..\ByzantineSystems.Automata.Storage.Postgres\ByzantineSystems.Automata.Storage.Postgres.fsproj" />
         <ProjectReference Include="..\ByzantineSystems.Automata.Resilience\ByzantineSystems.Automata.Resilience.fsproj" />
         <ProjectReference Include="..\ByzantineSystems.Automata.Runtime\ByzantineSystems.Automata.Runtime.fsproj" />

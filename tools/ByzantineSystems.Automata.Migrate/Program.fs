@@ -34,10 +34,14 @@ let main args =
 
         1
     | Some connectionString ->
-        try
-            Migrator.migrate connectionString
-            logger.LogInformation("Automata database migrations applied")
+        match Migrator.migrate logger connectionString with
+        | Ok report ->
+            logger.LogInformation(
+                "Automata database migrations applied: {Count} scripts run",
+                List.length report.Applied
+            )
+
             0
-        with ex ->
-            logger.LogError(ex, "Automata database migration failed")
+        | Error(MigrationError.Failed(script, error)) ->
+            logger.LogError(error, "Automata database migration failed at {Script}", script)
             1

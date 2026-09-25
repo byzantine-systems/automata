@@ -46,23 +46,18 @@ jobs:
 
     runs-on: ubuntu-latest
 
-    services:
-      postgres:
-        image: postgres:18
-        env:
-          POSTGRES_DB: bs-automata
-          POSTGRES_USER: bs-automata
-          POSTGRES_PASSWORD: bs-automata
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U bs-automata -d bs-automata"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
+    # PostgreSQL comes from the devenv shell rather than a services: container, so CI runs the
+    # same server as local development: the pinned postgresql_19 from the flake, with pgmq and
+    # pg_cron built against it and the settings in flake.nix applied. The official postgres:19
+    # image ships neither extension, and the command inbox is only the first part of this schema
+    # to need neither.
     env:
       AUTOMATA_TEST_DB: Host=127.0.0.1;Port=5432;Database=bs-automata;Username=bs-automata;Password=bs-automata
+      # The runner's own user is the devenv cluster's superuser, trusted over local TCP as on a
+      # development machine. The pg_cron test needs one: installing the extension and scheduling
+      # jobs are both superuser work, and running it here proves the path where the database
+      # schedules its own maintenance, not only the fallback.
+      AUTOMATA_TEST_CRON_DB: Host=127.0.0.1;Port=5432;Database=bs-automata;Username=runner
 
     permissions:
       contents: read
@@ -96,8 +91,40 @@ jobs:
         purge-last-accessed: P1DT12H
         purge-primary-key: never
 
+    # devenv's own binary cache. Without it the shell is built from source on every cold runner.
+    - uses: cachix/cachix-action@v16
+      with:
+        name: devenv
+
     - name: Build
       run: nix build
+
+    # --impure because the devenv shell reads PWD to locate its state directory.
+    #
+    # --detached, not --detach: devenv forwards the flag to process-compose, which rejects the
+    # latter while devenv still exits 0, so the typo starts nothing and shows a green step.
+    - name: Start PostgreSQL
+      run: nix develop --impure --command devenv up --detached
+
+    # devenv reports its supervisor up before postgres finishes starting, and initdb on a cold
+    # runner is not instant. Poll the socket rather than sleeping a guessed interval.
+    - name: Wait for PostgreSQL
+      run: |
+        # shellcheck disable=SC2016 # the loop is expanded by the inner shell, not this one
+        nix develop --impure --command bash -c '
+          for attempt in $(seq 1 60); do
+            if pg_isready -h 127.0.0.1 -p 5432 -q; then
+              echo "ready after ${attempt}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "postgres did not become ready"; exit 1
+        '
+
+    # The generated schema types must match what the migrations produce. This replaced the
+    # hand-maintained column lists, and it only protects anything if it runs on every change.
+    - name: Check generated schema types
+      run: nix develop .#ci --impure -c make schema-check
 
     - name: Run testing suite with coverage
       run: nix develop .#ci --impure -c make coverage

@@ -9,6 +9,7 @@
 #load "../src/ByzantineSystems.Automata.Core/Identifiers.fs"
 #load "../src/ByzantineSystems.Automata.Core/Transition.fs"
 #load "../src/ByzantineSystems.Automata.Core/Errors.fs"
+#load "../src/ByzantineSystems.Automata.Core/Boundary.fs"
 #load "../src/ByzantineSystems.Automata.Core/Codec.fs"
 #load "../src/ByzantineSystems.Automata.Core/Rules.fs"
 #load "../src/ByzantineSystems.Automata.Core/Resolution.fs"

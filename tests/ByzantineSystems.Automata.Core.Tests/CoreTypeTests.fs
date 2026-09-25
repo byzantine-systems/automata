@@ -92,36 +92,13 @@ let transitionTests =
 
               Expect.equal ("idle", 0UL, Running) (snapshot.State, Epoch.value snapshot.Epoch, snapshot.Status) ""
           }
-          test "transition records resolution metadata" {
-              let transition: Transition<EntityId<Order>, string, string, string> =
-                  { MachineId = machineId "payments"
-                    EntityId = entityId "ORD-1"
-                    IdempotencyKey = "payment-request-123"
-                    OccurredAt = DateTimeOffset(2026, 9, 18, 17, 0, 0, TimeSpan.Zero)
-                    Epoch = Epoch.next Epoch.initial
-                    Event = "InitiatePayment"
-                    Actions = [ "reserve-slot" ]
-                    FromState = "idle"
-                    ToState = "active.processing"
-                    Status = Running
-                    HandledBy = stateId "idle"
-                    Exited = [ stateId "idle" ]
-                    Entered = [ stateId "active"; stateId "active.processing" ] }
-
-              Expect.equal 1UL (Epoch.value transition.Epoch) "committed epoch"
-              Expect.equal "active.processing" transition.ToState "target state"
-              Expect.equal 2 transition.Entered.Length "entry path depth"
-          }
-          test "commit receipt carries idempotency, epoch, and timestamp" {
-              let receipt =
-                  { IdempotencyKey = "payment-request-123"
-                    Epoch = Epoch.next Epoch.initial
-                    OccurredAt = DateTimeOffset(2026, 9, 18, 17, 0, 0, TimeSpan.Zero) }
-
-              Expect.equal
-                  ("payment-request-123", 1UL)
-                  (receipt.IdempotencyKey, Epoch.value receipt.Epoch)
-                  "receipt fields"
+          // A committed transition and a commit receipt are no longer declared here. What the
+          // chart decides is a TransitionDraft and what the database answers with is a
+          // CommittedTransition, both in Storage, because everything that distinguishes them is
+          // a value only the database can supply. Their tests live with them.
+          test "epoch advances by one and starts at zero" {
+              Expect.equal 0UL (Epoch.value Epoch.initial) "an entity that has never committed"
+              Expect.equal 1UL (Epoch.value (Epoch.next Epoch.initial)) "the first commit"
           } ]
 
 let errorTests =
