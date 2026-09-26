@@ -129,6 +129,11 @@ jobs:
     - name: Run testing suite with coverage
       run: nix develop .#ci --impure -c make coverage
 
+    # Documentation is the GitHub Pages site. Build it for pull requests too, so broken docs are
+    # caught before merge; only main uploads and deploys the result below.
+    - name: Build documentation
+      run: nix develop .#ci --impure -c make docs
+
     - name: Code coverage summary
       uses: irongut/CodeCoverageSummary@v1.3.0
       with:
@@ -154,10 +159,6 @@ jobs:
         echo "percent=$percent" >> "$GITHUB_OUTPUT"
         echo "color=$color" >> "$GITHUB_OUTPUT"
 
-    - name: Prepare badges directory
-      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-      run: mkdir -p badges
-
     - name: Generate coverage badge
       if: github.event_name == 'push' && github.ref == 'refs/heads/main'
       uses: jaywcjlove/generated-badges@main
@@ -165,13 +166,13 @@ jobs:
         label: coverage
         status: ${{ steps.coverage.outputs.percent }}%
         color: ${{ steps.coverage.outputs.color }}
-        output: badges/coverage.svg
+        output: out/docs/coverage.svg
 
     - name: Upload Pages artifact
       if: github.event_name == 'push' && github.ref == 'refs/heads/main'
       uses: actions/upload-pages-artifact@v5
       with:
-        path: ./badges
+        path: ./out/docs
 
   deploy:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
