@@ -182,7 +182,9 @@ package-smoke: pack
 	DOTNET='$(DOTNET)' bash scripts/package-smoke.sh "$(VERSION)" "$(CURDIR)/$(PACKAGE_OUTPUT)" "$(NUGET_SOURCE)" \
 		$(notdir $(basename $(SRC_PROJECTS)))
 
-# Pushes the packed release to NuGet
+# Pushes the packed release to NuGet. Symbols are their own packages and are never carried by
+# the .nupkg, so both globs are pushed or debuggers get the library without its sources.
 push:
 	@echo "Pushing release '$(VERSION)' to $(NUGET_SOURCE)"
 	$(DOTNET) nuget push '$(PACKAGE_OUTPUT)/*.nupkg' -k "$(NUGET_API_KEY)" -s $(NUGET_SOURCE) --skip-duplicate
+	$(DOTNET) nuget push '$(PACKAGE_OUTPUT)/*.snupkg' -k "$(NUGET_API_KEY)" -s $(NUGET_SOURCE) --skip-duplicate

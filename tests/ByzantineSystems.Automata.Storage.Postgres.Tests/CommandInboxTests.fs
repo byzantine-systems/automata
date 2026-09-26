@@ -257,7 +257,7 @@ let tests =
               | None -> failtest "the command should still exist"
           }
 
-          testTask "rescheduling defers the command and counts the attempt" {
+          testTask "rescheduling returns the command to ready and counts the attempt" {
               do! reset ()
               let inbox = newInbox ()
 
@@ -266,9 +266,6 @@ let tests =
 
               let! outcome = inbox.Reschedule(head.Work.CommandId, head.Token, backoff, noCancellation)
               Expect.equal (outcome |> expectOk "reschedule") Updated "the holder may reschedule"
-
-              let! (empty: Claimed list) = claim inbox 10
-              Expect.isEmpty empty "the command is not claimable until its delay elapses"
 
               let! current = inbox.TryGet(head.Work.CommandId, noCancellation)
 
@@ -279,7 +276,8 @@ let tests =
                   Expect.isFalse record.Blocked "it keeps its place at the head of the entity"
               | None -> failtest "the command should still exist"
 
-              // The envelope caps the delay, so the retry is claimable again shortly.
+              // Full jitter may legally choose no delay. The envelope only promises an upper
+              // bound, so assert eventual claimability after that bound instead of racing it.
               do! Task.Delay(TimeSpan.FromMilliseconds 1200.0)
               let! (retried: Claimed list) = claim inbox 10
               Expect.hasLength retried 1 "the retry becomes claimable once the backoff elapses"

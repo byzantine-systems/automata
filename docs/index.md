@@ -1,8 +1,8 @@
 # ByzantineSystems.Automata documentation
 
-`ByzantineSystems.Automata` is a typed hierarchical state-machine toolkit for F# and .NET. It separates pure chart resolution from durable execution: a chart decides, and PostgreSQL orders, records and delivers what it decided.
+`ByzantineSystems.Automata` is a typed hierarchical **statechart** toolkit for F# and .NET. It separates pure chart resolution from durable execution: a chart decides, and PostgreSQL orders, records and delivers what it decided. The name **"statechart"** comes from David Harel's 1987 paper _Statecharts: A Visual Formalism for Complex Systems_, which introduced the visual notation this toolkit implements as a typed F# computation expression.
 
-The name "statechart" comes from David Harel's 1987 paper *Statecharts: A Visual Formalism for Complex Systems*, which introduced the visual formalism this toolkit models.
+> **Statecharts** constitute a visual formalism for describing states and transitions in a modular fashion, enabling clustering, orthogonality (i.e., concurrency) and refinement, and encouraging 'zoom' capabilities for moving easily back and forth between levels of abstraction.
 
 ## How it fits together
 
