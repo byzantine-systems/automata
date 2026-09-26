@@ -9,9 +9,20 @@
 
 `ByzantineSystems.Automata` is a strongly typed [statechart](https://en.wikipedia.org/wiki/State_diagram#Harel_statechart) toolkit for F# and .NET 10, whose main goal is to allow you to:
 
-- Model states, events, actions, and domain errors with ordinary F# types.
-- Validate the statechart once.
-- Resolve transitions with a pure core and execute the same model through a durable command inbox that orders work across processes.
+> **Statecharts** constitute a visual formalism for describing states and transitions in a modular fashion, enabling clustering, orthogonality (i.e., concurrency) and refinement, and encouraging 'zoom' capabilities for moving easily back and forth between levels of abstraction. [^1]
+>
+> [^1]: David Harel's 1987 paper *Statecharts: A Visual Formalism for Complex Systems*.
+
+```mermaid
+stateDiagram-v2
+    state D {
+        A --> C : γ(P)
+    }
+
+    B --> A : α
+    D --> B : β
+    B --> C : δ
+```
 
 This library is designed to keep domain behavior independent from runtime and infrastructure concerns:
 
@@ -224,7 +235,3 @@ If you have a local PostgreSQL server running:
 - `make coverage` runs every test project and generates merged Cobertura and HTML reports.
 - `make migrate` applies migrations using `BS_AUTOMATA_CONN`.
 - `make db-reset` resets the local disposable schema.
-
-## References
-
-- The name "statechart" comes from David Harel's 1987 paper *Statecharts: A Visual Formalism for Complex Systems*, which introduced the visual notation this toolkit implements as a typed F# computation expression.
