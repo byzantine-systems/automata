@@ -159,6 +159,11 @@
                 "2"
               ];
               includes = [ "*.sql" ];
+              # pg_format parses PostgreSQL. The SQLite store's scripts use syntax it does not
+              # know (STRICT tables, RAISE in trigger bodies, the -> JSON operator). Its output
+              # for them still loads today, but a formatter guessing at another dialect is one
+              # release away from rewriting a statement it does not understand.
+              excludes = [ "src/ByzantineSystems.Automata.Storage.Sqlite/**/*.sql" ];
             };
           };
 

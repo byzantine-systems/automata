@@ -11,6 +11,10 @@ DB_URL ?= postgresql://$(PROJECT_NAME):$(PROJECT_NAME)@127.0.0.1:5432/$(PROJECT_
 SOLUTION := bs-automata.slnx
 POSTGRES_PROJECT := src/ByzantineSystems.Automata.Storage.Postgres/ByzantineSystems.Automata.Storage.Postgres.fsproj
 SQLHYDRA_CONFIG := sqlhydra-npgsql.toml
+SQLITE_PROJECT := src/ByzantineSystems.Automata.Storage.Sqlite/ByzantineSystems.Automata.Storage.Sqlite.fsproj
+SQLHYDRA_SQLITE_CONFIG := sqlhydra-sqlite.toml
+# A scratch database migrated from scratch on every codegen run; nothing else reads it.
+SQLITE_SCHEMA_DB := out/sqlhydra/schema.db
 MIGRATE_PROJECT := tools/ByzantineSystems.Automata.Migrate/ByzantineSystems.Automata.Migrate.fsproj
 EXAMPLE_PAYMENT_PROJECT := examples/ByzantineSystems.Automata.Examples.PaymentProcessor/ByzantineSystems.Automata.Examples.PaymentProcessor.fsproj
 EXAMPLE_SUPERVISION_PROJECT := examples/ByzantineSystems.Automata.Examples.Supervision/ByzantineSystems.Automata.Examples.Supervision.fsproj
@@ -22,7 +26,8 @@ UNIT_TEST_PROJECTS := \
 	tests/ByzantineSystems.Automata.Core.Tests/ByzantineSystems.Automata.Core.Tests.fsproj \
 	tests/ByzantineSystems.Automata.Resilience.Tests/ByzantineSystems.Automata.Resilience.Tests.fsproj \
 	tests/ByzantineSystems.Automata.Runtime.Tests/ByzantineSystems.Automata.Runtime.Tests.fsproj \
-	tests/ByzantineSystems.Automata.DependencyInjection.Tests/ByzantineSystems.Automata.DependencyInjection.Tests.fsproj
+	tests/ByzantineSystems.Automata.DependencyInjection.Tests/ByzantineSystems.Automata.DependencyInjection.Tests.fsproj \
+	tests/ByzantineSystems.Automata.Storage.Sqlite.Tests/ByzantineSystems.Automata.Storage.Sqlite.Tests.fsproj
 INTEGRATION_TEST_PROJECTS := \
 	tests/ByzantineSystems.Automata.Storage.Postgres.Tests/ByzantineSystems.Automata.Storage.Postgres.Tests.fsproj
 TEST_PROJECTS := $(UNIT_TEST_PROJECTS) $(INTEGRATION_TEST_PROJECTS)
@@ -46,7 +51,7 @@ PROJECT_FILES := $(wildcard src/*/*.fsproj tests/*/*.fsproj tools/*/*.fsproj exa
 RESTORE_INPUTS := Makefile $(SOLUTION) global.json nuget.config $(PROJECT_FILES) \
 	$(wildcard Directory.Build.* Directory.Packages.*)
 
-.PHONY: build test test-unit test-integration coverage migrate schema-generate schema-check run-example run-example-supervision run-example-hosted db db-reset fmt docs nix-lock pack package-smoke push
+.PHONY: build test test-unit test-integration coverage migrate schema-generate schema-check migrate-sqlite-schema schema-generate-sqlite schema-check-sqlite run-example run-example-supervision run-example-hosted db db-reset fmt docs nix-lock pack package-smoke push
 
 build:
 	$(DOTNET) build $(SOLUTION) -m:1
@@ -102,6 +107,25 @@ schema-generate: migrate
 schema-check: migrate
 	$(DOTNET) tool restore
 	DOTNET='$(DOTNET)' FANTOMAS='$(FANTOMAS)' bash scripts/verify-sqlhydra.sh
+
+# The SQLite store's generated types come from a scratch database migrated from nothing, so
+# the generated file depends on the migrations alone and never on a developer's local data.
+migrate-sqlite-schema:
+	mkdir -p $(dir $(SQLITE_SCHEMA_DB))
+	$(RM) $(SQLITE_SCHEMA_DB) $(SQLITE_SCHEMA_DB)-wal $(SQLITE_SCHEMA_DB)-shm
+	BS_AUTOMATA_SQLITE_PATH='$(SQLITE_SCHEMA_DB)' $(DOTNET) run --project $(MIGRATE_PROJECT)
+
+schema-generate-sqlite: migrate-sqlite-schema
+	$(DOTNET) tool restore
+	$(DOTNET) sqlhydra sqlite -t $(SQLHYDRA_SQLITE_CONFIG) -p $(SQLITE_PROJECT)
+	$(FANTOMAS) src/ByzantineSystems.Automata.Storage.Sqlite/Schema.Generated.fs
+
+schema-check-sqlite: migrate-sqlite-schema
+	$(DOTNET) tool restore
+	DOTNET='$(DOTNET)' FANTOMAS='$(FANTOMAS)' SQLHYDRA_PROVIDER=sqlite SQLHYDRA_CONFIG='$(SQLHYDRA_SQLITE_CONFIG)' \
+		SQLHYDRA_SCHEMA_FILE=src/ByzantineSystems.Automata.Storage.Sqlite/Schema.Generated.fs \
+		SQLHYDRA_PROJECT_FILE='$(SQLITE_PROJECT)' SQLHYDRA_GENERATE_TARGET=schema-generate-sqlite \
+		bash scripts/verify-sqlhydra.sh
 
 run-example:
 	$(DOTNET) run --project $(EXAMPLE_PAYMENT_PROJECT)

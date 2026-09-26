@@ -6,6 +6,11 @@
   },
   {
     "pname": "dbup-core",
+    "version": "6.0.15",
+    "hash": "sha256-u3tJpKbZKrx56Q6Di0Z3BHrAf00rRORV4ka+HdG06s4="
+  },
+  {
+    "pname": "dbup-core",
     "version": "6.1.1",
     "hash": "sha256-wHLnnADzmOUiGJpXwMKJswHrvaTAFmVrq8bUTJG6/kU="
   },
@@ -13,6 +18,11 @@
     "pname": "dbup-postgresql",
     "version": "7.0.1",
     "hash": "sha256-Vust+aFaNLyIw9PXvt/fwc8KIthPWnEMbsZcqqBYicE="
+  },
+  {
+    "pname": "dbup-sqlite",
+    "version": "6.0.4",
+    "hash": "sha256-Iike6+Q/BT4GIvnLGFZ4GRyJENMaMcUU+prXAn6ILdY="
   },
   {
     "pname": "Expecto",
@@ -48,6 +58,21 @@
     "pname": "Microsoft.CodeCoverage",
     "version": "18.10.1",
     "hash": "sha256-j6kLSrn2sJA6sUf+tcDAfwI9maDTjU5+xZl7qd+5pEA="
+  },
+  {
+    "pname": "Microsoft.Data.Sqlite",
+    "version": "10.0.12",
+    "hash": "sha256-JGZ52MbIP/z0yKSABm4/T8TgUclrcb7f2TL+elrx99Q="
+  },
+  {
+    "pname": "Microsoft.Data.Sqlite.Core",
+    "version": "10.0.12",
+    "hash": "sha256-Xo7TUwBtrfVdXH9W0jcyHCC7EMeGJi5rJVJnVuEDYzI="
+  },
+  {
+    "pname": "Microsoft.Data.Sqlite.Core",
+    "version": "9.0.10",
+    "hash": "sha256-prsCR2WzQAhbhdZ30xk+/wvLt6rDj0M3k1tvyoD6uYM="
   },
   {
     "pname": "Microsoft.Extensions.Configuration",
@@ -241,6 +266,11 @@
   },
   {
     "pname": "Npgsql",
+    "version": "10.0.1",
+    "hash": "sha256-cb4z+WH9qynS6n4I43FzSiifWLzgH26HAP/DnZvsjak="
+  },
+  {
+    "pname": "Npgsql",
     "version": "10.0.3",
     "hash": "sha256-ddCXCSOoyfy7035OvnL+4LEDYqHjZyPoZ3ffG2coMW0="
   },
@@ -258,6 +288,26 @@
     "pname": "SqlHydra.Query",
     "version": "5.0.0",
     "hash": "sha256-ScIRL5PoGAaGcUbOyoM7NAolWrCaQAtoSw1xZ9mtwRo="
+  },
+  {
+    "pname": "SQLitePCLRaw.bundle_e_sqlite3",
+    "version": "2.1.12",
+    "hash": "sha256-qaBua1oxP27zZ1+RmX0BKt7/6KqeH/1p7Uak5oWwVOE="
+  },
+  {
+    "pname": "SQLitePCLRaw.core",
+    "version": "2.1.12",
+    "hash": "sha256-rwaQQTj/ptyVpZkTPWTSVHFtb6zHVDprO5EHk9rp3KU="
+  },
+  {
+    "pname": "SQLitePCLRaw.lib.e_sqlite3",
+    "version": "2.1.12",
+    "hash": "sha256-SiLAL/z0iXkpA88mPe+fzidzlxaIP5ZfC17v8WN0MKw="
+  },
+  {
+    "pname": "SQLitePCLRaw.provider.e_sqlite3",
+    "version": "2.1.12",
+    "hash": "sha256-3ysycZkuXXGRhsRnHjz0+GWAl8FUy81BSUq1lMWZdZU="
   },
   {
     "pname": "System.Diagnostics.EventLog",

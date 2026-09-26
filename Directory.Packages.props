@@ -23,10 +23,9 @@
         <PackageVersion Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.12" />
         <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.12" />
 
-        <!-- Persistence: raw Npgsql instead of Npgsql.FSharp (avoids the 8.x/9.x version skew) -->
+        <!-- Persistence shared by every storage provider. Each provider's own driver and
+             migration runner are versioned in its .fsproj, with VersionOverride. -->
         <PackageVersion Include="SqlHydra.Query" Version="5.0.0" />
-        <PackageVersion Include="Npgsql" Version="10.0.3" />
-        <PackageVersion Include="dbup-postgresql" Version="7.0.1" />
         <PackageVersion Include="FSharp.SystemTextJson" Version="1.4.36" />
 
         <!-- Optional, package-edge ergonomics only; never referenced by Core -->
