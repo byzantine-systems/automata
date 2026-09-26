@@ -67,8 +67,9 @@ jobs:
               else
                 echo "::warning title=Tag is not releasable::$tag has no successful build.yml push run for $sha" >&2
               fi
-            done | jq -R . | jq -s .
+            done | jq -R . | jq -sc .
           )"
+          # Compact JSON on purpose: $GITHUB_OUTPUT accepts single-line key=value pairs only.
           echo "tags=$tags" >> "$GITHUB_OUTPUT"
           echo "Unreleased tags: $tags"
 
