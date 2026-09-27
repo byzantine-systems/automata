@@ -7,8 +7,6 @@
 [![Build](https://github.com/byzantine-systems/automata/actions/workflows/build.yml/badge.svg)](https://github.com/byzantine-systems/automata/actions/workflows/build.yml)
 ![Coverage](https://byzantine-systems.github.io/automata/coverage.svg)
 
-`ByzantineSystems.Automata` is a strongly typed [statechart](https://en.wikipedia.org/wiki/State_diagram#Harel_statechart) toolkit for F# and .NET 10, whose main goal is to allow you to:
-
 > **Statecharts** constitute a visual formalism for describing states and transitions in a modular fashion, enabling clustering, orthogonality (i.e., concurrency) and refinement, and encouraging 'zoom' capabilities for moving easily back and forth between levels of abstraction. [^1]
 >
 > [^1]: David Harel's 1987 paper *Statecharts: A Visual Formalism for Complex Systems*.
@@ -24,7 +22,7 @@ stateDiagram-v2
     B --> C : δ
 ```
 
-This library is designed to keep domain behavior independent from runtime and infrastructure concerns:
+`ByzantineSystems.Automata` is a strongly typed [statechart](https://en.wikipedia.org/wiki/State_diagram#Harel_statechart) toolkit for F# and .NET 10. Our goal is to allow you keep domain behavior independent from runtime and infrastructure concerns, by offering:
 
 - **Typed and validated charts**: hierarchical and terminal states, guarded transitions, entry and exit actions, event bubbling, and accumulated construction errors.
 - **Deterministic core**: `Chart.resolve` is a pure function, so transition behavior can be tested without databases, clocks, or dependency injection.
