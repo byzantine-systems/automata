@@ -343,6 +343,78 @@ let cancellationTests =
               Expect.equal 1 calls.Value "a cancelled call is not repeated"
           } ]
 
+/// The outcome API is where store failures become values, so it must never throw, whatever the
+/// pipeline is made of and however the work fails.
+let outcomeTests =
+    let outcomeOf (pipeline: ResiliencePipeline) (operation: CancellationToken -> Task<int>) : Task<Outcome<int>> =
+        ResiliencePipeline.executeOutcome pipeline operation CancellationToken.None
+
+    testList
+        "executeOutcome"
+        [ testTask "the empty pipeline hands back an exception thrown before the work's task exists" {
+              let operation (_: CancellationToken) : Task<int> = raise (Permanent "synchronous")
+              let! (outcome: Outcome<int>) = outcomeOf Polly.ResiliencePipeline.Empty operation
+
+              match outcome.Exception with
+              | Permanent _ -> ()
+              | other -> failtestf "expected the work's exception, got %A" other
+          }
+
+          testTask "the empty pipeline hands back an exception the work's task faulted with" {
+              let operation, _ = scripted [ Error(Permanent "asynchronous") ]
+              let! (outcome: Outcome<int>) = outcomeOf Polly.ResiliencePipeline.Empty operation
+
+              match outcome.Exception with
+              | Permanent _ -> ()
+              | other -> failtestf "expected the work's exception, got %A" other
+
+              Expect.stringContains
+                  outcome.Exception.StackTrace
+                  "ResiliencePipelineTests.operation"
+                  "with the stack trace of the throw"
+          }
+
+          testTask "retries still see failures that arrive as outcomes" {
+              let operation, calls = scripted [ Error(Transient "once"); Ok 7 ]
+              let! (outcome: Outcome<int>) = outcomeOf (pipelineOf fastPolicy) operation
+              Expect.equal outcome.Result 7 "the second attempt's value"
+              Expect.equal calls.Value 2 "after one retry"
+          }
+
+          testTask "an overrun attempt is a timeout, not the work's cancellation" {
+              let policy =
+                  { fastPolicy with
+                      MaxAttempts = 1
+                      AttemptTimeout = TimeSpan.FromMilliseconds 20.
+                      TotalTimeout = TimeSpan.FromSeconds 5. }
+
+              let operation (token: CancellationToken) : Task<int> =
+                  task {
+                      do! Task.Delay(Timeout.Infinite, token)
+                      return 0
+                  }
+
+              let! (outcome: Outcome<int>) = outcomeOf (pipelineOf policy) operation
+              Expect.isTrue (outcome.Exception :? TimeoutRejectedException) "the strategy's own exception"
+          }
+
+          testTask "the caller's cancellation is a cancellation" {
+              let source = new CancellationTokenSource()
+              source.Cancel()
+
+              let operation (token: CancellationToken) : Task<int> =
+                  task {
+                      do! Task.Delay(Timeout.Infinite, token)
+                      return 0
+                  }
+
+              let! (outcome: Outcome<int>) =
+                  ResiliencePipeline.executeOutcome Polly.ResiliencePipeline.Empty operation source.Token
+
+              Expect.isTrue (outcome.Exception :? OperationCanceledException) "reported, not thrown"
+              source.Dispose()
+          } ]
+
 let tests =
     testList
         "resilience"
@@ -351,4 +423,5 @@ let tests =
           timeoutTests
           breakerTests
           telemetryTests
-          cancellationTests ]
+          cancellationTests
+          outcomeTests ]
