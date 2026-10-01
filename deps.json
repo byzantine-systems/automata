@@ -1,8 +1,8 @@
 [
   {
     "pname": "coverlet.msbuild",
-    "version": "10.0.1",
-    "hash": "sha256-p9QS/8A9FPTYhHiACfVpx98ANGrFZio6k8yqhVZWvHc="
+    "version": "10.1.0",
+    "hash": "sha256-LdJp9NkxMMIfpVoImFaQd8FlQxPTFNUDJAfZE+KJFrg="
   },
   {
     "pname": "dbup-core",
@@ -286,8 +286,8 @@
   },
   {
     "pname": "SqlHydra.Query",
-    "version": "5.0.0",
-    "hash": "sha256-ScIRL5PoGAaGcUbOyoM7NAolWrCaQAtoSw1xZ9mtwRo="
+    "version": "5.1.0",
+    "hash": "sha256-8rsUoF66Z3SLc/MUWBuZ60Zdc5dFUI68pMTWW1hRRlk="
   },
   {
     "pname": "SQLitePCLRaw.bundle_e_sqlite3",
