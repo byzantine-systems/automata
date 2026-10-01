@@ -55,6 +55,68 @@ module internal Db =
         | _ -> false
 
     /// <summary>
+    /// A named constraint the server reported as violated. Named, because a store recognises a
+    /// violation by the constraint it wrote, never by the message.
+    /// </summary>
+    type ConstraintViolation =
+        | Unique of constraintName: string
+        | ForeignKey of constraintName: string
+
+    /// <summary>What a failed attempt means, decided once from the exception it ended with.</summary>
+    type DriverFailure =
+        /// <summary>The caller cancelled. Reported as a cancelled task, never as an error.</summary>
+        | Cancelled
+
+        /// <summary>No answer arrived: a dropped connection, a pool timeout, a timed-out attempt, an open circuit.</summary>
+        | Unavailable of exn
+
+        /// <summary>The server answered that a named constraint refused the write.</summary>
+        | Violated of ConstraintViolation * exn
+
+        /// <summary>Anything else, which is a defect rather than an outage.</summary>
+        | Unexpected of exn
+
+    /// <summary>
+    /// Classifies the exception an attempt ended with. Pure and exhaustive: this is the one place
+    /// a driver exception is given a meaning, and it is given one as a value.
+    ///
+    /// A <see cref="T:Npgsql.PostgresException" /> is the server having answered, so apart from
+    /// admin shutdown and a named violation it is a defect. Any other
+    /// <see cref="T:Npgsql.NpgsqlException" /> is an answer that never arrived.
+    /// </summary>
+    let classify (ct: CancellationToken) (error: exn) : DriverFailure =
+        match error with
+        | :? OperationCanceledException when ct.IsCancellationRequested -> Cancelled
+        | :? PostgresException as postgresError when postgresError.SqlState = PostgresErrorCodes.UniqueViolation ->
+            Violated(Unique postgresError.ConstraintName, error)
+        | :? PostgresException as postgresError when postgresError.SqlState = PostgresErrorCodes.ForeignKeyViolation ->
+            Violated(ForeignKey postgresError.ConstraintName, error)
+        | :? PostgresException as postgresError when postgresError.SqlState = PostgresErrorCodes.AdminShutdown ->
+            Unavailable error
+        | :? PostgresException -> Unexpected error
+        | :? NpgsqlException
+        | :? TimeoutRejectedException
+        | :? BrokenCircuitException -> Unavailable error
+        | _ -> Unexpected error
+
+    /// <summary>
+    /// Turns an attempt's outcome into the store's answer. A violation nobody asked to handle is
+    /// a defect like any other.
+    /// </summary>
+    let private settle
+        (ct: CancellationToken)
+        (outcome: Outcome<Result<'T, StoreError>>)
+        : Task<Result<'T, StoreError>> =
+        match outcome.Exception with
+        | null -> Task.FromResult outcome.Result
+        | error ->
+            match classify ct error with
+            | Cancelled -> Task.FromCanceled<Result<'T, StoreError>>(ct)
+            | Unavailable cause -> Task.FromResult(Error(StoreError.Unavailable cause))
+            | Violated(_, cause)
+            | Unexpected cause -> Task.FromResult(Error(StoreError.Unexpected cause))
+
+    /// <summary>
     /// The PostgreSQL adapter boundary, and the only place resilience is applied.
     ///
     /// The pipeline runs <em>inside</em> this function rather than around it, because Polly
@@ -62,24 +124,18 @@ module internal Db =
     /// <see cref="T:Microsoft.FSharp.Core.FSharpResult`2" />. Wrapped the other way round it
     /// would retry nothing: an <c>Error</c> is a successful return to a resilience strategy.
     ///
-    /// Afterwards the translation happens once. Caller cancellation stays cancellation, the
-    /// driver and strategy failures this layer understands become
-    /// <c>StoreError.Unavailable</c>, and anything else is left alone to reach the worker's
-    /// supervision boundary with its stack trace intact. Only what is understood is caught.
+    /// The pipeline hands back the outcome as a value, so nothing here catches anything:
+    /// <see cref="M:ByzantineSystems.Automata.Storage.Postgres.Db.classify(System.Threading.CancellationToken,System.Exception)" />
+    /// decides what the exception means.
     /// </summary>
-    let private classify
-        (work: unit -> Task<Result<'T, StoreError>>)
+    let private attempt
+        (pipeline: ResiliencePipeline)
+        (work: CancellationToken -> Task<Result<'T, StoreError>>)
         (ct: CancellationToken)
         : Task<Result<'T, StoreError>> =
-        task {
-            try
-                return! work ()
-            with
-            | :? OperationCanceledException when ct.IsCancellationRequested ->
-                return! Task.FromCanceled<Result<'T, StoreError>>(ct)
-            | :? NpgsqlException as error -> return Error(StoreError.Unavailable error)
-            | :? TimeoutRejectedException as error -> return Error(StoreError.Unavailable error)
-            | :? BrokenCircuitException as error -> return Error(StoreError.Unavailable error)
+        backgroundTask {
+            let! outcome = ResiliencePipeline.executeOutcome pipeline work ct
+            return! settle ct outcome
         }
 
     /// <summary>
@@ -96,11 +152,11 @@ module internal Db =
         (work: CancellationToken -> Task<Result<'T, StoreError>>)
         (ct: CancellationToken)
         : Task<Result<'T, StoreError>> =
-        classify (fun () -> ResiliencePipeline.executeTask pipeline work ct) ct
+        attempt pipeline work ct
 
     /// <summary>
     /// Runs a statement that must not be repeated automatically, translating failures the same
-    /// way but without the pipeline.
+    /// way but without retries: the empty pipeline makes exactly one attempt.
     ///
     /// <c>fsm.claim_commands</c> is the reason this exists. A claim whose reply was lost has
     /// already leased a batch, and repeating it leases a second one while the first stays
@@ -113,7 +169,7 @@ module internal Db =
         (work: CancellationToken -> Task<Result<'T, StoreError>>)
         (ct: CancellationToken)
         : Task<Result<'T, StoreError>> =
-        classify (fun () -> work ct) ct
+        attempt Polly.ResiliencePipeline.Empty work ct
 
     /// <summary>
     /// Runs typed reads against the generated schema types, under the same pipeline and the same

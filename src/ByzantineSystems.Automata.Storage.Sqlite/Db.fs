@@ -163,24 +163,57 @@ module internal Db =
         | SqliteCantOpen -> true
         | _ -> false
 
+    /// <summary>What a failed attempt means, decided once from the exception it ended with.</summary>
+    type DriverFailure =
+        /// <summary>The caller cancelled. Reported as a cancelled task, never as an error.</summary>
+        | Cancelled
+
+        /// <summary>The file could not serve: contention, I/O, a full disk, a timed-out attempt, an open circuit.</summary>
+        | Unavailable of exn
+
+        /// <summary>
+        /// Anything else, which is a defect rather than an outage. A constraint violation is one:
+        /// every write checks what it depends on before it writes.
+        /// </summary>
+        | Unexpected of exn
+
     /// <summary>
-    /// The one translation from exceptions to results, run once, after the pipeline. Caller
-    /// cancellation stays cancellation, and the failures this layer understands become
-    /// <c>StoreError.Unavailable</c>. Anything else is left alone.
+    /// Classifies the exception an attempt ended with. Pure and exhaustive: this is the one place
+    /// a driver exception is given a meaning, and it is given one as a value.
     /// </summary>
-    let private classify
-        (work: unit -> Task<Result<'T, StoreError>>)
+    let classify (ct: CancellationToken) (error: exn) : DriverFailure =
+        match error with
+        | :? OperationCanceledException when ct.IsCancellationRequested -> Cancelled
+        | :? SqliteException as sqliteError when isUnavailable sqliteError -> Unavailable error
+        | :? TimeoutRejectedException
+        | :? BrokenCircuitException -> Unavailable error
+        | _ -> Unexpected error
+
+    /// <summary>Turns an attempt's outcome into the store's answer.</summary>
+    let private settle
+        (ct: CancellationToken)
+        (outcome: Outcome<Result<'T, StoreError>>)
+        : Task<Result<'T, StoreError>> =
+        match outcome.Exception with
+        | null -> Task.FromResult outcome.Result
+        | error ->
+            match classify ct error with
+            | Cancelled -> Task.FromCanceled<Result<'T, StoreError>>(ct)
+            | Unavailable cause -> Task.FromResult(Error(StoreError.Unavailable cause))
+            | Unexpected cause -> Task.FromResult(Error(StoreError.Unexpected cause))
+
+    /// <summary>
+    /// Runs the work through a pipeline that hands back the outcome as a value, then settles it.
+    /// Nothing here catches anything.
+    /// </summary>
+    let private attempt
+        (pipeline: ResiliencePipeline)
+        (work: CancellationToken -> Task<Result<'T, StoreError>>)
         (ct: CancellationToken)
         : Task<Result<'T, StoreError>> =
-        task {
-            try
-                return! work ()
-            with
-            | :? OperationCanceledException when ct.IsCancellationRequested ->
-                return! Task.FromCanceled<Result<'T, StoreError>>(ct)
-            | :? SqliteException as error when isUnavailable error -> return Error(StoreError.Unavailable error)
-            | :? TimeoutRejectedException as error -> return Error(StoreError.Unavailable error)
-            | :? BrokenCircuitException as error -> return Error(StoreError.Unavailable error)
+        backgroundTask {
+            let! outcome = ResiliencePipeline.executeOutcome pipeline work ct
+            return! settle ct outcome
         }
 
     /// <summary>
@@ -196,19 +229,19 @@ module internal Db =
         (work: CancellationToken -> Task<Result<'T, StoreError>>)
         (ct: CancellationToken)
         : Task<Result<'T, StoreError>> =
-        classify (fun () -> ResiliencePipeline.executeTask pipeline work ct) ct
+        attempt pipeline work ct
 
     /// <summary>
     /// Runs a unit of work that must not be repeated automatically, translating failures the
-    /// same way but without the pipeline. Claims go through here, as they do in the PostgreSQL
-    /// store: a worker that polls again in a moment recovers as well as a retry would, and never
-    /// holds a batch it did not ask for twice.
+    /// same way but without retries: the empty pipeline makes exactly one attempt. Claims go
+    /// through here, as they do in the PostgreSQL store: a worker that polls again in a moment
+    /// recovers as well as a retry would, and never holds a batch it did not ask for twice.
     /// </summary>
     let protectOnce
         (work: CancellationToken -> Task<Result<'T, StoreError>>)
         (ct: CancellationToken)
         : Task<Result<'T, StoreError>> =
-        classify (fun () -> work ct) ct
+        attempt Polly.ResiliencePipeline.Empty work ct
 
     /// <summary>
     /// Opens a pooled connection, which the caller owns and disposes. Pooling is on in every

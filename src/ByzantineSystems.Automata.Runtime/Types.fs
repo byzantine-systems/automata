@@ -125,6 +125,9 @@ module ProcessorPolicy =
         | Store(Serialization(typeName, _)) ->
             DeadLetter(CommandFailure.Machine $"a stored %s{typeName} could not be read")
         | Store(NotFound entity) -> DeadLetter(CommandFailure.Machine $"%s{entity} does not exist")
+        // A failure the store does not recognise is a defect, not this command's fault and not
+        // worth waiting out, so it goes to supervision rather than consuming the command.
+        | Store(Unexpected _) -> Escalate "the store failed in a way it does not recognise"
         | Rejected(InstanceNotRunning status) ->
             Reject(CommandFailure.Machine $"the instance is %A{status} and accepts no further commands")
         | Rejected lifecycle -> Escalate $"the machine is %A{lifecycle}"

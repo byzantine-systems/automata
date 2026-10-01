@@ -236,16 +236,20 @@ let tests =
                    BEGIN SELECT RAISE(ABORT, 'refused by the test'); END;"
                   []
 
-              let! failed =
-                  task {
-                      try
-                          let! outcome = commit (processorOf db) held Epoch.initial (Active 7)
-                          return Some outcome
-                      with :? SqliteException ->
-                          return None
-                  }
+              let! outcome =
+                  (processorOf db)
+                      .Commit(
+                          held.Work.CommandId,
+                          held.Token,
+                          Epoch.initial,
+                          draft held.Work.EntityId Idle (Active 7) effectiveAt,
+                          noCancellation
+                      )
 
-              Expect.isNone failed "the refused write surfaces as the defect it is"
+              match outcome with
+              | Error(StoreError.Unexpected(:? SqliteException)) -> ()
+              | other -> failtestf "the refused write should surface as the defect it is, got %A" other
+
               Expect.equal (counts db) "0/0/0/0" "no transition, snapshot or action survives"
               Expect.equal (statusOf db "k1") "leased" "the command is still open, so it is redelivered"
           }

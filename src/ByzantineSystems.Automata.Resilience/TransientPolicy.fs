@@ -317,3 +317,41 @@ module ResiliencePipeline =
         (ct: CancellationToken)
         : Task<'T> =
         pipeline.ExecuteAsync((fun token -> ValueTask<'T>(work token)), ct).AsTask()
+
+    /// <summary>
+    /// Runs a <c>Task</c>-returning function through a pipeline and hands back its outcome as a
+    /// value: the result, or the exception the last attempt ended with. Never throws.
+    ///
+    /// This is where a driver's exceptions become data, once, so nothing above it needs a
+    /// <c>try</c>. Polly captures whatever the work throws, synchronously or asynchronously, with
+    /// its stack trace, and its strategies still see those exceptions, so retries and the circuit
+    /// breaker behave exactly as they do under <c>executeTask</c>.
+    ///
+    /// The context is pooled, and goes back to the pool however the attempt ended.
+    /// </summary>
+    let executeOutcome
+        (pipeline: ResiliencePipeline)
+        (work: CancellationToken -> Task<'T>)
+        (ct: CancellationToken)
+        : Task<Outcome<'T>> =
+        backgroundTask {
+            let context = ResilienceContextPool.Shared.Get(ct)
+
+            try
+                return!
+                    pipeline
+                        .ExecuteOutcomeAsync(
+                            (fun (attempt: ResilienceContext) (_: unit) ->
+                                ValueTask<Outcome<'T>>(
+                                    backgroundTask {
+                                        let! value = work attempt.CancellationToken
+                                        return Outcome.FromResult value
+                                    }
+                                )),
+                            context,
+                            ()
+                        )
+                        .AsTask()
+            finally
+                ResilienceContextPool.Shared.Return context
+        }
