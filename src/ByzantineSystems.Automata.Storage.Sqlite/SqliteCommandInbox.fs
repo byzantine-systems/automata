@@ -246,7 +246,7 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
             let version = ChartVersion.value submission.ChartVersion
 
             let! existing =
-                Statement.tryOne
+                TxStatement.tryOne
                     conn
                     transaction
                     (SqlResources.get "command" "find_by_key")
@@ -260,7 +260,7 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
             | Some commandId -> return Ok(AlreadySubmitted(CommandId.ofInt64 commandId))
             | None ->
                 let! registered =
-                    Statement.tryOne
+                    TxStatement.tryOne
                         conn
                         transaction
                         (SqlResources.get "chart" "by_version")
@@ -294,7 +294,7 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
                         | CommandKind.Correction _ -> now, now
 
                     let! inserted =
-                        Statement.tryOne
+                        TxStatement.tryOne
                             conn
                             transaction
                             (SqlResources.get "command" "submit")
@@ -320,7 +320,7 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
                     | Some commandId, CommandKind.Event -> return Ok(Accepted(CommandId.ofInt64 commandId))
                     | Some commandId, CommandKind.Correction(at, policy) ->
                         let! _ =
-                            Statement.execute
+                            TxStatement.execute
                                 conn
                                 transaction
                                 (SqlResources.get "command" "submit_correction")
@@ -346,7 +346,7 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
         =
         backgroundTask {
             let! token =
-                Statement.tryOne
+                TxStatement.tryOne
                     conn
                     transaction
                     (SqlResources.get "system" "next_token")
@@ -358,7 +358,7 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
             | None -> return Error(Db.decodeFailure "LeaseToken" "the lease token counter is missing")
             | Some token ->
                 let! rows =
-                    Statement.rows
+                    TxStatement.rows
                         conn
                         transaction
                         (SqlResources.get "command" "claim")
@@ -379,7 +379,7 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
                 | [] -> return Ok(rows, Map.empty)
                 | ids ->
                     let! details =
-                        Statement.rows
+                        TxStatement.rows
                             conn
                             transaction
                             (SqlResources.get "command" "corrections")
@@ -427,7 +427,7 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
         member _.Reschedule(commandId, leaseToken, backoff, ct) =
             write
                 (fun conn transaction now token ->
-                    Statement.execute
+                    TxStatement.execute
                         conn
                         transaction
                         (SqlResources.get "command" "reschedule")
@@ -446,7 +446,7 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
 
             write
                 (fun conn transaction now token ->
-                    Statement.execute
+                    TxStatement.execute
                         conn
                         transaction
                         (SqlResources.get "command" "extend_lease")

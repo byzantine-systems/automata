@@ -408,7 +408,7 @@ module internal Row =
 /// with their <c>@</c> prefix, exactly as the statement spells them.
 /// </summary>
 [<RequireQualifiedAccess>]
-module internal Statement =
+module internal TxStatement =
 
     let private prepare
         (conn: SqliteConnection)

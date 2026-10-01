@@ -102,7 +102,7 @@ type SqliteActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'EntityId
                                 (fun conn transaction now cancel ->
                                     backgroundTask {
                                         let! leaseToken =
-                                            Statement.tryOne
+                                            TxStatement.tryOne
                                                 conn
                                                 transaction
                                                 (SqlResources.get "system" "next_token")
@@ -118,7 +118,7 @@ type SqliteActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'EntityId
                                                 )
                                         | Some leaseToken ->
                                             let! rows =
-                                                Statement.rows
+                                                TxStatement.rows
                                                     conn
                                                     transaction
                                                     (SqlResources.get "action" "claim")
@@ -141,14 +141,14 @@ type SqliteActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'EntityId
         member _.Complete(action, ct) =
             write
                 (fun conn transaction _ token ->
-                    Statement.execute conn transaction (SqlResources.get "action" "complete") (fence action) token
+                    TxStatement.execute conn transaction (SqlResources.get "action" "complete") (fence action) token
                     |> Task.map (CommandMapping.leaseOutcome >> Ok))
                 ct
 
         member _.Reschedule(action, backoff, ct) =
             write
                 (fun conn transaction now token ->
-                    Statement.execute
+                    TxStatement.execute
                         conn
                         transaction
                         (SqlResources.get "action" "reschedule")
@@ -168,7 +168,7 @@ type SqliteActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'EntityId
                 (fun conn transaction now token ->
                     backgroundTask {
                         let! recorded =
-                            Statement.execute
+                            TxStatement.execute
                                 conn
                                 transaction
                                 (SqlResources.get "action" "abandon")
@@ -179,7 +179,7 @@ type SqliteActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'EntityId
                         | LeaseLost -> return Ok LeaseLost
                         | Updated ->
                             let! _ =
-                                Statement.execute
+                                TxStatement.execute
                                     conn
                                     transaction
                                     (SqlResources.get "action" "complete")

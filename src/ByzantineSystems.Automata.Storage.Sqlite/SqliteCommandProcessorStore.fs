@@ -350,7 +350,7 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
 
     /// The entity's current epoch: the initial one when it has never committed.
     let currentEpochIn conn transaction (target: FinalizeTarget) ct : Task<Epoch> =
-        Statement.tryOne
+        TxStatement.tryOne
             conn
             transaction
             (SqlResources.get "command" "current_epoch")
@@ -389,7 +389,7 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                     "@now", box now ]
 
             let! _ =
-                Statement.execute
+                TxStatement.execute
                     conn
                     transaction
                     (SqlResources.get "command" "insert_transition")
@@ -404,7 +404,7 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                     ct
 
             let! _ =
-                Statement.execute
+                TxStatement.execute
                     conn
                     transaction
                     (SqlResources.get "command" "upsert_snapshot")
@@ -412,7 +412,7 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                     ct
 
             let! _ =
-                Statement.execute
+                TxStatement.execute
                     conn
                     transaction
                     (SqlResources.get "action" "enqueue")
@@ -428,7 +428,7 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
 
     /// The encoded failure of a rejected or dead-lettered command.
     let recordErrorIn conn transaction (now: int64) (commandId: int64) (error: string) ct : Task<unit> =
-        Statement.execute
+        TxStatement.execute
             conn
             transaction
             (SqlResources.get "command" "insert_error")
@@ -451,7 +451,7 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
         : Task<unit> =
         backgroundTask {
             let! _ =
-                Statement.execute
+                TxStatement.execute
                     conn
                     transaction
                     (SqlResources.get "command" "close")
@@ -459,7 +459,7 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                     ct
 
             let! _ =
-                Statement.execute
+                TxStatement.execute
                     conn
                     transaction
                     (SqlResources.get "command" "promote_head")
@@ -513,7 +513,7 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
             (fun conn transaction now cancel ->
                 backgroundTask {
                     let! target =
-                        Statement.tryOne
+                        TxStatement.tryOne
                             conn
                             transaction
                             (SqlResources.get "command" "finalize_read")
@@ -536,7 +536,7 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                         | Unknown -> return Error(StoreError.NotFound $"command %d{id}")
                         | FinishedByCaller ->
                             let! committed =
-                                Statement.tryOne
+                                TxStatement.tryOne
                                     conn
                                     transaction
                                     (SqlResources.get "command" "committed_epoch")
