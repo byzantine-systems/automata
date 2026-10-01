@@ -12,7 +12,7 @@
         <PackageVersion Include="FsCheck" Version="3.4.0" />
         <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.10.1" />
         <PackageVersion Include="YoloDev.Expecto.TestSdk" Version="0.16.1" />
-        <PackageVersion Include="coverlet.msbuild" Version="10.0.1" />
+        <PackageVersion Include="coverlet.msbuild" Version="10.1.0" />
 
         <!-- Resilience (Polly v8) -->
         <PackageVersion Include="Polly.Core" Version="8.8.0" />
@@ -25,7 +25,7 @@
 
         <!-- Persistence shared by every storage provider. Each provider's own driver and
              migration runner are versioned in its .fsproj, with VersionOverride. -->
-        <PackageVersion Include="SqlHydra.Query" Version="5.0.0" />
+        <PackageVersion Include="SqlHydra.Query" Version="5.1.0" />
         <PackageVersion Include="FSharp.SystemTextJson" Version="1.4.36" />
 
         <!-- Optional, package-edge ergonomics only; never referenced by Core -->
