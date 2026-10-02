@@ -7,7 +7,7 @@ on:
 
 permissions:
   contents: write
-  pull_requests: write
+  pull-requests: write
 
 jobs:
   dependabot-adjustments:
@@ -52,8 +52,10 @@ jobs:
         with:
           name: devenv
 
-      - name: "Generate new deps.json lockfile"
-        run: nix develop --impure --command make nix-lock
+      - name: "Generate new deps.json lockfile + SQLHydra updates"
+        run: |
+          nix develop --impure --command make nix-lock
+          nix develop --impure --command make schema-generate-sqlite
 
       - name: Commit and Push Generated File
         run: |
