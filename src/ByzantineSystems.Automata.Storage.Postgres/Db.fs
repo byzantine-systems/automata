@@ -100,21 +100,24 @@ module internal Db =
         | _ -> Unexpected error
 
     /// <summary>
-    /// Turns an attempt's outcome into the store's answer. A violation nobody asked to handle is
-    /// a defect like any other.
+    /// What one call through the boundary came to: an answer, or the server refusing it under a
+    /// named constraint. A refusal is a value the caller can match on, so a store that expects a
+    /// particular violation handles it as an outcome rather than catching anything.
     /// </summary>
-    let private settle
-        (ct: CancellationToken)
-        (outcome: Outcome<Result<'T, StoreError>>)
-        : Task<Result<'T, StoreError>> =
+    type Attempt<'T> =
+        | Answered of Result<'T, StoreError>
+        | Refused of ConstraintViolation * exn
+
+    /// <summary>Turns an attempt's outcome into an answer or a named refusal.</summary>
+    let private settle (ct: CancellationToken) (outcome: Outcome<Result<'T, StoreError>>) : Task<Attempt<'T>> =
         match outcome.Exception with
-        | null -> Task.FromResult outcome.Result
+        | null -> Task.FromResult(Answered outcome.Result)
         | error ->
             match classify ct error with
-            | Cancelled -> Task.FromCanceled<Result<'T, StoreError>>(ct)
-            | Unavailable cause -> Task.FromResult(Error(StoreError.Unavailable cause))
-            | Violated(_, cause)
-            | Unexpected cause -> Task.FromResult(Error(StoreError.Unexpected cause))
+            | Cancelled -> Task.FromCanceled<Attempt<'T>>(ct)
+            | Unavailable cause -> Task.FromResult(Answered(Error(StoreError.Unavailable cause)))
+            | Violated(violation, cause) -> Task.FromResult(Refused(violation, cause))
+            | Unexpected cause -> Task.FromResult(Answered(Error(StoreError.Unexpected cause)))
 
     /// <summary>
     /// The PostgreSQL adapter boundary, and the only place resilience is applied.
@@ -128,14 +131,22 @@ module internal Db =
     /// <see cref="M:ByzantineSystems.Automata.Storage.Postgres.Db.classify(System.Threading.CancellationToken,System.Exception)" />
     /// decides what the exception means.
     /// </summary>
-    let private attempt
+    let attempt
         (pipeline: ResiliencePipeline)
         (work: CancellationToken -> Task<Result<'T, StoreError>>)
         (ct: CancellationToken)
-        : Task<Result<'T, StoreError>> =
+        : Task<Attempt<'T>> =
         backgroundTask {
             let! outcome = ResiliencePipeline.executeOutcome pipeline work ct
             return! settle ct outcome
+        }
+
+    /// <summary>An attempt whose refusals nobody asked to handle, which makes them defects like any other.</summary>
+    let private answered (attempt: Task<Attempt<'T>>) : Task<Result<'T, StoreError>> =
+        backgroundTask {
+            match! attempt with
+            | Answered result -> return result
+            | Refused(_, cause) -> return Error(StoreError.Unexpected cause)
         }
 
     /// <summary>
@@ -152,7 +163,7 @@ module internal Db =
         (work: CancellationToken -> Task<Result<'T, StoreError>>)
         (ct: CancellationToken)
         : Task<Result<'T, StoreError>> =
-        attempt pipeline work ct
+        answered (attempt pipeline work ct)
 
     /// <summary>
     /// Runs a statement that must not be repeated automatically, translating failures the same
@@ -169,7 +180,7 @@ module internal Db =
         (work: CancellationToken -> Task<Result<'T, StoreError>>)
         (ct: CancellationToken)
         : Task<Result<'T, StoreError>> =
-        attempt Polly.ResiliencePipeline.Empty work ct
+        answered (attempt Polly.ResiliencePipeline.Empty work ct)
 
     /// <summary>
     /// Runs typed reads against the generated schema types, under the same pipeline and the same

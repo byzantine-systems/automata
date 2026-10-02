@@ -10,6 +10,7 @@
     <ItemGroup>
         <Compile Include="TestContext.fs" />
         <Compile Include="SqlResourceTests.fs" />
+        <Compile Include="SqlTests.fs" />
         <Compile Include="CommandInboxTests.fs" />
         <Compile Include="ChartRegistryTests.fs" />
         <Compile Include="TemporalTests.fs" />
