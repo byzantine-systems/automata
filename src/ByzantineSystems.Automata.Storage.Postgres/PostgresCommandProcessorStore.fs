@@ -6,10 +6,9 @@ open System.Threading
 open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
+open ByzantineSystems.Automata.Storage.Internal
 open ByzantineSystems.Automata.Storage.Postgres.Schema
 open FsToolkit.ErrorHandling
-open Npgsql
-open NpgsqlTypes
 open SqlHydra.Query
 
 /// <summary>
@@ -107,108 +106,95 @@ module private ReplayMapping =
 type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     (options: CommandProcessorOptions<'EntityId, 'State, 'Event, 'Action, 'Err>) =
 
-    let dataSource = options.Context.DataSource
+    let context = options.Context
 
-    /// Every statement goes through the context's pipeline, which is where transient driver
-    /// failures are retried and classified. Bound once here so no call site can forget it.
-    let protect work ct =
-        Db.protect options.Context.Resilience work ct
+    let finalizeCommand = Statement.load "command" "finalize"
+    let finalizeCorrection = Statement.load "command" "finalize_correction"
 
-    let addText (name: string) (value: string) (cmd: NpgsqlCommand) =
-        cmd.Parameters.AddWithValue(name, value) |> ignore
-
-    let addBigint (name: string) (value: int64) (cmd: NpgsqlCommand) =
-        cmd.Parameters.AddWithValue(name, value) |> ignore
-
-    /// An absent value is sent as a typed NULL. The routine rejects the combinations that make no
-    /// sense, so a half-filled shape fails loudly rather than being written.
-    let addNullable (name: string) (dbType: NpgsqlDbType) (value: obj option) (cmd: NpgsqlCommand) =
-        let parameter = NpgsqlParameter(name, dbType)
-
-        parameter.Value <-
-            match value with
-            | Some value -> value
-            | None -> box DBNull.Value
-
-        cmd.Parameters.Add parameter |> ignore
-
-    /// What a committed finalize sends beyond the command's identity: the draft and its four
-    /// encoded payloads. Kept together so the two shapes of the call cannot be half-filled.
+    /// What a commit sends beyond the command's identity: the draft and its four encoded
+    /// payloads, encoded before anything is sent.
     let encodeDraft
         (draft: TransitionDraft<'EntityId, 'State, 'Event, 'Action>)
-        : Result<string * string * string * string, StoreError> =
+        : Result<EncodedDraft<'EntityId, 'State, 'Event, 'Action>, StoreError> =
         match
             options.EventCodec.Encode draft.Event,
             options.ActionCodec.Encode draft.Actions,
             options.StateCodec.Encode draft.FromState,
             options.StateCodec.Encode draft.ToState
         with
-        | Ok event, Ok actions, Ok fromState, Ok toState -> Ok(event, actions, fromState, toState)
+        | Ok event, Ok actions, Ok fromState, Ok toState ->
+            Ok
+                { Source = draft
+                  EventJson = event
+                  ActionsJson = actions
+                  FromJson = fromState
+                  ToJson = toState }
         | Error error, _, _, _
         | _, Error error, _, _
         | _, _, Error error, _
         | _, _, _, Error error -> Error(Db.toStoreError error)
 
-    /// One finalize call. The three operations differ only in the status and which half of the
-    /// parameters they fill, so the call is written once.
+    let states (ids: StateId list) : string list = ids |> List.map StateId.value
+
+    /// <summary>
+    /// One call to <c>fsm.finalize_command</c>. Which half of its parameters is filled follows
+    /// from how the command ends, so the two shapes cannot be half-filled or mixed: a commit
+    /// sends its transition and no error, a failure sends its error and no transition.
+    ///
+    /// A failure writes no state, so there is nothing for a stale epoch to conflict with; it
+    /// sends the initial epoch and the routine skips the check.
+    /// </summary>
     let finalize
         (commandId: CommandId)
         (token: LeaseToken<CommandWork>)
-        (expected: Epoch)
-        (status: string)
-        (error: string option)
-        (committed: (TransitionDraft<'EntityId, 'State, 'Event, 'Action> * string * string * string * string) option)
-        (ct: CancellationToken)
-        : Task<Result<FinalizeOutcome, StoreError>> =
-        task {
-            use! conn = dataSource.OpenConnectionAsync(ct).AsTask()
-            use cmd = new NpgsqlCommand(SqlResources.get "command" "finalize", conn)
-            cmd |> addBigint "command_id" (CommandId.value commandId)
-            cmd |> addBigint "lease_token" (LeaseToken.value token)
-            cmd |> addBigint "expected_epoch" (int64 (Epoch.value expected))
-            cmd |> addText "status" status
-            cmd |> addText "action_queue" options.ActionQueue
-            cmd |> addNullable "error" NpgsqlDbType.Jsonb (error |> Option.map box)
+        (resolution: Resolution<'EntityId, 'State, 'Event, 'Action>)
+        : Op<PgSession, FinalizeOutcome> =
+        let expected = Resolution.unmoved resolution
 
-            let jsonb name selector =
-                cmd
-                |> addNullable name NpgsqlDbType.Jsonb (committed |> Option.map (selector >> box))
+        let ending =
+            match resolution with
+            | Commit(_, encoded) ->
+                let draft = encoded.Source
 
-            jsonb "state" (fun (_, _, _, _, toState) -> toState)
-            jsonb "event" (fun (_, event, _, _, _) -> event)
-            jsonb "actions" (fun (_, _, actions, _, _) -> actions)
-            jsonb "from_state" (fun (_, _, _, fromState, _) -> fromState)
-            jsonb "to_state" (fun (_, _, _, _, toState) -> toState)
+                [ "error", Param.JsonbOrNull None
+                  "state", Param.JsonbOrNull(Some encoded.ToJson)
+                  "instance_status", Param.TextOrNull(Some(Db.instanceStatusToString draft.Status))
+                  "effective_at", Param.TimestampOrNull(Some draft.EffectiveAt)
+                  "event", Param.JsonbOrNull(Some encoded.EventJson)
+                  "actions", Param.JsonbOrNull(Some encoded.ActionsJson)
+                  "from_state", Param.JsonbOrNull(Some encoded.FromJson)
+                  "to_state", Param.JsonbOrNull(Some encoded.ToJson)
+                  "handled_by", Param.TextOrNull(Some(StateId.value draft.HandledBy))
+                  "exited", Param.TextArrayOrNull(Some(states draft.Exited))
+                  "entered", Param.TextArrayOrNull(Some(states draft.Entered)) ]
+            | Reject error
+            | DeadLetter error ->
+                [ "error", Param.JsonbOrNull(Some error)
+                  "state", Param.JsonbOrNull None
+                  "instance_status", Param.TextOrNull None
+                  "effective_at", Param.TimestampOrNull None
+                  "event", Param.JsonbOrNull None
+                  "actions", Param.JsonbOrNull None
+                  "from_state", Param.JsonbOrNull None
+                  "to_state", Param.JsonbOrNull None
+                  "handled_by", Param.TextOrNull None
+                  "exited", Param.TextArrayOrNull None
+                  "entered", Param.TextArrayOrNull None ]
 
-            let fromDraft name dbType selector =
-                cmd
-                |> addNullable name dbType (committed |> Option.map (fun (draft, _, _, _, _) -> selector draft))
+        postgres {
+            let! outcome, epoch =
+                Sql.one
+                    (nameof FinalizeOutcome)
+                    finalizeCommand
+                    ([ "command_id", Param.Bigint(CommandId.value commandId)
+                       "lease_token", Param.Bigint(LeaseToken.value token)
+                       "expected_epoch", Param.Bigint(int64 (Epoch.value expected))
+                       "status", Param.Text(Resolution.status resolution)
+                       "action_queue", Param.Text options.ActionQueue ]
+                     @ ending)
+                    (fun reader -> Row.string reader "outcome", Row.int64 reader "epoch")
 
-            fromDraft "instance_status" NpgsqlDbType.Text (fun d -> box (Db.instanceStatusToString d.Status))
-
-            fromDraft "effective_at" NpgsqlDbType.TimestampTz (fun d -> box (Db.timestamp d.EffectiveAt))
-            fromDraft "handled_by" NpgsqlDbType.Text (fun d -> box (StateId.value d.HandledBy))
-
-            let textArray name selector =
-                cmd
-                |> addNullable
-                    name
-                    (NpgsqlDbType.Array ||| NpgsqlDbType.Text)
-                    (committed
-                     |> Option.map (fun (draft, _, _, _, _) ->
-                         box (selector draft |> List.map StateId.value |> List.toArray)))
-
-            textArray "exited" (fun d -> d.Exited)
-            textArray "entered" (fun d -> d.Entered)
-
-            use! reader = cmd.ExecuteReaderAsync ct
-            let! hasRow = reader.ReadAsync ct
-
-            if not hasRow then
-                return Error(Db.decodeFailure (nameof FinalizeOutcome) "finalize_command returned no row")
-            else
-                return
-                    ProcessorMapping.outcomeFromString (Row.string reader "outcome") (Row.int64 reader "epoch") expected
+            return! ProcessorMapping.outcomeFromString outcome epoch expected
         }
 
     /// <summary>
@@ -249,18 +235,18 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                     Db.decodeFailure (nameof CommandFailure) "a command error carried no domain, machine or replay tag"
                 )
 
-    let failWith (status: string) (commandId: CommandId) token (failure: CommandFailure<'Err>) ct =
-        protect
-            (fun cancel ->
-                task {
-                    match encodeFailure failure with
-                    | Error error -> return Error error
-                    | Ok encoded ->
-                        // No expected epoch: a failure writes no state, so there is nothing for a
-                        // stale epoch to conflict with, and the routine skips the check.
-                        return! finalize commandId token Epoch.initial status (Some encoded) None cancel
-                })
-            ct
+    /// A rejection or a dead letter, encoded before anything is sent.
+    let fail
+        (resolve: string -> Resolution<'EntityId, 'State, 'Event, 'Action>)
+        (commandId: CommandId)
+        token
+        (failure: CommandFailure<'Err>)
+        ct
+        =
+        backgroundTaskResult {
+            let! encoded = encodeFailure failure
+            return! Sql.run context (finalize commandId token (resolve encoded)) ct
+        }
 
     /// Rebuilds a committed transition from its generated row. Seven decodes can fail
     /// independently, and none of them is expected: each means the row is not what this code was
@@ -353,25 +339,27 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
         | "dead_letter", _ -> failure () |> Result.map CommandResult.DeadLettered
         | other, _ -> Error(Db.decodeFailure (nameof CommandResult) $"unknown command status {other}")
 
-    let read work ct =
-        Db.query options.Context.Resilience dataSource work ct
-
     interface IStateReader<'EntityId, 'State, 'Event, 'Action> with
 
         member _.TryGetSnapshot(machineId, entityId, ct) =
             let machine = Some(MachineId.value machineId)
             let entity = Some(options.EntityIdEncode entityId)
 
-            read
-                (fun context token ->
-                    selectTask context {
-                        for b in fsm.current_belief do
-                            where (b.machine_id = machine && b.entity_id = entity)
-                            select b
-                            tryHead
-                            cancel token
-                    }
-                    |> Task.map (Option.traverseResult toSnapshot))
+            Sql.run
+                context
+                (postgres {
+                    let! row =
+                        Sql.select (fun query token ->
+                            selectTask query {
+                                for b in fsm.current_belief do
+                                    where (b.machine_id = machine && b.entity_id = entity)
+                                    select b
+                                    tryHead
+                                    cancel token
+                            })
+
+                    return! row |> Option.traverseResult toSnapshot
+                })
                 ct
 
         member _.History(machineId, entityId, paging, ct) =
@@ -387,62 +375,58 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
 
             let limit = Page.limit paging
 
-            read
-                (fun context token ->
-                    selectTask context {
-                        for t in fsm.transition do
-                            where (t.machine_id = machine && t.entity_id = entity && t.epoch > after)
-                            orderBy t.epoch
-                            take limit
-                            select t
-                            toList
-                            cancel token
-                    }
-                    |> Task.map (List.traverseResultM toTransition))
+            Sql.run
+                context
+                (postgres {
+                    let! rows =
+                        Sql.select (fun query token ->
+                            selectTask query {
+                                for t in fsm.transition do
+                                    where (t.machine_id = machine && t.entity_id = entity && t.epoch > after)
+                                    orderBy t.epoch
+                                    take limit
+                                    select t
+                                    toList
+                                    cancel token
+                            })
+
+                    return! rows |> List.traverseResultM toTransition
+                })
                 ct
 
     interface ICommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err> with
 
         member _.Commit(commandId, token, expected, draft, ct) =
-            protect
-                (fun cancel ->
-                    task {
-                        match encodeDraft draft with
-                        | Error error -> return Error error
-                        | Ok(event, actions, fromState, toState) ->
-                            return!
-                                finalize
-                                    commandId
-                                    token
-                                    expected
-                                    "succeeded"
-                                    None
-                                    (Some(draft, event, actions, fromState, toState))
-                                    cancel
-                    })
-                ct
+            backgroundTaskResult {
+                let! encoded = encodeDraft draft
+                return! Sql.run context (finalize commandId token (Commit(expected, encoded))) ct
+            }
 
-        member _.Reject(commandId, token, error, ct) =
-            failWith "rejected" commandId token error ct
+        member _.Reject(commandId, token, error, ct) = fail Reject commandId token error ct
 
         member _.DeadLetter(commandId, token, error, ct) =
-            failWith "dead_letter" commandId token error ct
+            fail DeadLetter commandId token error ct
 
         member _.TryGetResult(commandId, ct) =
             let id = CommandId.value commandId
 
-            read
-                (fun context token ->
-                    selectTask context {
-                        for c in fsm.command do
-                            leftJoin t in fsm.transition on (c.command_id = t.Value.command_id)
-                            leftJoin e in fsm.command_error on (c.command_id = e.Value.command_id)
-                            where (c.command_id = id)
-                            select (c, t, e)
-                            tryHead
-                            cancel token
-                    }
-                    |> Task.map (Option.traverseResult toResult))
+            Sql.run
+                context
+                (postgres {
+                    let! row =
+                        Sql.select (fun query token ->
+                            selectTask query {
+                                for c in fsm.command do
+                                    leftJoin t in fsm.transition on (c.command_id = t.Value.command_id)
+                                    leftJoin e in fsm.command_error on (c.command_id = e.Value.command_id)
+                                    where (c.command_id = id)
+                                    select (c, t, e)
+                                    tryHead
+                                    cancel token
+                            })
+
+                    return! row |> Option.traverseResult toResult
+                })
                 ct
 
     interface IReplayStore<'EntityId, 'State, 'Event, 'Action> with
@@ -452,11 +436,12 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
             let entity = options.EntityIdEncode entityId
             let since = Db.timestamp from
 
-            read
-                (fun context token ->
-                    task {
-                        let! suffix =
-                            selectTask context {
+            Sql.run
+                context
+                (postgres {
+                    let! suffix =
+                        Sql.select (fun query token ->
+                            selectTask query {
                                 for t in fsm.transition do
                                     where (t.machine_id = machine && t.entity_id = entity && t.effective_at >= since)
                                     orderBy t.effective_at
@@ -465,80 +450,66 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                                     select t
                                     toList
                                     cancel token
-                            }
+                            })
 
-                        // Retention purges an entity's oldest commands with their transitions,
-                        // so a log that no longer starts at epoch 1, and whose oldest survivor is
-                        // already past the corrected instant, may have lost events after it.
-                        let! oldest =
-                            selectTask context {
+                    // Retention purges an entity's oldest commands with their transitions, so a
+                    // log that no longer starts at epoch 1, and whose oldest survivor is already
+                    // past the corrected instant, may have lost events after it.
+                    let! oldest =
+                        Sql.select (fun query token ->
+                            selectTask query {
                                 for t in fsm.transition do
                                     where (t.machine_id = machine && t.entity_id = entity)
                                     orderBy t.epoch
                                     select t
                                     tryHead
                                     cancel token
-                            }
+                            })
 
-                        let incomplete =
-                            match oldest with
-                            | Some first -> first.epoch > 1L && first.effective_at > since
-                            | None -> false
+                    let incomplete =
+                        match oldest with
+                        | Some first -> first.epoch > 1L && first.effective_at > since
+                        | None -> false
 
-                        return
-                            suffix
-                            |> List.traverseResultM toTransition
-                            |> Result.map (fun transitions ->
-                                { Transitions = transitions
-                                  Incomplete = incomplete })
-                    })
+                    let! transitions = suffix |> List.traverseResultM toTransition
+
+                    return
+                        { Transitions = transitions
+                          Incomplete = incomplete }
+                })
                 ct
 
         member _.CommitCorrection(commandId, token, expected, commit, ct) =
-            protect
-                (fun cancel ->
-                    task {
-                        match
-                            encodeDraft commit.Transition, BeliefPayload.encode options.StateCodec commit.Beliefs
-                        with
-                        | Error error, _
-                        | _, Error error -> return Error error
-                        | Ok(event, _, fromState, toState), Ok beliefs ->
-                            use! conn = dataSource.OpenConnectionAsync(cancel).AsTask()
-                            use cmd = new NpgsqlCommand(SqlResources.get "command" "finalize_correction", conn)
-                            let draft = commit.Transition
+            backgroundTaskResult {
+                // Everything is encoded before anything is sent, so a state that will not encode
+                // fails the correction rather than half-writing it.
+                let! encoded = encodeDraft commit.Transition
+                let! beliefs = BeliefPayload.encode options.StateCodec commit.Beliefs
+                let draft = commit.Transition
 
-                            let states (ids: StateId list) =
-                                ids |> List.map StateId.value |> List.toArray |> box
+                return!
+                    Sql.run
+                        context
+                        (postgres {
+                            let! outcome, epoch =
+                                Sql.one
+                                    (nameof FinalizeOutcome)
+                                    finalizeCorrection
+                                    [ "command_id", Param.Bigint(CommandId.value commandId)
+                                      "lease_token", Param.Bigint(LeaseToken.value token)
+                                      "expected_epoch", Param.Bigint(int64 (Epoch.value expected))
+                                      "valid_from", Param.Timestamp commit.ValidFrom
+                                      "beliefs", Param.Jsonb beliefs
+                                      "instance_status", Param.Text(Db.instanceStatusToString draft.Status)
+                                      "event", Param.Jsonb encoded.EventJson
+                                      "from_state", Param.Jsonb encoded.FromJson
+                                      "to_state", Param.Jsonb encoded.ToJson
+                                      "handled_by", Param.Text(StateId.value draft.HandledBy)
+                                      "exited", Param.TextArray(states draft.Exited)
+                                      "entered", Param.TextArray(states draft.Entered) ]
+                                    (fun reader -> Row.string reader "outcome", Row.int64 reader "epoch")
 
-                            Db.parameters
-                                [ "command_id", box (CommandId.value commandId)
-                                  "lease_token", box (LeaseToken.value token)
-                                  "expected_epoch", box (int64 (Epoch.value expected))
-                                  "valid_from", box (Db.timestamp commit.ValidFrom)
-                                  "beliefs", box beliefs
-                                  "instance_status", box (Db.instanceStatusToString draft.Status)
-                                  "event", box event
-                                  "from_state", box fromState
-                                  "to_state", box toState
-                                  "handled_by", box (StateId.value draft.HandledBy)
-                                  "exited", states draft.Exited
-                                  "entered", states draft.Entered ]
-                                cmd
-
-                            use! reader = cmd.ExecuteReaderAsync cancel
-
-                            match! reader.ReadAsync cancel with
-                            | false ->
-                                return
-                                    Error(
-                                        Db.decodeFailure (nameof FinalizeOutcome) "finalize_correction returned no row"
-                                    )
-                            | true ->
-                                return
-                                    ProcessorMapping.outcomeFromString
-                                        (Row.string reader "outcome")
-                                        (Row.int64 reader "epoch")
-                                        expected
-                    })
-                ct
+                            return! ProcessorMapping.outcomeFromString outcome epoch expected
+                        })
+                        ct
+            }
