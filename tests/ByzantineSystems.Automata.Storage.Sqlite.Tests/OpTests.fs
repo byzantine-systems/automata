@@ -1,8 +1,8 @@
 module ByzantineSystems.Automata.Storage.Sqlite.Tests.OpTests
 
-// The effect is compiled into both providers from one source file, so testing it here covers the
-// PostgreSQL copy too. Nothing below touches a database: the session is a counter that each
-// step bumps, which is enough to see what ran and how often.
+// The effect lives in the Storage library, internal to it and the bundled providers. Nothing
+// below touches a database: the session is a counter that each step bumps, which is enough to
+// see what ran and how often.
 
 open System
 open System.Threading

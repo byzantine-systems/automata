@@ -1,9 +1,5 @@
 namespace ByzantineSystems.Automata.Storage.Internal
 
-// Compiled into each storage provider through a linked <Compile> item rather than shipped as a
-// project of its own. Every type here is internal, so the two copies never meet: each provider
-// assembly carries its own, and neither is part of any public surface.
-
 open System.Threading
 open System.Threading.Tasks
 open ByzantineSystems.Automata.Core

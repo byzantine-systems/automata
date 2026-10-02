@@ -8,10 +8,6 @@
     </PropertyGroup>
 
     <ItemGroup>
-        <!-- The unit-of-work effect both stores are written in, shared as source rather than as
-             a project: it is internal, so each provider compiles its own copy. First, because
-             Db.fs builds its primitives and runners on it. -->
-        <Compile Include="..\ByzantineSystems.Automata.Storage.Shared\Op.fs" Link="Op.fs" />
         <!-- Db.fs precedes DataSource.fs: the data source's resilience is built from the
              driver-failure classifier that lives with the rest of the adapter boundary. -->
         <Compile Include="Db.fs" />

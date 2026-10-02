@@ -19,6 +19,16 @@
         <Compile Include="Maintenance.fs" />
         <Compile Include="MachineStore.fs" />
         <Compile Include="Supervision.fs" />
+        <!-- The unit-of-work effect the bundled providers are written in. Internal: it is how this
+             repository's stores are built, not part of the contract a provider implements. -->
+        <Compile Include="Op.fs" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <InternalsVisibleTo Include="ByzantineSystems.Automata.Storage.Postgres" />
+        <InternalsVisibleTo Include="ByzantineSystems.Automata.Storage.Sqlite" />
+        <InternalsVisibleTo Include="ByzantineSystems.Automata.Storage.Postgres.Tests" />
+        <InternalsVisibleTo Include="ByzantineSystems.Automata.Storage.Sqlite.Tests" />
     </ItemGroup>
 
     <ItemGroup>
