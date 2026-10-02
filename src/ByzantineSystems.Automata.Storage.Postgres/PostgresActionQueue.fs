@@ -6,7 +6,8 @@ open System.Threading
 open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
-open Npgsql
+open ByzantineSystems.Automata.Storage.Internal
+open FsToolkit.ErrorHandling
 
 /// <summary>
 /// What the action queue needs to bridge one machine's actions to a pgmq queue.
@@ -37,19 +38,15 @@ type ActionQueueOptions<'EntityId, 'Action> =
 /// </summary>
 type PostgresActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'EntityId, 'Action>) =
 
-    let dataSource = options.Context.DataSource
+    let context = options.Context
 
-    let protect work ct =
-        Db.protect options.Context.Resilience work ct
+    let ensureQueue = Statement.load "action" "ensure_queue"
+    let claimActions = Statement.load "action" "claim"
+    let completeAction = Statement.load "action" "complete"
+    let rescheduleAction = Statement.load "action" "reschedule"
+    let abandonAction = Statement.load "action" "abandon"
 
-    let addText (name: string) (value: string) (cmd: NpgsqlCommand) =
-        cmd.Parameters.AddWithValue(name, value) |> ignore
-
-    let addInt (name: string) (value: int) (cmd: NpgsqlCommand) =
-        cmd.Parameters.AddWithValue(name, value) |> ignore
-
-    let addBigint (name: string) (value: int64) (cmd: NpgsqlCommand) =
-        cmd.Parameters.AddWithValue(name, value) |> ignore
+    let queue = [ "queue", Param.Text options.Queue ]
 
     let outcomeFromString (value: string) : Result<LeaseUpdateOutcome, StoreError> =
         match value with
@@ -119,23 +116,22 @@ type PostgresActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'Entity
     /// </summary>
     let messageIdOf (action: LeasedAction<'EntityId, 'Action>) = LeaseToken.value action.Token
 
-    /// One fenced call, for the two writes that differ only in which routine they name.
-    let fencedWrite (operation: string) (bind: NpgsqlCommand -> unit) (ct: CancellationToken) =
-        protect
-            (fun token ->
-                task {
-                    use! conn = dataSource.OpenConnectionAsync(token).AsTask()
-                    use cmd = new NpgsqlCommand(SqlResources.get "action" operation, conn)
-                    cmd |> addText "queue" options.Queue
-                    bind cmd
-                    use! reader = cmd.ExecuteReaderAsync token
-                    let! hasRow = reader.ReadAsync token
+    /// The message and the claim that fences it, as every fenced routine binds them.
+    let fence (action: LeasedAction<'EntityId, 'Action>) =
+        queue
+        @ [ "msg_id", Param.Bigint(messageIdOf action)
+            "read_ct", Param.Int action.DeliveryCount ]
 
-                    if not hasRow then
-                        return Error(Db.decodeFailure (nameof LeaseUpdateOutcome) $"{operation} returned no row")
-                    else
-                        return outcomeFromString (Row.string reader "outcome")
-                })
+    /// One fenced call: the routine answers whether the caller still held the lease.
+    let fenced (statement: Statement) (values: (string * Param) list) (ct: CancellationToken) =
+        Sql.run
+            context
+            (postgres {
+                let! outcome =
+                    Sql.one (nameof LeaseUpdateOutcome) statement values (fun reader -> Row.string reader "outcome")
+
+                return! outcomeFromString outcome
+            })
             ct
 
     /// <summary>
@@ -143,21 +139,7 @@ type PostgresActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'Entity
     /// tables and indexes, which is not a question a hot path should be asking.
     /// </summary>
     member _.EnsureQueueAsync(ct: CancellationToken) : Task<Result<bool, StoreError>> =
-        protect
-            (fun token ->
-                task {
-                    use! conn = dataSource.OpenConnectionAsync(token).AsTask()
-                    use cmd = new NpgsqlCommand(SqlResources.get "action" "ensure_queue", conn)
-                    cmd |> addText "queue" options.Queue
-                    use! reader = cmd.ExecuteReaderAsync token
-                    let! hasRow = reader.ReadAsync token
-
-                    if not hasRow then
-                        return Error(Db.decodeFailure "ActionQueue" "ensure_action_queue returned no row")
-                    else
-                        return Ok(Row.bool reader "created")
-                })
-            ct
+        Sql.run context (Sql.one "ActionQueue" ensureQueue queue (fun reader -> Row.bool reader "created")) ct
 
     interface IActionQueue<'EntityId, 'Action> with
 
@@ -171,80 +153,43 @@ type PostgresActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'Entity
             // Not idempotent, like the command claim: a claim whose reply was lost has already
             // leased the messages, and repeating it leases more while the first batch stays
             // invisible. The dispatcher polls again shortly, which recovers faster.
-            Db.protectOnce
-                (fun token ->
-                    task {
-                        use! conn = dataSource.OpenConnectionAsync(token).AsTask()
-                        use cmd = new NpgsqlCommand(SqlResources.get "action" "claim", conn)
-                        cmd |> addText "queue" options.Queue
-                        cmd |> addInt "batch" batch
-                        cmd.Parameters.AddWithValue("lease", lease) |> ignore
-                        use! reader = cmd.ExecuteReaderAsync token
+            let claim =
+                Sql.rows
+                    claimActions
+                    (queue @ [ "batch", Param.Int batch; "lease", Param.Interval lease ])
+                    (fun reader ->
+                        Row.string reader "message",
+                        Row.int64 reader "msg_id",
+                        Row.int32 reader "read_ct",
+                        Row.timestamp reader "vt")
 
-                        let claimed = ResizeArray()
-                        let mutable failure = None
-                        let mutable reading = true
+            backgroundTaskResult {
+                let! claimed = Sql.runOnce context claim ct
 
-                        while reading do
-                            let! hasRow = reader.ReadAsync token
+                // Decoded once the claim has returned. The first message that does not decode
+                // fails the claim, as before; its lease lapses and it is redelivered.
+                return!
+                    claimed
+                    |> List.traverseResultM (fun (message, messageId, deliveries, visibleUntil) ->
+                        readMessage message
+                        |> Result.map (fun record ->
+                            { Work = record
+                              // The message's id identifies the claim; the delivery count fences
+                              // it. Every write below needs both.
+                              Token = LeaseToken.ofInt64 messageId
+                              DeliveryCount = deliveries
+                              ExpiresAt = visibleUntil }))
+            }
 
-                            if not hasRow then
-                                reading <- false
-                            else
-                                match readMessage (Row.string reader "message") with
-                                | Error error ->
-                                    failure <- Some error
-                                    reading <- false
-                                | Ok record ->
-                                    claimed.Add
-                                        { Work = record
-                                          // The message's id identifies the claim; the delivery
-                                          // count fences it. Every write below needs both.
-                                          Token = LeaseToken.ofInt64 (Row.int64 reader "msg_id")
-                                          DeliveryCount = Row.int32 reader "read_ct"
-                                          ExpiresAt = Row.timestamp reader "vt" }
-
-                        match failure with
-                        | Some error -> return Error error
-                        | None -> return Ok(List.ofSeq claimed)
-                    })
-                ct
-
-        member _.Complete(action, ct) =
-            fencedWrite
-                "complete"
-                (fun cmd ->
-                    cmd |> addBigint "msg_id" (messageIdOf action)
-                    cmd |> addInt "read_ct" action.DeliveryCount)
-                ct
+        member _.Complete(action, ct) = fenced completeAction (fence action) ct
 
         member _.Reschedule(action, backoff, ct) =
-            protect
-                (fun token ->
-                    task {
-                        use! conn = dataSource.OpenConnectionAsync(token).AsTask()
-                        use cmd = new NpgsqlCommand(SqlResources.get "action" "reschedule", conn)
-                        cmd |> addText "queue" options.Queue
-                        cmd |> addBigint "msg_id" (messageIdOf action)
-                        cmd |> addInt "read_ct" action.DeliveryCount
-                        cmd |> addInt "base_ms" (int (Backoff.baseDelay backoff).TotalMilliseconds)
-                        cmd |> addInt "cap_ms" (int (Backoff.ceiling backoff).TotalMilliseconds)
-                        use! reader = cmd.ExecuteReaderAsync token
-                        let! hasRow = reader.ReadAsync token
-
-                        if not hasRow then
-                            return
-                                Error(Db.decodeFailure (nameof LeaseUpdateOutcome) "reschedule_action returned no row")
-                        else
-                            return outcomeFromString (Row.string reader "outcome")
-                    })
+            fenced
+                rescheduleAction
+                (fence action
+                 @ [ "base_ms", Param.Int(int (Backoff.baseDelay backoff).TotalMilliseconds)
+                     "cap_ms", Param.Int(int (Backoff.ceiling backoff).TotalMilliseconds) ])
                 ct
 
         member _.Abandon(action, reason, ct) =
-            fencedWrite
-                "abandon"
-                (fun cmd ->
-                    cmd |> addBigint "msg_id" (messageIdOf action)
-                    cmd |> addInt "read_ct" action.DeliveryCount
-                    cmd |> addText "reason" reason)
-                ct
+            fenced abandonAction (fence action @ [ "reason", Param.Text reason ]) ct
