@@ -71,6 +71,8 @@ Supporting types: `CommandId`, `ChartVersion`, `CommandRecord`, `Leased<'kind,'W
 
 `TransitionDraft` is what pure chart resolution produces. `CommittedTransition` adds what only the database can decide: the authoritative `Epoch`, the `CommandId`, the `ChartVersion` and `CommittedAt`. `FinalizeOutcome` is `Finalized`, `AlreadyFinalized`, `Conflict` or `LeaseLost`.
 
+Every store method answers failures as `StoreError`, and the case says what a caller can do. `Unavailable` means no answer arrived and is retried; `Concurrency` is retried from a fresh snapshot; `Serialization` and `NotFound` are dead-lettered. `Unexpected` is a failure the store does not recognise, such as a routine refusing its arguments or a constraint nothing expected to fire: a defect rather than an outage, which the default processor policy escalates to supervision. The bundled stores never throw for a driver failure; they classify it into one of these cases. A custom store should do the same, and may also let a defect propagate as an exception, which reaches supervision the way it always has.
+
 ### Optional capabilities
 
 Two capabilities sit outside the required four, discovered by `Store.tryTemporal` and `Store.tryCorrections` rather than declared on `IMachineStore`. A type test is the only shape where adding a capability breaks nobody: members returning `option` would force every provider to write `None` for capabilities it has never heard of, and declaring one separately when a machine is wired would let a caller hand over a reader belonging to a different store than the one it configured. `Machine.temporal` and `Machine.corrections` return the options; `Machine.history` is always available because history is required.

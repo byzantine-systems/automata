@@ -14,27 +14,6 @@ open Polly.Timeout
 [<RequireQualifiedAccess>]
 module internal Db =
 
-    /// Recognises the named PostgreSQL uniqueness constraint used for an idempotency race.
-    let (|UniqueViolation|_|) (constraintName: string) (error: exn) =
-        match error with
-        | :? PostgresException as postgresError when
-            postgresError.SqlState = PostgresErrorCodes.UniqueViolation
-            && postgresError.ConstraintName = constraintName
-            ->
-            Some()
-        | _ -> None
-
-    /// Recognises the named PostgreSQL foreign-key constraint, for a reference that was never
-    /// registered rather than a transient failure.
-    let (|ForeignKeyViolation|_|) (constraintName: string) (error: exn) =
-        match error with
-        | :? PostgresException as postgresError when
-            postgresError.SqlState = PostgresErrorCodes.ForeignKeyViolation
-            && postgresError.ConstraintName = constraintName
-            ->
-            Some()
-        | _ -> None
-
     /// <summary>
     /// Which driver failures are worth another attempt in a moment.
     ///
@@ -183,31 +162,6 @@ module internal Db =
         answered (attempt Polly.ResiliencePipeline.Empty work ct)
 
     /// <summary>
-    /// Runs typed reads against the generated schema types, under the same pipeline and the same
-    /// failure classification as every hand-written statement. SqlHydra builds and runs the
-    /// query; the connection, the retries and what a failure means stay here. The context owns
-    /// the connection and disposes it.
-    /// </summary>
-    let query
-        (pipeline: ResiliencePipeline)
-        (dataSource: NpgsqlDataSource)
-        (work: SqlHydra.Query.QueryContext -> CancellationToken -> Task<Result<'T, StoreError>>)
-        (ct: CancellationToken)
-        : Task<Result<'T, StoreError>> =
-        protect
-            pipeline
-            (fun cancel ->
-                backgroundTask {
-                    let! conn = dataSource.OpenConnectionAsync(cancel).AsTask()
-
-                    use context =
-                        new SqlHydra.Query.QueryContext(conn, SqlHydra.Query.PostgresEmitter())
-
-                    return! work context cancel
-                })
-            ct
-
-    /// <summary>
     /// A column a view reports as nullable, which the schema says never is. PostgreSQL cannot
     /// carry NOT NULL through a view, so every view column arrives as an option; a missing one
     /// means the view and the code disagree, and is reported as such rather than defaulted.
@@ -218,11 +172,6 @@ module internal Db =
         | None -> Error(StoreError.Serialization(typeName, FormatException $"the view returned no {column}"))
 
     let timestamp (dto: DateTimeOffset) : DateTime = dto.UtcDateTime
-
-    /// <summary>Binds named parameters, in one call rather than one statement each.</summary>
-    let parameters (values: (string * obj) list) (cmd: NpgsqlCommand) : unit =
-        values
-        |> List.iter (fun (name, value) -> cmd.Parameters.AddWithValue(name, value) |> ignore)
 
     /// <summary>The instance lifecycle, as the fsm.instance_status domain spells it.</summary>
     let instanceStatusToString (status: InstanceStatus) : string =
