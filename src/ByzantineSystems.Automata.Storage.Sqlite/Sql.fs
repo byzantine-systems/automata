@@ -196,6 +196,55 @@ module internal Sql =
                 })
             ct
 
+    /// <summary>
+    /// Runs <paramref name="work" /> inside one write transaction, begun <c>IMMEDIATE</c>, and
+    /// commits it when the work answers <c>Ok</c>. An <c>Error</c> rolls back, so a refusal
+    /// never leaves half its writes behind.
+    ///
+    /// <c>IMMEDIATE</c> takes the write lock at <c>BEGIN</c>. A deferred transaction takes it at
+    /// the first write, and under WAL a reader that tries to become a writer after another
+    /// connection committed fails with <c>SQLITE_BUSY_SNAPSHOT</c>, which no busy timeout can
+    /// wait out. Taking the lock first means contention is a wait at the start and never a
+    /// failure in the middle.
+    ///
+    /// <paramref name="now" /> is read once, before the work, and every statement in the
+    /// transaction is meant to bind it. That is PostgreSQL's <c>now()</c>, fixed for a whole
+    /// transaction, so a commit's timestamps and the lease deadlines it writes agree with each
+    /// other.
+    ///
+    /// Before any of that, it takes the file's <see cref="T:ByzantineSystems.Automata.Storage.Sqlite.WriteGate" />,
+    /// so writers in this process queue asynchronously instead of inside SQLite. It is taken
+    /// per attempt, inside the pipeline, so a retry's backoff lets the others through. The gate
+    /// is not reentrant: <paramref name="work" /> must never begin another write transaction.
+    ///
+    /// Keep the work short. One file has one writer, and every machine sharing it waits for
+    /// this transaction to end, so encoding and decoding happen outside it.
+    /// </summary>
+    let private writeTransaction
+        (connectionString: string)
+        (clock: TimeProvider)
+        (work: SqliteConnection -> SqliteTransaction -> int64 -> CancellationToken -> Task<Result<'T, StoreError>>)
+        (ct: CancellationToken)
+        : Task<Result<'T, StoreError>> =
+        backgroundTask {
+            let gate = WriteGate.forConnectionString connectionString
+            do! gate.WaitAsync(ct)
+
+            try
+                use! conn = Db.openConnection connectionString ct
+                use transaction = conn.BeginTransaction(deferred = false)
+                let now = Instant.ofDateTimeOffset (clock.GetUtcNow())
+                let! outcome = work conn transaction now ct
+
+                match outcome with
+                | Ok _ -> do! transaction.CommitAsync(ct)
+                | Error _ -> do! transaction.RollbackAsync(ct)
+
+                return outcome
+            finally
+                gate.Release() |> ignore
+        }
+
     let private writeWith
         (protect:
             (CancellationToken -> Task<Result<'T, StoreError>>) -> CancellationToken -> Task<Result<'T, StoreError>>)
@@ -205,7 +254,7 @@ module internal Sql =
         : Task<Result<'T, StoreError>> =
         protect
             (fun token ->
-                Db.writeTransaction
+                writeTransaction
                     context.ConnectionString
                     context.Clock
                     (fun conn transaction now cancel ->

@@ -3,6 +3,7 @@ namespace ByzantineSystems.Automata.Storage.Sqlite
 open System
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
+open ByzantineSystems.Automata.Storage.Internal
 open ByzantineSystems.Automata.Storage.Sqlite.Schema
 open FsToolkit.ErrorHandling
 open Microsoft.Data.Sqlite
@@ -34,11 +35,11 @@ type SqliteActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'EntityId
 
     let context = options.Context
 
-    let write work ct =
-        Db.protect
-            context.Resilience
-            (fun token -> Db.writeTransaction context.ConnectionString context.Clock work token)
-            ct
+    let nextToken = Statement.load "system" "next_token"
+    let claimActions = Statement.load "action" "claim"
+    let completeAction = Statement.load "action" "complete"
+    let rescheduleAction = Statement.load "action" "reschedule"
+    let abandonAction = Statement.load "action" "abandon"
 
     let actionRow (reader: SqliteDataReader) : main.fsm_action =
         { command_id = Row.int64 reader "command_id"
@@ -75,10 +76,28 @@ type SqliteActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'EntityId
         }
 
     /// The row a lease names and the token that fences it, as every fenced statement binds them.
-    let fence (action: LeasedAction<'EntityId, 'Action>) : (string * obj) list =
-        [ "@command_id", box (CommandId.value action.Work.CommandId)
-          "@ordinal", box action.Work.Ordinal
-          "@lease_token", box (LeaseToken.value action.Token) ]
+    let fence (action: LeasedAction<'EntityId, 'Action>) : (string * Param) list =
+        [ "@command_id", Param.Integer(CommandId.value action.Work.CommandId)
+          "@ordinal", Param.Integer(int64 action.Work.Ordinal)
+          "@lease_token", Param.Integer(LeaseToken.value action.Token) ]
+
+    /// The token and the claimed rows, in the claim's own transaction. Decoding waits until it
+    /// has committed.
+    let claim (machineId: MachineId) (batch: int) (lease: TimeSpan) =
+        sqliteWrite {
+            let! now = Sql.now
+            let! leaseToken = Sql.one "LeaseToken" nextToken [] (fun reader -> Row.int64 reader "value")
+
+            return!
+                Sql.rows
+                    claimActions
+                    [ "@machine_id", Param.Text(MachineId.value machineId)
+                      "@batch", Param.Integer(int64 batch)
+                      "@now", Param.Integer now
+                      "@deadline", Param.Integer(Instant.add now lease)
+                      "@lease_token", Param.Integer leaseToken ]
+                    actionRow
+        }
 
     interface IActionQueue<'EntityId, 'Action> with
 
@@ -93,99 +112,49 @@ type SqliteActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'EntityId
             // leased the rows, and repeating it leases more while the first batch stays invisible.
             // The dispatcher polls again shortly, which recovers faster.
             backgroundTaskResult {
-                let! rows =
-                    Db.protectOnce
-                        (fun token ->
-                            Db.writeTransaction
-                                context.ConnectionString
-                                context.Clock
-                                (fun conn transaction now cancel ->
-                                    backgroundTask {
-                                        let! leaseToken =
-                                            TxStatement.tryOne
-                                                conn
-                                                transaction
-                                                (SqlResources.get "system" "next_token")
-                                                []
-                                                (fun reader -> Row.int64 reader "value")
-                                                cancel
-
-                                        match leaseToken with
-                                        | None ->
-                                            return
-                                                Error(
-                                                    Db.decodeFailure "LeaseToken" "the lease token counter is missing"
-                                                )
-                                        | Some leaseToken ->
-                                            let! rows =
-                                                TxStatement.rows
-                                                    conn
-                                                    transaction
-                                                    (SqlResources.get "action" "claim")
-                                                    [ "@machine_id", box (MachineId.value machineId)
-                                                      "@batch", box batch
-                                                      "@now", box now
-                                                      "@deadline", box (Instant.add now lease)
-                                                      "@lease_token", box leaseToken ]
-                                                    actionRow
-                                                    cancel
-
-                                            return Ok rows
-                                    })
-                                token)
-                        ct
-
+                let! rows = Sql.writeOnce context (claim machineId batch lease) ct
                 return! rows |> List.traverseResultM toLeased
             }
 
         member _.Complete(action, ct) =
-            write
-                (fun conn transaction _ token ->
-                    TxStatement.execute conn transaction (SqlResources.get "action" "complete") (fence action) token
-                    |> Task.map (CommandMapping.leaseOutcome >> Ok))
-                ct
+            Sql.write context (Sql.execute completeAction (fence action) |> Op.map CommandMapping.leaseOutcome) ct
 
         member _.Reschedule(action, backoff, ct) =
-            write
-                (fun conn transaction now token ->
-                    TxStatement.execute
-                        conn
-                        transaction
-                        (SqlResources.get "action" "reschedule")
-                        (fence action
-                         @ [ "@now", box now
-                             "@base_us", box (CommandMapping.micros (Backoff.baseDelay backoff))
-                             "@cap_us", box (CommandMapping.micros (Backoff.ceiling backoff)) ])
-                        token
-                    |> Task.map (CommandMapping.leaseOutcome >> Ok))
+            Sql.write
+                context
+                (sqliteWrite {
+                    let! now = Sql.now
+
+                    let! changed =
+                        Sql.execute
+                            rescheduleAction
+                            (fence action
+                             @ [ "@now", Param.Integer now
+                                 "@base_us", Param.Integer(CommandMapping.micros (Backoff.baseDelay backoff))
+                                 "@cap_us", Param.Integer(CommandMapping.micros (Backoff.ceiling backoff)) ])
+
+                    return CommandMapping.leaseOutcome changed
+                })
                 ct
 
         member _.Abandon(action, reason, ct) =
             if String.IsNullOrWhiteSpace reason then
                 invalidArg (nameof reason) "An abandoned delivery must say why."
 
-            write
-                (fun conn transaction now token ->
-                    backgroundTask {
-                        let! recorded =
-                            TxStatement.execute
-                                conn
-                                transaction
-                                (SqlResources.get "action" "abandon")
-                                (fence action @ [ "@reason", box reason; "@now", box now ])
-                                token
+            Sql.write
+                context
+                (sqliteWrite {
+                    let! now = Sql.now
 
-                        match CommandMapping.leaseOutcome recorded with
-                        | LeaseLost -> return Ok LeaseLost
-                        | Updated ->
-                            let! _ =
-                                TxStatement.execute
-                                    conn
-                                    transaction
-                                    (SqlResources.get "action" "complete")
-                                    (fence action)
-                                    token
+                    let! recorded =
+                        Sql.execute
+                            abandonAction
+                            (fence action @ [ "@reason", Param.Text reason; "@now", Param.Integer now ])
 
-                            return Ok Updated
-                    })
+                    match CommandMapping.leaseOutcome recorded with
+                    | LeaseLost -> return LeaseLost
+                    | Updated ->
+                        do! Sql.execute completeAction (fence action) |> Op.discard
+                        return Updated
+                })
                 ct
