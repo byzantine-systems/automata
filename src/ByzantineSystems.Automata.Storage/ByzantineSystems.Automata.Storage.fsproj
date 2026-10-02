@@ -22,6 +22,8 @@
         <!-- The unit-of-work effect the bundled providers are written in. Internal: it is how this
              repository's stores are built, not part of the contract a provider implements. -->
         <Compile Include="Op.fs" />
+        <!-- How a leased command ends, shared by the bundled providers' finalize paths. -->
+        <Compile Include="Finalize.fs" />
     </ItemGroup>
 
     <ItemGroup>
