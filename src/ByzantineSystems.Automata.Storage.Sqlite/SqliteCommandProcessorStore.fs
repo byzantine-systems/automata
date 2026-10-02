@@ -6,6 +6,7 @@ open System.Threading
 open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
+open ByzantineSystems.Automata.Storage.Internal
 open ByzantineSystems.Automata.Storage.Sqlite.Schema
 open FsToolkit.ErrorHandling
 open Microsoft.Data.Sqlite
@@ -90,47 +91,6 @@ type internal FinalizeTarget =
       Holder: int64
       Version: int64 }
 
-/// <summary>A committed draft with its four payloads already encoded, so the transaction only writes.</summary>
-type internal EncodedDraft<'EntityId, 'State, 'Event, 'Action> =
-    { Source: TransitionDraft<'EntityId, 'State, 'Event, 'Action>
-      EventJson: string
-      ActionsJson: string
-      FromJson: string
-      ToJson: string }
-
-/// <summary>How a leased command ends. Each case carries exactly what that ending writes.</summary>
-type internal Resolution<'EntityId, 'State, 'Event, 'Action> =
-    /// <summary>The chart accepted the event: a transition at the epoch after <c>expected</c>.</summary>
-    | Commit of expected: Epoch * draft: EncodedDraft<'EntityId, 'State, 'Event, 'Action>
-
-    /// <summary>The chart refused the event. The encoded failure is recorded and no state moves.</summary>
-    | Reject of error: string
-
-    /// <summary>The machine gave up on the command. The encoded failure is recorded and no state moves.</summary>
-    | DeadLetter of error: string
-
-/// <summary>Operations on <see cref="T:ByzantineSystems.Automata.Storage.Sqlite.Resolution`4" />.</summary>
-[<RequireQualifiedAccess>]
-module internal Resolution =
-
-    /// <summary>The terminal status an ending writes, as the status CHECK spells it.</summary>
-    let status (resolution: Resolution<'EntityId, 'State, 'Event, 'Action>) : string =
-        match resolution with
-        | Commit _ -> "succeeded"
-        | Reject _ -> "rejected"
-        | DeadLetter _ -> "dead_letter"
-
-    /// <summary>
-    /// The epoch an ending reports when no transition answers for it. A failure moves no state, so
-    /// it reports the initial epoch, as the PostgreSQL routine does; a commit reports the epoch it
-    /// expected.
-    /// </summary>
-    let unmoved (resolution: Resolution<'EntityId, 'State, 'Event, 'Action>) : Epoch =
-        match resolution with
-        | Commit(expected, _) -> expected
-        | Reject _
-        | DeadLetter _ -> Epoch.initial
-
 /// <summary>
 /// Where a finalizing caller stands with its command, as the command row shows it. Decided
 /// before anything is written, and the only thing that decides whether anything is.
@@ -196,14 +156,15 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
 
     let context = options.Context
 
-    let write work ct =
-        Db.protect
-            context.Resilience
-            (fun token -> Db.writeTransaction context.ConnectionString context.Clock work token)
-            ct
-
-    let read work ct =
-        Db.query context.Resilience context.ReadConnectionString work ct
+    let finalizeRead = Statement.load "command" "finalize_read"
+    let committedEpoch = Statement.load "command" "committed_epoch"
+    let currentEpochOf = Statement.load "command" "current_epoch"
+    let insertTransition = Statement.load "command" "insert_transition"
+    let upsertSnapshot = Statement.load "command" "upsert_snapshot"
+    let enqueueActions = Statement.load "action" "enqueue"
+    let insertError = Statement.load "command" "insert_error"
+    let closeCommand = Statement.load "command" "close"
+    let promoteHead = Statement.load "command" "promote_head"
 
     let encodeDraft
         (draft: TransitionDraft<'EntityId, 'State, 'Event, 'Action>)
@@ -348,125 +309,101 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
             | CommandStatus.Rejected, _ -> failure () |> Result.map CommandResult.Rejected
             | CommandStatus.DeadLettered, _ -> failure () |> Result.map CommandResult.DeadLettered)
 
+    let entityOf (target: FinalizeTarget) =
+        [ "@machine_id", Param.Text target.Machine
+          "@entity_id", Param.Text target.Entity ]
+
     /// The entity's current epoch: the initial one when it has never committed.
-    let currentEpochIn conn transaction (target: FinalizeTarget) ct : Task<Epoch> =
-        Statement.tryOne
-            conn
-            transaction
-            (SqlResources.get "command" "current_epoch")
-            [ "@machine_id", box target.Machine; "@entity_id", box target.Entity ]
-            (fun reader -> Row.int64 reader "epoch" |> Db.epochOf)
-            ct
-        |> Task.map (Option.defaultValue Epoch.initial)
+    let currentEpoch (target: FinalizeTarget) : Op<WriteSession, Epoch> =
+        Sql.tryOne "Epoch" currentEpochOf (entityOf target) (fun reader -> Row.int64 reader "epoch" |> Db.epochOf)
+        |> Op.map (Option.defaultValue Epoch.initial)
 
     /// <summary>
     /// A commit's writes, in order: the transition, then the snapshot, then the queued actions.
     /// The transition goes first so a snapshot that cannot be written leaves no transition
     /// claiming it did, and the actions share the transaction, which is the whole outbox.
     /// </summary>
-    let appendIn
-        conn
-        transaction
-        (now: int64)
+    let append
         (commandId: int64)
         (target: FinalizeTarget)
         (epoch: Epoch)
         (encoded: EncodedDraft<'EntityId, 'State, 'Event, 'Action>)
-        (ct: CancellationToken)
-        : Task<unit> =
-        backgroundTask {
+        : Op<WriteSession, unit> =
+        sqliteWrite {
+            let! now = Sql.now
             let draft = encoded.Source
-
-            let entity = [ "@machine_id", box target.Machine; "@entity_id", box target.Entity ]
+            let entity = entityOf target
 
             let written =
                 entity
-                @ [ "@command_id", box commandId
-                    "@epoch", box (int64 (Epoch.value epoch))
-                    "@chart_version", box target.Version
-                    "@status", box (Db.instanceStatusToString draft.Status)
-                    "@effective_at", box (Instant.ofDateTimeOffset draft.EffectiveAt)
-                    "@now", box now ]
+                @ [ "@command_id", Param.Integer commandId
+                    "@epoch", Param.Integer(int64 (Epoch.value epoch))
+                    "@chart_version", Param.Integer target.Version
+                    "@status", Param.Text(Db.instanceStatusToString draft.Status)
+                    "@effective_at", Param.Integer(Instant.ofDateTimeOffset draft.EffectiveAt)
+                    "@now", Param.Integer now ]
 
-            let! _ =
-                Statement.execute
-                    conn
-                    transaction
-                    (SqlResources.get "command" "insert_transition")
+            do!
+                Sql.execute
+                    insertTransition
                     (written
-                     @ [ "@event", box encoded.EventJson
-                         "@actions", box encoded.ActionsJson
-                         "@from_state", box encoded.FromJson
-                         "@to_state", box encoded.ToJson
-                         "@handled_by", box (StateId.value draft.HandledBy)
-                         "@exited", box (encodePath draft.Exited)
-                         "@entered", box (encodePath draft.Entered) ])
-                    ct
+                     @ [ "@event", Param.Text encoded.EventJson
+                         "@actions", Param.Text encoded.ActionsJson
+                         "@from_state", Param.Text encoded.FromJson
+                         "@to_state", Param.Text encoded.ToJson
+                         "@handled_by", Param.Text(StateId.value draft.HandledBy)
+                         "@exited", Param.Text(encodePath draft.Exited)
+                         "@entered", Param.Text(encodePath draft.Entered) ])
+                |> Op.discard
 
-            let! _ =
-                Statement.execute
-                    conn
-                    transaction
-                    (SqlResources.get "command" "upsert_snapshot")
-                    (written @ [ "@state", box encoded.ToJson ])
-                    ct
+            do!
+                Sql.execute upsertSnapshot (written @ [ "@state", Param.Text encoded.ToJson ])
+                |> Op.discard
 
-            let! _ =
-                Statement.execute
-                    conn
-                    transaction
-                    (SqlResources.get "action" "enqueue")
+            do!
+                Sql.execute
+                    enqueueActions
                     (entity
-                     @ [ "@command_id", box commandId
-                         "@epoch", box (int64 (Epoch.value epoch))
-                         "@actions", box encoded.ActionsJson
-                         "@now", box now ])
-                    ct
-
-            return ()
+                     @ [ "@command_id", Param.Integer commandId
+                         "@epoch", Param.Integer(int64 (Epoch.value epoch))
+                         "@actions", Param.Text encoded.ActionsJson
+                         "@now", Param.Integer now ])
+                |> Op.discard
         }
 
     /// The encoded failure of a rejected or dead-lettered command.
-    let recordErrorIn conn transaction (now: int64) (commandId: int64) (error: string) ct : Task<unit> =
-        Statement.execute
-            conn
-            transaction
-            (SqlResources.get "command" "insert_error")
-            [ "@command_id", box commandId; "@error", box error; "@now", box now ]
-            ct
-        |> Task.ignore
+    let recordError (commandId: int64) (error: string) : Op<WriteSession, unit> =
+        sqliteWrite {
+            let! now = Sql.now
+
+            do!
+                Sql.execute
+                    insertError
+                    [ "@command_id", Param.Integer commandId
+                      "@error", Param.Text error
+                      "@now", Param.Integer now ]
+                |> Op.discard
+        }
 
     /// <summary>
     /// Closes the command at its terminal status and promotes the entity's next command to head.
     /// Promotion runs after the close, so the command just finished is no longer open and cannot
     /// be re-elected.
     /// </summary>
-    let closeIn
-        conn
-        transaction
+    let close
         (commandId: int64)
         (target: FinalizeTarget)
         (resolution: Resolution<'EntityId, 'State, 'Event, 'Action>)
-        ct
-        : Task<unit> =
-        backgroundTask {
-            let! _ =
-                Statement.execute
-                    conn
-                    transaction
-                    (SqlResources.get "command" "close")
-                    [ "@command_id", box commandId; "@status", box (Resolution.status resolution) ]
-                    ct
+        : Op<WriteSession, unit> =
+        sqliteWrite {
+            do!
+                Sql.execute
+                    closeCommand
+                    [ "@command_id", Param.Integer commandId
+                      "@status", Param.Text(Resolution.status resolution) ]
+                |> Op.discard
 
-            let! _ =
-                Statement.execute
-                    conn
-                    transaction
-                    (SqlResources.get "command" "promote_head")
-                    [ "@machine_id", box target.Machine; "@entity_id", box target.Entity ]
-                    ct
-
-            return ()
+            do! Sql.execute promoteHead (entityOf target) |> Op.discard
         }
 
     /// <summary>
@@ -476,23 +413,27 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     /// than the mechanism: the head invariant already stops a second command for this entity
     /// being processed while this one is leased. What it catches is a writer outside that path.
     /// </summary>
-    let resolveIn conn transaction (now: int64) (commandId: int64) (target: FinalizeTarget) resolution ct =
-        backgroundTask {
+    let resolve
+        (commandId: int64)
+        (target: FinalizeTarget)
+        (resolution: Resolution<'EntityId, 'State, 'Event, 'Action>)
+        : Op<WriteSession, FinalizeOutcome> =
+        sqliteWrite {
             match resolution with
             | Commit(expected, encoded) ->
-                let! current = currentEpochIn conn transaction target ct
+                let! current = currentEpoch target
 
                 if current <> expected then
                     return Conflict(expected, current)
                 else
                     let committed = Epoch.next expected
-                    do! appendIn conn transaction now commandId target committed encoded ct
-                    do! closeIn conn transaction commandId target resolution ct
+                    do! append commandId target committed encoded
+                    do! close commandId target resolution
                     return Finalized committed
             | Reject error
             | DeadLetter error ->
-                do! recordErrorIn conn transaction now commandId error ct
-                do! closeIn conn transaction commandId target resolution ct
+                do! recordError commandId error
+                do! close commandId target resolution
                 return Finalized(Resolution.unmoved resolution)
         }
 
@@ -509,55 +450,45 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
         : Task<Result<FinalizeOutcome, StoreError>> =
         let id = CommandId.value commandId
 
-        write
-            (fun conn transaction now cancel ->
-                backgroundTask {
-                    let! target =
-                        Statement.tryOne
-                            conn
-                            transaction
-                            (SqlResources.get "command" "finalize_read")
-                            [ "@command_id", box id ]
-                            (fun reader ->
-                                Row.string reader "status"
-                                |> CommandMapping.statusFromString
-                                |> Result.map (fun status ->
-                                    { Machine = Row.string reader "machine_id"
-                                      Entity = Row.string reader "entity_id"
-                                      Status = status
-                                      Holder = Row.int64 reader "lease_token"
-                                      Version = Row.int64 reader "chart_version" }))
-                            cancel
+        Sql.write
+            context
+            (sqliteWrite {
+                let! read =
+                    Sql.tryOne (nameof FinalizeTarget) finalizeRead [ "@command_id", Param.Integer id ] (fun reader ->
+                        Row.string reader "status"
+                        |> CommandMapping.statusFromString
+                        |> Result.map (fun status ->
+                            { Machine = Row.string reader "machine_id"
+                              Entity = Row.string reader "entity_id"
+                              Status = status
+                              Holder = Row.int64 reader "lease_token"
+                              Version = Row.int64 reader "chart_version" }))
 
-                    match Option.sequenceResult target with
-                    | Error error -> return Error error
-                    | Ok target ->
-                        match LeaseStanding.classify (LeaseToken.value token) target with
-                        | Unknown -> return Error(StoreError.NotFound $"command %d{id}")
-                        | FinishedByCaller ->
-                            let! committed =
-                                Statement.tryOne
-                                    conn
-                                    transaction
-                                    (SqlResources.get "command" "committed_epoch")
-                                    [ "@command_id", box id ]
-                                    (fun reader -> Row.int64 reader "epoch" |> Db.epochOf)
-                                    cancel
+                let! target = Option.sequenceResult read
 
-                            return
-                                Ok(AlreadyFinalized(committed |> Option.defaultValue (Resolution.unmoved resolution)))
-                        | FinishedByAnother
-                        | HeldByAnother -> return Ok FinalizeOutcome.LeaseLost
-                        | HeldByCaller target ->
-                            let! outcome = resolveIn conn transaction now id target resolution cancel
-                            return Ok outcome
-                })
+                match LeaseStanding.classify (LeaseToken.value token) target with
+                | Unknown -> return! Op.fail (StoreError.NotFound $"command %d{id}")
+                | FinishedByCaller ->
+                    let! committed =
+                        Sql.tryOne "Epoch" committedEpoch [ "@command_id", Param.Integer id ] (fun reader ->
+                            Row.int64 reader "epoch" |> Db.epochOf)
+
+                    return AlreadyFinalized(committed |> Option.defaultValue (Resolution.unmoved resolution))
+                | FinishedByAnother
+                | HeldByAnother -> return FinalizeOutcome.LeaseLost
+                | HeldByCaller target -> return! resolve id target resolution
+            })
             ct
 
+    /// <summary>
+    /// A rejection or a dead letter. The failure is encoded before the write begins, so the
+    /// transaction only writes.
+    /// </summary>
     let fail (resolve: string -> Resolution<'EntityId, 'State, 'Event, 'Action>) commandId token failure ct =
-        match encodeFailure failure with
-        | Error error -> Task.FromResult(Error error)
-        | Ok encoded -> finalize commandId token (resolve encoded) ct
+        backgroundTaskResult {
+            let! encoded = encodeFailure failure
+            return! finalize commandId token (resolve encoded) ct
+        }
 
     interface IStateReader<'EntityId, 'State, 'Event, 'Action> with
 
@@ -565,16 +496,21 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
             let machine = MachineId.value machineId
             let entity = options.EntityIdEncode entityId
 
-            read
-                (fun query token ->
-                    selectTask query {
-                        for s in main.fsm_entity_snapshot do
-                            where (s.machine_id = machine && s.entity_id = entity)
-                            select s
-                            tryHead
-                            cancel token
-                    }
-                    |> Task.map (Option.traverseResult toSnapshot))
+            Sql.read
+                context
+                (sqliteRead {
+                    let! row =
+                        Sql.select (fun query token ->
+                            selectTask query {
+                                for s in main.fsm_entity_snapshot do
+                                    where (s.machine_id = machine && s.entity_id = entity)
+                                    select s
+                                    tryHead
+                                    cancel token
+                            })
+
+                    return! row |> Option.traverseResult toSnapshot
+                })
                 ct
 
         member _.History(machineId, entityId, paging, ct) =
@@ -590,26 +526,34 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
 
             let limit = Page.limit paging
 
-            read
-                (fun query token ->
-                    selectTask query {
-                        for t in main.fsm_transition do
-                            where (t.machine_id = machine && t.entity_id = entity && t.epoch > after)
-                            orderBy t.epoch
-                            take limit
-                            select t
-                            toList
-                            cancel token
-                    }
-                    |> Task.map (List.traverseResultM toTransition))
+            Sql.read
+                context
+                (sqliteRead {
+                    let! rows =
+                        Sql.select (fun query token ->
+                            selectTask query {
+                                for t in main.fsm_transition do
+                                    where (t.machine_id = machine && t.entity_id = entity && t.epoch > after)
+                                    orderBy t.epoch
+                                    take limit
+                                    select t
+                                    toList
+                                    cancel token
+                            })
+
+                    return! rows |> List.traverseResultM toTransition
+                })
                 ct
 
     interface ICommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err> with
 
         member _.Commit(commandId, token, expected, draft, ct) =
-            match encodeDraft draft with
-            | Error error -> Task.FromResult(Error error)
-            | Ok encoded -> finalize commandId token (Commit(expected, encoded)) ct
+            // Encoded before the write begins: one file has one writer, so codec work inside the
+            // transaction would be time every machine sharing the file waits for.
+            backgroundTaskResult {
+                let! encoded = encodeDraft draft
+                return! finalize commandId token (Commit(expected, encoded)) ct
+            }
 
         member _.Reject(commandId, token, error, ct) = fail Reject commandId token error ct
 
@@ -619,16 +563,21 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
         member _.TryGetResult(commandId, ct) =
             let id = CommandId.value commandId
 
-            read
-                (fun query token ->
-                    selectTask query {
-                        for c in main.fsm_command do
-                            leftJoin t in main.fsm_transition on (c.command_id = t.Value.command_id)
-                            leftJoin e in main.fsm_command_error on (c.command_id = e.Value.command_id)
-                            where (c.command_id = id)
-                            select (c, t, e)
-                            tryHead
-                            cancel token
-                    }
-                    |> Task.map (Option.traverseResult toResult))
+            Sql.read
+                context
+                (sqliteRead {
+                    let! row =
+                        Sql.select (fun query token ->
+                            selectTask query {
+                                for c in main.fsm_command do
+                                    leftJoin t in main.fsm_transition on (c.command_id = t.Value.command_id)
+                                    leftJoin e in main.fsm_command_error on (c.command_id = e.Value.command_id)
+                                    where (c.command_id = id)
+                                    select (c, t, e)
+                                    tryHead
+                                    cancel token
+                            })
+
+                    return! row |> Option.traverseResult toResult
+                })
                 ct

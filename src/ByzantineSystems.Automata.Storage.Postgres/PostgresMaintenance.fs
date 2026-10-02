@@ -7,9 +7,9 @@ open System.Threading
 open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
+open ByzantineSystems.Automata.Storage.Internal
 open ByzantineSystems.Automata.Storage.Postgres.Schema
 open FsToolkit.ErrorHandling
-open Npgsql
 open SqlHydra.Query
 
 /// <summary>What the catalog says about a database, before anything in it is trusted.</summary>
@@ -97,47 +97,37 @@ module internal Boot =
             String.Format(CultureInfo.InvariantCulture, "{0} microseconds", span.Ticks / 10L)
         | Retain.For span -> invalidArg (nameof retain) $"A retention period must be positive, not {span}."
 
-    /// <summary>Reads the catalog check. Never fails for a missing object; see boot_check.sql.</summary>
-    let check (conn: NpgsqlConnection) (ct: CancellationToken) : Task<Result<CatalogCheck, StoreError>> =
-        backgroundTask {
-            use cmd = new NpgsqlCommand(SqlResources.get "system" "boot_check", conn)
-            use! reader = cmd.ExecuteReaderAsync ct
+    let private bootCheck = Statement.load "system" "boot_check"
 
-            match! reader.ReadAsync ct with
-            | false -> return Error(Db.decodeFailure (nameof CatalogCheck) "boot_check returned no row")
-            | true ->
-                return
-                    Ok
-                        { HasSchema = Row.bool reader "has_schema"
-                          HasJournal = Row.bool reader "has_journal"
-                          HasRoutines = Row.bool reader "has_routines"
-                          HasBtreeGist = Row.bool reader "has_btree_gist"
-                          HasPgmq = Row.bool reader "has_pgmq" }
-        }
+    let private journalOf = Statement.load "system" "journal"
+
+    let private registerMaintenance = Statement.load "system" "register_maintenance"
+
+    /// <summary>Reads the catalog check. Never fails for a missing object; see boot_check.sql.</summary>
+    let check: Op<PgSession, CatalogCheck> =
+        Sql.one (nameof CatalogCheck) bootCheck [] (fun reader ->
+            { HasSchema = Row.bool reader "has_schema"
+              HasJournal = Row.bool reader "has_journal"
+              HasRoutines = Row.bool reader "has_routines"
+              HasBtreeGist = Row.bool reader "has_btree_gist"
+              HasPgmq = Row.bool reader "has_pgmq" })
 
     /// <summary>The applied migrations, read only once the check has said the journal exists.</summary>
-    let journal (conn: NpgsqlConnection) (check: CatalogCheck) (ct: CancellationToken) : Task<string list option> =
-        backgroundTask {
-            if not check.HasJournal then
-                return None
-            else
-                use cmd = new NpgsqlCommand(SqlResources.get "system" "journal", conn)
-                use! reader = cmd.ExecuteReaderAsync ct
-                let! applied = Row.all (fun row -> Row.string row "scriptname") reader ct
-                return Some applied
-        }
+    let journal (check: CatalogCheck) : Op<PgSession, string list option> =
+        if check.HasJournal then
+            Sql.rows journalOf [] (fun row -> Row.string row "scriptname") |> Op.map Some
+        else
+            Op.ok None
 
     /// <summary>Everything the database is missing, empty when it can serve.</summary>
     let inspect (context: PostgresContext) (ct: CancellationToken) : Task<Result<BootDefect list, StoreError>> =
-        Db.protect
-            context.Resilience
-            (fun cancel ->
-                backgroundTaskResult {
-                    use! conn = context.DataSource.OpenConnectionAsync(cancel).AsTask()
-                    let! check = check conn cancel
-                    let! applied = journal conn check cancel
-                    return defects check applied expectedMigrations
-                })
+        Sql.run
+            context
+            (postgres {
+                let! check = check
+                let! applied = journal check
+                return defects check applied expectedMigrations
+            })
             ct
 
     /// <summary>Writes this machine's maintenance registration. An upsert, so safe on every boot.</summary>
@@ -152,25 +142,17 @@ module internal Boot =
         if reapAfter <= TimeSpan.Zero then
             invalidArg (nameof reapAfter) "The reaping grace period must be a positive duration."
 
-        let bind =
-            Db.parameters
-                [ "machine_id", box (MachineId.value machineId)
-                  "action_queue", box queue
-                  "keep_commands", box (interval retention.Commands)
-                  "keep_belief_history", box (interval retention.BeliefHistory)
-                  "keep_action_archive", box (interval retention.ActionArchive)
-                  "reap_after", box reapAfter ]
-
-        Db.protect
-            context.Resilience
-            (fun cancel ->
-                backgroundTask {
-                    use! conn = context.DataSource.OpenConnectionAsync(cancel).AsTask()
-                    use cmd = new NpgsqlCommand(SqlResources.get "system" "register_maintenance", conn)
-                    bind cmd
-                    let! _ = cmd.ExecuteScalarAsync cancel
-                    return Ok()
-                })
+        Sql.run
+            context
+            (Sql.execute
+                registerMaintenance
+                [ "machine_id", Param.Text(MachineId.value machineId)
+                  "action_queue", Param.Text queue
+                  "keep_commands", Param.Text(interval retention.Commands)
+                  "keep_belief_history", Param.Text(interval retention.BeliefHistory)
+                  "keep_action_archive", Param.Text(interval retention.ActionArchive)
+                  "reap_after", Param.Interval reapAfter ]
+             |> Op.discard)
             ct
 
 /// <summary>
@@ -182,38 +164,14 @@ module internal Boot =
 /// </summary>
 type PostgresMaintenance(context: PostgresContext) =
 
-    let protect work ct = Db.protect context.Resilience work ct
-
-    /// One statement, its parameters, and a reader over every row it returns.
-    let query (domain: string) (operation: string) (bind: NpgsqlCommand -> unit) (read: NpgsqlDataReader -> 'T) ct =
-        protect
-            (fun cancel ->
-                backgroundTask {
-                    use! conn = context.DataSource.OpenConnectionAsync(cancel).AsTask()
-                    use cmd = new NpgsqlCommand(SqlResources.get domain operation, conn)
-                    bind cmd
-                    use! reader = cmd.ExecuteReaderAsync cancel
-                    let! rows = Row.all read reader cancel
-                    return Ok rows
-                })
-            ct
-
-    /// The same, for a statement that answers exactly one row.
-    let single domain operation bind read ct =
-        backgroundTask {
-            match! query domain operation bind read ct with
-            | Ok [ row ] -> return Ok row
-            | Ok rows ->
-                return
-                    Error(
-                        Db.decodeFailure
-                            operation
-                            $"{domain}/{operation} returned {List.length rows} rows rather than one"
-                    )
-            | Error error -> return Error error
-        }
-
-    let noParameters = Db.parameters []
+    let notifyPending = Statement.load "system" "notify_pending"
+    let runMaintenance = Statement.load "system" "run_maintenance"
+    let repairBlocked = Statement.load "command" "repair_blocked"
+    let scheduleMaintenance = Statement.load "system" "schedule"
+    let unscheduleMaintenance = Statement.load "system" "unschedule"
+    let beliefColdStale = Statement.load "system" "belief_cold_stale"
+    let refreshBeliefCold = Statement.load "system" "refresh_belief_cold"
+    let markBeliefCold = Statement.load "system" "mark_belief_cold"
 
     let schedulingOf (value: string) : Result<Scheduling, StoreError> =
         match value with
@@ -231,24 +189,15 @@ type PostgresMaintenance(context: PostgresContext) =
     /// repeat and safe to race: a second host's refresh waits for the first and finds nothing new.
     /// </summary>
     let refreshColdBeliefs ct : Task<Result<unit, StoreError>> =
-        protect
-            (fun token ->
-                backgroundTask {
-                    use! conn = context.DataSource.OpenConnectionAsync(token).AsTask()
-                    use check = new NpgsqlCommand(SqlResources.get "system" "belief_cold_stale", conn)
-                    let! stale = check.ExecuteScalarAsync token
+        Sql.run
+            context
+            (postgres {
+                let! stale = Sql.one "BeliefCold" beliefColdStale [] (fun reader -> Row.bool reader "stale")
 
-                    if unbox<bool> stale then
-                        use refresh =
-                            new NpgsqlCommand(SqlResources.get "system" "refresh_belief_cold", conn)
-
-                        let! _ = refresh.ExecuteNonQueryAsync token
-                        use mark = new NpgsqlCommand(SqlResources.get "system" "mark_belief_cold", conn)
-                        let! _ = mark.ExecuteScalarAsync token
-                        ()
-
-                    return Ok()
-                })
+                if stale then
+                    do! Sql.execute refreshBeliefCold [] |> Op.discard
+                    do! Sql.execute markBeliefCold [] |> Op.discard
+            })
             ct
 
     let positiveBatch (batch: int) =
@@ -258,31 +207,27 @@ type PostgresMaintenance(context: PostgresContext) =
     interface IDatabaseMaintenance with
 
         member _.NotifyPending(ct) =
-            single
-                "system"
-                "notify_pending"
-                noParameters
-                (fun row ->
+            Sql.run
+                context
+                (Sql.one "NotifyReport" notifyPending [] (fun row ->
                     { Sent = Row.int32 row "sent"
-                      QueueUsage = row.GetDouble(row.GetOrdinal "queue_usage") })
+                      QueueUsage = row.GetDouble(row.GetOrdinal "queue_usage") }))
                 ct
 
         member _.Run(batch, ct) =
             positiveBatch batch
 
-            taskResult {
+            backgroundTaskResult {
                 let! reports =
-                    query
-                        "system"
-                        "run_maintenance"
-                        (Db.parameters [ "batch", box batch ])
-                        (fun row ->
+                    Sql.run
+                        context
+                        (Sql.rows runMaintenance [ "batch", Param.Int batch ] (fun row ->
                             { MachineId = MachineId.create (Row.string row "machine_id")
                               Reaped = Row.int64 row "reaped"
                               PurgedCommands = Row.int64 row "purged_commands"
                               PurgedBeliefs = Row.int64 row "purged_beliefs"
                               PurgedActions = Row.int64 row "purged_actions"
-                              Drifted = Row.int64 row "drifted" })
+                              Drifted = Row.int64 row "drifted" }))
                         ct
 
                 do! refreshColdBeliefs ct
@@ -311,45 +256,51 @@ type PostgresMaintenance(context: PostgresContext) =
                           Expected = expected }
                 }
 
-            Db.query
-                context.Resilience
-                context.DataSource
-                (fun query token ->
-                    selectTask query {
-                        for d in fsm.blocked_drift do
-                            orderBy d.machine_id
-                            thenBy d.entity_id
-                            thenBy d.seq
-                            select d
-                            toList
-                            cancel token
-                    }
-                    |> Task.map (List.traverseResultM toDrift))
+            Sql.run
+                context
+                (postgres {
+                    let! rows =
+                        Sql.select (fun query token ->
+                            selectTask query {
+                                for d in fsm.blocked_drift do
+                                    orderBy d.machine_id
+                                    thenBy d.entity_id
+                                    thenBy d.seq
+                                    select d
+                                    toList
+                                    cancel token
+                            })
+
+                    return! rows |> List.traverseResultM toDrift
+                })
                 ct
 
         member _.RepairDrift(ct) =
-            query
-                "command"
-                "repair_blocked"
-                noParameters
-                (fun row ->
+            Sql.run
+                context
+                (Sql.rows repairBlocked [] (fun row ->
                     { RepairedBlock.CommandId = CommandId.ofInt64 (Row.int64 row "command_id")
-                      Blocked = Row.bool row "blocked" })
+                      Blocked = Row.bool row "blocked" }))
                 ct
 
         member _.Schedule(notifyEvery, runEvery, batch, ct) =
             positiveBatch batch
 
-            single
-                "system"
-                "schedule"
-                (Db.parameters
-                    [ "notify_every", box notifyEvery
-                      "run_every", box runEvery
-                      "batch", box batch ])
-                (fun row -> Row.string row "scheduling")
+            Sql.run
+                context
+                (postgres {
+                    let! scheduling =
+                        Sql.one
+                            (nameof Scheduling)
+                            scheduleMaintenance
+                            [ "notify_every", Param.Interval notifyEvery
+                              "run_every", Param.Interval runEvery
+                              "batch", Param.Int batch ]
+                            (fun row -> Row.string row "scheduling")
+
+                    return! schedulingOf scheduling
+                })
                 ct
-            |> Task.map (Result.bind schedulingOf)
 
         member _.Unschedule(ct) =
-            single "system" "unschedule" noParameters (fun row -> Row.int32 row "removed") ct
+            Sql.run context (Sql.one "Unscheduled" unscheduleMaintenance [] (fun row -> Row.int32 row "removed")) ct

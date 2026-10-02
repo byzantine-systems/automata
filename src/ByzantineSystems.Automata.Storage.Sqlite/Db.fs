@@ -163,24 +163,57 @@ module internal Db =
         | SqliteCantOpen -> true
         | _ -> false
 
+    /// <summary>What a failed attempt means, decided once from the exception it ended with.</summary>
+    type DriverFailure =
+        /// <summary>The caller cancelled. Reported as a cancelled task, never as an error.</summary>
+        | Cancelled
+
+        /// <summary>The file could not serve: contention, I/O, a full disk, a timed-out attempt, an open circuit.</summary>
+        | Unavailable of exn
+
+        /// <summary>
+        /// Anything else, which is a defect rather than an outage. A constraint violation is one:
+        /// every write checks what it depends on before it writes.
+        /// </summary>
+        | Unexpected of exn
+
     /// <summary>
-    /// The one translation from exceptions to results, run once, after the pipeline. Caller
-    /// cancellation stays cancellation, and the failures this layer understands become
-    /// <c>StoreError.Unavailable</c>. Anything else is left alone.
+    /// Classifies the exception an attempt ended with. Pure and exhaustive: this is the one place
+    /// a driver exception is given a meaning, and it is given one as a value.
     /// </summary>
-    let private classify
-        (work: unit -> Task<Result<'T, StoreError>>)
+    let classify (ct: CancellationToken) (error: exn) : DriverFailure =
+        match error with
+        | :? OperationCanceledException when ct.IsCancellationRequested -> Cancelled
+        | :? SqliteException as sqliteError when isUnavailable sqliteError -> Unavailable error
+        | :? TimeoutRejectedException
+        | :? BrokenCircuitException -> Unavailable error
+        | _ -> Unexpected error
+
+    /// <summary>Turns an attempt's outcome into the store's answer.</summary>
+    let private settle
+        (ct: CancellationToken)
+        (outcome: Outcome<Result<'T, StoreError>>)
+        : Task<Result<'T, StoreError>> =
+        match outcome.Exception with
+        | null -> Task.FromResult outcome.Result
+        | error ->
+            match classify ct error with
+            | Cancelled -> Task.FromCanceled<Result<'T, StoreError>>(ct)
+            | Unavailable cause -> Task.FromResult(Error(StoreError.Unavailable cause))
+            | Unexpected cause -> Task.FromResult(Error(StoreError.Unexpected cause))
+
+    /// <summary>
+    /// Runs the work through a pipeline that hands back the outcome as a value, then settles it.
+    /// Nothing here catches anything.
+    /// </summary>
+    let private attempt
+        (pipeline: ResiliencePipeline)
+        (work: CancellationToken -> Task<Result<'T, StoreError>>)
         (ct: CancellationToken)
         : Task<Result<'T, StoreError>> =
-        task {
-            try
-                return! work ()
-            with
-            | :? OperationCanceledException when ct.IsCancellationRequested ->
-                return! Task.FromCanceled<Result<'T, StoreError>>(ct)
-            | :? SqliteException as error when isUnavailable error -> return Error(StoreError.Unavailable error)
-            | :? TimeoutRejectedException as error -> return Error(StoreError.Unavailable error)
-            | :? BrokenCircuitException as error -> return Error(StoreError.Unavailable error)
+        backgroundTask {
+            let! outcome = ResiliencePipeline.executeOutcome pipeline work ct
+            return! settle ct outcome
         }
 
     /// <summary>
@@ -196,19 +229,19 @@ module internal Db =
         (work: CancellationToken -> Task<Result<'T, StoreError>>)
         (ct: CancellationToken)
         : Task<Result<'T, StoreError>> =
-        classify (fun () -> ResiliencePipeline.executeTask pipeline work ct) ct
+        attempt pipeline work ct
 
     /// <summary>
     /// Runs a unit of work that must not be repeated automatically, translating failures the
-    /// same way but without the pipeline. Claims go through here, as they do in the PostgreSQL
-    /// store: a worker that polls again in a moment recovers as well as a retry would, and never
-    /// holds a batch it did not ask for twice.
+    /// same way but without retries: the empty pipeline makes exactly one attempt. Claims go
+    /// through here, as they do in the PostgreSQL store: a worker that polls again in a moment
+    /// recovers as well as a retry would, and never holds a batch it did not ask for twice.
     /// </summary>
     let protectOnce
         (work: CancellationToken -> Task<Result<'T, StoreError>>)
         (ct: CancellationToken)
         : Task<Result<'T, StoreError>> =
-        classify (fun () -> work ct) ct
+        attempt Polly.ResiliencePipeline.Empty work ct
 
     /// <summary>
     /// Opens a pooled connection, which the caller owns and disposes. Pooling is on in every
@@ -223,86 +256,6 @@ module internal Db =
             do! conn.OpenAsync(ct)
             return conn
         }
-
-    /// <summary>
-    /// Runs <paramref name="work" /> inside one write transaction, begun <c>IMMEDIATE</c>, and
-    /// commits it when the work answers <c>Ok</c>. An <c>Error</c> rolls back, so a refusal
-    /// never leaves half its writes behind.
-    ///
-    /// <c>IMMEDIATE</c> takes the write lock at <c>BEGIN</c>. A deferred transaction takes it at
-    /// the first write, and under WAL a reader that tries to become a writer after another
-    /// connection committed fails with <c>SQLITE_BUSY_SNAPSHOT</c>, which no busy timeout can
-    /// wait out. Taking the lock first means contention is a wait at the start and never a
-    /// failure in the middle.
-    ///
-    /// <paramref name="now" /> is read once, before the work, and every statement in the
-    /// transaction is meant to bind it. That is PostgreSQL's <c>now()</c>, fixed for a whole
-    /// transaction, so a commit's timestamps and the lease deadlines it writes agree with each
-    /// other.
-    ///
-    /// Before any of that, it takes the file's <see cref="T:ByzantineSystems.Automata.Storage.Sqlite.WriteGate" />,
-    /// so writers in this process queue asynchronously instead of inside SQLite. It is taken
-    /// per attempt, inside the pipeline, so a retry's backoff lets the others through. The gate
-    /// is not reentrant: <paramref name="work" /> must never begin another write transaction.
-    ///
-    /// Keep the work short. One file has one writer, and every machine sharing it waits for
-    /// this transaction to end, so encoding and decoding happen outside it.
-    /// </summary>
-    let writeTransaction
-        (connectionString: string)
-        (clock: TimeProvider)
-        (work: SqliteConnection -> SqliteTransaction -> int64 -> CancellationToken -> Task<Result<'T, StoreError>>)
-        (ct: CancellationToken)
-        : Task<Result<'T, StoreError>> =
-        backgroundTask {
-            let gate = WriteGate.forConnectionString connectionString
-            do! gate.WaitAsync(ct)
-
-            try
-                use! conn = openConnection connectionString ct
-                use transaction = conn.BeginTransaction(deferred = false)
-                let now = Instant.ofDateTimeOffset (clock.GetUtcNow())
-                let! outcome = work conn transaction now ct
-
-                match outcome with
-                | Ok _ -> do! transaction.CommitAsync(ct)
-                | Error _ -> do! transaction.RollbackAsync(ct)
-
-                return outcome
-            finally
-                gate.Release() |> ignore
-        }
-
-    /// <summary>
-    /// Runs typed reads against the generated schema types, under the same pipeline and the same
-    /// failure classification as every hand-written statement. SqlHydra builds and runs the
-    /// query; the connection, the retries and what a failure means stay here.
-    ///
-    /// Pass the context's read-only connection string. Reads take no gate and no write lock,
-    /// and under WAL they see the last committed state while a writer works.
-    /// </summary>
-    let query
-        (pipeline: ResiliencePipeline)
-        (readConnectionString: string)
-        (work: SqlHydra.Query.QueryContext -> CancellationToken -> Task<Result<'T, StoreError>>)
-        (ct: CancellationToken)
-        : Task<Result<'T, StoreError>> =
-        protect
-            pipeline
-            (fun cancel ->
-                backgroundTask {
-                    let! conn = openConnection readConnectionString cancel
-
-                    use context = new SqlHydra.Query.QueryContext(conn, SqlHydra.Query.SqliteEmitter())
-
-                    return! work context cancel
-                })
-            ct
-
-    /// <summary>Binds named parameters, in one call rather than one statement each.</summary>
-    let parameters (values: (string * obj) list) (cmd: SqliteCommand) : unit =
-        values
-        |> List.iter (fun (name, value) -> cmd.Parameters.AddWithValue(name, value) |> ignore)
 
     /// <summary>A boolean as the schema stores it. STRICT tables have no boolean type.</summary>
     let flag (value: bool) : int64 = if value then 1L else 0L
@@ -366,51 +319,3 @@ module internal Row =
             }
 
         next []
-
-/// <summary>
-/// Statements run inside a write transaction, one call each.
-///
-/// Microsoft.Data.Sqlite refuses a command on a connection with an open transaction unless the
-/// command names it, so every command here is enlisted before it runs. Parameters are named
-/// with their <c>@</c> prefix, exactly as the statement spells them.
-/// </summary>
-[<RequireQualifiedAccess>]
-module internal Statement =
-
-    let private prepare
-        (conn: SqliteConnection)
-        (transaction: SqliteTransaction)
-        (sql: string)
-        (values: (string * obj) list)
-        : SqliteCommand =
-        let cmd = conn.CreateCommand()
-        cmd.Transaction <- transaction
-        cmd.CommandText <- sql
-        Db.parameters values cmd
-        cmd
-
-    /// <summary>Runs a statement for its effect and answers how many rows it changed.</summary>
-    let execute conn transaction sql values (ct: CancellationToken) : Task<int> =
-        backgroundTask {
-            use cmd = prepare conn transaction sql values
-            return! cmd.ExecuteNonQueryAsync ct
-        }
-
-    /// <summary>Every row a statement returns, read through <paramref name="read" />.</summary>
-    let rows conn transaction sql values (read: SqliteDataReader -> 'T) (ct: CancellationToken) : Task<'T list> =
-        backgroundTask {
-            use cmd = prepare conn transaction sql values
-            use! reader = cmd.ExecuteReaderAsync ct
-            return! Row.all read reader ct
-        }
-
-    /// <summary>The first row a statement returns, if it returns any.</summary>
-    let tryOne conn transaction sql values (read: SqliteDataReader -> 'T) (ct: CancellationToken) : Task<'T option> =
-        backgroundTask {
-            use cmd = prepare conn transaction sql values
-            use! reader = cmd.ExecuteReaderAsync ct
-
-            match! reader.ReadAsync ct with
-            | true -> return Some(read reader)
-            | false -> return None
-        }

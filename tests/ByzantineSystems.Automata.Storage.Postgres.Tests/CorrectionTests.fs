@@ -179,7 +179,7 @@ let tests =
                       )
 
               match outcome with
-              | Error(StoreError.Unavailable _) -> ()
+              | Error(StoreError.Unexpected _) -> ()
               | other -> failtestf "expected the routine to refuse an unordered timeline, got %A" other
 
               // Refused before anything was written, which is why the original belief is intact.
@@ -198,6 +198,6 @@ let tests =
                       .Correct(machine, entity "e1", jan 12, [ corrected (jan 11) (Active 7) 1L ], noCancellation)
 
               match outcome with
-              | Error(StoreError.Unavailable _) -> ()
+              | Error(StoreError.Unexpected _) -> ()
               | other -> failtestf "expected the routine to refuse a belief behind the instant, got %A" other
           } ]

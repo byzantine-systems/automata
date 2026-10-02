@@ -17,7 +17,8 @@ let tests =
           if TestContext.configured then
               testList
                   "integration"
-                  [ CommandInboxTests.tests
+                  [ SqlTests.tests
+                    CommandInboxTests.tests
                     ChartRegistryTests.tests
                     TemporalTests.tests
                     TemporalReaderTests.tests

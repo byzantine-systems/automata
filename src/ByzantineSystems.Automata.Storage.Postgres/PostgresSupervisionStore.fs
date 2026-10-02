@@ -6,9 +6,9 @@ open System.Threading
 open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
+open ByzantineSystems.Automata.Storage.Internal
 open ByzantineSystems.Automata.Storage.Postgres.Schema
 open FsToolkit.ErrorHandling
-open Npgsql
 open SqlHydra.Query
 
 [<RequireQualifiedAccess>]
@@ -62,36 +62,22 @@ module private SupervisionMapping =
 /// <summary>PostgreSQL append-only supervision audit writer backed by a pooled data source.</summary>
 type PostgresSupervisionStore(context: PostgresContext) =
 
-    let protect work ct = Db.protect context.Resilience work ct
+    let record = Statement.load "supervision" "record"
 
     interface ISupervisionEventStore with
 
-        member _.Record(record, ct) =
-            protect
-                (fun token ->
-                    task {
-                        use! conn = context.DataSource.OpenConnectionAsync(token).AsTask()
-                        use cmd = new NpgsqlCommand(SqlResources.get "supervision" "record", conn)
-
-                        cmd.Parameters.AddWithValue("supervisor", SupervisorName.value record.Supervisor)
-                        |> ignore
-
-                        cmd.Parameters.AddWithValue("child_id", SupervisedChildId.value record.ChildId)
-                        |> ignore
-
-                        cmd.Parameters.AddWithValue("kind", SupervisionMapping.kindToString record.Kind)
-                        |> ignore
-
-                        cmd.Parameters.AddWithValue("strategy", SupervisionMapping.strategyToString record.Strategy)
-                        |> ignore
-
-                        cmd.Parameters.AddWithValue("reason", JsonSerializer.Serialize record.Reason)
-                        |> ignore
-
-                        cmd.Parameters.AddWithValue("at", Db.timestamp record.At) |> ignore
-                        do! (cmd.ExecuteNonQueryAsync(token) :> Task)
-                        return Ok()
-                    })
+        member _.Record(entry, ct) =
+            Sql.run
+                context
+                (Sql.execute
+                    record
+                    [ "supervisor", Param.Text(SupervisorName.value entry.Supervisor)
+                      "child_id", Param.Text(SupervisedChildId.value entry.ChildId)
+                      "kind", Param.Text(SupervisionMapping.kindToString entry.Kind)
+                      "strategy", Param.Text(SupervisionMapping.strategyToString entry.Strategy)
+                      "reason", Param.Jsonb(JsonSerializer.Serialize entry.Reason)
+                      "at", Param.Timestamp entry.At ]
+                 |> Op.discard)
                 ct
 
 /// <summary>Read-side query adapters for the supervision audit log.</summary>
@@ -127,18 +113,21 @@ module PostgresSupervisionQueries =
 
         // Newest first is the only order this table is ever read in, and it is what
         // supervision_event_recent_idx is built for.
-        Db.query
-            context.Resilience
-            context.DataSource
-            (fun query token ->
-                selectTask query {
-                    for e in fsm.supervision_event do
-                        orderByDescending e.at
-                        thenByDescending e.id
-                        take limit
-                        select e
-                        toList
-                        cancel token
-                }
-                |> Task.map (List.traverseResultM toRecord))
+        Sql.run
+            context
+            (postgres {
+                let! rows =
+                    Sql.select (fun query token ->
+                        selectTask query {
+                            for e in fsm.supervision_event do
+                                orderByDescending e.at
+                                thenByDescending e.id
+                                take limit
+                                select e
+                                toList
+                                cancel token
+                        })
+
+                return! rows |> List.traverseResultM toRecord
+            })
             ct

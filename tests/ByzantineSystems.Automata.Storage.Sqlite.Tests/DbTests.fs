@@ -5,6 +5,7 @@ open System.IO
 open System.Threading
 open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
+open ByzantineSystems.Automata.Storage.Internal
 open ByzantineSystems.Automata.Storage.Sqlite
 open ByzantineSystems.Automata.Storage.Sqlite.Tests.TestContext
 open Microsoft.Data.Sqlite
@@ -142,23 +143,22 @@ let private classificationTests =
               Expect.isTrue (DataSource.isInMemory "Data Source=") "an empty data source is a temporary database"
               Expect.isFalse (DataSource.isInMemory (DataSource.connectionString "store.db")) "a file" ]
 
+/// A unit that bumps the counter inside the session's transaction, then answers with
+/// <paramref name="answer" />. Built from the driver directly, because the counter table is this
+/// suite's own and has no embedded statement.
+let private bumpThen (answer: Result<'T, StoreError>) : Op<WriteSession, 'T> =
+    Op.ofDriver (fun session ct ->
+        task {
+            do! increment session.Connection session.Transaction ct
+            return answer
+        })
+
 let private transactionTests =
     testList
-        "writeTransaction"
+        "Sql.write"
         [ testTask "commits on Ok" {
               let context = contextFor (scratch "commit")
-
-              let! outcome =
-                  Db.writeTransaction
-                      context.ConnectionString
-                      context.Clock
-                      (fun conn transaction _ ct ->
-                          task {
-                              do! increment conn transaction ct
-                              return Ok()
-                          })
-                      CancellationToken.None
-
+              let! outcome = Sql.write context (bumpThen (Ok())) CancellationToken.None
               Expect.equal outcome (Ok()) "the work succeeded"
               Expect.equal (scalar context.ConnectionString "SELECT n FROM counter;") "1" "and its write is durable"
           }
@@ -166,19 +166,17 @@ let private transactionTests =
           testTask "rolls back on Error" {
               let context = contextFor (scratch "rollback")
 
-              let! outcome =
-                  Db.writeTransaction
-                      context.ConnectionString
-                      context.Clock
-                      (fun conn transaction _ ct ->
-                          task {
-                              do! increment conn transaction ct
-                              return Error(StoreError.NotFound "anything")
-                          })
-                      CancellationToken.None
+              let! outcome = Sql.write context (bumpThen (Error(StoreError.NotFound "anything"))) CancellationToken.None
 
               Expect.isError outcome "the work refused"
               Expect.equal (scalar context.ConnectionString "SELECT n FROM counter;") "0" "and left nothing behind"
+          }
+
+          testTask "an outcome that is a refusal but not a failure still commits" {
+              let context = contextFor (scratch "refusal")
+              let! outcome = Sql.write context (bumpThen (Ok "lease_lost")) CancellationToken.None
+              Expect.equal outcome (Ok "lease_lost") "the outcome is reported"
+              Expect.equal (scalar context.ConnectionString "SELECT n FROM counter;") "1" "and what it wrote stays"
           }
 
           testTask "reads the clock once, before the work" {
@@ -189,15 +187,185 @@ let private transactionTests =
                   { contextFor (scratch "clock") with
                       Clock = clock }
 
-              let! outcome =
-                  Db.writeTransaction
-                      context.ConnectionString
-                      context.Clock
-                      (fun _ _ now _ -> Task.FromResult(Ok now))
-                      CancellationToken.None
+              let! outcome = Sql.write context Sql.now CancellationToken.None
 
               Expect.equal outcome (Ok(Instant.ofDateTimeOffset start)) "the work sees the first reading"
               Expect.equal clock.Reads 1 "and there is only one"
+          }
+
+          testTask "a transient failure runs the whole unit again, with a new now" {
+              let clock = SteppingClock(DateTimeOffset(2026, 9, 25, 10, 0, 0, TimeSpan.Zero))
+
+              let context =
+                  { contextFor (scratch "retry") with
+                      Clock = clock }
+
+              let mutable attempts = 0
+
+              // The driver's contention error, raised by the first attempt only, after its write:
+              // what a retry must not keep is that write.
+              let flaky =
+                  Op.ofDriver (fun (session: WriteSession) ct ->
+                      task {
+                          attempts <- attempts + 1
+                          do! increment session.Connection session.Transaction ct
+
+                          if attempts = 1 then
+                              raise (SqliteException("busy", Db.SqliteBusy))
+
+                          return Ok session.Now
+                      })
+
+              let! outcome = Sql.write context flaky CancellationToken.None
+
+              Expect.equal attempts 2 "the unit ran again"
+              Expect.equal clock.Reads 2 "in a new transaction, which read the clock again"
+              Expect.isOk outcome "and the second attempt committed"
+              Expect.equal (scalar context.ConnectionString "SELECT n FROM counter;") "1" "only its write survived"
+          }
+
+          testTask "writeOnce makes one attempt and reports the outage" {
+              let context = contextFor (scratch "once")
+              let mutable attempts = 0
+
+              let busy =
+                  Op.ofDriver (fun (_: WriteSession) _ ->
+                      attempts <- attempts + 1
+                      raise (SqliteException("busy", Db.SqliteBusy)))
+
+              let! outcome = Sql.writeOnce context busy CancellationToken.None
+
+              Expect.equal attempts 1 "never retried"
+
+              match outcome with
+              | Error(StoreError.Unavailable _) -> ()
+              | other -> failtestf "contention should read as unavailable, got %A" other
+          }
+
+          testTask "a failure the store does not recognise is Unexpected, and rolls back" {
+              let context = contextFor (scratch "unexpected")
+
+              let broken =
+                  Op.ofDriver (fun (session: WriteSession) ct ->
+                      task {
+                          do! increment session.Connection session.Transaction ct
+                          return raise (InvalidOperationException "a defect")
+                      })
+
+              let! outcome = Sql.write context broken CancellationToken.None
+
+              match outcome with
+              | Error(StoreError.Unexpected(:? InvalidOperationException)) -> ()
+              | other -> failtestf "a defect should read as unexpected, got %A" other
+
+              Expect.equal (scalar context.ConnectionString "SELECT n FROM counter;") "0" "nothing it wrote survives"
+          } ]
+
+let private primitiveTests =
+    let journal = Statement.load "system" "journal"
+    let byVersion = Statement.load "chart" "by_version"
+
+    let fingerprintOf (version: int64) =
+        Sql.one
+            "ChartFingerprint"
+            byVersion
+            [ "@machine_id", Param.Text machine; "@version", Param.Integer version ]
+            (fun reader -> Row.string reader "fingerprint")
+
+    testList
+        "Sql primitives"
+        [ testTask "one refuses a statement that returns no row" {
+              let context = contextFor (migrated "one-none")
+              let! outcome = Sql.write context (fingerprintOf 99L) CancellationToken.None
+
+              match outcome with
+              | Error(StoreError.Serialization(_, error)) ->
+                  Expect.stringContains error.Message "chart/by_version returned no row" "names the statement"
+              | other -> failtestf "expected a decode failure, got %A" other
+          }
+
+          testTask "one refuses a statement that returns more than one row" {
+              let context = contextFor (migrated "one-many")
+
+              let! outcome =
+                  Sql.write
+                      context
+                      (Sql.one "Script" journal [] (fun reader -> Row.string reader "script_name"))
+                      CancellationToken.None
+
+              match outcome with
+              | Error(StoreError.Serialization(_, error)) ->
+                  Expect.stringContains error.Message "system/journal returned more than one row" "names the statement"
+              | other -> failtestf "expected a decode failure, got %A" other
+          }
+
+          testTask "rows reads every row, in order" {
+              let context = contextFor (migrated "rows")
+
+              let! outcome =
+                  Sql.write
+                      context
+                      (Sql.rows journal [] (fun reader -> Row.string reader "script_name"))
+                      CancellationToken.None
+
+              match outcome with
+              | Ok scripts -> Expect.equal scripts (List.sort scripts) "in the statement's order"
+              | Error error -> failtestf "expected the journal, got %A" error
+          }
+
+          testTask "a null text is refused as the defect it is, not sent as NULL" {
+              let context = contextFor (migrated "null-text")
+
+              let lookup =
+                  Sql.tryOne
+                      "ChartFingerprint"
+                      byVersion
+                      [ "@machine_id", Param.Text null; "@version", Param.Integer 1L ]
+                      (fun reader -> Row.string reader "fingerprint")
+
+              let! outcome = Sql.write context lookup CancellationToken.None
+
+              match outcome with
+              | Error(StoreError.Unexpected(:? ArgumentNullException)) -> ()
+              | other -> failtestf "expected the null to be refused, got %A" other
+          }
+
+          testTask "a read sees one snapshot, even when a writer commits between its statements" {
+              let connectionString = scratch "snapshot"
+              let context = contextFor connectionString
+
+              let counterNow =
+                  Sql.select (fun query ct ->
+                      task {
+                          use cmd = query.Connection.CreateCommand()
+                          cmd.CommandText <- "SELECT n FROM counter;"
+
+                          match query.Transaction with
+                          | Some transaction -> cmd.Transaction <- (transaction :?> SqliteTransaction)
+                          | None -> ()
+
+                          let! value = cmd.ExecuteScalarAsync ct
+                          return unbox<int64> value
+                      })
+
+              let writeBetween =
+                  Sql.select (fun _ _ ->
+                      exec connectionString "UPDATE counter SET n = n + 1;" []
+                      Task.FromResult())
+
+              let! outcome =
+                  Sql.read
+                      context
+                      (sqliteRead {
+                          let! before = counterNow
+                          do! writeBetween
+                          let! after = counterNow
+                          return before, after
+                      })
+                      CancellationToken.None
+
+              Expect.equal outcome (Ok(0L, 0L)) "the second statement saw the first one's snapshot"
+              Expect.equal (scalar connectionString "SELECT n FROM counter;") "1" "while the write did commit"
           } ]
 
 let private gateTests =
@@ -237,17 +405,16 @@ let private gateTests =
               let context = contextFor impatient
               let writers = 50
 
+              let slowBump =
+                  Op.ofDriver (fun (session: WriteSession) ct ->
+                      task {
+                          do! increment session.Connection session.Transaction ct
+                          do! Task.Delay(50, ct)
+                          return Ok()
+                      })
+
               let write () =
-                  Db.writeTransaction
-                      context.ConnectionString
-                      context.Clock
-                      (fun conn transaction _ ct ->
-                          task {
-                              do! increment conn transaction ct
-                              do! Task.Delay(50, ct)
-                              return Ok()
-                          })
-                      CancellationToken.None
+                  Sql.write context slowBump CancellationToken.None
 
               let! outcomes =
                   Array.init writers (fun _ -> Task.Run<Result<unit, StoreError>>(write))
@@ -259,4 +426,10 @@ let private gateTests =
 
 [<Tests>]
 let tests =
-    testList "Db" [ instantTests; classificationTests; transactionTests; gateTests ]
+    testList
+        "Db"
+        [ instantTests
+          classificationTests
+          transactionTests
+          primitiveTests
+          gateTests ]

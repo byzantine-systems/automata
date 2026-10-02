@@ -7,9 +7,8 @@ open System.Threading.Tasks
 open FsToolkit.ErrorHandling
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
+open ByzantineSystems.Automata.Storage.Internal
 open ByzantineSystems.Automata.Storage.Postgres.Schema
-open Npgsql
-open NpgsqlTypes
 open SqlHydra.Query
 
 /// <summary>
@@ -37,16 +36,9 @@ type TemporalOptions<'EntityId, 'State> =
 /// </summary>
 type PostgresTemporalStore<'EntityId, 'State>(options: TemporalOptions<'EntityId, 'State>) =
 
-    let dataSource = options.Context.DataSource
+    let context = options.Context
 
-    let protect work ct =
-        Db.protect options.Context.Resilience work ct
-
-    let addText (name: string) (value: string) (cmd: NpgsqlCommand) =
-        cmd.Parameters.AddWithValue(name, value) |> ignore
-
-    let addInstant (name: string) (value: DateTimeOffset) (cmd: NpgsqlCommand) =
-        cmd.Parameters.AddWithValue(name, Db.timestamp value) |> ignore
+    let correctBeliefs = Statement.load "belief" "correct"
 
     /// Rebuilds one belief from a row of fsm.belief. The view cannot carry NOT NULL, so every
     /// column is required here rather than assumed; a row that will not decode fails on its first
@@ -105,53 +97,30 @@ type PostgresTemporalStore<'EntityId, 'State>(options: TemporalOptions<'EntityId
         let valid = Some(Db.timestamp validAt)
         let known = Some(Db.timestamp knownAt)
 
-        Db.query
-            options.Context.Resilience
-            dataSource
-            (fun context token ->
-                selectTask context {
-                    for b in fsm.belief do
-                        where (
-                            b.machine_id = machine
-                            && b.entity_id = entity
-                            && b.valid_from <= valid
-                            && b.valid_to > valid
-                            && b.known_from <= known
-                            && b.known_to > known
-                        )
+        Sql.run
+            context
+            (postgres {
+                let! row =
+                    Sql.select (fun query token ->
+                        selectTask query {
+                            for b in fsm.belief do
+                                where (
+                                    b.machine_id = machine
+                                    && b.entity_id = entity
+                                    && b.valid_from <= valid
+                                    && b.valid_to > valid
+                                    && b.known_from <= known
+                                    && b.known_to > known
+                                )
 
-                        select b
-                        tryHead
-                        cancel token
-                }
-                |> Task.map (Option.traverseResult toBelief))
+                                select b
+                                tryHead
+                                cancel token
+                        })
+
+                return! row |> Option.traverseResult toBelief
+            })
             ct
-
-    let sendCorrection machineId entityId validFrom (payload: string) cancel =
-        task {
-            use! conn = dataSource.OpenConnectionAsync(cancel).AsTask()
-            use cmd = new NpgsqlCommand(SqlResources.get "belief" "correct", conn)
-            cmd |> addText "machine_id" (MachineId.value machineId)
-            cmd |> addText "entity_id" (options.EntityIdEncode entityId)
-            cmd |> addInstant "valid_from" validFrom
-
-            let beliefs = NpgsqlParameter("beliefs", NpgsqlDbType.Jsonb)
-            beliefs.Value <- payload
-            cmd.Parameters.Add beliefs |> ignore
-
-            use! reader = cmd.ExecuteReaderAsync cancel
-            let! hasRow = reader.ReadAsync cancel
-
-            if not hasRow then
-                return Error(Db.decodeFailure (nameof CorrectionOutcome) "correct_beliefs returned no row")
-            else
-                return
-                    Ok(
-                        match Row.int32 reader "superseded" with
-                        | 0 -> NothingSuperseded
-                        | superseded -> Corrected superseded
-                    )
-        }
 
     interface ITemporalReader<'EntityId, 'State> with
 
@@ -167,10 +136,25 @@ type PostgresTemporalStore<'EntityId, 'State>(options: TemporalOptions<'EntityId
     interface ICorrectionStore<'EntityId, 'State> with
 
         member _.Correct(machineId, entityId, validFrom, beliefs, ct) =
-            protect
-                (fun cancel ->
-                    taskResult {
-                        let! payload = BeliefPayload.encode options.StateCodec beliefs
-                        return! sendCorrection machineId entityId validFrom payload cancel
-                    })
-                ct
+            backgroundTaskResult {
+                // The whole timeline is encoded before anything is sent.
+                let! payload = BeliefPayload.encode options.StateCodec beliefs
+
+                let! superseded =
+                    Sql.run
+                        context
+                        (Sql.one
+                            (nameof CorrectionOutcome)
+                            correctBeliefs
+                            [ "machine_id", Param.Text(MachineId.value machineId)
+                              "entity_id", Param.Text(options.EntityIdEncode entityId)
+                              "valid_from", Param.Timestamp validFrom
+                              "beliefs", Param.Jsonb payload ]
+                            (fun reader -> Row.int32 reader "superseded"))
+                        ct
+
+                return
+                    match superseded with
+                    | 0 -> NothingSuperseded
+                    | superseded -> Corrected superseded
+            }

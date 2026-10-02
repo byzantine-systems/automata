@@ -39,6 +39,13 @@ type StoreError =
     /// <summary>The referenced entity does not exist.</summary>
     | NotFound of entity: string
 
+    /// <summary>
+    /// The store failed in a way it does not recognise: an answer no store method expects, such
+    /// as a routine refusing its arguments or a statement the schema rejects. Not transient and
+    /// not the caller's data, so it is a defect to escalate rather than a failure to retry.
+    /// </summary>
+    | Unexpected of exn
+
 /// <summary>Operations on <see cref="T:ByzantineSystems.Automata.Core.StoreError" />.</summary>
 [<RequireQualifiedAccess>]
 module StoreError =
@@ -53,6 +60,7 @@ module StoreError =
         | Serialization _ -> "serialization"
         | Unavailable _ -> "unavailable"
         | NotFound _ -> "not-found"
+        | Unexpected _ -> "unexpected"
 
 /// <summary>
 /// A machine lifecycle state that prevents new work from being accepted. These are

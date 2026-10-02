@@ -5,10 +5,10 @@ open System.Threading
 open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
+open ByzantineSystems.Automata.Storage.Internal
 open ByzantineSystems.Automata.Storage.Postgres.Schema
 open Npgsql
 open FsToolkit.ErrorHandling
-open NpgsqlTypes
 open SqlHydra.Query
 
 /// <summary>
@@ -79,38 +79,13 @@ module private CommandMapping =
 /// </summary>
 type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityId, 'Event>) =
 
-    let dataSource = options.Context.DataSource
+    let context = options.Context
 
-    /// Every statement goes through the context's pipeline, which is where transient driver
-    /// failures are retried and classified. Bound once here so no call site can forget it.
-    let protect work ct =
-        Db.protect options.Context.Resilience work ct
-
-    let command (statement: string) (conn: NpgsqlConnection) = new NpgsqlCommand(statement, conn)
-
-    let addText (name: string) (value: string) (cmd: NpgsqlCommand) =
-        cmd.Parameters.AddWithValue(name, value) |> ignore
-
-    let addInt (name: string) (value: int) (cmd: NpgsqlCommand) =
-        cmd.Parameters.AddWithValue(name, value) |> ignore
-
-    let addBigint (name: string) (value: int64) (cmd: NpgsqlCommand) =
-        cmd.Parameters.AddWithValue(name, value) |> ignore
-
-    let addInterval (name: string) (value: TimeSpan) (cmd: NpgsqlCommand) =
-        cmd.Parameters.AddWithValue(name, value) |> ignore
-
-    /// An absent instant is sent as a typed NULL. The routine substitutes its own default, which
-    /// is the database clock, and the explicit type keeps the server from having to guess.
-    let addOptionalTimestamp (name: string) (value: DateTimeOffset option) (cmd: NpgsqlCommand) =
-        let parameter = NpgsqlParameter(name, NpgsqlDbType.TimestampTz)
-
-        parameter.Value <-
-            match value with
-            | Some instant -> box (Db.timestamp instant)
-            | None -> box DBNull.Value
-
-        cmd.Parameters.Add parameter |> ignore
+    let submitCommand = Statement.load "command" "submit"
+    let submitCorrection = Statement.load "command" "submit_correction"
+    let claimCommands = Statement.load "command" "claim"
+    let rescheduleCommand = Statement.load "command" "reschedule"
+    let extendLease = Statement.load "command" "extend_lease"
 
     /// The schema stores the empty string for an unsupplied audit field.
     let optional (value: string) : string option = if value = "" then None else Some value
@@ -253,151 +228,122 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
             }
             |> Task.map (List.map (fun d -> d.command_id, d) >> Map.ofList)
 
-    let readOutcome (cmd: NpgsqlCommand) (ct: CancellationToken) : Task<Result<LeaseUpdateOutcome, StoreError>> =
-        task {
-            let! value = cmd.ExecuteScalarAsync ct
-
-            match value with
-            | :? string as outcome -> return CommandMapping.outcomeFromString outcome
-            | other ->
-                return
-                    Error(
-                        Db.decodeFailure (nameof LeaseUpdateOutcome) $"expected a lease outcome, got {other |> string}"
-                    )
-        }
-
     let findExisting
         (machineId: MachineId)
         (entityId: string)
         (idempotencyKey: string)
         (ct: CancellationToken)
         : Task<Result<CommandRecord<'EntityId, 'Event> option, StoreError>> =
-        Db.query
-            options.Context.Resilience
-            dataSource
-            (fun context token ->
-                selectTask context {
-                    for c in fsm.command do
-                        leftJoin d in fsm.command_correction on (c.command_id = d.Value.command_id)
+        let machine = MachineId.value machineId
 
-                        where (
-                            c.machine_id = MachineId.value machineId
-                            && c.entity_id = entityId
-                            && c.idempotency_key = idempotencyKey
-                        )
+        Sql.run
+            context
+            (postgres {
+                let! row =
+                    Sql.select (fun query token ->
+                        selectTask query {
+                            for c in fsm.command do
+                                leftJoin d in fsm.command_correction on (c.command_id = d.Value.command_id)
 
-                        select (c, d)
-                        tryHead
-                        cancel token
-                }
-                |> Task.map single)
+                                where (
+                                    c.machine_id = machine
+                                    && c.entity_id = entityId
+                                    && c.idempotency_key = idempotencyKey
+                                )
+
+                                select (c, d)
+                                tryHead
+                                cancel token
+                        })
+
+                return! single row
+            })
             ct
 
-    let submitOnce
-        (submission: CommandSubmission<'EntityId, 'Event>)
-        (encodedEvent: string)
-        (entityId: string)
-        (ct: CancellationToken)
-        : Task<Result<SubmissionOutcome, StoreError>> =
-        task {
-            use! conn = dataSource.OpenConnectionAsync(ct).AsTask()
+    /// <summary>
+    /// One submission. A correction is submitted through its own routine, which records what it
+    /// corrects in the same transaction. It is claimable at once and arrives now: its effective
+    /// time is the instant it corrects, which the routine stores beside it.
+    /// </summary>
+    let submit (submission: CommandSubmission<'EntityId, 'Event>) (encodedEvent: string) (entityId: string) =
+        let common =
+            [ "machine_id", Param.Text(MachineId.value submission.MachineId)
+              "entity_id", Param.Text entityId
+              "idempotency_key", Param.Text submission.IdempotencyKey
+              "chart_version", Param.Int(ChartVersion.value submission.ChartVersion)
+              "event", Param.Jsonb encodedEvent
+              "tenant", Param.Text(CommandMapping.audit submission.Audit.Tenant)
+              "principal", Param.Text(CommandMapping.audit submission.Audit.Principal)
+              "source", Param.Text(CommandMapping.audit submission.Audit.Source)
+              "correlation_id", Param.Text(CommandMapping.audit submission.Audit.CorrelationId)
+              "causation_id", Param.Text(CommandMapping.audit submission.Audit.CausationId) ]
 
-            // A correction is submitted through its own routine, which records what it corrects
-            // in the same transaction. It is claimable at once and arrives now: its effective
-            // time is the instant it corrects, which the routine stores beside it.
-            use cmd =
-                match submission.Kind with
-                | CommandKind.Event ->
-                    let cmd = command (SqlResources.get "command" "submit") conn
-                    cmd |> addOptionalTimestamp "visible_at" submission.VisibleAt
-                    cmd |> addOptionalTimestamp "received_at" submission.ReceivedAt
-                    cmd
-                | CommandKind.Correction(at, policy) ->
-                    let cmd = command (SqlResources.get "command" "submit_correction") conn
-                    cmd.Parameters.AddWithValue("effective_at", Db.timestamp at) |> ignore
+        let statement, values =
+            match submission.Kind with
+            | CommandKind.Event ->
+                submitCommand,
+                common
+                @ [ "visible_at", Param.TimestampOrNull submission.VisibleAt
+                    "received_at", Param.TimestampOrNull submission.ReceivedAt ]
+            | CommandKind.Correction(at, policy) ->
+                submitCorrection,
+                common
+                @ [ "effective_at", Param.Timestamp at
+                    "on_divergence", Param.Text(CommandMapping.divergenceToString policy.OnDivergence)
+                    "replay_limit", Param.Int policy.ReplayLimit ]
 
-                    cmd
-                    |> addText "on_divergence" (CommandMapping.divergenceToString policy.OnDivergence)
+        Sql.one (nameof SubmissionOutcome) statement values (fun reader ->
+            let commandId = Row.int64 reader "command_id" |> CommandId.ofInt64
 
-                    cmd |> addInt "replay_limit" policy.ReplayLimit
-                    cmd
-
-            cmd |> addText "machine_id" (MachineId.value submission.MachineId)
-            cmd |> addText "entity_id" entityId
-            cmd |> addText "idempotency_key" submission.IdempotencyKey
-            cmd |> addInt "chart_version" (ChartVersion.value submission.ChartVersion)
-            cmd |> addText "event" encodedEvent
-            cmd |> addText "tenant" (CommandMapping.audit submission.Audit.Tenant)
-            cmd |> addText "principal" (CommandMapping.audit submission.Audit.Principal)
-            cmd |> addText "source" (CommandMapping.audit submission.Audit.Source)
-
-            cmd
-            |> addText "correlation_id" (CommandMapping.audit submission.Audit.CorrelationId)
-
-            cmd
-            |> addText "causation_id" (CommandMapping.audit submission.Audit.CausationId)
-
-            use! reader = cmd.ExecuteReaderAsync ct
-            let! hasRow = reader.ReadAsync ct
-
-            if not hasRow then
-                return Error(Db.decodeFailure (nameof SubmissionOutcome) "submit_command returned no row")
+            if Row.bool reader "accepted" then
+                Accepted commandId
             else
-                let commandId = Row.int64 reader "command_id" |> CommandId.ofInt64
+                AlreadySubmitted commandId)
 
-                return
-                    if Row.bool reader "accepted" then
-                        Ok(Accepted commandId)
-                    else
-                        Ok(AlreadySubmitted commandId)
+    /// What a fenced lease routine answers: whether the caller still held the lease.
+    let leaseOutcome (statement: Statement) (values: (string * Param) list) =
+        postgres {
+            let! outcome =
+                Sql.one (nameof LeaseUpdateOutcome) statement values (fun reader -> Row.string reader "outcome")
+
+            return! CommandMapping.outcomeFromString outcome
         }
 
     interface ICommandInbox<'EntityId, 'Event> with
 
         member _.Submit(submission, ct) =
-            protect
-                (fun token ->
-                    task {
-                        let entityId = options.EntityIdEncode submission.EntityId
+            let entityId = options.EntityIdEncode submission.EntityId
 
-                        match options.EventCodec.Encode submission.Event with
-                        | Error error -> return Error(Db.toStoreError error)
-                        | Ok encodedEvent ->
-                            try
-                                return! submitOnce submission encodedEvent entityId token
-                            with
-                            | Db.ForeignKeyViolation "command_chart_version_fkey" ->
-                                // The version this command pins was never registered, so nothing
-                                // records which chart it refers to and a replay could not resolve
-                                // it. Caught here so the caller gets the contract's error rather
-                                // than a PostgresException crossing the store boundary.
-                                return
-                                    Error(
-                                        StoreError.NotFound
-                                            $"chart version %d{ChartVersion.value submission.ChartVersion} of machine %s{MachineId.value submission.MachineId}"
-                                    )
-                            | Db.UniqueViolation "command_unique_idem" ->
-                                // fsm.submit_command serialises submissions per entity, so this
-                                // is unreachable through the routine. It stays because the
-                                // constraint, not the advisory lock, is the integrity boundary:
-                                // if anything ever writes the table another way, a concurrent
-                                // duplicate must still read as AlreadySubmitted rather than
-                                // escaping as an error.
-                                let! existing =
-                                    findExisting submission.MachineId entityId submission.IdempotencyKey token
+            backgroundTaskResult {
+                let! encodedEvent = options.EventCodec.Encode submission.Event |> Result.mapError Db.toStoreError
 
-                                return
-                                    existing
-                                    |> Result.bind (function
-                                        | Some record -> Ok(AlreadySubmitted record.CommandId)
-                                        | None ->
-                                            Error(
-                                                Db.decodeFailure
-                                                    (nameof SubmissionOutcome)
-                                                    "a duplicate idempotency key had no matching command"
-                                            ))
-                    })
-                ct
+                match! Sql.attempt context (submit submission encodedEvent entityId) ct with
+                | Db.Answered outcome -> return! outcome
+                | Db.Refused(Db.ForeignKey "command_chart_version_fkey", _) ->
+                    // The version this command pins was never registered, so nothing records
+                    // which chart it refers to and a replay could not resolve it.
+                    return!
+                        Error(
+                            StoreError.NotFound
+                                $"chart version %d{ChartVersion.value submission.ChartVersion} of machine %s{MachineId.value submission.MachineId}"
+                        )
+                | Db.Refused(Db.Unique "command_unique_idem", _) ->
+                    // fsm.submit_command serialises submissions per entity, so this is
+                    // unreachable through the routine. It stays because the constraint, not the
+                    // advisory lock, is the integrity boundary: if anything ever writes the table
+                    // another way, a concurrent duplicate must still read as AlreadySubmitted
+                    // rather than escaping as an error.
+                    match! findExisting submission.MachineId entityId submission.IdempotencyKey ct with
+                    | Some record -> return AlreadySubmitted record.CommandId
+                    | None ->
+                        return!
+                            Error(
+                                Db.decodeFailure
+                                    (nameof SubmissionOutcome)
+                                    "a duplicate idempotency key had no matching command"
+                            )
+                | Db.Refused(_, cause) -> return! Error(StoreError.Unexpected cause)
+            }
 
         member _.Claim(machineId, batch, lease, ct) =
             if batch < 1 then
@@ -411,87 +357,64 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
             // leases a second one while the first stays invisible until its lease lapses. The
             // worker polls again in a moment, which recovers sooner than a retry would.
             let claim =
-                Db.protectOnce
-                    (fun token ->
-                        task {
-                            use! conn = dataSource.OpenConnectionAsync(token).AsTask()
-                            use cmd = command (SqlResources.get "command" "claim") conn
-                            cmd |> addText "machine_id" (MachineId.value machineId)
-                            cmd |> addInt "batch" batch
-                            cmd |> addInterval "lease" lease
-                            use! reader = cmd.ExecuteReaderAsync token
-                            let! rows = Row.all commandRow reader token
-                            return Ok rows
-                        })
-                    ct
+                Sql.rows
+                    claimCommands
+                    [ "machine_id", Param.Text(MachineId.value machineId)
+                      "batch", Param.Int batch
+                      "lease", Param.Interval lease ]
+                    commandRow
 
             // The claim has already leased its rows, so reading their correction details is an
             // ordinary read and may be retried like one.
-            taskResult {
-                let! rows = claim
-
-                let! corrections =
-                    Db.query
-                        options.Context.Resilience
-                        dataSource
-                        (fun context token -> correctionsOf rows context token |> Task.map Ok)
-                        ct
-
+            backgroundTaskResult {
+                let! rows = Sql.runOnce context claim ct
+                let! corrections = Sql.run context (Sql.select (correctionsOf rows)) ct
                 return! rows |> List.traverseResultM (toLeased corrections)
             }
 
         member _.Reschedule(commandId, leaseToken, backoff, ct) =
-            protect
-                (fun token ->
-                    task {
-                        use! conn = dataSource.OpenConnectionAsync(token).AsTask()
-                        use cmd = command (SqlResources.get "command" "reschedule") conn
-                        cmd |> addBigint "command_id" (CommandId.value commandId)
-                        cmd |> addBigint "lease_token" (LeaseToken.value leaseToken)
-                        cmd |> addInt "base_ms" (int (Backoff.baseDelay backoff).TotalMilliseconds)
-                        cmd |> addInt "cap_ms" (int (Backoff.ceiling backoff).TotalMilliseconds)
-                        use! reader = cmd.ExecuteReaderAsync token
-                        let! hasRow = reader.ReadAsync token
-
-                        if not hasRow then
-                            return Error(Db.decodeFailure (nameof LeaseUpdateOutcome) "reschedule returned no row")
-                        else
-                            return Row.string reader "outcome" |> CommandMapping.outcomeFromString
-                    })
+            Sql.run
+                context
+                (leaseOutcome
+                    rescheduleCommand
+                    [ "command_id", Param.Bigint(CommandId.value commandId)
+                      "lease_token", Param.Bigint(LeaseToken.value leaseToken)
+                      "base_ms", Param.Int(int (Backoff.baseDelay backoff).TotalMilliseconds)
+                      "cap_ms", Param.Int(int (Backoff.ceiling backoff).TotalMilliseconds) ])
                 ct
 
         member _.ExtendLease(commandId, leaseToken, lease, ct) =
             if lease <= TimeSpan.Zero then
                 invalidArg (nameof lease) "A lease must be a positive duration."
 
-            protect
-                (fun token ->
-                    task {
-                        use! conn = dataSource.OpenConnectionAsync(token).AsTask()
-                        use cmd = command (SqlResources.get "command" "extend_lease") conn
-                        cmd |> addBigint "command_id" (CommandId.value commandId)
-                        cmd |> addBigint "lease_token" (LeaseToken.value leaseToken)
-                        cmd |> addInterval "lease" lease
-                        return! readOutcome cmd token
-                    })
+            Sql.run
+                context
+                (leaseOutcome
+                    extendLease
+                    [ "command_id", Param.Bigint(CommandId.value commandId)
+                      "lease_token", Param.Bigint(LeaseToken.value leaseToken)
+                      "lease", Param.Interval lease ])
                 ct
 
         member _.TryGet(commandId, ct) =
             let id = CommandId.value commandId
 
-            Db.query
-                options.Context.Resilience
-                dataSource
-                (fun context token ->
-                    selectTask context {
-                        for c in fsm.command do
-                            leftJoin d in fsm.command_correction on (c.command_id = d.Value.command_id)
-                            where (c.command_id = id)
-                            select (c, d)
-                            tryHead
-                            cancel token
-                    }
-                    |> Task.map single)
+            Sql.run
+                context
+                (postgres {
+                    let! row =
+                        Sql.select (fun query token ->
+                            selectTask query {
+                                for c in fsm.command do
+                                    leftJoin d in fsm.command_correction on (c.command_id = d.Value.command_id)
+                                    where (c.command_id = id)
+                                    select (c, d)
+                                    tryHead
+                                    cancel token
+                            })
+
+                    return! single row
+                })
                 ct
 
         member _.TryFind(machineId, entityId, idempotencyKey, ct) =

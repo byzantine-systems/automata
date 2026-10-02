@@ -1,10 +1,9 @@
 namespace ByzantineSystems.Automata.Storage.Postgres
 
-open System.Threading
-open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
-open Npgsql
+open ByzantineSystems.Automata.Storage.Internal
+open FsToolkit.ErrorHandling
 
 /// <summary>What the chart registry needs. Only a data source: it reads and writes text.</summary>
 type ChartRegistryOptions = { Context: PostgresContext }
@@ -18,12 +17,11 @@ type ChartRegistryOptions = { Context: PostgresContext }
 /// </summary>
 type PostgresChartRegistry(options: ChartRegistryOptions) =
 
-    let dataSource = options.Context.DataSource
+    let context = options.Context
 
-    /// Every statement goes through the context's pipeline, which is where transient driver
-    /// failures are retried and classified. Bound once here so no call site can forget it.
-    let protect work ct =
-        Db.protect options.Context.Resilience work ct
+    let register = Statement.load "chart" "register"
+
+    let byVersion = Statement.load "chart" "by_version"
 
     /// A stored fingerprint that no longer parses is a corrupt row, reported as the contract's
     /// serialization failure rather than as an exception out of the store. The shape constraint
@@ -35,70 +33,48 @@ type PostgresChartRegistry(options: ChartRegistryOptions) =
         ChartFingerprint.tryCreate value
         |> Result.mapError (Db.decodeFailure "ChartFingerprint")
 
+    let key (machineId: MachineId) (version: ChartVersion) =
+        [ "machine_id", Param.Text(MachineId.value machineId)
+          "version", Param.Int(ChartVersion.value version) ]
+
     interface IChartRegistry with
 
         member _.Register(identity, ct) =
-            protect
-                (fun token ->
-                    task {
-                        use! conn = dataSource.OpenConnectionAsync(token).AsTask()
-                        use cmd = new NpgsqlCommand(SqlResources.get "chart" "register", conn)
+            Sql.run
+                context
+                (postgres {
+                    let! registration, stored =
+                        Sql.one
+                            (nameof ChartRegistration)
+                            register
+                            (key identity.MachineId identity.Version
+                             @ [ "fingerprint", Param.Text(ChartFingerprint.value identity.Fingerprint) ])
+                            (fun reader -> Row.string reader "registration", Row.string reader "stored_fingerprint")
 
-                        cmd.Parameters.AddWithValue("machine_id", MachineId.value identity.MachineId)
-                        |> ignore
-
-                        cmd.Parameters.AddWithValue("version", ChartVersion.value identity.Version)
-                        |> ignore
-
-                        cmd.Parameters.AddWithValue("fingerprint", ChartFingerprint.value identity.Fingerprint)
-                        |> ignore
-
-                        use! reader = cmd.ExecuteReaderAsync token
-                        let! hasRow = reader.ReadAsync token
-
-                        if not hasRow then
-                            return
-                                Error(
-                                    Db.decodeFailure
-                                        (nameof ChartRegistration)
-                                        "register_chart_version returned no row"
-                                )
-                        else
-                            match Row.string reader "registration" with
-                            | "registered" -> return Ok ChartRegistration.Registered
-                            | "matched" -> return Ok ChartRegistration.Matched
-                            | "mismatched" ->
-                                return
-                                    Row.string reader "stored_fingerprint"
-                                    |> parse
-                                    |> Result.map ChartRegistration.Mismatched
-                            | other ->
-                                return
-                                    Error(
-                                        Db.decodeFailure
-                                            (nameof ChartRegistration)
-                                            $"unknown chart registration outcome {other}"
-                                    )
-                    })
+                    match registration with
+                    | "registered" -> return ChartRegistration.Registered
+                    | "matched" -> return ChartRegistration.Matched
+                    | "mismatched" ->
+                        let! fingerprint = parse stored
+                        return ChartRegistration.Mismatched fingerprint
+                    | other ->
+                        return!
+                            Op.fail (
+                                Db.decodeFailure
+                                    (nameof ChartRegistration)
+                                    $"unknown chart registration outcome {other}"
+                            )
+                })
                 ct
 
         member _.TryGet(machineId, version, ct) =
-            protect
-                (fun token ->
-                    task {
-                        use! conn = dataSource.OpenConnectionAsync(token).AsTask()
-                        use cmd = new NpgsqlCommand(SqlResources.get "chart" "by_version", conn)
+            Sql.run
+                context
+                (postgres {
+                    let! stored =
+                        Sql.tryOne "ChartFingerprint" byVersion (key machineId version) (fun reader ->
+                            Row.string reader "fingerprint")
 
-                        cmd.Parameters.AddWithValue("machine_id", MachineId.value machineId) |> ignore
-
-                        cmd.Parameters.AddWithValue("version", ChartVersion.value version) |> ignore
-
-                        use! reader = cmd.ExecuteReaderAsync token
-                        let! hasRow = reader.ReadAsync token
-
-                        if not hasRow then
-                            return Ok None
-                        else
-                            return Row.string reader "fingerprint" |> parse |> Result.map Some
-                    })
+                    return! stored |> Option.traverseResult parse
+                })
                 ct

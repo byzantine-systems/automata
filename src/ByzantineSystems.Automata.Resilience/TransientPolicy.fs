@@ -317,3 +317,60 @@ module ResiliencePipeline =
         (ct: CancellationToken)
         : Task<'T> =
         pipeline.ExecuteAsync((fun token -> ValueTask<'T>(work token)), ct).AsTask()
+
+    /// <summary>
+    /// One attempt's work, settled into an outcome that is never a faulted task.
+    ///
+    /// The work is started inside a task builder, so even an exception it throws before
+    /// returning its task lands on that task. <c>Task.WhenAny</c> then waits for it to finish
+    /// without rethrowing, and the finished task's status says what it ended as. The exception
+    /// object is the one the work raised, so its stack trace is intact.
+    /// </summary>
+    let private settle (work: CancellationToken -> Task<'T>) (ct: CancellationToken) : Task<Outcome<'T>> =
+        backgroundTask {
+            let attempt = backgroundTask { return! work ct }
+            let! _ = Task.WhenAny(attempt)
+
+            return
+                match attempt.Status with
+                | TaskStatus.RanToCompletion -> Outcome.FromResult attempt.Result
+                | TaskStatus.Faulted -> Outcome.FromException<'T>(attempt.Exception.InnerExceptions[0])
+                // WhenAny returns only once the task has finished, so the one terminal status
+                // left is Canceled. TaskStatus is an enum, which no match can make exhaustive.
+                | _ -> Outcome.FromException<'T>(TaskCanceledException(attempt))
+        }
+
+    /// <summary>
+    /// Runs a <c>Task</c>-returning function through a pipeline and hands back its outcome as a
+    /// value: the result, or the exception the last attempt ended with. Never throws.
+    ///
+    /// This is where a driver's exceptions become data, once, so nothing above it needs a
+    /// <c>try</c>. Each attempt hands the pipeline an outcome rather than a faulted task, and
+    /// the strategies read <c>Outcome.Exception</c>, so retries, the attempt timeout and the
+    /// circuit breaker see every failure exactly as they would under <c>executeTask</c>. That
+    /// holds for any pipeline, including <c>ResiliencePipeline.Empty</c>, which runs the
+    /// callback with no strategy around it at all.
+    ///
+    /// The context is pooled, and goes back to the pool however the attempt ended.
+    /// </summary>
+    let executeOutcome
+        (pipeline: ResiliencePipeline)
+        (work: CancellationToken -> Task<'T>)
+        (ct: CancellationToken)
+        : Task<Outcome<'T>> =
+        backgroundTask {
+            let context = ResilienceContextPool.Shared.Get(ct)
+
+            try
+                return!
+                    pipeline
+                        .ExecuteOutcomeAsync(
+                            (fun (attempt: ResilienceContext) (_: unit) ->
+                                ValueTask<Outcome<'T>>(settle work attempt.CancellationToken)),
+                            context,
+                            ()
+                        )
+                        .AsTask()
+            finally
+                ResilienceContextPool.Shared.Return context
+        }

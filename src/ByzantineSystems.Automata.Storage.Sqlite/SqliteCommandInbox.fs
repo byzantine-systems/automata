@@ -6,6 +6,7 @@ open System.Threading
 open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
+open ByzantineSystems.Automata.Storage.Internal
 open ByzantineSystems.Automata.Storage.Sqlite.Schema
 open FsToolkit.ErrorHandling
 open Microsoft.Data.Sqlite
@@ -114,15 +115,15 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
 
     let context = options.Context
 
-    /// A whole write transaction, retried as one unit when another process held the file.
-    let write work ct =
-        Db.protect
-            context.Resilience
-            (fun token -> Db.writeTransaction context.ConnectionString context.Clock work token)
-            ct
-
-    let read work ct =
-        Db.query context.Resilience context.ReadConnectionString work ct
+    let findByKey = Statement.load "command" "find_by_key"
+    let chartByVersion = Statement.load "chart" "by_version"
+    let submitCommand = Statement.load "command" "submit"
+    let submitCorrection = Statement.load "command" "submit_correction"
+    let nextToken = Statement.load "system" "next_token"
+    let claimCommands = Statement.load "command" "claim"
+    let correctionsOf = Statement.load "command" "corrections"
+    let rescheduleCommand = Statement.load "command" "reschedule"
+    let extendLease = Statement.load "command" "extend_lease"
 
     /// What the command asks for. A correction's details live beside it, and one missing is a
     /// correction half-written, which the submission's single transaction makes impossible.
@@ -213,68 +214,70 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
         | None -> Ok None
 
     let findExisting (machineId: MachineId) (entityId: string) (idempotencyKey: string) (ct: CancellationToken) =
-        read
-            (fun query token ->
-                selectTask query {
-                    for c in main.fsm_command do
-                        leftJoin d in main.fsm_command_correction on (c.command_id = d.Value.command_id)
+        let machine = MachineId.value machineId
 
-                        where (
-                            c.machine_id = MachineId.value machineId
-                            && c.entity_id = entityId
-                            && c.idempotency_key = idempotencyKey
-                        )
+        Sql.read
+            context
+            (sqliteRead {
+                let! row =
+                    Sql.select (fun query token ->
+                        selectTask query {
+                            for c in main.fsm_command do
+                                leftJoin d in main.fsm_command_correction on (c.command_id = d.Value.command_id)
 
-                        select (c, d)
-                        tryHead
-                        cancel token
-                }
-                |> Task.map single)
+                                where (
+                                    c.machine_id = machine
+                                    && c.entity_id = entityId
+                                    && c.idempotency_key = idempotencyKey
+                                )
+
+                                select (c, d)
+                                tryHead
+                                cancel token
+                        })
+
+                return! single row
+            })
             ct
 
-    let submitIn
+    let submit
         (submission: CommandSubmission<'EntityId, 'Event>)
         (entityId: string)
         (encodedEvent: string)
-        (conn: SqliteConnection)
-        (transaction: SqliteTransaction)
-        (now: int64)
-        (ct: CancellationToken)
-        : Task<Result<SubmissionOutcome, StoreError>> =
-        backgroundTask {
+        : Op<WriteSession, SubmissionOutcome> =
+        sqliteWrite {
             let machineId = MachineId.value submission.MachineId
             let version = ChartVersion.value submission.ChartVersion
 
             let! existing =
-                Statement.tryOne
-                    conn
-                    transaction
-                    (SqlResources.get "command" "find_by_key")
-                    [ "@machine_id", box machineId
-                      "@entity_id", box entityId
-                      "@idempotency_key", box submission.IdempotencyKey ]
+                Sql.tryOne
+                    (nameof SubmissionOutcome)
+                    findByKey
+                    [ "@machine_id", Param.Text machineId
+                      "@entity_id", Param.Text entityId
+                      "@idempotency_key", Param.Text submission.IdempotencyKey ]
                     (fun reader -> Row.int64 reader "command_id")
-                    ct
 
             match existing with
-            | Some commandId -> return Ok(AlreadySubmitted(CommandId.ofInt64 commandId))
+            | Some commandId -> return AlreadySubmitted(CommandId.ofInt64 commandId)
             | None ->
                 let! registered =
-                    Statement.tryOne
-                        conn
-                        transaction
-                        (SqlResources.get "chart" "by_version")
-                        [ "@machine_id", box machineId; "@version", box version ]
+                    Sql.tryOne
+                        "ChartFingerprint"
+                        chartByVersion
+                        [ "@machine_id", Param.Text machineId
+                          "@version", Param.Integer(int64 version) ]
                         (fun reader -> Row.string reader "fingerprint")
-                        ct
 
                 match registered with
                 | None ->
                     // The version this command pins was never registered, so nothing records
                     // which chart it refers to and a replay could not resolve it. Asked rather
                     // than caught: SQLite's foreign key failure names no constraint.
-                    return Error(StoreError.NotFound $"chart version %d{version} of machine %s{machineId}")
+                    return! Op.fail (StoreError.NotFound $"chart version %d{version} of machine %s{machineId}")
                 | Some _ ->
+                    let! now = Sql.now
+
                     let kind =
                         match submission.Kind with
                         | CommandKind.Event -> "event"
@@ -293,101 +296,72 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
                             |> Option.defaultValue now
                         | CommandKind.Correction _ -> now, now
 
-                    let! inserted =
-                        Statement.tryOne
-                            conn
-                            transaction
-                            (SqlResources.get "command" "submit")
-                            [ "@machine_id", box machineId
-                              "@entity_id", box entityId
-                              "@idempotency_key", box submission.IdempotencyKey
-                              "@chart_version", box version
-                              "@event", box encodedEvent
-                              "@kind", box kind
-                              "@visible_at", box visibleAt
-                              "@received_at", box receivedAt
-                              "@tenant", box (CommandMapping.audit submission.Audit.Tenant)
-                              "@principal", box (CommandMapping.audit submission.Audit.Principal)
-                              "@source", box (CommandMapping.audit submission.Audit.Source)
-                              "@correlation_id", box (CommandMapping.audit submission.Audit.CorrelationId)
-                              "@causation_id", box (CommandMapping.audit submission.Audit.CausationId) ]
+                    let! commandId =
+                        Sql.one
+                            (nameof SubmissionOutcome)
+                            submitCommand
+                            [ "@machine_id", Param.Text machineId
+                              "@entity_id", Param.Text entityId
+                              "@idempotency_key", Param.Text submission.IdempotencyKey
+                              "@chart_version", Param.Integer(int64 version)
+                              "@event", Param.Text encodedEvent
+                              "@kind", Param.Text kind
+                              "@visible_at", Param.Integer visibleAt
+                              "@received_at", Param.Integer receivedAt
+                              "@tenant", Param.Text(CommandMapping.audit submission.Audit.Tenant)
+                              "@principal", Param.Text(CommandMapping.audit submission.Audit.Principal)
+                              "@source", Param.Text(CommandMapping.audit submission.Audit.Source)
+                              "@correlation_id", Param.Text(CommandMapping.audit submission.Audit.CorrelationId)
+                              "@causation_id", Param.Text(CommandMapping.audit submission.Audit.CausationId) ]
                             (fun reader -> Row.int64 reader "command_id")
-                            ct
 
-                    match inserted, submission.Kind with
-                    | None, _ ->
-                        return Error(Db.decodeFailure (nameof SubmissionOutcome) "the submission returned no row")
-                    | Some commandId, CommandKind.Event -> return Ok(Accepted(CommandId.ofInt64 commandId))
-                    | Some commandId, CommandKind.Correction(at, policy) ->
-                        let! _ =
-                            Statement.execute
-                                conn
-                                transaction
-                                (SqlResources.get "command" "submit_correction")
-                                [ "@command_id", box commandId
-                                  "@effective_at", box (Instant.ofDateTimeOffset at)
-                                  "@on_divergence", box (CommandMapping.divergenceToString policy.OnDivergence)
-                                  "@replay_limit", box policy.ReplayLimit ]
-                                ct
+                    match submission.Kind with
+                    | CommandKind.Event -> return Accepted(CommandId.ofInt64 commandId)
+                    | CommandKind.Correction(at, policy) ->
+                        do!
+                            Sql.execute
+                                submitCorrection
+                                [ "@command_id", Param.Integer commandId
+                                  "@effective_at", Param.Integer(Instant.ofDateTimeOffset at)
+                                  "@on_divergence", Param.Text(CommandMapping.divergenceToString policy.OnDivergence)
+                                  "@replay_limit", Param.Integer(int64 policy.ReplayLimit) ]
+                            |> Op.discard
 
-                        return Ok(Accepted(CommandId.ofInt64 commandId))
+                        return Accepted(CommandId.ofInt64 commandId)
         }
 
     /// The lease token, the claimed rows and their correction details, all in the claim's own
     /// transaction. Decoding waits until it has committed.
-    let claimIn
-        (machineId: MachineId)
-        (batch: int)
-        (lease: TimeSpan)
-        (conn: SqliteConnection)
-        (transaction: SqliteTransaction)
-        (now: int64)
-        (ct: CancellationToken)
-        =
-        backgroundTask {
-            let! token =
-                Statement.tryOne
-                    conn
-                    transaction
-                    (SqlResources.get "system" "next_token")
-                    []
-                    (fun reader -> Row.int64 reader "value")
-                    ct
+    let claim (machineId: MachineId) (batch: int) (lease: TimeSpan) =
+        sqliteWrite {
+            let! now = Sql.now
+            let! token = Sql.one "LeaseToken" nextToken [] (fun reader -> Row.int64 reader "value")
 
-            match token with
-            | None -> return Error(Db.decodeFailure "LeaseToken" "the lease token counter is missing")
-            | Some token ->
-                let! rows =
-                    Statement.rows
-                        conn
-                        transaction
-                        (SqlResources.get "command" "claim")
-                        [ "@machine_id", box (MachineId.value machineId)
-                          "@batch", box batch
-                          "@now", box now
-                          "@deadline", box (Instant.add now lease)
-                          "@lease_token", box token ]
-                        CommandMapping.commandRow
-                        ct
+            let! rows =
+                Sql.rows
+                    claimCommands
+                    [ "@machine_id", Param.Text(MachineId.value machineId)
+                      "@batch", Param.Integer(int64 batch)
+                      "@now", Param.Integer now
+                      "@deadline", Param.Integer(Instant.add now lease)
+                      "@lease_token", Param.Integer token ]
+                    CommandMapping.commandRow
 
-                let corrections =
-                    rows
-                    |> List.filter (fun row -> row.kind = "correction")
-                    |> List.map _.command_id
+            let corrections =
+                rows
+                |> List.filter (fun row -> row.kind = "correction")
+                |> List.map _.command_id
 
-                match corrections with
-                | [] -> return Ok(rows, Map.empty)
-                | ids ->
-                    let! details =
-                        Statement.rows
-                            conn
-                            transaction
-                            (SqlResources.get "command" "corrections")
-                            [ "@ids", box (JsonSerializer.Serialize ids) ]
-                            CommandMapping.correctionRow
-                            ct
+            match corrections with
+            | [] -> return rows, Map.empty
+            | ids ->
+                let! details =
+                    Sql.rows
+                        correctionsOf
+                        [ "@ids", Param.Text(JsonSerializer.Serialize ids) ]
+                        CommandMapping.correctionRow
 
-                    return Ok(rows, details |> List.map (fun d -> d.command_id, d) |> Map.ofList)
+                return rows, details |> List.map (fun d -> d.command_id, d) |> Map.ofList
         }
 
     interface ICommandInbox<'EntityId, 'Event> with
@@ -395,9 +369,11 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
         member _.Submit(submission, ct) =
             let entityId = options.EntityIdEncode submission.EntityId
 
-            match options.EventCodec.Encode submission.Event with
-            | Error error -> Task.FromResult(Error(Db.toStoreError error))
-            | Ok encodedEvent -> write (submitIn submission entityId encodedEvent) ct
+            // Encoded before the write begins, so the transaction only writes.
+            backgroundTaskResult {
+                let! encodedEvent = options.EventCodec.Encode submission.Event |> Result.mapError Db.toStoreError
+                return! Sql.write context (submit submission entityId encodedEvent) ct
+            }
 
         member _.Claim(machineId, batch, lease, ct) =
             if batch < 1 then
@@ -411,66 +387,68 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
             // while the first stays invisible until its lease lapses. The worker polls again in a
             // moment, which recovers sooner than a retry would.
             backgroundTaskResult {
-                let! rows, corrections =
-                    Db.protectOnce
-                        (fun token ->
-                            Db.writeTransaction
-                                context.ConnectionString
-                                context.Clock
-                                (claimIn machineId batch lease)
-                                token)
-                        ct
-
+                let! rows, corrections = Sql.writeOnce context (claim machineId batch lease) ct
                 return! rows |> List.traverseResultM (toLeased corrections)
             }
 
         member _.Reschedule(commandId, leaseToken, backoff, ct) =
-            write
-                (fun conn transaction now token ->
-                    Statement.execute
-                        conn
-                        transaction
-                        (SqlResources.get "command" "reschedule")
-                        [ "@command_id", box (CommandId.value commandId)
-                          "@lease_token", box (LeaseToken.value leaseToken)
-                          "@now", box now
-                          "@base_us", box (CommandMapping.micros (Backoff.baseDelay backoff))
-                          "@cap_us", box (CommandMapping.micros (Backoff.ceiling backoff)) ]
-                        token
-                    |> Task.map (CommandMapping.leaseOutcome >> Ok))
+            Sql.write
+                context
+                (sqliteWrite {
+                    let! now = Sql.now
+
+                    let! changed =
+                        Sql.execute
+                            rescheduleCommand
+                            [ "@command_id", Param.Integer(CommandId.value commandId)
+                              "@lease_token", Param.Integer(LeaseToken.value leaseToken)
+                              "@now", Param.Integer now
+                              "@base_us", Param.Integer(CommandMapping.micros (Backoff.baseDelay backoff))
+                              "@cap_us", Param.Integer(CommandMapping.micros (Backoff.ceiling backoff)) ]
+
+                    return CommandMapping.leaseOutcome changed
+                })
                 ct
 
         member _.ExtendLease(commandId, leaseToken, lease, ct) =
             if lease <= TimeSpan.Zero then
                 invalidArg (nameof lease) "A lease must be a positive duration."
 
-            write
-                (fun conn transaction now token ->
-                    Statement.execute
-                        conn
-                        transaction
-                        (SqlResources.get "command" "extend_lease")
-                        [ "@command_id", box (CommandId.value commandId)
-                          "@lease_token", box (LeaseToken.value leaseToken)
-                          "@deadline", box (Instant.add now lease) ]
-                        token
-                    |> Task.map (CommandMapping.leaseOutcome >> Ok))
+            Sql.write
+                context
+                (sqliteWrite {
+                    let! now = Sql.now
+
+                    let! changed =
+                        Sql.execute
+                            extendLease
+                            [ "@command_id", Param.Integer(CommandId.value commandId)
+                              "@lease_token", Param.Integer(LeaseToken.value leaseToken)
+                              "@deadline", Param.Integer(Instant.add now lease) ]
+
+                    return CommandMapping.leaseOutcome changed
+                })
                 ct
 
         member _.TryGet(commandId, ct) =
             let id = CommandId.value commandId
 
-            read
-                (fun query token ->
-                    selectTask query {
-                        for c in main.fsm_command do
-                            leftJoin d in main.fsm_command_correction on (c.command_id = d.Value.command_id)
-                            where (c.command_id = id)
-                            select (c, d)
-                            tryHead
-                            cancel token
-                    }
-                    |> Task.map single)
+            Sql.read
+                context
+                (sqliteRead {
+                    let! row =
+                        Sql.select (fun query token ->
+                            selectTask query {
+                                for c in main.fsm_command do
+                                    leftJoin d in main.fsm_command_correction on (c.command_id = d.Value.command_id)
+                                    where (c.command_id = id)
+                                    select (c, d)
+                                    tryHead
+                                    cancel token
+                            })
+
+                    return! single row
+                })
                 ct
 
         member _.TryFind(machineId, entityId, idempotencyKey, ct) =
