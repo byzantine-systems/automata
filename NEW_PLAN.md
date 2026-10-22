@@ -191,31 +191,59 @@ module ChartEquivalence =
 
 ---
 
-## Phase B: computation expressions and F# types (no schema change)
+## Phase B: the store algebra, types, runtime loops, TAP (no schema change)
 
-A store method should read as what it decides, and nothing stringly-typed should cross an internal boundary. Tests stay unchanged except where a signature tightens.
+A store method should read as what it decides, and nothing stringly-typed should cross an internal boundary. Both providers answer through one instruction algebra, so the choreography is written once and each provider supplies statements and session mechanics. Tests stay unchanged except where a signature tightens.
 
-### B1. Make `do!` work on statements, so `Op.discard` disappears (12 sites)
-`Sql.execute` returns `Op<_, int>`, so every `do!` needs `|> Op.discard`. Split the primitive:
+### B0. The store algebra: one program per concern, one interpreter per provider
+
+Today every store concern exists twice. `PostgresCommandInbox.fs` and `SqliteCommandInbox.fs` spell the same submit/claim choreography over the same decisions with different statements, and the review has already caught them drifting (E29). The remedy is not a third copy with a test suite; it is to write the choreography **once** as a program in a small instruction algebra, and make each provider an interpreter of it.
+
 ```fsharp
-Sql.execute      : Statement -> Params -> Op<'S, unit>   // the common case
-Sql.executeCount : Statement -> Params -> Op<'S, int>    // when the count decides something
-```
-A `Bind` overload on `Op<_, int>` is rejected: overload resolution between `'T` and `int` is fragile in inference, and it would silently drop counts a caller meant to check.
+/// The instruction set: the store algebra's signature, at statement granularity.
+type StoreInstruction<'Next> =
+    | Execute      of key: StatementKey * kind: WriteKind * ps: Params * next: (int -> 'Next)
+    | QueryOne     of key: StatementKey * ps: Params * read: Read<'Row> * next: ('Row -> 'Next)
+    | TryQueryOne  of key: StatementKey * ps: Params * read: Read<'Row> * next: ('Row option -> 'Next)
+    | QueryRows    of key: StatementKey * ps: Params * read: Read<'Row> * next: ('Row list -> 'Next)
+    | WithEntityGate of entity: EntityKey * body: StoreProgram<'Next>
+    | InSession    of SessionKind * body: StoreProgram<'Next>
 
-### B2. Row readers return `Result`, so decode-after-read folds into the read (about 8 sites)
-Today a pattern repeats: `let! s = Sql.one "Name" stmt ps (Row.string r "outcome")`, then `return! outcomeFromString s`. It appears in both inboxes, both action queues, the processor and maintenance. Instead:
-```fsharp
-type internal Read<'Reader, 'T> = 'Reader -> Result<'T, StoreError>
-module internal Read =
-    let ok (f: 'Reader -> 'T) : Read<'Reader, 'T>
-    let map / bind
-Sql.one    : Statement -> Params -> Read<_, 'T> -> Op<'S, 'T>
-Sql.tryOne : ... -> Op<'S, 'T option>
-Sql.rows   : ... -> Op<'S, 'T list>
+and StoreProgram<'T> = Pure of 'T | Impure of StoreInstruction<StoreProgram<'T>>
+
+type store = StoreBuilder()   // Bind/Return/Zero/Combine/Delay over StoreProgram
 ```
-- The `typeName: string` argument goes. Errors name the statement key (`command/finalize returned no row`), which is more useful, and the 9 string literals ("Epoch", "LeaseToken", "ChartFingerprint", ...) disappear.
-- A reader that throws is still a defect: `Db.classify` makes it `Unexpected`. A reader that recognises bad data returns `Error(Serialization …)`.
+
+- **`StatementKey`** is the semantic key the providers already use (`Statement.load domain operation`, the D2 mechanism). The program names what it wants ("`command/finalize`"); the interpreter supplies the provider's text. SQL stays data.
+- **`WithEntityGate`** is where the two providers genuinely differ, made explicit: PostgreSQL interprets it as the per-entity advisory-lock statement inside the routine call; SQLite interprets it as the `IMMEDIATE` write session itself, whose transaction is the gate. The instruction is the shared meaning, the realization is per provider.
+- **`InSession`** owns connection and transaction shape: read sessions, write sessions. Nesting rules are instruction laws (below).
+- **Interpreters** live in each provider: a `StatementKey → Statement` map over the existing `SqlResources`, session and gate realization, and the existing runners, resilience pipeline and `Op` underneath. `Op` survives, demoted one level: it is how an interpreter talks to a driver, no longer how store logic is composed.
+- **Programs replace choreography files.** `CommandInboxProgram`, `ActionQueueProgram`, `ProcessorProgram`, `TemporalProgram` and so on are written once in `Storage` and become the only place a SQL sequence is decided. A provider package shrinks to: interpreter, statements, migrations, boot, and the provider-true extras (LISTEN/NOTIFY, pgmq). Where choreography genuinely differs by provider, provider fragments compose at the program level rather than forking the file.
+- **This reverses Phase A's "OpBuilder stays minimal" conclusion, on purpose.** Phase A kept `Op` a closure because nothing then needed a second interpreter. The store algebra needs two things a closure cannot give: provider-generic programs (the closure fuses program with session mechanics) and a pure interpreter for law tests. The initial encoding costs an allocation per instruction, which is noise under database I/O; the benchmark still runs before any performance sentence, per the repo rule.
+- **Migration order**, each step green before the next: `Sql.fs` primitives become instruction constructors; the interpreter lands per provider; then store by store, **CommandInbox first** (it is the most duplicated), then ActionQueue, CommandProcessorStore, Temporal/Supervision/Maintenance; last, the dead per-provider choreography is deleted.
+
+### B0.1 Instruction and program laws
+
+Three tiers, each with its own tests:
+
+1. **Instruction laws** (against a **recording interpreter**: pure, returns scripted outcomes, records the instruction log):
+   - `WithEntityGate` composes: gating twice for one entity within a program runs the body once, nested gates for different entities interleave legally;
+   - session normal form: one write session per program, read sessions never nested inside a write session's gate;
+   - `Execute` with `WriteKind.Discard` never binds the count, mirroring B1.
+2. **Interpreter laws**: each provider's interpreter, driven through the real runners, passes the C0 conformance suite. This is where per-provider behaviour is pinned.
+3. **Behaviour preservation**: each provider's existing suite passes unchanged after that store's migration. The recording interpreter inherits the reference-implementation role the withdrawn in-memory store was to play: program-level outcomes are tested purely, without a database.
+
+### B1. `do!` works on statements: `WriteKind` instead of `Op.discard` (absorbed)
+The old `Sql.execute : Statement -> Params -> Op<_, int>` split becomes a constructor argument: `Execute (key, Discard, ps, next)` drops the count by type, `Execute (key, Count, ps, next)` hands it to the continuation. A `Bind` overload that silently drops counts was rejected in the Phase A draft for the same reason it stays rejected: inference between `'T` and `int` is fragile, and a silently dropped count is a bug.
+
+### B2. Row readers return `Result`, folded into the instruction (absorbed)
+The `Read<'Reader, 'T>` type moves from a per-provider helper to the algebra:
+
+```fsharp
+type internal Read<'T> = NpgsqlDataReader -> Result<'T, StoreError>   // per provider, at the interpreter
+```
+
+`QueryOne`/`TryQueryOne`/`QueryRows` carry it, so decode-after-read is part of the query, not a follow-up step. The `typeName: string` argument goes: errors name the statement key (`command/finalize returned no row`), which is more useful and kills the 9 string literals. A reader that throws is a defect (`Unexpected`); a reader that recognises bad data answers `Error(Serialization …)`.
 
 ### B3. One spelling table per database enum, both directions derived from it
 Status and outcome strings are mapped by hand in both directions, in several copies:
@@ -276,13 +304,13 @@ type Reason = private Reason of string                              // non-blank
 ```
 Each type has `tryCreate`/`create`. The interfaces take these types. The runtime builds them once from `MachineBuilder` configuration, so a misconfiguration fails at build time, not on the first poll. `Backoff.tryCreate` also rejects a ceiling above `Int32.MaxValue` ms, which fixes the overflow in E17.
 
-This matters for Phase F as well: a provider written against the interfaces inherits the validation instead of re-implementing it. That is the third copy B7 would otherwise have to keep in sync.
+This matters for Phase B0 as well: a provider's interpreter inherits the validation instead of re-implementing it, and the shared programs never see an unvalidated argument.
 
-### B8. Small CE and runner fixes
-- **`Sql.session` leaks the connection** when the `QueryContext` constructor throws, and `Listener.openDirect` leaks it when `OpenAsync` throws (E19). Hold the connection under `use` until ownership passes, or dispose in a `try/finally` that ownership transfer disarms.
-- **Claim's corrections read joins the claim** (E32). Today `Claim` makes two runs, `runOnce` claim then `run` correction details. If the second run fails, the batch is leased and the call answers `Error`, so every entity in it stalls for the lease. Make `claim_commands` (and SQLite `claim.sql`) return the correction columns through a `LEFT JOIN`, so a claim is one statement.
+### B8. Small CE and interpreter fixes
+- **The interpreter leaks the connection** when a session constructor throws, and `Listener.openDirect` leaks it when `OpenAsync` throws (E19). Hold the connection under `use` until ownership passes, or dispose in a `try/finally` that ownership transfer disarms. The program layer cannot fix this; the interpreter owns sessions.
+- **Claim's corrections read joins the claim** (E32). Today `Claim` makes two runs, `runOnce` claim then `run` correction details. If the second run fails, the batch is leased and the call answers `Error`, so every entity in it stalls for the lease. Make `claim_commands` (and SQLite `claim.sql`) return the correction columns through a `LEFT JOIN`, so a claim is one statement. The shared `CommandInboxProgram` fixes this once for both providers.
 - **`PostgresMachineStore.boot`** uses `taskResult`. Switch it to `backgroundTaskResult`, like the rest of the library.
-- **`OpBuilder` stays minimal.** Still absent: `Source(Task)`, `and!`, `TryWith`, `Using`. Add `For` only when a store needs a per-element loop, implemented inside one `backgroundTask` (Phase A finding 13). The review found no such loop today: SQLite fans out with JSON parameters.
+- **`StoreBuilder` stays minimal.** Still absent: binding a raw `Task` (a program must not open a second session under the first), `and!` (one connection cannot run two commands at once), `TryWith` (exception translation belongs to the interpreter's single boundary), `Using`. Add `For` only when a program needs a per-element loop. The Phase A finding carries over: the absences are the design.
 - **Two `<summary>` blocks collide** (E18):
   - In `Processing.fs`, the `CommandFailure` comment sits above `ReplayError`.
   - In `PostgresCommandProcessorStore.fs:48-59`, the store's summary is attached to `ReplayMapping`.
@@ -291,7 +319,7 @@ This matters for Phase F as well: a provider written against the interfaces inhe
 ### B9. .NET compliance
 - **Logging:** use `LoggerMessage.Define` cached delegates in `DependencyInjection/Logging.fs` and `Maintenance.fs`, in place of `LogX(eventId, format, box …)`. F# has no source generators, and `Define` is the allocation-free equivalent.
 - **Data source ownership:** `PostgresContext.ofConnectionString` builds an `NpgsqlDataSource` that nobody owns. Remove it from the public surface and keep `PostgresContext.create dataSource policy sink`. Examples build the data source under `use`. A host registers it once, through DI.
-- **Clocks:** `PostgresTemporalStore.ValidAt` reads `DateTimeOffset.UtcNow`. That changes in E (one clock, the database's); until then, use `TimeProvider`. The memory store (F) has no database clock, so `TimeProvider` is its only clock.
+- **Clocks:** `PostgresTemporalStore.ValidAt` reads `DateTimeOffset.UtcNow`. That changes in E (one clock, the database's); until then, use `TimeProvider`.
 - **Cancellation:** `SqliteBoot.fs:141` calls `CloseAsync()` without the token. Both migrators stay synchronous, because DbUp is synchronous; document this rather than wrap it in `Task.Run`.
 
 ### B10. Runtime loops become `while` loops (E41)
@@ -301,7 +329,7 @@ The long-running loops are recursive `task`/`backgroundTask` functions using `re
 - `ObserverDispatcher.drain`;
 - `Recurring.repeat` (`Core/Boundary.fs:96`), which drives the listener and maintenance.
 
-F# `task` has no tail calls, so a loop that never ends should keep one pending state machine per iteration: a slow, unbounded leak in every long-running host. (`Supervisor`'s `async` loop is unaffected, because `async` trampolines `return!`.) With a store that completes synchronously (Phase F), the full-batch path (`return! loop totals` when `Claimed = Batch`) also recurses on the stack, and a large backlog can raise `StackOverflowException`, which cannot be caught.
+F# `task` has no tail calls, so a loop that never ends should keep one pending state machine per iteration: a slow, unbounded leak in every long-running host. (`Supervisor`'s `async` loop is unaffected, because `async` trampolines `return!`.) With a store that completes synchronously (a warm SQLite file, or the recording interpreter under test), the full-batch path (`return! loop totals` when `Claimed = Batch`) also recurses on the stack, and a large backlog can raise `StackOverflowException`, which cannot be caught.
 - **First, a test that should fail.** Run each loop for 100k iterations against a synchronous fake store. Assert there is no stack overflow, and that `GC.GetTotalMemory(true)` is flat (within a tolerance) between 10k and 100k iterations. It should fail on today's code; that confirms the diagnosis before anything is rewritten.
 - Rewrite the four loops as `while` loops over `mutable` state. `renewWhile.renew` and `awaitSettled` are bounded by one command's lifetime, but get the same rewrite for consistency.
 - On the full-batch path, `do! Task.Yield()` when the poll completed synchronously (*Consuming TAP*, `YieldLoop`). A synchronous store draining a backlog then shares the thread pool fairly, and `StopAsync` is seen promptly.
@@ -327,14 +355,17 @@ B11:
 - A test runs under a single-threaded `SynchronizationContext`, blocks on `.Result` of `Machine.send`, and does not deadlock.
 - The cancellation and null-argument checks move into the C0 suite (C0).
 
-Extend `OpTests.fs` to check that:
-- an exception inside `Delay` becomes `Unexpected` through a runner, never a faulted task;
-- `Sql.one` returns `Error` on zero rows and on two rows, naming the statement key;
-- a `Read` returning `Error` stops the unit.
+B0: the instruction and program laws of B0.1 against the recording interpreter, and each migrated provider's existing suite passing unchanged, store by store, in the migration order.
+
+New `StoreProgramTests` check that:
+- an exception inside an instruction becomes `Unexpected` through an interpreter, never a faulted task;
+- `QueryOne` answers `Error` on zero rows and on two rows, naming the statement key;
+- a `Read` answering `Error` stops the program;
+- the recording interpreter's instruction log satisfies the session and gate normal forms.
 
 Pure `Spelling` completeness tests. Constrained types: property tests (FsCheck is already used in Core tests) that `tryCreate` accepts exactly the documented range.
 
-Grep checks: none of `Op.discard`, `invalidArg` in store members, `"ready" |` or `typeName` literals in `Sql.one` calls remain.
+Grep checks: none of `Op.discard`, per-provider choreography in store files (after B0's migration completes), `invalidArg` in store members, `"ready" |` or `typeName` literals in query calls remain.
 
 Then `dotnet build bs-automata.slnx`, `make test-unit`, `make db && make test-integration`, and `make fmt`.
 
