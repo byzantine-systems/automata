@@ -1,4 +1,4 @@
-# Plan: the stores, from Phase B onward (reworked 2026-10-08)
+# Plan: the stores, from Phase B onward (reworked 2026-10-08, revised 2026-11-01)
 
 ## Status
 
@@ -15,49 +15,52 @@ Carried over from Phase A, still open:
 
 ### What changed from the previous plan
 
-1. **The CE work continues as Phase B.** Phase A built the effect; Phase B makes stores written in it say less and type more.
-2. **New Phase C, correctness fixes.** The review found real bugs: a maintenance wedge, an ordering race, and poison-row wedges. They get fixed before any structural change. **C0 also creates a provider-agnostic conformance suite**, so each fix is proven once against every store.
-3. **New Phase D, configurable schema.** The default stays `fsm`.
-4. **New Phase E, bitemporal opt-in.** The timeline moves to a sibling schema `<schema>_temporal`, installed only on request. The core schema keeps a plain snapshot table. Corrections ship with the temporal module. The infrastructure they need becomes public interfaces, so an application can implement corrections over the core store itself.
-5. **Phase B gains B10 and B11.** B10 replaces the runtime's recursive `task` loops, which leak per iteration and can overflow the stack. B11 brings the library in line with Microsoft's TAP guidance, translated to F#: a functional core with a thin `Task` shell.
-6. **New Phase F, an in-memory store.** Some machines need no storage backend at all: tests, examples, single-process tools, and workflows whose state is worth nothing after a restart. Today they still need SQLite or PostgreSQL, or a hand-written fake. Phase F ships `ByzantineSystems.Automata.Storage.Memory`, a complete provider built only on the public interfaces, that passes the same conformance suite.
-7. **The old Phase B (JSON reduction) is now Phase G**, adjusted for the split. The old Phase C (DB-enforced lifecycle) is now Phase H.
-8. **"No public API change" is lifted.** Automata is unreleased. Every public change is listed in its phase and recorded in `docs/public-api.md`. There is still no version bump, tag or CHANGELOG.
+1. **The CE work continues as Phase B**, rewritten around a **store algebra**. Phase A built the effect; Phase B gives both SQL providers one semantic instruction set, one `store { }` program per concern and one interpreter per provider, so the choreography that today exists twice (PostgreSQL and SQLite, already drifting) is written once.
+2. **New phases A2, A3 and A4, the core algebra track.** The chart and rule vocabulary gets an explicit law portfolio and generated tests (A2), a two-tier condition DSL with a faithful fingerprint (A3), and a public chart-equivalence API (A4). The A track touches only Core, so it runs before and alongside Phase B.
+3. **New Phase C, correctness fixes.** The review found real bugs: a maintenance wedge, an ordering race, and poison-row wedges. They get fixed before any structural change. **C0 also creates a provider-agnostic conformance suite**, so each fix is proven once against every store.
+4. **New Phase D, configurable schema.** The default stays `fsm`.
+5. **New Phase E, bitemporal opt-in.** The timeline moves to a sibling schema `<schema>_temporal`, installed only on request. The core schema keeps a plain snapshot table. Corrections ship with the temporal module. The infrastructure they need becomes public interfaces, so an application can implement corrections over the core store itself.
+6. **Phase B gains B10 and B11.** B10 replaces the runtime's recursive `task` loops, which leak per iteration and can overflow the stack. B11 brings the library in line with Microsoft's TAP guidance, translated to F#: a functional core with a thin `Task` shell.
+7. **The in-memory store is withdrawn from the plan.** The earlier draft had it as Phase F. Its two load-bearing roles are covered better elsewhere: the law-testing and reference-implementation role by the store algebra's recording interpreter (Phase B), and the corrections-evidence role by a test-only `IPriorState` and `ICorrectionCommitter` (Phase E). Its own section is gone; E44 and E49 were real bugs independent of it and are re-homed.
+8. **The old Phase B (JSON reduction) is now Phase G**, adjusted for the split. The old Phase C (DB-enforced lifecycle) is now Phase H.
+9. **"No public API change" is lifted.** Automata is unreleased. Every public change is listed in its phase and recorded in `docs/public-api.md`. There is still no version bump, tag or CHANGELOG.
 
 ## Phase order and why
 
 | Phase | Changes schema | Changes public API | Depends on |
 |---|---|---|---|
-| B. CEs, types, runtime loops, TAP | no | yes (constrained arguments, `Async` names) | A |
+| A2. Core algebra: laws, generators, observations | no | no | A |
+| A3. Two-tier condition DSL, faithful fingerprint | no | yes (rule surface, additive + breaking) | A2 |
+| A4. Public chart equivalence | no | yes, additive | A3 |
+| B. Store algebra, types, runtime loops, TAP | no | yes (constrained arguments, `Async` names) | A |
 | C. Correctness fixes, conformance suite | yes, in place | small (typed refusals) | B |
 | D. Configurable schema | templating only | yes (`SchemaName`, options) | B |
 | E. Core/temporal split | yes | yes (store types, correction interfaces) | C, D |
-| F. In-memory store | none (no schema) | yes, additive (new package) | C, E |
 | G. Less JSON | yes | no | E |
 | H. DB-enforced lifecycle | yes | no | G |
 
+The A track is ordered by the algebraic-design method itself: A2 writes the laws against today's closures, A3 changes the representation behind those laws, A4 publishes the observation the laws always compared with. A2 runs first because its properties are the safety net that makes A3's representation swap safe. The A track shares no files with Phase B, so the two tracks proceed in parallel.
+
 D precedes E so that the temporal module is born templated. C precedes E because two of the bugs (E2, E5 in the register) change how the split must be written.
 
-F follows E because E settles the last store-facing public types: `SubmissionOutcome.Refused`, `AlreadyFinalized of …`, `ActionDelivery`, `ITransitionLog`, `IPriorState`, `ICorrectionCommitter` and the removal of `IReplayStore`. Built earlier, the memory store would be rewritten twice. F needs nothing from G or H, which only touch SQL. It can run in parallel with them.
+Migrations are **edited in place** throughout (unreleased): `make db-reset`, delete local SQLite files, `make schema-generate` / `make schema-generate-sqlite`, update `SchemaContractTests`.
 
-Migrations are **edited in place** throughout (unreleased): `make db-reset`, delete local SQLite files, `make schema-generate` / `make schema-generate-sqlite`, update `SchemaContractTests`. Phase F has no migrations.
+### Two kinds of store, one contract
 
-### Three kinds of store, one contract
+Each phase states which providers it touches. "Both stores" means SQLite and PostgreSQL:
 
-Each phase states which providers it touches. "Both stores" in the previous plan meant SQLite and PostgreSQL. From now on:
+| | PostgreSQL | SQLite |
+|---|---|---|
+| Survives a restart | yes | yes |
+| Shared between processes | yes | yes (one host, WAL) |
+| Codecs | required | required |
+| Schema, migrations, boot check | yes | yes |
+| Cross-process wake-ups (`IWorkNotifications`) | yes | no |
+| Bitemporal (`ITemporalReader`) | opt-in (E) | no |
+| Corrections (E5 capability) | with the temporal module | no, refused at submission (E27) |
+| Retention | `run_maintenance` | maintenance |
 
-| | PostgreSQL | SQLite | Memory (F) |
-|---|---|---|---|
-| Survives a restart | yes | yes | **no** |
-| Shared between processes | yes | yes (one host, WAL) | **no**, one process |
-| Codecs | required | required | not used (optional round-trip mode, F3) |
-| Schema, migrations, boot check | yes | yes | none |
-| Cross-process wake-ups (`IWorkNotifications`) | yes | no | no (in-process `WorkSignal` is enough) |
-| Bitemporal (`ITemporalReader`) | opt-in (E) | no | no |
-| Corrections (E5 capability) | with the temporal module | no | **yes**, over the transition log |
-| Retention | `run_maintenance` | maintenance | inline, on every close (F4) |
-
-What does not change across the three: per-entity ordering, lease fencing, idempotent submission, the epoch check on commit, a commit and its actions as one fact, and dead letters. Phase C0's conformance suite is where that is checked, not each provider's own tests.
+What does not change across the two: per-entity ordering, lease fencing, idempotent submission, the epoch check on commit, a commit and its actions as one fact, and dead letters. Phase C0's conformance suite is where that is checked, not each provider's own tests. Phase B's recording interpreter checks the program-level laws those interfaces cannot see.
 
 ---
 
