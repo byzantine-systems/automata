@@ -64,6 +64,133 @@ What does not change across the two: per-entity ordering, lease fencing, idempot
 
 ---
 
+## Phase A2: the core algebra: laws, generators, observations (no schema change, no public change)
+
+Everything in A2 works against today's closure encoding. That is deliberate: the laws are written and tested before A3 changes the representation they constrain, which is the only order in which a representation swap is safe.
+
+### A2.1 The law portfolio
+
+Each law names its **observation** (the public function the equality is claimed under) and its **scope** (which terms it covers). Laws are listed here as the spec; A2 turns each into a named FsCheck property.
+
+Rule laws (observation `Rule.invoke`, syntax `Rule.kind`):
+
+| Law | Statement |
+|---|---|
+| Guard transparency | When the guard predicate holds, `invoke (guarded p reason r) = invoke r` on the same pair. When it does not, `invoke (guarded p reason r) = GuardFailed reason`, independent of the wrapped rule. |
+| Constructor refinement | For each combinator, the verdict is a total function of its predicate and transform: `transition` answers `NoMatch` exactly when the predicate does not hold, `attempt` maps `Error` to `Rejected`, `internalOn` never changes the state, `goto` echoes its target. |
+| Kind injectivity | `kind` names the combinator that built the rule; `kind (goto p t tr) = Goto t` and `kind (guarded p reason r) = Guarded (reason, kind r)`. |
+| Target projection | `target (goto _ t _) = Some t` and `target (guarded _ _ r) = target r`; the other combinators answer `None`. |
+| Retarget homomorphism | `invoke (retarget f r) s e` equals `invoke r s e` with `Goto` targets mapped through `f` and every other verdict untouched, both through guards. |
+
+Chart laws (observation `Chart.resolve`):
+
+| Law | Statement |
+|---|---|
+| Internal identity | An `internalOn` match resolves `Ok` with `Exited = []`, `Entered = []` and `Next` the same state. |
+| Chain locality | Resolution consults only nodes on `Hierarchy.chain` of the classified leaf; an event handled by an off-chain node is `Unhandled`. |
+| First match wins | Within a node, the first rule whose verdict is not `NoMatch` decides; later rules are unreachable for that pair. |
+| LCA path law | `Exited` is exactly the prefix of `chain leaf` below the least common ancestor of leaf and target; `Entered` is the outermost-first suffix of `chain target`. |
+| Self-transition | When handler and leaf differ and the target is the leaf itself, `Exited` is the path leaf to handler and `Entered` its reverse. |
+| Goto descent | A `goto` resolves at the target's initial-child leaf, and `Classify nextState` must equal that leaf or the answer is `TargetMismatch`. |
+| Actions order | `Actions = exit actions ▸ rule actions ▸ entry actions`, concatenated in execution order. |
+| Anchors | A chart with exactly one matching rule resolves `Ok` and names the handler (rules out the always-`Unhandled` degenerate model); a terminal leaf is `Unhandled` by construction. |
+
+Hierarchy laws (observation the module functions, over generated parent functions): `leastCommonAncestor a b = leastCommonAncestor b a`; `leastCommonAncestor a a = a`; `chain` starts at the node, ends at the root, is strictly parent-linked and duplicate-free; `pathUpTo` is a prefix of `chain`.
+
+Fragment laws (observation the built chart, plus `Chart.fingerprint`):
+
+| Law | Statement |
+|---|---|
+| Splice monoid | Part splicing is associative with `Zero`, and rule declaration order survives splicing, because order is observable (first match wins). |
+| Prefix compositionality | `prefix "a" (prefix "b" d) = prefix "a.b" d`, and `prefix` distributes over child splicing. |
+| Classifier boundary | `prefix` cannot rename classifier outputs. This is a stated law boundary, not a silent gap: the classifier is the host's own code and the failure is typed (`UnknownState`), never a wrong resolution. |
+| Fingerprint stability | Renaming sibling declaration order leaves the fingerprint unchanged; reordering rules changes it. |
+
+### A2.2 Generators
+
+The generators in `ChartPropertyTests.fs` grow into the portfolio's engine, under the rules that make generated evidence trustworthy:
+
+- Terms are built **through the public constructors only** (the `statechart` CE, the `Rule` and `Fragment` combinators). Nothing constructs a `Node` or a `Rule` record directly, so unreachable states are not generated.
+- Recursion is sized, every constructor of `Rule`, `NodePart` and `Condition` (once A3 adds it) has a route, and the frequencies are biased so compound shapes occur.
+- Coverage is asserted, not just reported: a property whose generator cannot reach a constructor family is a generator defect, and the suite says so.
+
+### Phase A2 verification
+
+- Every law above is a named property; the suite fails if one is missing.
+- `dotnet build bs-automata.slnx`, `make test-unit`, `make fmt`.
+- No change under `src/` other than test-only additions.
+
+---
+
+## Phase A3: the two-tier condition DSL, faithful fingerprint (no schema change; public rule surface)
+
+### A3.1 The condition language
+
+`Rule` today is a record of two halves: `Kind`, a syntax projection, and `Invoke`, a closure. The fingerprint can only see the first, which is why `Chart.fs` has to describe it as a tripwire rather than a proof. A3 closes that gap the way a restricted predicate language can: rules whose deciding parts are expressed as **terms** become inspectable, comparable and hashable, while genuinely opaque predicates keep the closure escape hatch.
+
+```fsharp
+type Condition<'State, 'Event> =
+    | Always
+    | Never
+    | AllOf of Condition<'State, 'Event> list
+    | AnyOf of Condition<'State, 'Event> list
+    | Not of Condition<'State, 'Event>
+    | EventIs of predicate: 'Event -> bool * name: string
+    | StateIs of predicate: 'State -> bool * name: string
+    | Both of ('State -> 'Event -> bool) * name: string
+    | Custom of name: string * ('State -> 'Event -> bool)
+```
+
+- The named scrutinee cases carry a stable `name` so the fingerprint can see them; `Custom` carries a name for the same reason, but the fingerprint records only the name, never the behaviour, and the docs say so.
+- `matches` is the observation, and it is a **homomorphism** onto the boolean algebra: `matches (AllOf [a; b]) s e = matches a s e && matches b s e`, `matches Always = true`, `matches Never = false`, `Not ∘ Not = id`, and De Morgan holds between `AllOf`/`AnyOf`/`Not`. `AllOf`/`Always` and `AnyOf`/`Never` are commutative monoids. These are laws, with properties.
+- Smart constructors normalize: `allOf [] = Always`, `anyOf [] = Never`, `anyOf [c] = c` (and the `AllOf` mirror), nesting is flattened, and normalization is idempotent. Normalization is what makes structural comparison meaningful.
+- On a finite toy domain (`'Event` a pair of bools, a handful of named scrutinees), a small exploratory harness enumerates well-typed terms and compares observations, QuickSpec-style: candidate equalities are printed for review, and the accepted ones become the named properties above. .NET has no QuickSpec; this harness is the honest substitute, and it runs only on that finite signature.
+
+### A3.2 Rules over the DSL
+
+- `Rule.transition` (and friends) gain overloads taking a `Condition`; the closure overloads stay and build a `Custom`-shaped kind, so nothing existing breaks.
+- `RuleKind` and `Condition` merge into one syntax: the kind of a rule built from a condition **is** that condition. The `Kind`/`Invoke` duality collapses to syntax plus one interpreter (`invoke`), which is the shape the fingerprint always wanted.
+- `Fragment.prefix` and `Rule.retarget` become syntax rewrites; the A2 homomorphism laws now hold structurally, which is worth a comment on each.
+- The fingerprint scheme bumps `automata.chart.fingerprint/1` to `/2`: conditions and their names are hashed in normalized form. For charts whose rules are DSL-only, the fingerprint becomes **faithful**: same normalized structure means same resolution behaviour, and the tripwire caveat in `Chart.fs` is retired for those charts. Charts containing `Custom` keep today's caveat, stated once.
+- `docs/public-api.md` records the change. No version bump.
+
+### Phase A3 verification
+
+- The full A2 portfolio passes unchanged: the laws did not move when the representation did, which is the point.
+- Fingerprint properties: DSL-only charts with equal normalized structure have equal fingerprints and equal traces (A2's observation); a `Custom` rule changes the fingerprint only through its name.
+- Normalization laws; mini-QuickSpec run reviewed and its accepted laws folded into the suite.
+- `dotnet build bs-automata.slnx`, `make test-unit`, `make fmt`.
+
+---
+
+## Phase A4: public chart equivalence (no schema change; public, additive)
+
+The trace observation A2 used internally becomes public, with its honesty stated on the type:
+
+```fsharp
+module ChartEquivalence =
+    /// One observable step: what the outside can see of a resolution.
+    type Step = { Leaf: StateId; Terminal: bool; Actions: obj list }
+    /// Runs an event sequence, observing (leaf, terminal, actions) per step.
+    val trace : Chart<'S,'E,'A,'Err> -> 'S -> 'E list -> Step list
+    /// Trace equality over a caller-supplied suite of event sequences. Samples, never proves.
+    val equivalentOn : 'E list list -> Chart<'S,'E,'A,'Err> * 'S -> Chart<'S,'E,'A,'Err> * 'S -> bool
+    /// Exact structural equivalence for DSL-only charts. Typed refusal for Custom-containing charts.
+    val structurallyEquivalent : Chart<'S,'E,'A,'Err> -> Chart<'S,'E,'A,'Err> -> Result<bool, EquivalenceLimit>
+```
+
+- The observation is deliberately **not** `'State` equality: two states that classify to the same leaf are observationally equal, so the trace compares leaves, terminal flags and actions. Representation does not leak.
+- `equivalentOn` documents that a finite suite is evidence, not proof; `structurallyEquivalent` is exact for DSL-only charts and refuses (typed, not boolean) charts containing `Custom`.
+- Minimization of charts is **considered and not adopted**: the trace algebra makes it possible later, and nothing today needs it.
+- `docs/public-api.md` records the addition.
+
+### Phase A4 verification
+
+- Properties: equivalent charts (reordered siblings, renamed-but-equivalent spellings) agree on traces; `structurallyEquivalent` agrees with trace equivalence on DSL-only charts over generated suites.
+- The two observations disagree only where they must: on `Custom`-containing charts, where structural says nothing and trace still speaks.
+
+---
+
 ## Phase B: computation expressions and F# types (no schema change)
 
 A store method should read as what it decides, and nothing stringly-typed should cross an internal boundary. Tests stay unchanged except where a signature tightens.
