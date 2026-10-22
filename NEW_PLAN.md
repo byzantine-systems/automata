@@ -267,7 +267,7 @@ Instances:
 - `Divergence`, `CommandKind` (tag), `ChartRegistration` (tag);
 - `SupervisionAuditKind`, `SupervisionAuditStrategy`.
 
-They live once in `Storage.Internal` and are shared by the SQL providers. The memory store never spells anything, because it keeps the unions themselves. A pure test asserts that `all` covers `FSharpType.GetUnionCases` for each instance, and that `ofDb (toDb x) = Ok x`.
+They live once in `Storage.Internal` and are shared by the SQL providers. A pure test asserts that `all` covers `FSharpType.GetUnionCases` for each instance, and that `ofDb (toDb x) = Ok x`.
 
 `toResult` then parses `CommandStatus` first and matches the union exhaustively. An unknown status becomes one `Serialization` error at the parse, not a wildcard arm.
 
@@ -376,7 +376,18 @@ Then `dotnet build bs-automata.slnx`, `make test-unit`, `make db && make test-in
 Each fix starts with a failing test that reproduces it on today's schema.
 
 ### C0. A conformance suite every provider runs
-Today SQLite and PostgreSQL each carry their own `CommandInboxTests`, `ActionQueueTests`, `FinalizeTests`, `HistoryTests` and `ProcessorIntegrationTests`, written twice and already drifting (E29 is one result). Phase F adds a third provider, and a third copy would drift too.
+Today SQLite and PostgreSQL each carry their own `CommandInboxTests`, `ActionQueueTests`, `FinalizeTests`, `HistoryTests` and `ProcessorIntegrationTests`, written twice and already drifting (E29 is one result). The contract each suite defends is the same algebra, so the suite makes that explicit: **every contract rule is a named equation** with the interface operations as constructors and the typed outcomes as observations.
+
+The equation portfolio, each one a property in the suite:
+- **Idempotency:** `Submit(k, r) ▸ Submit(k, r) = AlreadySubmitted` (second submission returns the original command id).
+- **Key honesty:** `Submit(k, r) ▸ Submit(k, r') = Refused(KeyReused …)` once C5 lands.
+- **Claim exclusivity:** two claims never return the same command, and never two commands for one entity.
+- **Head-of-line order:** a committed command's successor for the same entity becomes claimable only after it.
+- **Fencing conservation:** `Commit` with an expired token answers `LeaseLost` and writes nothing; the log, snapshot and epoch are unchanged.
+- **Epoch atomicity:** `Commit` with the wrong expected epoch refuses and leaves no partial write.
+- **Dead-letter release:** a dead-lettered command releases its entity for the next claim.
+- **History visibility:** a commit appends exactly one transition, visible to `History` at its epoch.
+
 - **New test library** `tests/ByzantineSystems.Automata.Storage.Conformance` (Expecto, not a test runner itself). It exposes `Conformance.tests : StoreUnderTest -> Test`, where:
   ```fsharp
   type StoreUnderTest =
@@ -384,11 +395,11 @@ Today SQLite and PostgreSQL each carry their own `CommandInboxTests`, `ActionQue
         /// A fresh, isolated store for one test, and its teardown.
         Create: TimeProvider -> Task<IMachineStore<…> * IAsyncDisposable>
         /// What the provider offers beyond the contract, so the suite skips rather than fails.
-        Capabilities: Set<Capability> }   // Durable, CrossProcess, Bitemporal, Corrections
+        Capabilities: Set<Capability> }   // CrossProcess, Bitemporal, Corrections
   ```
-- The suite tests **only through the public interfaces**: submit and idempotency, claim exclusivity per entity, head-of-line ordering, lease expiry and fencing (`LeaseLost`), reschedule keeping its place, commit's epoch check, reject and dead-letter releasing the entity, history paging, action delivery and abandon.
-- Lease tests drive time through `FakeTimeProvider` where the provider honours it (memory), and through short real leases where the clock belongs to the database (SQL). The suite takes a `Delay` from `StoreUnderTest` for that, rather than branching on the provider.
-- Both SQL test projects call `Conformance.tests`. Their duplicated contract tests are deleted, and what stays in them is schema-, SQL- or file-specific (`SchemaContractTests`, `CrossProcessTests`, migrations, boot).
+- The suite tests **only through the public interfaces**, one named property per equation above.
+- Lease tests drive time through short real leases, because the clock belongs to the database in both providers. The suite takes a `Delay` from `StoreUnderTest` for that, rather than branching on the provider.
+- Both SQL test projects call `Conformance.tests`. Their duplicated contract tests are deleted, and what stays in them is schema-, SQL- or file-specific (`SchemaContractTests`, `CrossProcessTests`, migrations, boot). Program-level laws that interfaces cannot see live in B0's recording-interpreter tests instead.
 - The reproduction tests below go **into the suite** wherever the bug is observable through the interfaces (C2, C3 for corrupt payloads via a provider hook, C5, C6, C7's `Suffix` once E moves it to `ITransitionLog`). C1 and C4's SQL checks stay PostgreSQL-specific.
 
 ### C1. `fsm.purge_commands` wedges maintenance once a correction is old enough (E1)
@@ -401,13 +412,13 @@ The routine deletes a doomed command's transition, error and dead letters, but n
 - **Database-stamped:** take `CLOCK_TIMESTAMP()` *after* the lock, and clamp it with `GREATEST(…, predecessor.received_at)`, where the predecessor is the previous `seq` (one index probe on `command_unique_seq`). A system clock that steps backwards then cannot reorder an entity.
 - **Caller-supplied and earlier than the predecessor:** refuse it as a typed outcome rather than store it (see C5): `SubmissionOutcome.Refused(ArrivedBeforePredecessor predecessorReceivedAt)`.
 - SQLite does the same with the write session's `Now`, which is already read inside the `IMMEDIATE` transaction.
-- The rule is now part of the contract (stated on `ICommandInbox.Submit`), so Phase F implements the same clamp under its lock.
+- The rule is now part of the contract (stated on `ICommandInbox.Submit`).
 
 ### C3. One undecodable row wedges a claim batch (E6)
 `Claim` decodes the batch with `List.traverseResultM`. One row whose event no longer decodes fails the whole call, and every other row in the batch stays leased until expiry, is reclaimed, and fails again. The same holds for actions.
 - `Claim` decodes per row. An undecodable command is dead-lettered by the store in a follow-up `run` (fenced by the token it just received), with `CommandFailure.Machine "undecodable: <type>: <message>"`. The rest of the batch is returned. An undecodable action is abandoned the same way, with a durable `action_dead_letter` row.
 - If the follow-up write fails, the row is reclaimed after the lease and the store tries again. The processor's `DeliveryCount > MaxAttempts` path never sees these rows, so the store, not the processor, owns this.
-- Covers SQLite (`SqliteCommandInbox.fs:391`, `SqliteActionQueue.fs:114`) and PostgreSQL. The memory store only meets this in round-trip mode (F3), where it follows the same rule.
+- Covers SQLite (`SqliteCommandInbox.fs:391`, `SqliteActionQueue.fs:114`) and PostgreSQL.
 
 ### C4. Actions are routed by what the client says (E7)
 `finalize_command` takes `p_action_queue` from the caller on every commit. A client configured with a different queue than the one it registered at boot enqueues into the wrong queue. An empty string is a magic value meaning "drop the actions": a chart that emits actions with `ActionQueue = ""` records them in the transition and silently never delivers them.
@@ -419,7 +430,7 @@ The routine deletes a doomed command's transition, error and dead letters, but n
       | Discard
   ```
   `ActionQueueName` is a validated name. It is checked against pgmq's length limit as well as the regex; verify that limit in pgmq's source in the spike. This replaces `ActionQueue: string` in `MachineStoreOptions`. `Discard` registers the empty queue explicitly.
-- `ActionDelivery` lives in `Storage`, not in the PostgreSQL package, because SQLite and the memory store take it too. For the memory store, `Deliver` names an in-process queue, which only matters when two machines share a store instance (F2).
+- `ActionDelivery` lives in `Storage`, not in the PostgreSQL package, because SQLite takes it too.
 
 ### C5. Idempotency-key reuse with a different request is silent (E8)
 Resubmitting a key returns the original command, whatever the new request was. A correction submitted under an event's key comes back as `AlreadySubmitted` of the event: `submit_correction` says "a repeated key returns the original, whatever it was".
@@ -435,7 +446,6 @@ Resubmitting a key returns the original command, whatever the new request was. A
       | Refused of SubmissionRefusal
   ```
 - `submit_correction` stops writing the command row twice (insert, then `UPDATE kind`, E21). It passes `kind` into a shared internal insert. Phase H's immutability trigger depends on this.
-- The memory store has no JSON to digest. It compares requests by value, which is why it constrains `'Event: equality` (F2, E36).
 
 ### C6. `AlreadyFinalized` does not say what was stored (E9)
 A retry whose first attempt committed, but which now sends a rejection, is told `AlreadyFinalized`, and the caller cannot tell its resolution was not the one recorded. Change it to `AlreadyFinalized of stored: Epoch * status: CommandStatus` (**public**). The routine already reads `v_status`.
@@ -467,7 +477,7 @@ C0 itself: both SQL providers pass the suite, and the per-provider tests it repl
 
 ## Phase D: configurable schema (default `fsm`)
 
-PostgreSQL only. SQLite has one schema per file, and the memory store has none.
+PostgreSQL only. SQLite has one schema per file.
 
 ### D1. The name is a type, not a string (public)
 ```fsharp
@@ -581,7 +591,7 @@ Every ordinary commit today writes about **5 to 6 rows plus one per action**:
   It has its own DbUp journal, `<schema>_temporal.schemaversions`. A DBA can grant or drop it separately.
 
 ### E2. `entity_state`, the core snapshot
-It mirrors SQLite's `fsm_entity_snapshot`, so the two SQL stores keep identical shapes, and the memory store's `Entity` record (F2) has the same fields:
+It mirrors SQLite's `fsm_entity_snapshot`, so the two SQL stores keep identical shapes:
 ```sql
 CREATE TABLE $schema$.entity_state (
     machine_id text NOT NULL, entity_id text NOT NULL,
@@ -599,7 +609,6 @@ CREATE INDEX entity_state_command_idx ON $schema$.entity_state (command_id);
 - **Edge (E20): the FK conflicts with purge.** The snapshot points at the last *succeeded* command. Purge keeps only the newest command, which may be a later rejected one, so the snapshot's command is purgeable and the FK would abort the whole purge batch.
   - `purge_commands` excludes `command_id IN (SELECT command_id FROM entity_state)` (served by the index above).
   - The contract test from C1 asserts this exclusion exists.
-  - The memory store has the same rule without the FK: retention never drops the command a snapshot points at (F4).
 
 ### E3. Opting in, and keeping clients honest (E26)
 - **The database records the profile:** `$schema$.store_profile (singleton boolean PRIMARY KEY CHECK (singleton), beliefs text NOT NULL CHECK (beliefs IN ('snapshot','bitemporal')))`. The migrator sets it.
@@ -625,7 +634,7 @@ type PostgresBitemporalMachineStore<…>(options)    // the core plus ITemporalR
 - `PostgresMachineStore` stops implementing the temporal interfaces. `Store.tryTemporal` then answers truthfully by type test, which is the mechanism `MachineStore.fs` already documents.
 - `PostgresBitemporalMachineStore` composes the core store rather than inheriting from it, as the current store composes its parts.
 - `MachineStoreOptions.forEntityId` stays; `.bitemporal` returns the options for the second type.
-- `BeliefModel` describes PostgreSQL's choice only. It is not a property every store has: the memory store is snapshot-only by construction and takes no `BeliefModel`.
+- `BeliefModel` describes PostgreSQL's choice only. It is not a property every store has.
 
 ### E5. Corrections: shipped in the temporal module, open to implement over the core
 Today the runtime needs `ITemporalReader` (only for the state just before `T`, `Correction.fs:45`) and `IReplayStore` (`Suffix` plus `CommitCorrection`). Split that into the smallest interfaces a third party would implement (**public**):
@@ -659,7 +668,7 @@ type ICorrectionCommitter<'EntityId, 'State, 'Event, 'Action> =
   - `docs/corrections.md`, which shows a custom `ICorrectionCommitter` that opens an `NpgsqlTransaction`, calls those routines, and writes its own beliefs alongside them.
 
   These are the same pieces the bundled temporal commit uses, so the fence logic is written once.
-- **The memory store (F) is the first real implementation over a snapshot-only model.** It answers `IPriorState.Before` from its transition log and commits corrections under its lock. That is the evidence that the three interfaces are sufficient without beliefs, so the split must be designed for it. In particular, `IPriorState.Before` must not assume a valid-time table, and `ReplaySuffix`'s `Incomplete` flag must be computable from a purge watermark alone (C7).
+- **A test-only implementation over a snapshot-only model is the evidence the split needs.** A derived `IPriorState` (the `to_state` of the last transition effective before `T`) plus an `ICorrectionCommitter` built on the core routines answers `Before` from the transition log and commits corrections under its own fence. That is the proof that the three interfaces are sufficient without beliefs, so the split must be designed for it. In particular, `IPriorState.Before` must not assume a valid-time table, and `ReplaySuffix`'s `Incomplete` flag must be computable from a purge watermark alone (C7). The recording interpreter from B0 carries the same argument at the program level.
 - **Refuse at submission, not at processing (E27, E28).** Today `Machine.correct` submits regardless of capability, and the processor dead-letters the command later ("this store cannot replay corrections"). SQLite's inbox stores correction commands it can never process.
   - `Machine.correct` / `previewCorrection` return `MachineRejection.CorrectionsUnsupported` (**public, new case**) when `Store.tryCorrections` is `None`.
   - The processor's dead-letter path stays, as the backstop for a store swapped under a queued correction.
@@ -700,179 +709,17 @@ type ICorrectionCommitter<'EntityId, 'State, 'Event, 'Action> =
 
 **A third-party correction:**
 - A test-only `IPriorState` (derived from the transition log) plus an `ICorrectionCommitter` built on the core routines replays a correction on a snapshot-mode schema.
-- The correction scenarios move into the C0 suite under the `Corrections` capability, so Phase F's store runs them unchanged.
+- The correction scenarios move into the C0 suite under the `Corrections` capability.
 
 ---
 
-## Phase F: an in-memory store (no backend)
+## Phase F: withdrawn (revised 2026-11-01)
 
-### Why
-A machine whose state is worth nothing after a restart still needs ordering, fencing, idempotency and history while it runs. That covers unit and property tests of an application's charts, examples and `readme.fsx`, CLI tools, request-scoped workflows, and prototypes. Today such a machine must either run SQLite (a file, migrations, WAL; `:memory:` is refused, see `DataSource.isInMemory`) or use a hand-written fake like the runtime tests' `StubStore`, which implements none of the semantics.
-
-### Non-goals
-- **Durability.** A process exit loses every command, lease, snapshot and queued action. `Accepted` means "accepted by this process". This is stated on the type, in `docs/`, and in the startup log line.
-- **Sharing between processes,** or a snapshot/restore file. A memory store that persists is SQLite, which already exists.
-- **Bitemporal reads.** There is no system time to ask `AsOf` about. `Store.tryTemporal` is `None`.
-- **Maintenance as a separate service.** No `IDatabaseMaintenance`, no scheduling. Retention runs inline (F4).
-
-### F1. A package of its own (public, additive)
-`src/ByzantineSystems.Automata.Storage.Memory`, referencing only `Storage` and `Core`.
-- **It uses no `InternalsVisibleTo`.** It is written against the public interfaces only, exactly as a third-party provider would be. If it needs something internal, that is a gap in the public contract, which gets fixed in `Storage` instead.
-- It does not use `Op`/`OpBuilder`. `Op` models a database session with resilience and classification, and the memory store has neither.
-- It is kept separate from `Storage`, which stays interfaces and shared types, matching one package per provider. It adds no package dependencies, so nothing goes into `Directory.Packages.props`. `FakeTimeProvider` (`Microsoft.Extensions.TimeProvider.Testing`) goes into test projects only.
-- **`InMemorySupervisionStore` moves here** from `DependencyInjection` (**public move, unreleased**), and becomes **bounded** (E49). Today it is an unbounded `ConcurrentQueue` (`SupervisionAudit.fs:24`), so a host that restarts children for weeks leaks. It becomes a ring buffer under a lock with `Capacity` (default 1000) that drops the oldest record. `Recorded()` stays a snapshot copy, documented as O(capacity).
-- **`InMemoryChartRegistry`** joins it, because `Machine.StartAsync` needs an `IChartRegistry`. It is a `ConcurrentDictionary` keyed by `(MachineId, ChartVersion)` with `TryAdd` semantics: the first writer wins, which reproduces the SQL providers' fingerprint-conflict outcomes. The conformance suite checks registry behaviour too.
-
-### F2. Shape: a synchronous functional core, a TAP shell, sharded state
-```fsharp
-type InMemoryMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err
-                          when 'EntityId: equality and 'Event: equality>
-    (options: InMemoryStoreOptions<…>) =
-    // IMachineStore (inbox, reader, processor, action queue), with B11's Async names
-    // ITransitionLog, IPriorState, ICorrectionCommitter (the E5 capability)
-    // not IStoreBoot, not IWorkNotifications, not ITemporalReader, not ICorrectionStore
-    // not IDisposable: it owns no unmanaged resources, and DI must not dispose a shared singleton
-
-type InMemoryStoreOptions<…> =
-    { Time: TimeProvider                  // the only clock: leases, ReceivedAt, CommittedAt
-      Random: Random                      // backoff jitter; Random.Shared by default
-      Actions: ActionDelivery             // from C4
-      Limits: Limits                      // F4
-      Retention: InMemoryRetention        // F4
-      RoundTrip: RoundTrip<…> option }    // F3
-```
-
-**Functional core, TAP shell (B11).** The store's logic is compute-bound. TAP says such work should be synchronous and the caller decides whether to offload it, and a TAP method may complete synchronously when its data is at hand (*Implementing TAP*, "Workloads"). So:
-- An internal `ShardOps` module holds every operation as a synchronous function: `now -> request -> Shard -> Result<'Outcome, StoreError>`, with no `Task` in it. It is unit-tested directly.
-- Each interface member is a thin shell over it:
-  - usage errors (`nullArg`) are thrown before any task exists;
-  - a token already cancelled gives `Task.FromCanceled`;
-  - otherwise it runs the core under the shard lock and returns a completed task after the lock is released, so no continuation ever runs under it;
-  - there is no `Task.Run`.
-- **Cached tasks.** `Tap.ofResult` returns static cached tasks for the hot constant answers (`Ok []` from an idle `ClaimAsync`, `Ok Updated`, `Ok LeaseLost`, `Ok None`), so an idle store allocates nothing per poll (E56). Everything else uses `Task.FromResult`. `ValueTask` is not introduced, because TAP reserves it for measured allocation pressure.
-
-```fsharp
-module internal ShardOps =
-    let submit (now: DateTimeOffset) (request: CommandSubmission<'EntityId, 'Event>) (shard: Shard<…>)
-        : Result<SubmissionOutcome, StoreError> =
-        validate now request shard                   // reads only: limits, idempotency, the C2 clamp
-        |> Result.map (apply now request shard)      // mutations that cannot fail for domain reasons
-
-member _.SubmitAsync(submission, cancellationToken: CancellationToken) =
-    if isNull (box submission) then nullArg (nameof submission)
-    if cancellationToken.IsCancellationRequested then
-        Task.FromCanceled<Result<SubmissionOutcome, StoreError>> cancellationToken
-    else
-        shards.Run(submission.MachineId, ShardOps.submit (time.GetUtcNow()) submission)
-        |> Tap.ofResult
-```
-
-**Concurrency choices.** Each choice below rests on the Microsoft docs for concurrent collections and synchronisation primitives.
-
-| Need | Choice | Reason (source page) |
-|---|---|---|
-| Partition by machine | `ConcurrentDictionary<MachineId, Lazy<Shard>>`, `Lazy` in `ExecutionAndPublication` mode | `GetOrAdd`'s factory runs outside the dictionary's lock and can run more than once (*How to add and remove items from a ConcurrentDictionary*). Creating a shard registers metrics gauges, so it must run exactly once. `Lazy` caches a factory's exception (*Lazy initialization*), so the shard constructor only allocates. If `.Value` throws anyway, the entry is removed with `TryRemove(KeyValuePair(key, thatLazy))` and the call answers `Unexpected`; the next call retries (E51). |
-| Atomic writes across about seven structures | One `System.Threading.Lock` per shard, taken with `use _ = gate.EnterScope()` | Concurrent collections are thread-safe per collection only. A commit changes the command status, entity queue, snapshot, log, actions, claim index and expiry queue as one fact. Taking a `Lock` through F#'s `lock` function goes through `Monitor` and loses its benefit. |
-| Write-side indexes (claim, expiry, idempotency, per-entity queues) | `PriorityQueue`, `Dictionary`, `Queue` under the shard lock | For mixed producer-consumer use with small per-item work, "a Queue with an external lock scales better than ConcurrentQueue" (*When to use a thread-safe collection*). A benchmark confirms it rather than assumes it. |
-| Read-mostly lookups (`TryGetSnapshotAsync`, `TryGetResultAsync`, which `send` polls) | `ConcurrentDictionary`s of **immutable** records, written only under the shard lock and read without it | ConcurrentDictionary is "significantly faster" with many reads and many updates (*When to use*). Readers never contend with writers. |
-| Metrics gauges | `int64` counters written under the lock, read with `Volatile.Read` | Lock-free reads via `Interlocked`/volatile (*Thread-safe collections*). A gauge never takes the lock. |
-| Bounding | Count limits checked under the lock, answering `Unavailable` | Bounding "enables you to control the maximum size of the collection in memory" (*BlockingCollection overview*). `BlockingCollection` itself is not used, because it blocks threads and is `IDisposable`. |
-| Not used | `SpinLock`/`SpinWait`, `ConcurrentBag`/`ConcurrentStack`, `ThreadLocal<T>`, `Barrier`/`CountdownEvent`/`ManualResetEventSlim` | `SpinLock` is "only when profiling shows Monitor is slow", must be held "very briefly", and is a struct that F# copies (*SpinLock*). Bag and stack have no FIFO semantics. `ThreadLocal` is `IDisposable`. The blocking primitives would block pool threads in async code. Concurrency tests release N workers with one `TaskCompletionSource`. |
-
-**Atomicity without immutable copies.**
-- Every operation first validates and looks up without mutating (fence, epoch, limits, idempotency). It then applies mutations that cannot fail for domain reasons.
-- The apply phase calls only user code that already ran during validation: `GetHashCode`/`Equals` on the same keys. A throw leaves the shard untouched. Only a fatal exception (out-of-memory) can interrupt apply, and the process is lost then anyway.
-- This replaces the earlier "one immutable world" design. Persistent maps allocate a new path on every write and cost several times `Dictionary`'s per-entry memory.
-
-**Publication order for lock-free readers (E52).** A commit publishes the log entry, then the snapshot, then the actions, and the command result **last**. `ConcurrentDictionary` writes are fully fenced, so a reader that sees `Succeeded` also sees the new snapshot. `HistoryAsync` reads the per-entity log under the lock, because pages are rare.
-
-**Reentrancy (E45).** `Lock` is reentrant, so a user `Equals` calling back into the store would mutate the shard in the middle of an operation. On entry, `gate.IsHeldByCurrentThread` is checked, and a reentrant call answers `Unexpected(InvalidOperationException "reentrant store call")`.
-
-**Rules kept from the earlier draft:**
-- **Claim indexes** are keyed by `(VisibleAt, Sequence, CommandId)`, so a claim costs O(batch · log n), not O(backlog). An expired lease needs no reaper: claim treats `leased && VisibleAt <= now` as claimable, as the SQL providers do.
-- **Lifecycle edges are asserted.** A status edge outside Phase H's list is refused as `Unexpected`.
-- **Equality.** `'EntityId: equality` covers the keys. `comparison` is no longer needed, because no sorted index keys on the entity. `'Event: equality` implements C5. A `[<ReferenceEquality>]` event, or one with NaN fields, compares unequal to an equal resubmission and reports `KeyReused` (E46). This is documented, and round-trip mode compares bytes instead.
-- **No boot, no notifications.** Within one process `WorkSignal` already wakes the worker.
-- **Corrections are supported** through the E5 interfaces, answered from the transition log.
-- **Cancellation (E48).** A token already cancelled gives `Canceled`. Once the lock is taken, the operation completes and the task is `RanToCompletion`, as TAP prescribes.
-- **Clock (E47).** A wall-clock step changes only liveness, because every write is fenced by its token. `ReceivedAt` is clamped per C2.
-- **Ids (E53).** `CommandId` and `LeaseToken` are int64 counters per store instance, so ids are meaningful within one instance only. This is documented.
-
-### F3. Round-trip mode: catching codec bugs without a database
-Without codecs, the store keeps references to the caller's values. That has two consequences:
-- a mutable `'State` mutated after a commit changes history (E33);
-- a codec bug, such as a field the codec drops, passes every memory-store test and fails in production.
-
-`RoundTrip = Some { Event; State; Action }` (the same `Codec<'T>` values the SQL stores take) makes the store hold bytes, never references.
-- **Encoding runs before the lock and decoding after it,** on bytes copied out, so codec work never extends lock hold time.
-- An undecodable value follows C3's rule: it is dead-lettered or abandoned, and the rest of the batch is delivered.
-- Round-trip mode is also what makes a byte budget possible (F4).
-- The test projects run the conformance suite in both modes. Applications are advised to turn it on in their own tests.
-
-### F4. Bounds and retention: nothing grows without a limit
-```fsharp
-type Limits =                                   // tryCreate-validated (B7)
-    private { MaxPendingCommands: int; MaxPendingActions: int; MaxEntities: int; MaxBytes: int64 option }
-
-type InMemoryRetention =                        // tryCreate rejects Retain.Forever (E50)
-    private { Commands: Retain; Transitions: Retain; ActionDeadLetters: Retain
-              TerminatedEntities: Retain; MaxTransitionsPerEntity: int option }
-```
-
-| What grows | Bound |
-|---|---|
-| Pending commands | Above `MaxPendingCommands`, `SubmitAsync` answers `Unavailable` (transient), so callers back off. |
-| Pending actions (E42) | The dispatcher is optional in `AddAutomata`, so a `Deliver` store with nothing consuming it grows forever. Above `MaxPendingActions`, `CommitAsync` answers `Unavailable`, the processor reschedules, and backpressure reaches the inbox. DI warns at startup when a `Deliver` memory store has no dispatcher. |
-| Entities (E43) | Above `MaxEntities`, a submit for a new entity answers `Unavailable`. `TerminatedEntities` evicts idle entities whose status is `Terminated` to a **tombstone** `(epoch, Terminated)`, so a later command is still `InstanceNotRunning` and never restarts from the initial state. Tombstones expire under the same `Retain`, and the docs say the entity may then start again. |
-| Terminal commands, errors, transitions, action dead letters | Each has its own `Retain`. `Forever` is rejected, because in a process it is a leak (E50). Defaults: commands for one hour, transitions for one day, dead letters for as long as commands. |
-| Payload bytes | `MaxBytes`, round-trip mode only. Without it the docs state that the limits are counts. |
-| Per-entity structures | Allocated lazily under the lock. The head command is stored inline, the waiting `Queue` exists only while a second command is pending, and a shard's action queue appears on the first action. Each is released when it drains. |
-
-Retention mechanics:
-- **O(k) per call.** Victims come from a per-shard expiry `PriorityQueue`, at most a fixed number per call, oldest first. No timer and no background task. Purging runs on writes *and* on `ClaimAsync`, so an idle store still shrinks.
-- **Every index at once.** A victim leaves every structure together: the idempotency map, the per-entity queue, the claim index, the result dictionary and the log. A test asserts all index counts agree after purging, which catches the classic forgotten-index leak.
-- **Same rules as SQL.** An entity's newest command is kept, so an idempotent retry still answers `AlreadySubmitted` within the horizon. The command a snapshot points at is never dropped (E20). Every purge raises the entity's watermark, so `Suffix` reports `Incomplete` exactly (C7).
-- **Purged results stop `send` spinning (E44).** `Machine.awaitSettled` (`Machine.fs:398`) polls forever on `Ok None`. After a confirmed submission, `send` re-reads once and then answers `MachineError.Store(NotFound …)`. Every store benefits, but the memory store's short horizon makes the case likely.
-
-### F5. Wiring
-- **Builder:** `machine { store (InMemoryMachineStore.create options) }`. `InMemoryStoreOptions.defaults` uses `TimeProvider.System`, `Random.Shared`, the default limits and retention, `Discard` for actions only when the chart declares none, and otherwise `Deliver` with the machine's name.
-- **DI (public):** `services.AddAutomataInMemory()` registers `InMemoryChartRegistry` and `InMemorySupervisionStore` as singletons. `AddInMemoryMachine<…>(configure)` binds `InMemoryStoreOptions` through `IOptions<_>` with `IValidateOptions` and `ValidateOnStart()`, so bad limits stop the host at startup. It throws at registration when a durable store is already registered for that machine (E38).
-- **Logging and metrics:**
-  - Construction logs that the store is not durable, and its limits, through `LoggerMessage.Define` (B9).
-  - A `Meter` named `ByzantineSystems.Automata.Storage.Memory` exposes per-machine observable gauges: pending commands, pending actions, entities, tombstones, retained transitions. A leak then shows on a dashboard before it shows as out-of-memory.
-- **Examples:** `readme.fsx` and `Examples.Supervision` switch to the memory store, so they run with no database. `Examples.PaymentProcessor` and `Examples.Hosted` stay on SQL, because they demonstrate durability.
-- **Runtime tests:** `StubStore` stays, because it injects faults the real store never produces. Tests that check semantics rather than fault handling (most of `MachineTests`, `ReplayTests`) move to the memory store, with no assertion changes.
-
-### F6. Docs
-- `docs/stores.md` (new):
-  - the three-way table from the top of this plan, and how to choose;
-  - the memory store's limits, retention, tombstones and the non-durable warning;
-  - the concurrency table from F2.
-- `docs/public-api.md`: the new package, the `InMemorySupervisionStore` move and bounding, `InMemoryChartRegistry`, DI extensions, `Limits`, `InMemoryRetention`.
-- `docs/corrections.md` (E5): the memory store as the worked example of corrections without beliefs.
-
-### Phase F verification
-- **Conformance.** The C0 suite passes against `InMemoryMachineStore`, with and without round-trip mode, including the `Corrections` scenarios from E. This includes the TAP shape checks (B11): a token already cancelled gives `Canceled`, a null argument throws synchronously, and an expected outcome never faults.
-- **Model-based test (FsCheck).** Random sequences of submit, claim, clock advance, commit, reject, reschedule, extend and dead-letter run against `ShardOps` directly, with no tasks. After every step: at most one leased command per entity; epochs and `Sequence` gapless; every terminal command was leased first; actions exist only for committed transitions; all index counts agree.
-- **Differential test.** The same sequences run against SQLite, comparing every observable outcome under a fixed clock and seed. Integration suite only.
-- **Concurrency.** N workers, released together by one `TaskCompletionSource`, submit and claim in parallel. The invariants hold, and no claim returns two commands for one entity.
-- **Publication order.** A reader task polls result then snapshot while commits run, and never sees `Succeeded` with the old snapshot.
-- **Atomicity and reentrancy:**
-  - a throwing `Equals` leaves the shard unchanged;
-  - a reentrant call answers `Unexpected`;
-  - a shard whose `Lazy` faults is removed and recreated on the next call.
-- **Limits.** Submitting past `MaxPendingCommands` gives `Unavailable`; after draining, submissions are accepted again. The same holds for actions and entities. A terminated entity evicted to a tombstone still rejects with `InstanceNotRunning`.
-- **Soak.** 1M commands across 10k entities with short retention. The gauges and `GC.GetTotalMemory(true)` plateau, measured after a forced collection at checkpoints. `dotnet-counters` shows the gauges (manual step).
-- **Retention.** Idempotent retries within the horizon still answer `AlreadySubmitted`, `Suffix` past the watermark answers `Incomplete`, and `send` on a purged command returns `NotFound` promptly.
-- **Aliasing.** Mutating a returned state changes history without round-trip mode (the documented hazard) and leaves it unchanged with it.
-- **Benchmarks (BenchmarkDotNet).** Claim with a lock plus `PriorityQueue` against `ConcurrentQueue`-based alternatives; lock-free against locked `TryGetResultAsync` under load. The F2 table changes if the numbers disagree with the docs.
-- **Build checks.** No `InternalsVisibleTo` from `Storage`. `readme.fsx` runs with `dotnet fsi` and no `make db`.
-
----
+The in-memory store is no longer planned. Its two load-bearing roles are covered elsewhere: the law-testing and reference-implementation role by the store algebra recording interpreter (B0), and the corrections-evidence role by a test-only `IPriorState` and `ICorrectionCommitter` (E5). The phases keep their letters; G and H are unchanged. E44 is re-homed to Phase B (a runtime fix in `Machine.awaitSettled`) and E49 is re-homed to the DependencyInjection package, where the unbounded supervision queue lives today.
 
 ## Phase G: less JSON (formerly B1 to B7, adjusted)
 
-SQL providers only; the memory store holds no JSON. The rules from the previous plan hold:
+SQL providers only. The rules from the previous plan hold:
 - Both SQL stores keep identical table shapes.
 - What stays JSON is the user payloads behind `Codec<'T>`, plus SQLite's `exited`/`entered`.
 
@@ -924,7 +771,7 @@ These are unchanged from the previous plan's Phase B:
 - `event` and `from_state` read back through `History` at epoch 0, at a later epoch, and after a correction;
 - the payload benchmark.
 
-The C0 suite, now including the memory store, passes unchanged: G changes storage, not behaviour.
+The C0 suite passes unchanged: G changes storage, not behaviour.
 
 ---
 
@@ -942,7 +789,6 @@ Terminal states never change again.
 - Before enabling it, list every `UPDATE … SET status` in both `sql/` trees and every routine.
   - Include C3's store-side dead-lettering and E5's `close_command`.
   - Include the SQLite equivalents.
-  - Cross-check the list against the memory store's asserted edges (F2). They must be the same set; a test reads both.
 - Failure completeness: closing as `rejected` or `dead_letter` requires the G1 header **and** its child row.
 
 ### H2. Append-only and immutable facts
@@ -964,8 +810,8 @@ Unchanged from the previous plan:
 
 Added:
 - **Triggers to dispatch the bitemporal write** (an `AFTER INSERT` on `transition` calling `close_and_open`). It would keep core routines oblivious to the module, but corrections would have to suppress it. An explicit temporal `commit_command` plus the profile guard (E3) states the same thing where a reader looks for it.
-- **SQLite `:memory:` as the in-memory store.** Pooling gives every connection its own empty database, WAL is unavailable, and it would still pay for codecs, SQL and migrations on every start. Sharing one connection would serialise reads and writes behind `WriteGate` for no durability gain. Phase F's store is simpler, faster, and needs no codecs.
-- **An in-memory store that snapshots to a file.** That is a second, weaker SQLite.
+- **SQLite `:memory:` as an in-process store.** Pooling gives every connection its own empty database, WAL is unavailable, and it would still pay for codecs, SQL and migrations on every start. Sharing one connection would serialise reads and writes behind `WriteGate` for no durability gain. For process-local tests, B0's recording interpreter covers the program-level laws without a database at all.
+- **A durable store that snapshots to a file.** That is a second, weaker SQLite, which already exists.
 - **Promoting `StubStore` to a public test double.** It fakes outcomes rather than implementing semantics, so tests against it prove nothing about ordering or fencing. Fault injection stays a test-only concern.
 
 ### Phase H verification
