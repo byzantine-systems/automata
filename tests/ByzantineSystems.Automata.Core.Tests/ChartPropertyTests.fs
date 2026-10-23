@@ -20,13 +20,13 @@ let private build (shape: int list) : Tree option =
     let size =
         match shape with
         | [] -> 1
-        | head :: _ -> 1 + (abs head) % 12
+        | head :: _ -> 1 + Property.bounded 12 head
 
     let parentOf (i: int) =
         if i = 0 then
             None
         else
-            Some(abs shape.[i % shape.Length] % i)
+            Some(Property.bounded i shape.[i % shape.Length])
 
     let idOf i = stateId $"n%d{i}"
 
@@ -87,8 +87,8 @@ let tests =
                   match build shape with
                   | None -> false
                   | Some tree ->
-                      let j = tree.Leaves.[abs jSeed % tree.Leaves.Length]
-                      let k = abs kSeed % tree.Size
+                      let j = tree.Leaves.[Property.bounded tree.Leaves.Length jSeed]
+                      let k = Property.bounded tree.Size kSeed
                       let onChain = chainIndex tree.ParentIndex j |> List.contains k
 
                       match Chart.resolve tree.Chart j k with
@@ -102,8 +102,8 @@ let tests =
                   match build shape with
                   | None -> false
                   | Some tree ->
-                      let j = tree.Leaves.[abs jSeed % tree.Leaves.Length]
-                      let k = abs kSeed % tree.Size
+                      let j = tree.Leaves.[Property.bounded tree.Leaves.Length jSeed]
+                      let k = Property.bounded tree.Size kSeed
 
                       if not (chainIndex tree.ParentIndex j |> List.contains k) then
                           true

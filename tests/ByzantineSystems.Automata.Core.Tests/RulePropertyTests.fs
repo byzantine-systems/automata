@@ -18,7 +18,8 @@ let tests =
               "a holding guard is transparent: the wrapped rule decides"
               (fun (seed: int, state: int, event: int) ->
                   let inner =
-                      Rule.transition (fun _ e -> abs e % 3 = abs seed % 3) (fun s e -> [ e; seed ], s + event)
+                      Rule.transition (fun _ e -> Property.bounded 3 e = Property.bounded 3 seed) (fun s e ->
+                          [ e; seed ], s + event)
 
                   let guarded = Rule.guarded (fun _ _ -> true) "always holds" inner
 
@@ -36,9 +37,10 @@ let tests =
               "transition: NoMatch exactly when the predicate refuses, Handled carrying the transform's answer"
               (fun (seed: int, state: int, event: int) ->
                   let rule =
-                      Rule.transition (fun _ e -> abs e % 5 = abs seed % 5) (fun s e -> [ e * 2 ], s - event)
+                      Rule.transition (fun _ e -> Property.bounded 5 e = Property.bounded 5 seed) (fun s e ->
+                          [ e * 2 ], s - event)
 
-                  if abs event % 5 = abs seed % 5 then
+                  if Property.bounded 5 event = Property.bounded 5 seed then
                       Rule.invoke rule state event = RuleVerdict.Handled(
                           [ event * 2 ],
                           RuleOutcome.Next(state - event)
@@ -60,7 +62,7 @@ let tests =
           Property.property
               "goto: a matched rule echoes its target beside the next state"
               (fun (seed: int, state: int, event: int) ->
-                  let target = stateId $"t%d{abs seed % 4}"
+                  let target = stateId $"t%d{Property.bounded 4 seed}"
 
                   let rule = Rule.goto (fun _ _ -> true) target (fun s _ -> [ seed ], s)
 
@@ -74,7 +76,7 @@ let tests =
           Property.property
               "kind names the combinator that built the rule, and target projects goto through guards"
               (fun (seed: int) ->
-                  let target = stateId $"t%d{abs seed % 4}"
+                  let target = stateId $"t%d{Property.bounded 4 seed}"
                   let transition = Rule.transition (fun _ _ -> true) (fun s _ -> [], s)
                   let attemptRule = Rule.attempt (fun _ _ -> true) (fun s _ -> Ok([], s))
                   let internalRule = Rule.internalOn (fun _ _ -> true) (fun _ _ -> [])
@@ -95,12 +97,12 @@ let tests =
           Property.property
               "retarget renames goto targets in verdicts and kinds, and touches nothing else"
               (fun (seed: int, state: int, event: int) ->
-                  let source = stateId $"t%d{abs seed % 4}"
+                  let source = stateId $"t%d{Property.bounded 4 seed}"
                   let destination = stateId "elsewhere"
 
                   let rule =
                       Rule.guarded
-                          (fun _ e -> abs e % 2 = 0)
+                          (fun _ e -> Property.bounded 2 e = 0)
                           "even events only"
                           (Rule.goto (fun _ _ -> true) source (fun s _ -> [ seed ], s))
 
