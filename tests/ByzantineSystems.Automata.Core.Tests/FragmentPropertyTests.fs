@@ -6,7 +6,7 @@ open Expecto
 let private expectChart result =
     match result with
     | Ok chart -> chart
-    | Result.Error errors -> failwithf "fragment property fixture is invalid: %A" errors
+    | Result.Error errors -> failtestf "fragment property fixture is invalid: %A" errors
 
 let private rulePart action : NodePart<int, int, int, string> =
     NodeRule(Rule.transition (fun _ _ -> true) (fun state _ -> [ action ], state))

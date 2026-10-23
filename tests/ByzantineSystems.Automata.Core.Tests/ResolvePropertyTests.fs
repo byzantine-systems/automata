@@ -175,7 +175,7 @@ let private chart =
     }
     |> function
         | Ok chart -> chart
-        | Result.Error errors -> failwithf "resolve property fixture is invalid: %A" errors
+        | Result.Error errors -> failtestf "resolve property fixture is invalid: %A" errors
 
 let private decisionOf selector =
     match Property.bounded 3 selector with
