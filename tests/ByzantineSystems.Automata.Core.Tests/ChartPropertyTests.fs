@@ -80,6 +80,70 @@ let private chainIndex (parentOf: int -> int option) (j: int) : int list =
 let private parentId (tree: Tree) (id: StateId) =
     Chart.tryNode tree.Chart id |> Option.bind (fun n -> n.Parent)
 
+let private expectChart result =
+    match result with
+    | Ok chart -> chart
+    | Result.Error errors -> failtestf "constructor coverage fixture is invalid: %A" errors
+
+let private coverageTest =
+    test "public constructor coverage reaches every Rule and NodePart family" {
+        let leafId = stateId "leaf"
+
+        let leafParts: NodePart<int, int, int, string> list =
+            [ EntryAction(fun _ _ -> [ 1 ])
+              ExitAction(fun _ _ -> [ 2 ])
+              NodeRule(Rule.transition (fun _ _ -> false) (fun state _ -> [], state))
+              NodeRule(Rule.attempt (fun _ _ -> false) (fun state _ -> Ok([], state)))
+              NodeRule(Rule.internalOn (fun _ _ -> false) (fun _ _ -> []))
+              NodeRule(Rule.goto (fun _ _ -> false) leafId (fun state _ -> [], state))
+              NodeRule(
+                  Rule.transition (fun _ _ -> false) (fun state _ -> [], state)
+                  |> Rule.guarded (fun _ _ -> true) "covered"
+              ) ]
+
+        let leaf = NodeBuilder<int, int, int, string>("leaf").Run leafParts
+
+        let terminal = NodeBuilder<int, int, int, string>("terminal").Run [ TerminalPart ]
+
+        let parentParts: NodePart<int, int, int, string> list =
+            [ InitialChildPart leafId; ChildNode leaf; ChildNode terminal ]
+
+        let parent = NodeBuilder<int, int, int, string>("parent").Run parentParts
+
+        let chart =
+            statechart<int, int, int, string> {
+                root "root"
+                classify (fun _ -> leafId)
+                parent
+            }
+            |> expectChart
+
+        let expectNode id =
+            Chart.tryNode chart id
+            |> Option.defaultWith (fun () -> failtestf "coverage node %A was not built" id)
+
+        let leafNode = expectNode leafId
+        let terminalNode = expectNode (stateId "terminal")
+
+        Expect.sequenceEqual
+            (leafNode.Rules |> List.map Rule.kind)
+            [ RuleKind.Transition
+              RuleKind.Attempt
+              RuleKind.Internal
+              RuleKind.Goto leafId
+              RuleKind.Guarded("covered", RuleKind.Transition) ]
+            "every rule constructor has a public route"
+
+        Expect.equal (leafNode.OnEntry 0 0) [ 1 ] "entry actions survive construction"
+        Expect.equal (leafNode.OnExit 0 0) [ 2 ] "exit actions survive construction"
+        Expect.equal terminalNode.Terminal true "the terminal part survives construction"
+
+        Expect.sequenceEqual
+            (Chart.children chart (stateId "parent"))
+            [ leafId; stateId "terminal" ]
+            "child parts survive construction"
+    }
+
 let tests =
     testList
         "chart properties"
@@ -154,4 +218,6 @@ let tests =
                       linked
                       && List.last chain = stateId "root"
                       && List.head chain = idOf leaf
-                      && List.length chain = List.length (List.distinct chain))) ]
+                      && List.length chain = List.length (List.distinct chain)))
+
+          coverageTest ]
