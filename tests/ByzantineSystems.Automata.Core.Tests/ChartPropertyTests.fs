@@ -78,29 +78,10 @@ let private chainIndex (parentOf: int -> int option) (j: int) : int list =
 let private parentId (tree: Tree) (id: StateId) =
     Chart.tryNode tree.Chart id |> Option.bind (fun n -> n.Parent)
 
-/// FsCheck 3's Check.One prints falsifications instead of throwing, so the property always
-/// reports true to FsCheck while real counterexamples are captured and asserted here. FsCheck
-/// owns generation; Expecto owns failure.
-let private property (name: string) (prop: 'a -> bool) : Test =
-    testCase name (fun () ->
-        let failures = ResizeArray<'a>()
-
-        Check.One(
-            Config.Quick,
-            fun (sample: 'a) ->
-                if not (prop sample) then
-                    failures.Add sample
-
-                true
-        )
-
-        if failures.Count > 0 then
-            failtestf "%s - %d counterexamples, first: %A" name failures.Count (Seq.head failures))
-
 let tests =
     testList
         "chart properties"
-        [ property
+        [ Property.property
               "nearest handler: Ok exactly when the event's node is on the chain"
               (fun (shape: int list, jSeed: int, kSeed: int) ->
                   match build shape with
@@ -115,7 +96,7 @@ let tests =
                       | Result.Error(Unhandled(leaf, _)) -> (not onChain) && leaf = stateId $"n%d{j}"
                       | Result.Error _ -> false)
 
-          property
+          Property.property
               "exit/entry paths are parent-linked, start at the leaf, end at the target"
               (fun (shape: int list, jSeed: int, kSeed: int) ->
                   match build shape with
@@ -152,7 +133,7 @@ let tests =
 
                               exitedLinked && enteredLinked && headIsLeaf && lastIsTarget)
 
-          property "chains end at the root and are strictly parent-linked" (fun (shape: int list) ->
+          Property.property "chains end at the root and are strictly parent-linked" (fun (shape: int list) ->
               match build shape with
               | None -> false
               | Some tree ->

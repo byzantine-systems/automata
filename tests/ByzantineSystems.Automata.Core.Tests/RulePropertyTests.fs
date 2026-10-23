@@ -2,26 +2,6 @@ module ByzantineSystems.Automata.Core.Tests.RulePropertyTests
 
 open ByzantineSystems.Automata.Core
 open Expecto
-open FsCheck
-
-/// FsCheck 3's Check.One prints falsifications instead of throwing, so the property always
-/// reports true to FsCheck while real counterexamples are captured and asserted here. FsCheck
-/// owns generation; Expecto owns failure. The same contract as ChartPropertyTests.
-let private property (name: string) (prop: 'a -> bool) : Test =
-    testCase name (fun () ->
-        let failures = ResizeArray<'a>()
-
-        Check.One(
-            Config.Quick,
-            fun (sample: 'a) ->
-                if not (prop sample) then
-                    failures.Add sample
-
-                true
-        )
-
-        if failures.Count > 0 then
-            failtestf "%s - %d counterexamples, first: %A" name failures.Count (Seq.head failures))
 
 /// The observation the retarget law compares under: every verdict passes through untouched
 /// except a Goto outcome, whose target is mapped. This is the spec of what retarget may see.
@@ -34,7 +14,7 @@ let private mapGoto (f: StateId -> StateId) (verdict: RuleVerdict<int, int, stri
 let tests =
     testList
         "rule laws"
-        [ property
+        [ Property.property
               "a holding guard is transparent: the wrapped rule decides"
               (fun (seed: int, state: int, event: int) ->
                   let inner =
@@ -44,7 +24,7 @@ let tests =
 
                   Rule.invoke guarded state event = Rule.invoke inner state event)
 
-          property
+          Property.property
               "a refusing guard stops the search with its reason, whatever it wraps"
               (fun (state: int, event: int) ->
                   let inner = Rule.transition (fun _ _ -> true) (fun s _ -> [], s)
@@ -52,7 +32,7 @@ let tests =
 
                   Rule.invoke guarded state event = RuleVerdict.GuardFailed "the reason")
 
-          property
+          Property.property
               "transition: NoMatch exactly when the predicate refuses, Handled carrying the transform's answer"
               (fun (seed: int, state: int, event: int) ->
                   let rule =
@@ -66,7 +46,7 @@ let tests =
                   else
                       Rule.invoke rule state event = RuleVerdict.NoMatch)
 
-          property
+          Property.property
               "attempt: a matched rule maps Ok to Handled and Error to Rejected"
               (fun (state: int, event: int, fail: bool) ->
                   let rule =
@@ -77,7 +57,7 @@ let tests =
                   else
                       Rule.invoke rule state event = RuleVerdict.Handled([ event ], RuleOutcome.Next(state + 1)))
 
-          property
+          Property.property
               "goto: a matched rule echoes its target beside the next state"
               (fun (seed: int, state: int, event: int) ->
                   let target = stateId $"t%d{abs seed % 4}"
@@ -86,12 +66,12 @@ let tests =
 
                   Rule.invoke rule state event = RuleVerdict.Handled([ seed ], RuleOutcome.Goto(target, state)))
 
-          property "internalOn: actions only, the state never moves" (fun (state: int, event: int) ->
+          Property.property "internalOn: actions only, the state never moves" (fun (state: int, event: int) ->
               let rule = Rule.internalOn (fun _ _ -> true) (fun _ e -> [ e * 3 ])
 
               Rule.invoke rule state event = RuleVerdict.Handled([ event * 3 ], RuleOutcome.Internal))
 
-          property
+          Property.property
               "kind names the combinator that built the rule, and target projects goto through guards"
               (fun (seed: int) ->
                   let target = stateId $"t%d{abs seed % 4}"
@@ -112,7 +92,7 @@ let tests =
                   && Rule.target gotoRule = Some target
                   && Rule.target guardedGoto = Some target)
 
-          property
+          Property.property
               "retarget renames goto targets in verdicts and kinds, and touches nothing else"
               (fun (seed: int, state: int, event: int) ->
                   let source = stateId $"t%d{abs seed % 4}"
