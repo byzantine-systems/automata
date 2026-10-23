@@ -11,7 +11,8 @@ let tests =
           ChartPropertyTests.tests
           ChartFingerprintTests.tests
           FragmentTests.tests
-          FragmentTests.targetTests ]
+          FragmentTests.targetTests
+          RulePropertyTests.tests ]
 
 [<EntryPoint>]
 let main argv = runTestsWithCLIArgs [] argv tests
