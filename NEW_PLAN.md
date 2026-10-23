@@ -848,7 +848,7 @@ Added:
 | E17 | `int TotalMilliseconds` overflows above about 24.8 days | `PostgresCommandInbox.fs:382`, `PostgresActionQueue.fs:190` | B7 |
 | E18 | Misplaced XML doc comments | `Processing.fs`, `PostgresCommandProcessorStore.fs:48` | B8 |
 | E19 | A connection leaks if `QueryContext` or `OpenAsync` throws | `Sql.fs:184` (both), `PostgresWorkNotifications.fs:48` | B8 |
-| E20 | The new `entity_state` FK would block purging the snapshot's command | E2 | E2 (and F4 for memory) |
+| E20 | The new `entity_state` FK would block purging the snapshot's command | E2 | E2 |
 | E21 | `submit_correction` writes the command row twice, which breaks immutability triggers | `R__correction_routines.sql:121` | C5 |
 | E22 | `WriteGate` keys `:memory:`, `file:` URIs and symlinked paths imperfectly | `Sqlite/Db.fs:101` | B8 (normalise `file:` URIs; document the rest) |
 | E23 | Statuses are compared as strings, so an unknown value only fails at run time | `toResult` and others | B3 |
@@ -861,39 +861,44 @@ Added:
 | E30 | DbUp `$name$` substitution collides with named dollar-quote tags | migrations | D3 |
 | E31 | Decoders call throwing constructors | several | B5 |
 | E32 | The claim plus correction-details read is two runs; a failed second run stalls the leased batch | `PostgresCommandInbox.fs:369` | B8 |
-| E33 | A memory store holding references lets a caller mutate committed history through a returned `'State` | new | F3 (round-trip mode; immutability documented) |
-| E34 | A memory store with nothing purging it grows without bound | new | F4 (inline retention) |
-| E35 | An expired lease in memory has no reaper | new | F2 (claim treats `VisibleAt <= now` as claimable) |
-| E36 | Without JSON, "same key, different request" (C5) has nothing to digest | new | F2 (`'Event: equality`, or encoded bytes in round-trip mode) |
-| E37 | Awaiting or running unbounded work under the memory store's lock would serialise or deadlock the process | new | F2 (pure functions, `Task.FromResult`, cancellation checked before the lock) |
-| E38 | Two registrations for one machine in DI (memory and durable) silently pick the last | `ServiceCollectionExtensions.fs` | F5 |
+| E33 | A memory store holding references lets a caller mutate committed history through a returned `'State` | new | **withdrawn with Phase F** |
+| E34 | A memory store with nothing purging it grows without bound | new | **withdrawn with Phase F** |
+| E35 | An expired lease in memory has no reaper | new | **withdrawn with Phase F** |
+| E36 | Without JSON, "same key, different request" (C5) has nothing to digest | new | **withdrawn with Phase F** |
+| E37 | Awaiting or running unbounded work under the memory store's lock would serialise or deadlock the process | new | **withdrawn with Phase F** |
+| E38 | Two registrations for one machine in DI (memory and durable) silently pick the last | `ServiceCollectionExtensions.fs` | **withdrawn with Phase F** |
 | E39 | Per-provider contract tests drift (E29 is one case), and a third provider would add a third copy | both SQL test projects | C0 |
-| E40 | `Accepted` from a memory store is not durable, which callers may assume | new | F (non-goals, docs, startup log) |
+| E40 | `Accepted` from a memory store is not durable, which callers may assume | new | **withdrawn with Phase F** |
 | E41 | Recursive `task` loops leak a state machine per iteration, and with a synchronous store can overflow the stack | `CommandProcessor.fs:504`, `ActionDispatcher.fs:271`, `ObserverDispatcher.fs`, `Boundary.fs:96` | B10 |
-| E42 | `Deliver` with no dispatcher grows the action queue forever | `ServiceCollectionExtensions.fs` (dispatcher optional) | F4 (`MaxPendingActions`, DI warning) |
-| E43 | Entities are never evicted; evicting one without a tombstone would restart it from the initial state | new | F4 (tombstones) |
-| E44 | `send` polls forever on a purged command (`Ok None`) | `Machine.fs:398` | F4 |
-| E45 | A reentrant store call from user `Equals` corrupts a shard | new | F2 (`IsHeldByCurrentThread`) |
-| E46 | `[<ReferenceEquality>]` events, or NaN fields, make an equal resubmission look like `KeyReused` | new | F2 (documented; round-trip compares bytes) |
-| E47 | A wall-clock step ends leases early or late | new | F2 (fencing keeps correctness; C2 clamps `ReceivedAt`) |
+| E42 | `Deliver` with no dispatcher grows the action queue forever | `ServiceCollectionExtensions.fs` (dispatcher optional) | **withdrawn with Phase F** |
+| E43 | Entities are never evicted; evicting one without a tombstone would restart it from the initial state | new | **withdrawn with Phase F** |
+| E44 | `send` polls forever on a purged command (`Ok None`) | `Machine.fs:398` | B (re-homed) |
+| E45 | A reentrant store call from user `Equals` corrupts a shard | new | **withdrawn with Phase F** |
+| E46 | `[<ReferenceEquality>]` events, or NaN fields, make an equal resubmission look like `KeyReused` | new | **withdrawn with Phase F** |
+| E47 | A wall-clock step ends leases early or late | new | **withdrawn with Phase F** |
 | E48 | Cancellation shape differs between providers (`StoreError` has no `Cancelled` case) | all stores | B11, C0 |
-| E49 | `InMemorySupervisionStore` is unbounded | `SupervisionAudit.fs:24` | F1 (ring buffer) |
-| E50 | `Retain.Forever` in a process is a leak | new | F4 (rejected) |
-| E51 | `GetOrAdd`'s factory runs twice, and a cached `Lazy` exception poisons a shard | new | F2 |
-| E52 | A lock-free reader sees the result before the snapshot | new | F2 (publication order) |
-| E53 | Ids restart at 1 per memory store instance | new | F2 (documented) |
+| E49 | `InMemorySupervisionStore` is unbounded | `SupervisionAudit.fs:24` | DI package, bounded in place (re-homed) |
+| E50 | `Retain.Forever` in a process is a leak | new | **withdrawn with Phase F** |
+| E51 | `GetOrAdd`'s factory runs twice, and a cached `Lazy` exception poisons a shard | new | **withdrawn with Phase F** |
+| E52 | A lock-free reader sees the result before the snapshot | new | **withdrawn with Phase F** |
+| E53 | Ids restart at 1 per memory store instance | new | **withdrawn with Phase F** |
 | E54 | Library `task {}` resumes on a captured `SynchronizationContext`, so a caller that blocks deadlocks | 52 sites under `src/` | B11 (`backgroundTask`) |
 | E55 | Validation inside the task CE faults the task for a usage error, instead of throwing to the caller | store members | B11 |
-| E56 | An idle memory store allocates a task per poll per machine | new | F2 (cached tasks) |
+| E56 | An idle memory store allocates a task per poll per machine | new | **withdrawn with Phase F** |
+| E57 | The chart fingerprint sees only rule kinds, so a behaviour change behind closures is invisible to it | `Chart.fs` fingerprint | A3 (DSL-only charts become faithful) |
+| E58 | Finite-suite trace equivalence is evidence, not proof, and `Custom` rules defeat structural equivalence | new | A4 (typed refusal, documented bound) |
+| E59 | A generator that cannot reach a constructor family makes false laws pass | new | A2 (coverage asserted, not reported) |
+| E60 | Store choreography written per provider drifts, and the closure `Op` fuses program with session so nothing else can interpret it | both providers | B0 (store algebra) |
 
 ## Conventions to hold throughout
 - `<summary>` comments, with no em dashes or `--` asides in comments.
-- Exhaustive matches on `Resolution`, `Param`, `Spelling` cases, `BeliefModel`, `ActionDelivery` and command status edges in the memory store; no wildcard arms.
+- Exhaustive matches on `Resolution`, `Param`, `Spelling` cases, `BeliefModel` and `ActionDelivery`; no wildcard arms.
 - `Row` and `Read` read by name, never by ordinal.
 - Every public change is listed in its phase and recorded in `docs/public-api.md`. No version bump, tag or CHANGELOG.
 - Provider packages keep `VersionOverride` in their own fsproj, and nothing is added to `Directory.Packages.props`.
-- A behaviour the interfaces promise is tested in the C0 suite, not in a provider's own tests.
-- The memory store uses no internals of `Storage`.
+- A behaviour the interfaces promise is tested in the C0 suite, not in a provider's own tests. A program-level law is tested against the recording interpreter, not re-derived per provider.
+- **The store algebra (B0):** store logic is written once, as a `store { }` program; a provider contributes statements, an interpreter and sessions, never its own choreography. `StatementKey` names what a program wants; SQL text is data.
+- **The core algebra (A2 onward):** every public algebraic surface carries its law portfolio as named FsCheck properties; generators build terms through public constructors only, and coverage is asserted, not reported; an equality claim names the observation it holds under.
 - **TAP (B11):**
   - Public `Task`-returning members end in `Async` and take `cancellationToken` last.
   - F# module functions stay curried, with the token last.
@@ -902,10 +907,10 @@ Added:
   - Library code uses `backgroundTask {}`.
 - No recursive `task` loops; long-running loops are `while` loops (B10).
 - Every new in-memory collection names its bound and its purge path.
-- `schema-evolution.md` is updated in D (templating, journal, global names) and in E (layout, profile, opt-in recipe). `stores.md` is written in F.
+- `schema-evolution.md` is updated in D (templating, journal, global names) and in E (layout, profile, opt-in recipe).
 
 ## Verification, every phase
-1. `dotnet build bs-automata.slnx` and `make test-unit` after every migrated file. From F on, `make test-unit` includes the conformance suite against the memory store, so most contract regressions show up without a database.
+1. `dotnet build bs-automata.slnx` and `make test-unit` after every migrated file. The A-track law portfolio (A2) and the recording-interpreter laws (B0.1) run under `make test-unit`, so most contract and program regressions show up without a database.
 2. `make db`, then `make test-integration` (from D on, also with `SCHEMA=automata_ci`).
 3. `make schema-check`, `make schema-check-sqlite`, `make fmt` and `nix flake check`.
 4. The phase's own reproduction tests listed above, written first and failing before the fix.
