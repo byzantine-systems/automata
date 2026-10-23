@@ -110,7 +110,12 @@ let tests =
                   let retargeted = Rule.retarget rename rule
 
                   Rule.invoke retargeted state event = mapGoto rename (Rule.invoke rule state event)
-                  && Rule.kind retargeted = RuleKind.Guarded("even events only", RuleKind.Goto destination))
+                  && Rule.kind retargeted = RuleKind.Guarded("even events only", RuleKind.Goto destination)
+                  && Rule.syntax retargeted = RuleSyntax.Guarded(
+                      "even events only",
+                      ConditionSyntax.Custom "legacy.guard",
+                      RuleSyntax.Goto(ConditionSyntax.Custom "legacy.goto", destination)
+                  ))
 
           Property.property
               "condition-based rules interpret their normalized condition syntax"

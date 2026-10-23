@@ -30,11 +30,7 @@ and RuleOutcome<'State> =
     /// <summary>Internal transition: no exit or entry actions, state unchanged.</summary>
     | Internal
 
-/// <summary>
-/// What a rule is, stripped of the closures that decide when it fires. A rule's behaviour lives
-/// in predicates and transforms, which are opaque functions; this is the part of it that can be
-/// compared, printed, or hashed into a chart fingerprint.
-/// </summary>
+/// <summary>Compatibility projection of a rule's combinator.</summary>
 type RuleKind =
     /// <summary>An ordinary transition, built by <c>Rule.transition</c>.</summary>
     | Transition
@@ -51,10 +47,7 @@ type RuleKind =
     /// <summary>The kind a <c>Rule.guarded</c> wrapper reports, keeping the wrapped rule visible.</summary>
     | Guarded of reason: string * inner: RuleKind
 
-/// <summary>
-/// The inspectable syntax of a rule: its combinator, normalized condition syntax, goto target,
-/// and any guard wrappers. Transforms and emitted actions remain opaque callbacks.
-/// </summary>
+/// <summary>Rule structure with normalized conditions. Transforms remain opaque.</summary>
 [<RequireQualifiedAccess>]
 type RuleSyntax =
     | Transition of condition: ConditionSyntax
@@ -63,14 +56,7 @@ type RuleSyntax =
     | Internal of condition: ConditionSyntax
     | Guarded of reason: string * condition: ConditionSyntax * inner: RuleSyntax
 
-/// <summary>
-/// One transition rule: a total function from (state, event) to a
-/// <see cref="T:ByzantineSystems.Automata.Core.RuleVerdict`3" />, paired with the
-/// <see cref="T:ByzantineSystems.Automata.Core.RuleSyntax" /> that describes its combinator and
-/// normalized condition syntax.
-/// Private constructor keeps rules built through
-/// <see cref="T:ByzantineSystems.Automata.Core.Rule" /> combinators.
-/// </summary>
+/// <summary>An executable transition paired with inspectable syntax.</summary>
 type Rule<'State, 'Event, 'Action, 'Err> =
     private
         { Syntax: RuleSyntax
@@ -94,10 +80,7 @@ module Rule =
                 else
                     RuleVerdict.NoMatch }
 
-    /// <summary>
-    /// Ordinary transition controlled by an opaque legacy predicate. Use <c>transitionWhen</c>
-    /// when condition syntax should distinguish predicates structurally.
-    /// </summary>
+    /// <summary>Ordinary transition with an opaque predicate.</summary>
     let transition predicate transform =
         transitionWhen (Condition.custom "legacy.transition" predicate) transform
 
@@ -156,11 +139,7 @@ module Rule =
     let internalOn predicate transform =
         internalWhen (Condition.custom "legacy.internal" predicate) transform
 
-    /// <summary>
-    /// Guard combinator controlled by inspectable condition syntax. When it refuses, the rule reports
-    /// <see cref="F:ByzantineSystems.Automata.Core.RuleVerdict`3.GuardFailed" /> instead of
-    /// silently not matching; the search stops with a reportable reason rather than bubbling.
-    /// </summary>
+    /// <summary>Guard controlled by inspectable condition syntax.</summary>
     let guardedWhen
         (condition: Condition<'State, 'Event>)
         (reason: string)
@@ -186,20 +165,13 @@ module Rule =
         | RuleSyntax.Internal _ -> RuleKind.Internal
         | RuleSyntax.Guarded(reason, _, inner) -> RuleKind.Guarded(reason, kindOf inner)
 
-    /// <summary>
-    /// Compatibility projection naming the combinator that built a rule. Use <c>syntax</c> when
-    /// the normalized condition structure is also required.
-    /// </summary>
+    /// <summary>Returns the compatibility combinator projection.</summary>
     let kind (rule: Rule<'State, 'Event, 'Action, 'Err>) : RuleKind = kindOf rule.Syntax
 
     /// <summary>The rule's normalized, function-free structural syntax.</summary>
     let syntax (rule: Rule<'State, 'Event, 'Action, 'Err>) : RuleSyntax = rule.Syntax
 
-    /// <summary>
-    /// The compound node a rule sends the entity to, looking through any guards, or <c>None</c>
-    /// for a rule that does not goto anywhere. Read from the kind, so a chart can check every
-    /// target it names without firing a single rule.
-    /// </summary>
+    /// <summary>Returns a goto target through guard wrappers.</summary>
     let target (rule: Rule<'State, 'Event, 'Action, 'Err>) : StateId option =
         let rec targetOf syntax =
             match syntax with
@@ -211,13 +183,7 @@ module Rule =
 
         targetOf rule.Syntax
 
-    /// <summary>
-    /// Renames the goto target a rule can produce, both where the chart reads it (the kind,
-    /// through any guards) and where resolution does (the outcome its closure returns). The
-    /// second is only reachable by wrapping the closure, which is why this lives beside the
-    /// private fields rather than in the fragment code that calls it. Every other verdict and
-    /// outcome passes through untouched.
-    /// </summary>
+    /// <summary>Renames goto targets in syntax and execution.</summary>
     let retarget
         (rename: StateId -> StateId)
         (rule: Rule<'State, 'Event, 'Action, 'Err>)

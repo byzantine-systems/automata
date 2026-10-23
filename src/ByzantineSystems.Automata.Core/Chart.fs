@@ -196,45 +196,64 @@ module Chart =
         else
             Result.Error errors
 
-    /// The canonicalisation this fingerprint scheme describes. It is hashed along with the chart,
-    /// so a future scheme cannot produce the same digest as this one for a different structure.
-    /// Bump it in the same commit that changes what is hashed below.
-    let private fingerprintScheme = "automata.chart.fingerprint/1"
+    /// Included in the digest; bump whenever canonicalization changes.
+    let private fingerprintScheme = "automata.chart.fingerprint/2"
 
-    /// Appends a length-prefixed field. Length prefixes rather than a delimiter with escaping:
-    /// the encoding stays injective without having to defend against a state id that happens to
-    /// contain whatever the delimiter is.
+    /// Appends an unambiguous length-prefixed field.
     let private appendField (builder: StringBuilder) (value: string) =
         builder.Append(value.Length).Append(':').Append(value) |> ignore
 
-    let rec private appendKind (builder: StringBuilder) (kind: RuleKind) =
-        match kind with
-        | RuleKind.Transition -> builder.Append 't' |> ignore
-        | RuleKind.Attempt -> builder.Append 'a' |> ignore
-        | RuleKind.Internal -> builder.Append 'i' |> ignore
-        | RuleKind.Goto target ->
+    let rec private appendCondition (builder: StringBuilder) condition =
+        match condition with
+        | ConditionSyntax.Always -> builder.Append 'A' |> ignore
+        | ConditionSyntax.Never -> builder.Append 'N' |> ignore
+        | ConditionSyntax.AllOf terms ->
+            builder.Append('L').Append(terms.Length).Append(':') |> ignore
+            terms |> List.iter (appendCondition builder)
+        | ConditionSyntax.AnyOf terms ->
+            builder.Append('Y').Append(terms.Length).Append(':') |> ignore
+            terms |> List.iter (appendCondition builder)
+        | ConditionSyntax.Not inner ->
+            builder.Append '!' |> ignore
+            appendCondition builder inner
+        | ConditionSyntax.EventIs name ->
+            builder.Append 'e' |> ignore
+            appendField builder name
+        | ConditionSyntax.StateIs name ->
+            builder.Append 's' |> ignore
+            appendField builder name
+        | ConditionSyntax.Both name ->
+            builder.Append 'b' |> ignore
+            appendField builder name
+        | ConditionSyntax.Custom name ->
+            builder.Append 'c' |> ignore
+            appendField builder name
+
+    let rec private appendRule (builder: StringBuilder) syntax =
+        match syntax with
+        | RuleSyntax.Transition condition ->
+            builder.Append 't' |> ignore
+            appendCondition builder condition
+        | RuleSyntax.Attempt condition ->
+            builder.Append 'a' |> ignore
+            appendCondition builder condition
+        | RuleSyntax.Internal condition ->
+            builder.Append 'i' |> ignore
+            appendCondition builder condition
+        | RuleSyntax.Goto(condition, target) ->
             builder.Append 'g' |> ignore
             appendField builder (StateId.value target)
-        | RuleKind.Guarded(reason, inner) ->
+            appendCondition builder condition
+        | RuleSyntax.Guarded(reason, condition, inner) ->
             builder.Append 'u' |> ignore
             appendField builder reason
-            appendKind builder inner
+            appendCondition builder condition
+            appendRule builder inner
 
     /// <summary>
-    /// Hashes the chart's structure: the root, and for every node its id, parent, initial child,
-    /// terminal flag and the kind of each of its rules.
-    ///
-    /// Two things about the ordering carry the meaning. Nodes are sorted by id, because sibling
-    /// declaration order decides nothing at resolution time (the walk follows parent links, and
-    /// an initial child is named explicitly), so two spellings of one chart must agree. Rules are
-    /// left in declaration order, because first-match-wins makes their order part of what the
-    /// chart does.
-    ///
-    /// What is deliberately invisible: the classifier, every predicate and transform, and entry
-    /// and exit actions. All are closures. The builder has also already composed several
-    /// <c>onEntry</c> declarations into one function by the time a chart exists, so not even
-    /// their number survives. This is why the fingerprint is a tripwire against editing a chart
-    /// without bumping its version, and not a proof that two charts decide alike.
+    /// Hashes normalized chart and condition syntax. Nodes sort by id; rules retain declaration
+    /// order. Predicate names are structural, but delegates, transforms, actions, and classifiers
+    /// remain opaque, so equal fingerprints do not prove equal resolution behavior.
     /// </summary>
     let fingerprint (chart: Chart<'State, 'Event, 'Action, 'Err>) : ChartFingerprint =
         let builder = StringBuilder()
@@ -264,7 +283,7 @@ module Chart =
 
             builder.Append(if node.Terminal then '1' else '0') |> ignore
             builder.Append('k').Append(node.Rules.Length).Append(':') |> ignore
-            node.Rules |> List.iter (fun rule -> appendKind builder (Rule.kind rule))
+            node.Rules |> List.iter (fun rule -> appendRule builder (Rule.syntax rule))
             builder.Append '\n' |> ignore)
 
         // Hashed explicitly rather than through GetHashCode, which .NET randomises per process:

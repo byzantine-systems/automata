@@ -1,9 +1,6 @@
 namespace ByzantineSystems.Automata.Core
 
-/// <summary>
-/// The inspectable, normalized description of a condition. Predicate implementations are never
-/// represented here: their names are caller-supplied semantic identifiers, not hashes of delegates.
-/// </summary>
+/// <summary>Normalized condition syntax. Names identify predicates whose delegates stay opaque.</summary>
 [<RequireQualifiedAccess>]
 type ConditionSyntax =
     | Always
@@ -16,15 +13,11 @@ type ConditionSyntax =
     | Both of name: string
     | Custom of name: string
 
-/// <summary>
-/// A condition pairs normalized, inspectable syntax with the predicate that interprets it. Build
-/// values through <see cref="T:ByzantineSystems.Automata.Core.Condition" /> module functions so
-/// equivalent conjunction and disjunction spellings receive the same syntax.
-/// </summary>
+/// <summary>An executable predicate paired with normalized syntax.</summary>
 [<NoEquality; NoComparison>]
 type Condition<'State, 'Event> = private Condition of syntax: ConditionSyntax * matches: ('State -> 'Event -> bool)
 
-/// <summary>Construction, normalization, inspection, and interpretation of conditions.</summary>
+/// <summary>Condition construction, inspection, and evaluation.</summary>
 [<RequireQualifiedAccess>]
 module Condition =
 
@@ -103,14 +96,11 @@ module Condition =
     let both (name: string) (predicate: 'State -> 'Event -> bool) : Condition<'State, 'Event> =
         named "Both" name ConditionSyntax.Both predicate
 
-    /// <summary>
-    /// An explicitly opaque predicate. Its name is inspectable and fingerprinted; its behavior is
-    /// not. Reusing one name for different predicates is therefore a broken caller contract.
-    /// </summary>
+    /// <summary>An opaque predicate identified structurally by its name.</summary>
     let custom (name: string) (predicate: 'State -> 'Event -> bool) : Condition<'State, 'Event> =
         named "Custom" name ConditionSyntax.Custom predicate
 
-    /// <summary>Conjunction. Empty, singleton, nested, identity, and annihilator forms normalize.</summary>
+    /// <summary>Normalized conjunction.</summary>
     let allOf (conditions: Condition<'State, 'Event> list) : Condition<'State, 'Event> =
         let syntax =
             conditions
@@ -120,7 +110,7 @@ module Condition =
 
         Condition(syntax, fun state event -> conditions |> List.forall (fun (Condition(_, f)) -> f state event))
 
-    /// <summary>Disjunction. Empty, singleton, nested, identity, and annihilator forms normalize.</summary>
+    /// <summary>Normalized disjunction.</summary>
     let anyOf (conditions: Condition<'State, 'Event> list) : Condition<'State, 'Event> =
         let syntax =
             conditions
@@ -130,7 +120,7 @@ module Condition =
 
         Condition(syntax, fun state event -> conditions |> List.exists (fun (Condition(_, f)) -> f state event))
 
-    /// <summary>Boolean negation. Constants and double negation normalize.</summary>
+    /// <summary>Normalized negation.</summary>
     let negate (condition: Condition<'State, 'Event>) : Condition<'State, 'Event> =
         let (Condition(syntax, predicate)) = condition
         Condition(normalize (ConditionSyntax.Not syntax), fun state event -> not (predicate state event))
@@ -140,7 +130,7 @@ module Condition =
         let (Condition(_, predicate)) = condition
         predicate state event
 
-    /// <summary>Returns the normalized, function-free syntax used by structural observations.</summary>
+    /// <summary>Returns normalized, function-free syntax.</summary>
     let syntax (condition: Condition<'State, 'Event>) : ConditionSyntax =
         let (Condition(syntax, _)) = condition
         syntax

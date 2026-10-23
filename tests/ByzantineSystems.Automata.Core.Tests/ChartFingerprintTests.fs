@@ -55,6 +55,12 @@ let private differs (description: string) (nodes: Node<int, int, int, string> li
 let private agrees (description: string) (nodes: Node<int, int, int, string> list) =
     test description { Expect.equal (fingerprintOf nodes) baseline "the fingerprint should not have changed" }
 
+let private fingerprintWithCondition condition =
+    replace "a" (fun node ->
+        { node with
+            Rules = [ Rule.transitionWhen condition (fun state _ -> [], state) ] })
+    |> fingerprintOf
+
 let tests =
     testList
         "chart fingerprint"
@@ -66,7 +72,7 @@ let tests =
           test "a fixed chart has a fixed fingerprint" {
               Expect.equal
                   baseline
-                  "810215e3609bcc93a0f29f68b2cb00ea3bfa6f38f830b1c71cad86f9f198edba"
+                  "30e9a42a34c3877eaaf5cdfb95262ae1c98bb8a267139e2860592a820a472ecc"
                   "the canonical form changed; bump fingerprintScheme in Chart.fs if that was intended"
           }
 
@@ -94,6 +100,57 @@ let tests =
                   |> List.filter (fun order -> fingerprintOf (order |> List.map (fun i -> baseNodes[i])) <> baseline)
 
               Expect.isEmpty divergent $"%d{orderings.Length} orderings checked"
+          }
+
+          test "normalized condition spellings have one fingerprint" {
+              let eventEven: Condition<int, int> =
+                  Condition.eventIs "event.even" (fun event -> event % 2 = 0)
+
+              let statePositive = Condition.stateIs "state.positive" (fun state -> state > 0)
+
+              let nested =
+                  Condition.allOf [ Condition.always; eventEven; Condition.allOf [ statePositive ] ]
+
+              let reordered = Condition.allOf [ statePositive; eventEven ]
+
+              Expect.equal
+                  (fingerprintWithCondition nested)
+                  (fingerprintWithCondition reordered)
+                  "canonical condition syntax, not construction order, is hashed"
+          }
+
+          test "predicate names and categories are fingerprinted" {
+              let eventCondition: Condition<int, int> =
+                  Condition.eventIs "positive" (fun event -> event > 0)
+
+              let renamed = Condition.eventIs "event.positive" (fun event -> event > 0)
+              let stateCondition = Condition.stateIs "positive" (fun state -> state > 0)
+
+              Expect.notEqual
+                  (fingerprintWithCondition eventCondition)
+                  (fingerprintWithCondition renamed)
+                  "renaming the semantic identifier changes syntax"
+
+              Expect.notEqual
+                  (fingerprintWithCondition eventCondition)
+                  (fingerprintWithCondition stateCondition)
+                  "event and state predicates are different syntax"
+          }
+
+          test "Custom is identified only by its explicit name" {
+              let accepts: Condition<int, int> = Condition.custom "opaque" (fun _ _ -> true)
+              let refuses = Condition.custom "opaque" (fun (_: int) (_: int) -> false)
+              let renamed = Condition.custom "different" (fun (_: int) (_: int) -> true)
+
+              Expect.equal
+                  (fingerprintWithCondition accepts)
+                  (fingerprintWithCondition refuses)
+                  "delegate behavior is opaque"
+
+              Expect.notEqual
+                  (fingerprintWithCondition accepts)
+                  (fingerprintWithCondition renamed)
+                  "the caller-supplied name is structural"
           }
 
           // Everything the fingerprint is supposed to notice.
