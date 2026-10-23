@@ -1,14 +1,12 @@
 module ByzantineSystems.Automata.Core.Tests.ChartPropertyTests
 
-open System
 open ByzantineSystems.Automata.Core
 open Expecto
-open FsCheck
 
-/// A generated random tree: node 0 is the root and node i's parent is some node j &lt; i,
-/// which keeps the graph acyclic and connected. Every node k carries exactly one rule that
-/// matches event k and targets a fixed leaf, so the expected handler of (leaf j, event k)
-/// is: node k, if k sits on j's chain; Unhandled otherwise.
+/// A generated random tree under the chart's implicit root: node 0 is the top generated node and
+/// node i's parent is some node j &lt; i, which keeps the graph acyclic and connected. Every node k
+/// carries exactly one rule that matches event k and targets a fixed leaf, so the expected handler
+/// of (leaf j, event k) is node k if k sits on j's chain, and Unhandled otherwise.
 type private Tree =
     { Chart: Chart<int, int, int, string>
       Size: int
@@ -40,24 +38,28 @@ let private build (shape: int list) : Tree option =
     else
         let target = leaves |> List.min
 
-        let mkNode (i: int) : Node<int, int, int, string> =
+        let rec mkDraft (i: int) : NodeDraft<int, int, int, string> =
             let kids = [ 0 .. size - 1 ] |> List.filter (fun j -> parentOf j = Some i)
 
-            { Id = idOf i
-              Parent = parentOf i |> Option.map idOf
-              InitialChild =
-                (if kids.IsEmpty then
-                     None
-                 else
-                     kids |> List.min |> idOf |> Some)
-              Terminal = false
-              OnEntry = fun _ _ -> []
-              OnExit = fun _ _ -> []
-              Rules = [ Rule.transition (fun _ e -> e = i) (fun _ _ -> [], target) ] }
+            let parts =
+                [ if not kids.IsEmpty then
+                      InitialChildPart(kids |> List.min |> idOf)
 
-        let nodes = [ 0 .. size - 1 ] |> List.map mkNode
+                  NodeRule(Rule.transition (fun _ event -> event = i) (fun _ _ -> [], target))
 
-        match Chart.create (idOf 0) idOf nodes with
+                  for child in kids do
+                      ChildNode(mkDraft child) ]
+
+            NodeBuilder<int, int, int, string>(StateId.value (idOf i)).Run parts
+
+        let result =
+            statechart<int, int, int, string> {
+                root "root"
+                classify idOf
+                mkDraft 0
+            }
+
+        match result with
         | Ok chart ->
             Some
                 { Chart = chart
@@ -150,6 +152,6 @@ let tests =
                           chain |> List.pairwise |> List.forall (fun (a, b) -> parentById a = Some b)
 
                       linked
-                      && List.last chain = idOf 0
+                      && List.last chain = stateId "root"
                       && List.head chain = idOf leaf
                       && List.length chain = List.length (List.distinct chain))) ]
