@@ -9,6 +9,7 @@ let tests =
         [ CoreTypeTests.tests
           ChartTests.tests
           ChartPropertyTests.tests
+          HierarchyPropertyTests.tests
           ChartFingerprintTests.tests
           FragmentTests.tests
           FragmentTests.targetTests
