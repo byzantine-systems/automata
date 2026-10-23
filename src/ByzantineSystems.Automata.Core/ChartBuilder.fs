@@ -270,12 +270,26 @@ module ChartCE =
         : NodePart<'State, 'Event, 'Action, 'Err> =
         NodeRule(Rule.transition predicate transform)
 
+    /// <summary>Ordinary transition controlled by inspectable condition syntax.</summary>
+    let onWhen
+        (condition: Condition<'State, 'Event>)
+        (transform: 'State -> 'Event -> 'Action list * 'State)
+        : NodePart<'State, 'Event, 'Action, 'Err> =
+        NodeRule(Rule.transitionWhen condition transform)
+
     /// <summary>Result-returning rule: may reject the event with a domain error.</summary>
     let attempt
         (predicate: 'State -> 'Event -> bool)
         (transform: 'State -> 'Event -> Result<'Action list * 'State, 'Err>)
         : NodePart<'State, 'Event, 'Action, 'Err> =
         NodeRule(Rule.attempt predicate transform)
+
+    /// <summary>Result-returning transition controlled by inspectable condition syntax.</summary>
+    let attemptWhen
+        (condition: Condition<'State, 'Event>)
+        (transform: 'State -> 'Event -> Result<'Action list * 'State, 'Err>)
+        : NodePart<'State, 'Event, 'Action, 'Err> =
+        NodeRule(Rule.attemptWhen condition transform)
 
     /// <summary>Compound-target rule: follows the target's initial-child path to a leaf.</summary>
     let goto
@@ -285,9 +299,24 @@ module ChartCE =
         : NodePart<'State, 'Event, 'Action, 'Err> =
         NodeRule(Rule.goto predicate target transform)
 
+    /// <summary>Compound-target transition controlled by inspectable condition syntax.</summary>
+    let gotoWhen
+        (condition: Condition<'State, 'Event>)
+        (target: StateId)
+        (transform: 'State -> 'Event -> 'Action list * 'State)
+        : NodePart<'State, 'Event, 'Action, 'Err> =
+        NodeRule(Rule.gotoWhen condition target transform)
+
     /// <summary>Internal transition rule: actions without exit/entry or a state change.</summary>
     let internalOn
         (predicate: 'State -> 'Event -> bool)
         (transform: 'State -> 'Event -> 'Action list)
         : NodePart<'State, 'Event, 'Action, 'Err> =
         NodeRule(Rule.internalOn predicate transform)
+
+    /// <summary>Internal transition controlled by inspectable condition syntax.</summary>
+    let internalWhen
+        (condition: Condition<'State, 'Event>)
+        (transform: 'State -> 'Event -> 'Action list)
+        : NodePart<'State, 'Event, 'Action, 'Err> =
+        NodeRule(Rule.internalWhen condition transform)

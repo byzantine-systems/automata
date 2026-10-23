@@ -110,4 +110,52 @@ let tests =
                   let retargeted = Rule.retarget rename rule
 
                   Rule.invoke retargeted state event = mapGoto rename (Rule.invoke rule state event)
-                  && Rule.kind retargeted = RuleKind.Guarded("even events only", RuleKind.Goto destination)) ]
+                  && Rule.kind retargeted = RuleKind.Guarded("even events only", RuleKind.Goto destination))
+
+          Property.property
+              "condition-based rules interpret their normalized condition syntax"
+              (fun (state: int, event: int) ->
+                  let condition =
+                      Condition.allOf
+                          [ Condition.stateIs "state.nonnegative" (fun value -> value >= 0)
+                            Condition.eventIs "event.even" (fun value -> Property.bounded 2 value = 0) ]
+
+                  let rule =
+                      Rule.transitionWhen condition (fun current value -> [ value ], current + 1)
+
+                  let expectedMatch = state >= 0 && Property.bounded 2 event = 0
+
+                  Rule.syntax rule = RuleSyntax.Transition(Condition.syntax condition)
+                  && if expectedMatch then
+                         Rule.invoke rule state event = RuleVerdict.Handled([ event ], RuleOutcome.Next(state + 1))
+                     else
+                         Rule.invoke rule state event = RuleVerdict.NoMatch)
+
+          test "every condition-based constructor exposes its syntax while RuleKind stays compatible" {
+              let condition: Condition<int, int> =
+                  Condition.eventIs "event.positive" (fun event -> event > 0)
+
+              let syntax = Condition.syntax condition
+              let target = stateId "target"
+              let transition = Rule.transitionWhen condition (fun state _ -> [], state)
+              let attemptRule = Rule.attemptWhen condition (fun state _ -> Ok([], state))
+              let gotoRule = Rule.gotoWhen condition target (fun state _ -> [], state)
+              let internalRule = Rule.internalWhen condition (fun _ _ -> [])
+              let guardedRule = Rule.guardedWhen condition "allowed" gotoRule
+
+              Expect.equal (Rule.syntax transition) (RuleSyntax.Transition syntax) "transition syntax"
+              Expect.equal (Rule.syntax attemptRule) (RuleSyntax.Attempt syntax) "attempt syntax"
+              Expect.equal (Rule.syntax gotoRule) (RuleSyntax.Goto(syntax, target)) "goto syntax"
+              Expect.equal (Rule.syntax internalRule) (RuleSyntax.Internal syntax) "internal syntax"
+
+              Expect.equal
+                  (Rule.syntax guardedRule)
+                  (RuleSyntax.Guarded("allowed", syntax, RuleSyntax.Goto(syntax, target)))
+                  "guard syntax"
+
+              Expect.equal (Rule.kind transition) RuleKind.Transition "transition kind"
+              Expect.equal (Rule.kind attemptRule) RuleKind.Attempt "attempt kind"
+              Expect.equal (Rule.kind gotoRule) (RuleKind.Goto target) "goto kind"
+              Expect.equal (Rule.kind internalRule) RuleKind.Internal "internal kind"
+              Expect.equal (Rule.kind guardedRule) (RuleKind.Guarded("allowed", RuleKind.Goto target)) "guard kind"
+          } ]
