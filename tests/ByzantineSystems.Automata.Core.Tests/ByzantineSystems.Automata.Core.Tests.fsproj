@@ -9,6 +9,7 @@
 
     <ItemGroup>
         <Compile Include="Property.fs" />
+        <Compile Include="ConditionPropertyTests.fs" />
         <Compile Include="CoreTypeTests.fs" />
         <Compile Include="ChartTests.fs" />
         <Compile Include="ChartPropertyTests.fs" />

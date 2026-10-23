@@ -6,7 +6,8 @@ open Expecto
 let tests =
     testList
         "ByzantineSystems.Automata.Core"
-        [ CoreTypeTests.tests
+        [ ConditionPropertyTests.tests
+          CoreTypeTests.tests
           ChartTests.tests
           ChartPropertyTests.tests
           ResolvePropertyTests.tests
