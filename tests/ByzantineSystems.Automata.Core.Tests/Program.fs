@@ -14,6 +14,7 @@ let tests =
           ChartFingerprintTests.tests
           FragmentTests.tests
           FragmentTests.targetTests
+          FragmentPropertyTests.tests
           RulePropertyTests.tests ]
 
 [<EntryPoint>]
