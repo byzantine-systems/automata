@@ -73,3 +73,10 @@ module ChartEquivalence =
             | _ -> false
 
         eventSequences |> List.forall traceEqual
+
+    /// <summary>Tests exact canonical declaration equality, not callback behavior.</summary>
+    let declaredEquivalent
+        (left: Chart<'State, 'Event, 'Action, 'Err>)
+        (right: Chart<'State, 'Event, 'Action, 'Err>)
+        : bool =
+        Chart.declaredSyntax left = Chart.declaredSyntax right

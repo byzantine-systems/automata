@@ -196,6 +196,12 @@ module Chart =
         else
             Result.Error errors
 
+    let internal declaredSyntax (chart: Chart<'State, 'Event, 'Action, 'Err>) =
+        let nodeSyntax node =
+            node.Id, node.Parent, node.InitialChild, node.Terminal, (node.Rules |> List.map Rule.syntax)
+
+        chart.Root, (chart.Nodes |> Map.toList |> List.map (snd >> nodeSyntax))
+
     /// Included in the digest; bump whenever canonicalization changes.
     let private fingerprintScheme = "automata.chart.fingerprint/2"
 
