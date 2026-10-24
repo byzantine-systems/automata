@@ -134,19 +134,3 @@ module Condition =
     let syntax (condition: Condition<'State, 'Event>) : ConditionSyntax =
         let (Condition(syntax, _)) = condition
         syntax
-
-    /// <summary>True when the syntax contains an explicitly opaque Custom predicate.</summary>
-    let containsCustom (condition: Condition<'State, 'Event>) : bool =
-        let rec contains syntax =
-            match syntax with
-            | ConditionSyntax.Custom _ -> true
-            | ConditionSyntax.AllOf terms
-            | ConditionSyntax.AnyOf terms -> List.exists contains terms
-            | ConditionSyntax.Not inner -> contains inner
-            | ConditionSyntax.Always
-            | ConditionSyntax.Never
-            | ConditionSyntax.EventIs _
-            | ConditionSyntax.StateIs _
-            | ConditionSyntax.Both _ -> false
-
-        condition |> syntax |> contains

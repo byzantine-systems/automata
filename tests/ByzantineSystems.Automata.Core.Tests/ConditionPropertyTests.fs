@@ -184,4 +184,41 @@ let tests =
                   "blank names cannot identify opaque behavior"
           }
 
+          test "statechart condition helpers preserve rule syntax" {
+              let condition: Condition<int, int> =
+                  Condition.eventIs "event.positive" (fun event -> event > 0)
+
+              let syntax = Condition.syntax condition
+              let leafId = stateId "leaf"
+
+              let chart =
+                  statechart<int, int, int, string> {
+                      root "root"
+                      classify (fun _ -> leafId)
+
+                      state "leaf" {
+                          onWhen condition (fun state _ -> [], state)
+                          attemptWhen condition (fun state _ -> Ok([], state))
+                          gotoWhen condition leafId (fun state _ -> [], state)
+                          internalWhen condition (fun _ _ -> [])
+                      }
+                  }
+                  |> function
+                      | Ok chart -> chart
+                      | Result.Error errors -> failtestf "condition chart is invalid: %A" errors
+
+              let rules =
+                  Chart.tryNode chart leafId
+                  |> Option.map (fun node -> node.Rules |> List.map Rule.syntax)
+                  |> Option.defaultWith (fun () -> failtest "condition chart omitted its leaf")
+
+              Expect.sequenceEqual
+                  rules
+                  [ RuleSyntax.Transition syntax
+                    RuleSyntax.Attempt syntax
+                    RuleSyntax.Goto(syntax, leafId)
+                    RuleSyntax.Internal syntax ]
+                  "the CE delegates to condition-based rule constructors"
+          }
+
           explorationTest ]
