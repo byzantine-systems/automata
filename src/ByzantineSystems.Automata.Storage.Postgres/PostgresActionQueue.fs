@@ -40,19 +40,16 @@ type PostgresActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'Entity
 
     let context = options.Context
 
-    let ensureQueue = Statement.load "action" "ensure_queue"
-    let claimActions = Statement.load "action" "claim"
-    let completeAction = Statement.load "action" "complete"
-    let rescheduleAction = Statement.load "action" "reschedule"
-    let abandonAction = Statement.load "action" "abandon"
+    let ensureQueue = StatementKey.create "action" "ensure_queue" |> Sql.prepareProgram
+    let claimActions = StatementKey.create "action" "claim" |> Sql.prepareProgram
+    let completeAction = StatementKey.create "action" "complete" |> Sql.prepareProgram
+
+    let rescheduleAction =
+        StatementKey.create "action" "reschedule" |> Sql.prepareProgram
+
+    let abandonAction = StatementKey.create "action" "abandon" |> Sql.prepareProgram
 
     let queue = [ "queue", Param.Text options.Queue ]
-
-    let outcomeFromString (value: string) : Result<LeaseUpdateOutcome, StoreError> =
-        match value with
-        | "updated" -> Ok Updated
-        | "lease_lost" -> Ok LeaseUpdateOutcome.LeaseLost
-        | other -> Error(Db.decodeFailure (nameof LeaseUpdateOutcome) $"unknown lease outcome {other}")
 
     /// The message body finalize_command wrote. Every field is required: a message missing one
     /// was not written by this library's finalize, and guessing what it meant would be worse
@@ -80,32 +77,32 @@ type PostgresActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'Entity
                 | JsonValueKind.Number -> Ok(value.GetInt64())
                 | _ -> Error(Db.decodeFailure (nameof ActionRecord) $"{name} was not a number"))
 
-        let entityId =
-            text "entity_id"
-            |> Result.bind (options.EntityIdDecode >> Result.mapError (Db.decodeFailure "EntityId"))
+        result {
+            let! machineId = text "machine_id"
 
-        let action =
-            field "action"
-            |> Result.bind (fun value ->
-                value.GetRawText()
-                |> options.ActionCodec.Decode
-                |> Result.mapError Db.toStoreError)
+            let! entityId =
+                text "entity_id"
+                |> Result.bind (options.EntityIdDecode >> Result.mapError (Db.decodeFailure "EntityId"))
 
-        match text "machine_id", entityId, number "command_id", number "epoch", number "ordinal", action with
-        | Ok machineId, Ok entityId, Ok commandId, Ok epoch, Ok ordinal, Ok action ->
-            Ok
+            let! commandId = number "command_id"
+            let! epoch = number "epoch"
+            let! ordinal = number "ordinal"
+
+            let! action =
+                field "action"
+                |> Result.bind (fun value ->
+                    value.GetRawText()
+                    |> options.ActionCodec.Decode
+                    |> Result.mapError Db.toStoreError)
+
+            return
                 { MachineId = MachineId.create machineId
                   EntityId = entityId
                   CommandId = CommandId.ofInt64 commandId
                   Epoch = Epoch.ofUInt64 (uint64 epoch)
                   Ordinal = int ordinal
                   Action = action }
-        | Error error, _, _, _, _, _
-        | _, Error error, _, _, _, _
-        | _, _, Error error, _, _, _
-        | _, _, _, Error error, _, _
-        | _, _, _, _, Error error, _
-        | _, _, _, _, _, Error error -> Error error
+        }
 
     /// <summary>
     /// The two halves of a pgmq claim, both carried on the lease.
@@ -123,15 +120,10 @@ type PostgresActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'Entity
             "read_ct", Param.Int action.DeliveryCount ]
 
     /// One fenced call: the routine answers whether the caller still held the lease.
-    let fenced (statement: Statement) (values: (string * Param) list) (ct: CancellationToken) =
-        Sql.run
+    let fenced (statement: StatementKey) (values: (string * Param) list) (ct: CancellationToken) =
+        Sql.runProgram
             context
-            (postgres {
-                let! outcome =
-                    Sql.one (nameof LeaseUpdateOutcome) statement values (fun reader -> Row.string reader "outcome")
-
-                return! outcomeFromString outcome
-            })
+            (StoreProgram.queryOne statement values (EnumCodec.read Row.string EnumCodec.leaseOutcome "outcome"))
             ct
 
     /// <summary>
@@ -139,7 +131,10 @@ type PostgresActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'Entity
     /// tables and indexes, which is not a question a hot path should be asking.
     /// </summary>
     member _.EnsureQueueAsync(ct: CancellationToken) : Task<Result<bool, StoreError>> =
-        Sql.run context (Sql.one "ActionQueue" ensureQueue queue (fun reader -> Row.bool reader "created")) ct
+        Sql.runProgram
+            context
+            (StoreProgram.queryOne ensureQueue queue (fun reader -> Ok(Row.bool reader "created")))
+            ct
 
     interface IActionQueue<'EntityId, 'Action> with
 
@@ -154,17 +149,19 @@ type PostgresActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'Entity
             // leased the messages, and repeating it leases more while the first batch stays
             // invisible. The dispatcher polls again shortly, which recovers faster.
             let claim =
-                Sql.rows
+                StoreProgram.queryRows
                     claimActions
                     (queue @ [ "batch", Param.Int batch; "lease", Param.Interval lease ])
                     (fun reader ->
-                        Row.string reader "message",
-                        Row.int64 reader "msg_id",
-                        Row.int32 reader "read_ct",
-                        Row.timestamp reader "vt")
+                        Ok(
+                            Row.string reader "message",
+                            Row.int64 reader "msg_id",
+                            Row.int32 reader "read_ct",
+                            Row.timestamp reader "vt"
+                        ))
 
             backgroundTaskResult {
-                let! claimed = Sql.runOnce context claim ct
+                let! claimed = Sql.runProgramOnce context claim ct
 
                 // Decoded once the claim has returned. The first message that does not decode
                 // fails the claim, as before; its lease lapses and it is redelivered.
