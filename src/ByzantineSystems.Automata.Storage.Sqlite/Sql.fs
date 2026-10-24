@@ -16,7 +16,10 @@ open SqlHydra.Query
 /// WAL it pins one snapshot, so a writer that commits between two statements is invisible to
 /// the second. It takes no write lock, so it never makes the writer wait.
 /// </summary>
-type internal ReadSession = { Query: QueryContext }
+type internal ReadSession =
+    { Connection: SqliteConnection
+      Transaction: SqliteTransaction
+      Query: QueryContext }
 
 /// <summary>
 /// What a write sees: the connection, the <c>IMMEDIATE</c> transaction every statement must be
@@ -99,6 +102,17 @@ module internal Sql =
         values |> List.iter (bind cmd)
         cmd
 
+    let private readCommand
+        (session: ReadSession)
+        (statement: Statement)
+        (values: (string * Param) list)
+        : SqliteCommand =
+        let cmd = session.Connection.CreateCommand()
+        cmd.Transaction <- session.Transaction
+        cmd.CommandText <- Statement.text statement
+        values |> List.iter (bind cmd)
+        cmd
+
     /// <summary>The instant this transaction binds as its <c>now</c>, read once before it began.</summary>
     let now: Op<WriteSession, int64> = Op.map (fun session -> session.Now) Op.session
 
@@ -164,6 +178,53 @@ module internal Sql =
             | Some value -> Op.ok value
             | None -> Op.fail (Db.decodeFailure typeName $"%s{Statement.key statement} returned no row"))
 
+    let private readRows
+        (statement: Statement)
+        (values: (string * Param) list)
+        (read: SqliteDataReader -> 'T)
+        : Op<ReadSession, 'T list> =
+        Op.ofDriver (fun session ct ->
+            backgroundTask {
+                use cmd = readCommand session statement values
+                use! reader = cmd.ExecuteReaderAsync ct
+                let! all = Row.all read reader ct
+                return Ok all
+            })
+
+    let private readTryOne
+        (typeName: string)
+        (statement: Statement)
+        (values: (string * Param) list)
+        (read: SqliteDataReader -> 'T)
+        : Op<ReadSession, 'T option> =
+        Op.ofDriver (fun session ct ->
+            backgroundTask {
+                use cmd = readCommand session statement values
+                use! reader = cmd.ExecuteReaderAsync ct
+
+                match! reader.ReadAsync ct with
+                | false -> return Ok None
+                | true ->
+                    let value = read reader
+
+                    match! reader.ReadAsync ct with
+                    | true ->
+                        return
+                            Error(Db.decodeFailure typeName $"%s{Statement.key statement} returned more than one row")
+                    | false -> return Ok(Some value)
+            })
+
+    let private readOne
+        (typeName: string)
+        (statement: Statement)
+        (values: (string * Param) list)
+        (read: SqliteDataReader -> 'T)
+        : Op<ReadSession, 'T> =
+        readTryOne typeName statement values read
+        |> Op.bind (function
+            | Some value -> Op.ok value
+            | None -> Op.fail (Db.decodeFailure typeName $"%s{Statement.key statement} returned no row"))
+
     /// <summary>
     /// A typed read through SqlHydra, against the session's query context. The work must hand
     /// back materialised values, never a lazy sequence, because the connection closes when the
@@ -189,11 +250,18 @@ module internal Sql =
             context.Resilience
             (fun token ->
                 backgroundTask {
-                    let! conn = Db.openConnection context.ReadConnectionString token
+                    use! conn = Db.openConnection context.ReadConnectionString token
                     use query = new QueryContext(conn, SqliteEmitter())
                     use transaction = conn.BeginTransaction(deferred = true)
                     query.Transaction <- Some(transaction :> DbTransaction)
-                    return! Op.run op { Query = query } token
+
+                    return!
+                        Op.run
+                            op
+                            { Connection = conn
+                              Transaction = transaction
+                              Query = query }
+                            token
                 })
             ct
 
@@ -314,11 +382,73 @@ module internal Sql =
 
         List.foldBack prepend rows (Ok [])
 
+    let private readProgramSession
+        (context: SqliteContext)
+        (program: StoreProgram<ReadAccess, (string * Param) list, SqliteDataReader, 'T>)
+        (ct: CancellationToken)
+        =
+        backgroundTask {
+            use! conn = Db.openConnection context.ReadConnectionString ct
+            use query = new QueryContext(conn, SqliteEmitter())
+            use transaction = conn.BeginTransaction(deferred = true)
+            query.Transaction <- Some(transaction :> DbTransaction)
+
+            let session =
+                { Connection = conn
+                  Transaction = transaction
+                  Query = query }
+
+            let interpreter =
+                { new IStoreInterpreter<(string * Param) list, SqliteDataReader> with
+                    member _.ExecuteAsync(key, _, _) =
+                        Task.FromResult(
+                            Error(
+                                StoreError.Unexpected(
+                                    InvalidOperationException(
+                                        $"Read program attempted write instruction '%s{StatementKey.value key}'."
+                                    )
+                                )
+                            )
+                        )
+
+                    member _.QueryOneAsync<'Row>
+                        (key, parameters, read: Read<SqliteDataReader, 'Row>, cancellationToken)
+                        : Task<Result<'Row, StoreError>> =
+                        readOne (StatementKey.value key) (programStatement key) parameters read
+                        |> Op.bind Op.ofResult
+                        |> fun op -> Op.run op session cancellationToken
+
+                    member _.TryQueryOneAsync<'Row>
+                        (key, parameters, read: Read<SqliteDataReader, 'Row>, cancellationToken)
+                        : Task<Result<'Row option, StoreError>> =
+                        readTryOne (StatementKey.value key) (programStatement key) parameters read
+                        |> Op.bind (function
+                            | Some result -> result |> Result.map Some |> Op.ofResult
+                            | None -> Op.ok None)
+                        |> fun op -> Op.run op session cancellationToken
+
+                    member _.QueryRowsAsync<'Row>
+                        (key, parameters, read: Read<SqliteDataReader, 'Row>, cancellationToken)
+                        : Task<Result<'Row list, StoreError>> =
+                        readRows (programStatement key) parameters read
+                        |> Op.bind (sequenceRows >> Op.ofResult)
+                        |> fun op -> Op.run op session cancellationToken }
+
+            return! StoreProgram.run interpreter ct program
+        }
+
+    let readProgram
+        (context: SqliteContext)
+        (program: StoreProgram<ReadAccess, (string * Param) list, SqliteDataReader, 'T>)
+        (ct: CancellationToken)
+        : Task<Result<'T, StoreError>> =
+        Db.protect context.Resilience (readProgramSession context program) ct
+
     let private runWriteProgram
         (protect:
             (CancellationToken -> Task<Result<'T, StoreError>>) -> CancellationToken -> Task<Result<'T, StoreError>>)
         (context: SqliteContext)
-        (program: int64 -> StoreProgram<(string * Param) list, SqliteDataReader, 'T>)
+        (program: int64 -> StoreProgram<WriteAccess, (string * Param) list, SqliteDataReader, 'T>)
         (ct: CancellationToken)
         =
         protect
@@ -366,28 +496,28 @@ module internal Sql =
 
     let writeProgram
         (context: SqliteContext)
-        (program: StoreProgram<(string * Param) list, SqliteDataReader, 'T>)
+        (program: StoreProgram<WriteAccess, (string * Param) list, SqliteDataReader, 'T>)
         (ct: CancellationToken)
         : Task<Result<'T, StoreError>> =
         runWriteProgram (Db.protect context.Resilience) context (fun _ -> program) ct
 
     let writeProgramWith
         (context: SqliteContext)
-        (program: int64 -> StoreProgram<(string * Param) list, SqliteDataReader, 'T>)
+        (program: int64 -> StoreProgram<WriteAccess, (string * Param) list, SqliteDataReader, 'T>)
         (ct: CancellationToken)
         : Task<Result<'T, StoreError>> =
         runWriteProgram (Db.protect context.Resilience) context program ct
 
     let writeProgramOnce
         (context: SqliteContext)
-        (program: StoreProgram<(string * Param) list, SqliteDataReader, 'T>)
+        (program: StoreProgram<WriteAccess, (string * Param) list, SqliteDataReader, 'T>)
         (ct: CancellationToken)
         : Task<Result<'T, StoreError>> =
         runWriteProgram Db.protectOnce context (fun _ -> program) ct
 
     let writeProgramOnceWith
         (context: SqliteContext)
-        (program: int64 -> StoreProgram<(string * Param) list, SqliteDataReader, 'T>)
+        (program: int64 -> StoreProgram<WriteAccess, (string * Param) list, SqliteDataReader, 'T>)
         (ct: CancellationToken)
         : Task<Result<'T, StoreError>> =
         runWriteProgram Db.protectOnce context program ct

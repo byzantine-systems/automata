@@ -30,6 +30,12 @@ module internal StatementKey =
 /// <summary>Decodes one provider row without exposing its representation to a program.</summary>
 type internal Read<'Reader, 'T> = 'Reader -> Result<'T, StoreError>
 
+/// <summary>Capability marker for programs that only observe a session.</summary>
+type internal ReadAccess = private ReadAccess of unit
+
+/// <summary>Capability marker for programs that may change a session.</summary>
+type internal WriteAccess = private WriteAccess of unit
+
 /// <summary>The statement algebra implemented once per provider session.</summary>
 type internal IStoreInterpreter<'Params, 'Reader> =
 
@@ -45,7 +51,7 @@ type internal IStoreInterpreter<'Params, 'Reader> =
         StatementKey * 'Params * Read<'Reader, 'T> * CancellationToken -> Task<Result<'T list, StoreError>>
 
 /// <summary>A cold, provider-generic sequence of store instructions.</summary>
-type internal StoreProgram<'Params, 'Reader, 'T> =
+type internal StoreProgram<'Access, 'Params, 'Reader, 'T> =
     private | StoreProgram of (IStoreInterpreter<'Params, 'Reader> -> CancellationToken -> Task<Result<'T, StoreError>>)
 
 [<RequireQualifiedAccess>]
@@ -54,23 +60,23 @@ module internal StoreProgram =
     let run
         (interpreter: IStoreInterpreter<'Params, 'Reader>)
         (cancellationToken: CancellationToken)
-        (StoreProgram program: StoreProgram<'Params, 'Reader, 'T>)
+        (StoreProgram program: StoreProgram<'Access, 'Params, 'Reader, 'T>)
         : Task<Result<'T, StoreError>> =
         program interpreter cancellationToken
 
-    let ok (value: 'T) : StoreProgram<'Params, 'Reader, 'T> =
+    let ok (value: 'T) : StoreProgram<'Access, 'Params, 'Reader, 'T> =
         StoreProgram(fun _ _ -> Task.FromResult(Ok value))
 
-    let fail (error: StoreError) : StoreProgram<'Params, 'Reader, 'T> =
+    let fail (error: StoreError) : StoreProgram<'Access, 'Params, 'Reader, 'T> =
         StoreProgram(fun _ _ -> Task.FromResult(Error error))
 
-    let ofResult (result: Result<'T, StoreError>) : StoreProgram<'Params, 'Reader, 'T> =
+    let ofResult (result: Result<'T, StoreError>) : StoreProgram<'Access, 'Params, 'Reader, 'T> =
         StoreProgram(fun _ _ -> Task.FromResult result)
 
     let bind
-        (next: 'T -> StoreProgram<'Params, 'Reader, 'U>)
-        (StoreProgram program: StoreProgram<'Params, 'Reader, 'T>)
-        : StoreProgram<'Params, 'Reader, 'U> =
+        (next: 'T -> StoreProgram<'Access, 'Params, 'Reader, 'U>)
+        (StoreProgram program: StoreProgram<'Access, 'Params, 'Reader, 'T>)
+        : StoreProgram<'Access, 'Params, 'Reader, 'U> =
         StoreProgram(fun interpreter cancellationToken ->
             backgroundTask {
                 match! program interpreter cancellationToken with
@@ -78,20 +84,23 @@ module internal StoreProgram =
                 | Error error -> return Error error
             })
 
-    let map (mapping: 'T -> 'U) (program: StoreProgram<'Params, 'Reader, 'T>) : StoreProgram<'Params, 'Reader, 'U> =
+    let map
+        (mapping: 'T -> 'U)
+        (program: StoreProgram<'Access, 'Params, 'Reader, 'T>)
+        : StoreProgram<'Access, 'Params, 'Reader, 'U> =
         bind (mapping >> ok) program
 
-    let executeCount (key: StatementKey) (parameters: 'Params) : StoreProgram<'Params, 'Reader, int> =
+    let executeCount (key: StatementKey) (parameters: 'Params) : StoreProgram<WriteAccess, 'Params, 'Reader, int> =
         StoreProgram(fun interpreter cancellationToken -> interpreter.ExecuteAsync(key, parameters, cancellationToken))
 
-    let executeDiscard (key: StatementKey) (parameters: 'Params) : StoreProgram<'Params, 'Reader, unit> =
+    let executeDiscard (key: StatementKey) (parameters: 'Params) : StoreProgram<WriteAccess, 'Params, 'Reader, unit> =
         executeCount key parameters |> map ignore
 
     let queryOne
         (key: StatementKey)
         (parameters: 'Params)
         (read: Read<'Reader, 'T>)
-        : StoreProgram<'Params, 'Reader, 'T> =
+        : StoreProgram<'Access, 'Params, 'Reader, 'T> =
         StoreProgram(fun interpreter cancellationToken ->
             interpreter.QueryOneAsync(key, parameters, read, cancellationToken))
 
@@ -99,7 +108,7 @@ module internal StoreProgram =
         (key: StatementKey)
         (parameters: 'Params)
         (read: Read<'Reader, 'T>)
-        : StoreProgram<'Params, 'Reader, 'T option> =
+        : StoreProgram<'Access, 'Params, 'Reader, 'T option> =
         StoreProgram(fun interpreter cancellationToken ->
             interpreter.TryQueryOneAsync(key, parameters, read, cancellationToken))
 
@@ -107,35 +116,35 @@ module internal StoreProgram =
         (key: StatementKey)
         (parameters: 'Params)
         (read: Read<'Reader, 'T>)
-        : StoreProgram<'Params, 'Reader, 'T list> =
+        : StoreProgram<'Access, 'Params, 'Reader, 'T list> =
         StoreProgram(fun interpreter cancellationToken ->
             interpreter.QueryRowsAsync(key, parameters, read, cancellationToken))
 
 /// <summary>Computation expression for one sequential store program.</summary>
 type internal StoreProgramBuilder() =
 
-    member _.Return(value: 'T) : StoreProgram<'Params, 'Reader, 'T> = StoreProgram.ok value
+    member _.Return(value: 'T) : StoreProgram<'Access, 'Params, 'Reader, 'T> = StoreProgram.ok value
 
-    member _.ReturnFrom(program: StoreProgram<'Params, 'Reader, 'T>) = program
+    member _.ReturnFrom(program: StoreProgram<'Access, 'Params, 'Reader, 'T>) = program
 
-    member _.Zero() : StoreProgram<'Params, 'Reader, unit> = StoreProgram.ok ()
+    member _.Zero() : StoreProgram<'Access, 'Params, 'Reader, unit> = StoreProgram.ok ()
 
     member _.Bind
-        (program: StoreProgram<'Params, 'Reader, 'T>, next: 'T -> StoreProgram<'Params, 'Reader, 'U>)
-        : StoreProgram<'Params, 'Reader, 'U> =
+        (program: StoreProgram<'Access, 'Params, 'Reader, 'T>, next: 'T -> StoreProgram<'Access, 'Params, 'Reader, 'U>)
+        : StoreProgram<'Access, 'Params, 'Reader, 'U> =
         StoreProgram.bind next program
 
     member _.Bind
-        (result: Result<'T, StoreError>, next: 'T -> StoreProgram<'Params, 'Reader, 'U>)
-        : StoreProgram<'Params, 'Reader, 'U> =
+        (result: Result<'T, StoreError>, next: 'T -> StoreProgram<'Access, 'Params, 'Reader, 'U>)
+        : StoreProgram<'Access, 'Params, 'Reader, 'U> =
         result |> StoreProgram.ofResult |> StoreProgram.bind next
 
-    member _.Delay(body: unit -> StoreProgram<'Params, 'Reader, 'T>) =
+    member _.Delay(body: unit -> StoreProgram<'Access, 'Params, 'Reader, 'T>) =
         StoreProgram(fun interpreter cancellationToken -> StoreProgram.run interpreter cancellationToken (body ()))
 
     member _.Combine
-        (first: StoreProgram<'Params, 'Reader, unit>, next: StoreProgram<'Params, 'Reader, 'T>)
-        : StoreProgram<'Params, 'Reader, 'T> =
+        (first: StoreProgram<'Access, 'Params, 'Reader, unit>, next: StoreProgram<'Access, 'Params, 'Reader, 'T>)
+        : StoreProgram<'Access, 'Params, 'Reader, 'T> =
         first |> StoreProgram.bind (fun () -> next)
 
 [<AutoOpen>]

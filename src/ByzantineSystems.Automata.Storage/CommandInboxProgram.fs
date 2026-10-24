@@ -10,26 +10,26 @@ type internal LeaseUpdateInstruction<'Params, 'Reader> =
 
 /// <summary>Provider-specific evidence and writes for one idempotent submission.</summary>
 type internal SubmitInstruction<'Params, 'Reader> =
-    | AtomicSubmission of StoreProgram<'Params, 'Reader, SubmissionOutcome>
+    | AtomicSubmission of StoreProgram<WriteAccess, 'Params, 'Reader, SubmissionOutcome>
     | CheckedSubmission of
-        existing: StoreProgram<'Params, 'Reader, CommandId option> *
-        registered: StoreProgram<'Params, 'Reader, bool> *
+        existing: StoreProgram<WriteAccess, 'Params, 'Reader, CommandId option> *
+        registered: StoreProgram<WriteAccess, 'Params, 'Reader, bool> *
         unregistered: StoreError *
-        insert: StoreProgram<'Params, 'Reader, CommandId> *
-        correction: (CommandId -> StoreProgram<'Params, 'Reader, unit>) option
+        insert: StoreProgram<WriteAccess, 'Params, 'Reader, CommandId> *
+        correction: (CommandId -> StoreProgram<WriteAccess, 'Params, 'Reader, unit>) option
 
 /// <summary>Provider statements and row evidence for one non-retriable claim.</summary>
 type internal ClaimInstruction<'Params, 'Reader, 'Row, 'Id, 'Correction> =
-    { Claim: StoreProgram<'Params, 'Reader, 'Row list>
+    { Claim: StoreProgram<WriteAccess, 'Params, 'Reader, 'Row list>
       CorrectionId: 'Row -> 'Id option
-      Corrections: 'Id list -> StoreProgram<'Params, 'Reader, 'Correction list> }
+      Corrections: 'Id list -> StoreProgram<WriteAccess, 'Params, 'Reader, 'Correction list> }
 
 [<RequireQualifiedAccess>]
 module internal CommandInboxProgram =
 
     let claim
         (instruction: ClaimInstruction<'Params, 'Reader, 'Row, 'Id, 'Correction>)
-        : StoreProgram<'Params, 'Reader, 'Row list * 'Correction list> =
+        : StoreProgram<WriteAccess, 'Params, 'Reader, 'Row list * 'Correction list> =
         store {
             let! rows = instruction.Claim
 
@@ -40,7 +40,9 @@ module internal CommandInboxProgram =
                 return rows, corrections
         }
 
-    let submit (instruction: SubmitInstruction<'Params, 'Reader>) : StoreProgram<'Params, 'Reader, SubmissionOutcome> =
+    let submit
+        (instruction: SubmitInstruction<'Params, 'Reader>)
+        : StoreProgram<WriteAccess, 'Params, 'Reader, SubmissionOutcome> =
         store {
             match instruction with
             | AtomicSubmission program -> return! program
@@ -62,7 +64,7 @@ module internal CommandInboxProgram =
 
     let leaseUpdate
         (instruction: LeaseUpdateInstruction<'Params, 'Reader>)
-        : StoreProgram<'Params, 'Reader, LeaseUpdateOutcome> =
+        : StoreProgram<WriteAccess, 'Params, 'Reader, LeaseUpdateOutcome> =
         store {
             match instruction with
             | ChangedRows(key, parameters) ->

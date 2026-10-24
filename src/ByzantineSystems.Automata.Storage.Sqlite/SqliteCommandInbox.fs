@@ -253,7 +253,7 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
         (entityId: string)
         (encodedEvent: string)
         (now: int64)
-        : StoreProgram<(string * Param) list, SqliteDataReader, SubmissionOutcome> =
+        : StoreProgram<WriteAccess, (string * Param) list, SqliteDataReader, SubmissionOutcome> =
         let machineId = MachineId.value submission.MachineId
         let version = ChartVersion.value submission.ChartVersion
 

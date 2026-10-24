@@ -184,7 +184,7 @@ module internal Sql =
     /// <summary>One pooled connection for the whole unit; the query context closes it.</summary>
     let private session (dataSource: NpgsqlDataSource) (op: Op<PgSession, 'T>) (ct: CancellationToken) =
         backgroundTask {
-            let! conn = dataSource.OpenConnectionAsync(ct).AsTask()
+            use! conn = dataSource.OpenConnectionAsync(ct).AsTask()
             use query = new QueryContext(conn, PostgresEmitter())
             return! Op.run op { Connection = conn; Query = query } ct
         }
@@ -240,11 +240,11 @@ module internal Sql =
 
     let private programSession
         (dataSource: NpgsqlDataSource)
-        (program: StoreProgram<(string * Param) list, NpgsqlDataReader, 'T>)
+        (program: StoreProgram<'Access, (string * Param) list, NpgsqlDataReader, 'T>)
         (ct: CancellationToken)
         =
         backgroundTask {
-            let! conn = dataSource.OpenConnectionAsync(ct).AsTask()
+            use! conn = dataSource.OpenConnectionAsync(ct).AsTask()
             use query = new QueryContext(conn, PostgresEmitter())
             let session = { Connection = conn; Query = query }
 
@@ -281,21 +281,28 @@ module internal Sql =
 
     let runProgram
         (context: PostgresContext)
-        (program: StoreProgram<(string * Param) list, NpgsqlDataReader, 'T>)
+        (program: StoreProgram<WriteAccess, (string * Param) list, NpgsqlDataReader, 'T>)
+        (ct: CancellationToken)
+        : Task<Result<'T, StoreError>> =
+        Db.protect context.Resilience (programSession context.DataSource program) ct
+
+    let readProgram
+        (context: PostgresContext)
+        (program: StoreProgram<ReadAccess, (string * Param) list, NpgsqlDataReader, 'T>)
         (ct: CancellationToken)
         : Task<Result<'T, StoreError>> =
         Db.protect context.Resilience (programSession context.DataSource program) ct
 
     let attemptProgram
         (context: PostgresContext)
-        (program: StoreProgram<(string * Param) list, NpgsqlDataReader, 'T>)
+        (program: StoreProgram<WriteAccess, (string * Param) list, NpgsqlDataReader, 'T>)
         (ct: CancellationToken)
         : Task<Db.Attempt<'T>> =
         Db.attempt context.Resilience (programSession context.DataSource program) ct
 
     let runProgramOnce
         (context: PostgresContext)
-        (program: StoreProgram<(string * Param) list, NpgsqlDataReader, 'T>)
+        (program: StoreProgram<WriteAccess, (string * Param) list, NpgsqlDataReader, 'T>)
         (ct: CancellationToken)
         : Task<Result<'T, StoreError>> =
         Db.protectOnce (programSession context.DataSource program) ct
