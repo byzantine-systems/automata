@@ -21,13 +21,11 @@ type MachineId = private MachineId of string
 type EntityId<'entity> = private EntityId of string
 
 /// <summary>
-/// A hash of a chart's structure: the node graph, the terminal and initial-child markers, and
-/// the kind of every rule, in the order the rules were declared. Rendered as 64 lowercase hex
-/// digits.
+/// A hash of a chart's canonical declaration: the node graph, terminal and initial-child markers,
+/// and normalized rule and condition syntax. Rendered as 64 lowercase hex digits.
 ///
-/// This is a tripwire, not a proof of equivalence: guards, transforms, entry and exit actions and
-/// the classifier are closures, and nothing can see inside them. It catches a chart edited
-/// without a version bump; it cannot catch a behaviour change that leaves the structure alone.
+/// This is a tripwire, not a proof of equivalence: transforms, predicate delegates, entry and exit
+/// actions, and the classifier remain opaque. It cannot catch behavior changes outside the syntax.
 /// </summary>
 [<Struct>]
 type ChartFingerprint = private ChartFingerprint of string

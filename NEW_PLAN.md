@@ -172,17 +172,25 @@ The trace observation A2 used internally becomes public, with its honesty stated
 ```fsharp
 module ChartEquivalence =
     /// One observable step: what the outside can see of a resolution.
-    type Step = { Leaf: StateId; Terminal: bool; Actions: obj list }
-    /// Runs an event sequence, observing (leaf, terminal, actions) per step.
-    val trace : Chart<'S,'E,'A,'Err> -> 'S -> 'E list -> Step list
+    type Step<'A> = { Leaf: StateId; Terminal: bool; Actions: 'A list }
+    /// The successful prefix and first failure of a trace.
+    type TraceFailure<'A,'Err> = { Steps: Step<'A> list; Error: TransitionError<'Err> }
+    /// Runs an event sequence, stopping at the first typed resolution failure.
+    val trace : Chart<'S,'E,'A,'Err> -> 'S -> 'E list -> Result<Step<'A> list, TraceFailure<'A,'Err>>
     /// Trace equality over a caller-supplied suite of event sequences. Samples, never proves.
-    val equivalentOn : 'E list list -> Chart<'S,'E,'A,'Err> * 'S -> Chart<'S,'E,'A,'Err> * 'S -> bool
+    val equivalentOn :
+        ('A -> 'A -> bool) ->
+        (TransitionError<'Err> -> TransitionError<'Err> -> bool) ->
+        'E list list ->
+        Chart<'S,'E,'A,'Err> * 'S ->
+        Chart<'S,'E,'A,'Err> * 'S -> bool
     /// Exact equality of canonical declared syntax; not behavioral equivalence.
     val declaredEquivalent : Chart<'S,'E,'A,'Err> -> Chart<'S,'E,'A,'Err> -> bool
 ```
 
-- The observation is deliberately **not** `'State` equality: two states that classify to the same leaf are observationally equal, so the trace compares leaves, terminal flags and actions. Representation does not leak.
-- `equivalentOn` documents that a finite suite is evidence, not proof. `declaredEquivalent` compares canonical syntax only; predicate delegates and transforms remain outside it.
+- The observation is deliberately **not** `'State` equality: two states that classify to the same leaf are observationally equal, so the trace compares leaves, terminal flags and typed actions. Representation does not leak.
+- A trace returns its successful prefix with the first typed failure. `equivalentOn` takes action and error equality explicitly, avoiding equality constraints on domain types.
+- `equivalentOn` documents that a finite suite is evidence, not proof. `declaredEquivalent` compares canonical syntax directly rather than relying on hash equality; predicate delegates and transforms remain outside it.
 - Minimization of charts is **considered and not adopted**: the trace algebra makes it possible later, and nothing today needs it.
 - `docs/public-api.md` records the addition.
 

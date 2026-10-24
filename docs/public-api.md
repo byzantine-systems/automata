@@ -26,6 +26,8 @@ The lower-level `Rule` module keeps the closure constructors and adds `transitio
 
 **The fingerprint describes declared syntax, not behavior.** Predicate delegates, transforms, entry and exit actions, and classifiers remain opaque. Reusing a predicate name for different behavior is a broken caller contract, and replay correctness still requires a new `ChartVersion` for any behavior change.
 
+`ChartEquivalence.trace` runs an event sequence and observes each successful resolution as a typed action list, classified leaf, and terminal flag. It stops at the first typed `TransitionError` and returns that error with the successful prefix. `equivalentOn` compares traces over caller-supplied samples and explicit action/error equality functions; finite samples are evidence, never proof. `declaredEquivalent` compares canonical declarations directly, ignoring sibling order and opaque callbacks. Declaration equality and sampled behavioral agreement are intentionally separate questions.
+
 ## Runtime
 
 The `machine` computation expression creates a `Machine<'EntityId,'State,'Event,'Action,'Err>` from a machine id and declarations. A chart, a declared `chartVersion`, an initial state and an `IMachineStore` are required; `processor`, `onTransition`, `logger` and `timeProvider` are optional, and the builder returns every `MachineConfigError` at once rather than the first. The action queue is not declared here: the store owns it, so it is named once, where it is created.
