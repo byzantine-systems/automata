@@ -25,9 +25,16 @@ let private failed<'T> (failureAt: StatementKey option) (key: StatementKey) : Ta
         Some(Task.FromResult(Error(StoreError.Unexpected(InvalidOperationException(StatementKey.value key)))))
     | _ -> None
 
-type private RecordingInterpreter(rows: Map<string, string> list, ?failureAt: StatementKey, ?changedRows: int) =
+type private RecordingInterpreter
+    (
+        rows: Map<string, string> list,
+        ?failureAt: StatementKey,
+        ?changedRows: int,
+        ?queryBatches: Map<string, string> list list
+    ) =
     let instructions = ResizeArray<Instruction>()
     let mutable remaining = rows
+    let mutable remainingBatches = defaultArg queryBatches [ rows ]
 
     member _.Instructions = instructions |> Seq.toList
 
@@ -88,10 +95,17 @@ type private RecordingInterpreter(rows: Map<string, string> list, ?failureAt: St
                 match failed<'T list> failureAt key with
                 | Some failure -> failure
                 | None ->
+                    let batch =
+                        match remainingBatches with
+                        | batch :: rest ->
+                            remainingBatches <- rest
+                            batch
+                        | [] -> []
+
                     let result =
                         List.foldBack
                             (fun row values -> Result.map2 (fun head tail -> head :: tail) (read row) values)
-                            remaining
+                            batch
                             (Ok [])
 
                     remaining <- []
@@ -266,4 +280,46 @@ let tests =
                   interpreter.Instructions
                   [ Execute first; QueryOne second; Execute third ]
                   "registration, insert, and correction detail writes stay sequential"
+          }
+
+          testTask "claims skip correction reads for event batches" {
+              let row = Map [ "kind", "event"; "id", "1" ]
+              let interpreter = RecordingInterpreter([ row ])
+
+              let program =
+                  CommandInboxProgram.claim
+                      { Claim = StoreProgram.queryRows first parameters Ok
+                        CorrectionId =
+                          (fun row ->
+                              if Map.find "kind" row = "correction" then
+                                  Some(Map.find "id" row)
+                              else
+                                  None)
+                        Corrections = (fun _ -> StoreProgram.fail (StoreError.NotFound "should not query")) }
+
+              let! result = StoreProgram.run interpreter CancellationToken.None program
+
+              Expect.equal result (Ok([ row ], [])) "event-only batches need no details"
+              Expect.equal interpreter.Instructions [ QueryRows first ] "only the claim statement runs"
+          }
+
+          testTask "claims fetch correction details after claimed rows" {
+              let row = Map [ "kind", "correction"; "id", "7" ]
+              let detail = Map [ "id", "7"; "policy", "fail" ]
+              let interpreter = RecordingInterpreter([], queryBatches = [ [ row ]; [ detail ] ])
+
+              let program =
+                  CommandInboxProgram.claim
+                      { Claim = StoreProgram.queryRows first parameters Ok
+                        CorrectionId = (fun row -> Some(Map.find "id" row))
+                        Corrections = (fun _ -> StoreProgram.queryRows second parameters Ok) }
+
+              let! result = StoreProgram.run interpreter CancellationToken.None program
+
+              Expect.equal result (Ok([ row ], [ detail ])) "details stay paired with the claim"
+
+              Expect.equal
+                  interpreter.Instructions
+                  [ QueryRows first; QueryRows second ]
+                  "claim and correction reads remain sequential"
           } ]

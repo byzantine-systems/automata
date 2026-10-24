@@ -52,6 +52,7 @@ type internal Param =
     | Timestamp of DateTimeOffset
     | Jsonb of string
     | TextArray of string list
+    | BigintArray of int64 list
     | TextOrNull of string option
     | JsonbOrNull of string option
     | TimestampOrNull of DateTimeOffset option
@@ -93,6 +94,7 @@ module internal Sql =
             | Param.Timestamp value -> NpgsqlDbType.TimestampTz, box (Db.timestamp value)
             | Param.Jsonb value -> NpgsqlDbType.Jsonb, text name value
             | Param.TextArray values -> NpgsqlDbType.Array ||| NpgsqlDbType.Text, array name values
+            | Param.BigintArray values -> NpgsqlDbType.Array ||| NpgsqlDbType.Bigint, box (List.toArray values)
             | Param.TextOrNull value -> NpgsqlDbType.Text, orNull (text name) value
             | Param.JsonbOrNull value -> NpgsqlDbType.Jsonb, orNull (text name) value
             | Param.TimestampOrNull value -> NpgsqlDbType.TimestampTz, orNull (Db.timestamp >> box) value

@@ -115,16 +115,18 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
 
     let context = options.Context
 
-    let nextToken = Statement.load "system" "next_token"
-    let claimCommands = Statement.load "command" "claim"
-    let correctionsOf = Statement.load "command" "corrections"
-
     let findByKey = StatementKey.create "command" "find_by_key" |> Sql.prepareProgram
     let chartByVersion = StatementKey.create "chart" "by_version" |> Sql.prepareProgram
     let submitCommand = StatementKey.create "command" "submit" |> Sql.prepareProgram
 
     let submitCorrection =
         StatementKey.create "command" "submit_correction" |> Sql.prepareProgram
+
+    let nextToken = StatementKey.create "system" "next_token" |> Sql.prepareProgram
+    let claimCommands = StatementKey.create "command" "claim" |> Sql.prepareProgram
+
+    let correctionsOf =
+        StatementKey.create "command" "corrections" |> Sql.prepareProgram
 
     let rescheduleCommand =
         StatementKey.create "command" "reschedule" |> Sql.prepareProgram
@@ -325,36 +327,36 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
 
     /// The lease token, the claimed rows and their correction details, all in the claim's own
     /// transaction. Decoding waits until it has committed.
-    let claim (machineId: MachineId) (batch: int) (lease: TimeSpan) =
-        sqliteWrite {
-            let! now = Sql.now
-            let! token = Sql.one "LeaseToken" nextToken [] (fun reader -> Row.int64 reader "value")
+    let claim (machineId: MachineId) (batch: int) (lease: TimeSpan) (now: int64) =
+        let token =
+            StoreProgram.queryOne nextToken [] (fun reader -> Ok(Row.int64 reader "value"))
 
-            let! rows =
-                Sql.rows
-                    claimCommands
-                    [ "@machine_id", Param.Text(MachineId.value machineId)
-                      "@batch", Param.Integer(int64 batch)
-                      "@now", Param.Integer now
-                      "@deadline", Param.Integer(Instant.add now lease)
-                      "@lease_token", Param.Integer token ]
-                    CommandMapping.commandRow
+        store {
+            let! token = token
 
-            let corrections =
-                rows
-                |> List.filter (fun row -> row.kind = "correction")
-                |> List.map _.command_id
-
-            match corrections with
-            | [] -> return rows, Map.empty
-            | ids ->
-                let! details =
-                    Sql.rows
-                        correctionsOf
-                        [ "@ids", Param.Text(JsonSerializer.Serialize ids) ]
-                        CommandMapping.correctionRow
-
-                return rows, details |> List.map (fun d -> d.command_id, d) |> Map.ofList
+            return!
+                CommandInboxProgram.claim
+                    { Claim =
+                        StoreProgram.queryRows
+                            claimCommands
+                            [ "@machine_id", Param.Text(MachineId.value machineId)
+                              "@batch", Param.Integer(int64 batch)
+                              "@now", Param.Integer now
+                              "@deadline", Param.Integer(Instant.add now lease)
+                              "@lease_token", Param.Integer token ]
+                            (CommandMapping.commandRow >> Ok)
+                      CorrectionId =
+                        (fun row ->
+                            if row.kind = "correction" then
+                                Some row.command_id
+                            else
+                                None)
+                      Corrections =
+                        (fun ids ->
+                            StoreProgram.queryRows
+                                correctionsOf
+                                [ "@ids", Param.Text(JsonSerializer.Serialize ids) ]
+                                (CommandMapping.correctionRow >> Ok)) }
         }
 
     interface ICommandInbox<'EntityId, 'Event> with
@@ -380,7 +382,11 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
             // while the first stays invisible until its lease lapses. The worker polls again in a
             // moment, which recovers sooner than a retry would.
             backgroundTaskResult {
-                let! rows, corrections = Sql.writeOnce context (claim machineId batch lease) ct
+                let! rows, details = Sql.writeProgramOnceWith context (claim machineId batch lease) ct
+
+                let corrections =
+                    details |> List.map (fun detail -> detail.command_id, detail) |> Map.ofList
+
                 return! rows |> List.traverseResultM (toLeased corrections)
             }
 

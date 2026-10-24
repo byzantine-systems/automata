@@ -81,12 +81,15 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
 
     let context = options.Context
 
-    let claimCommands = Statement.load "command" "claim"
-
     let submitCommand = StatementKey.create "command" "submit" |> Sql.prepareProgram
 
     let submitCorrection =
         StatementKey.create "command" "submit_correction" |> Sql.prepareProgram
+
+    let claimCommands = StatementKey.create "command" "claim" |> Sql.prepareProgram
+
+    let correctionsOf =
+        StatementKey.create "command" "corrections" |> Sql.prepareProgram
 
     let rescheduleCommand =
         StatementKey.create "command" "reschedule" |> Sql.prepareProgram
@@ -192,6 +195,13 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
           correlation_id = Row.string reader "correlation_id"
           causation_id = Row.string reader "causation_id" }
 
+    let correctionRow (reader: NpgsqlDataReader) : Result<fsm.command_correction, StoreError> =
+        Ok
+            { command_id = Row.int64 reader "command_id"
+              effective_at = reader.GetDateTime(reader.GetOrdinal "effective_at")
+              on_divergence = Row.string reader "on_divergence"
+              replay_limit = Row.int32 reader "replay_limit" }
+
     /// A claimed row carries its own lease: the token that fences it, the delivery count, and the
     /// deadline the database assigned. visible_at means the lease deadline while a command is
     /// leased, which is the one place that dual reading of the column surfaces in F#.
@@ -213,26 +223,6 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
         match rows with
         | Some row -> toRecord row |> Result.map Some
         | None -> Ok None
-
-    /// The details of whichever claimed commands are corrections, in one query. Most claims have
-    /// none, and ask nothing.
-    let correctionsOf (rows: fsm.command list) (context: QueryContext) (token: CancellationToken) =
-        let ids =
-            rows
-            |> List.filter (fun row -> row.kind = "correction")
-            |> List.map _.command_id
-
-        match ids with
-        | [] -> Task.FromResult Map.empty
-        | ids ->
-            selectTask context {
-                for d in fsm.command_correction do
-                    where (d.command_id |=| ids)
-                    select d
-                    toList
-                    cancel token
-            }
-            |> Task.map (List.map (fun d -> d.command_id, d) >> Map.ofList)
 
     let findExisting
         (machineId: MachineId)
@@ -365,18 +355,31 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
             // leases a second one while the first stays invisible until its lease lapses. The
             // worker polls again in a moment, which recovers sooner than a retry would.
             let claim =
-                Sql.rows
+                StoreProgram.queryRows
                     claimCommands
                     [ "machine_id", Param.Text(MachineId.value machineId)
                       "batch", Param.Int batch
                       "lease", Param.Interval lease ]
-                    commandRow
+                    (commandRow >> Ok)
 
-            // The claim has already leased its rows, so reading their correction details is an
-            // ordinary read and may be retried like one.
+            let program =
+                CommandInboxProgram.claim
+                    { Claim = claim
+                      CorrectionId =
+                        (fun row ->
+                            if row.kind = "correction" then
+                                Some row.command_id
+                            else
+                                None)
+                      Corrections =
+                        (fun ids -> StoreProgram.queryRows correctionsOf [ "ids", Param.BigintArray ids ] correctionRow) }
+
             backgroundTaskResult {
-                let! rows = Sql.runOnce context claim ct
-                let! corrections = Sql.run context (Sql.select (correctionsOf rows)) ct
+                let! rows, details = Sql.runProgramOnce context program ct
+
+                let corrections =
+                    details |> List.map (fun detail -> detail.command_id, detail) |> Map.ofList
+
                 return! rows |> List.traverseResultM (toLeased corrections)
             }
 

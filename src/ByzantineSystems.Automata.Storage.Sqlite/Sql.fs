@@ -384,3 +384,10 @@ module internal Sql =
         (ct: CancellationToken)
         : Task<Result<'T, StoreError>> =
         runWriteProgram Db.protectOnce context (fun _ -> program) ct
+
+    let writeProgramOnceWith
+        (context: SqliteContext)
+        (program: int64 -> StoreProgram<(string * Param) list, SqliteDataReader, 'T>)
+        (ct: CancellationToken)
+        : Task<Result<'T, StoreError>> =
+        runWriteProgram Db.protectOnce context program ct
