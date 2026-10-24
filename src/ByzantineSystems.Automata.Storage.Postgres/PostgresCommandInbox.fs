@@ -84,8 +84,11 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
     let submitCommand = Statement.load "command" "submit"
     let submitCorrection = Statement.load "command" "submit_correction"
     let claimCommands = Statement.load "command" "claim"
-    let rescheduleCommand = Statement.load "command" "reschedule"
-    let extendLease = Statement.load "command" "extend_lease"
+
+    let rescheduleCommand =
+        StatementKey.create "command" "reschedule" |> Sql.prepareProgram
+
+    let extendLease = StatementKey.create "command" "extend_lease" |> Sql.prepareProgram
 
     /// The schema stores the empty string for an unsupplied audit field.
     let optional (value: string) : string option = if value = "" then None else Some value
@@ -300,14 +303,14 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
             else
                 AlreadySubmitted commandId)
 
-    /// What a fenced lease routine answers: whether the caller still held the lease.
-    let leaseOutcome (statement: Statement) (values: (string * Param) list) =
-        postgres {
-            let! outcome =
-                Sql.one (nameof LeaseUpdateOutcome) statement values (fun reader -> Row.string reader "outcome")
-
-            return! CommandMapping.outcomeFromString outcome
-        }
+    let leaseUpdate statement values =
+        CommandInboxProgram.leaseUpdate (
+            ReturnedOutcome(
+                statement,
+                values,
+                fun reader -> Row.string reader "outcome" |> CommandMapping.outcomeFromString
+            )
+        )
 
     interface ICommandInbox<'EntityId, 'Event> with
 
@@ -373,9 +376,9 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
             }
 
         member _.Reschedule(commandId, leaseToken, backoff, ct) =
-            Sql.run
+            Sql.runProgram
                 context
-                (leaseOutcome
+                (leaseUpdate
                     rescheduleCommand
                     [ "command_id", Param.Bigint(CommandId.value commandId)
                       "lease_token", Param.Bigint(LeaseToken.value leaseToken)
@@ -387,9 +390,9 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
             if lease <= TimeSpan.Zero then
                 invalidArg (nameof lease) "A lease must be a positive duration."
 
-            Sql.run
+            Sql.runProgram
                 context
-                (leaseOutcome
+                (leaseUpdate
                     extendLease
                     [ "command_id", Param.Bigint(CommandId.value commandId)
                       "lease_token", Param.Bigint(LeaseToken.value leaseToken)

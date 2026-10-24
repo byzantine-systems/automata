@@ -22,6 +22,11 @@ module internal StatementKey =
 
     let value (StatementKey value) = value
 
+    let parts (StatementKey value) =
+        match value.Split('/', 2) with
+        | [| domain; operation |] -> domain, operation
+        | _ -> invalidOp $"Invalid statement key '%s{value}'."
+
 /// <summary>Decodes one provider row without exposing its representation to a program.</summary>
 type internal Read<'Reader, 'T> = 'Reader -> Result<'T, StoreError>
 

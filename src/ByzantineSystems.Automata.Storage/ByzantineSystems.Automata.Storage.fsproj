@@ -24,6 +24,7 @@
         <Compile Include="Op.fs" />
         <!-- Provider-generic store programs interpreted over each provider's row and parameter types. -->
         <Compile Include="StoreProgram.fs" />
+        <Compile Include="CommandInboxProgram.fs" />
         <!-- How a leased command ends, shared by the bundled providers' finalize paths. -->
         <Compile Include="Finalize.fs" />
     </ItemGroup>

@@ -122,8 +122,11 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
     let nextToken = Statement.load "system" "next_token"
     let claimCommands = Statement.load "command" "claim"
     let correctionsOf = Statement.load "command" "corrections"
-    let rescheduleCommand = Statement.load "command" "reschedule"
-    let extendLease = Statement.load "command" "extend_lease"
+
+    let rescheduleCommand =
+        StatementKey.create "command" "reschedule" |> Sql.prepareProgram
+
+    let extendLease = StatementKey.create "command" "extend_lease" |> Sql.prepareProgram
 
     /// What the command asks for. A correction's details live beside it, and one missing is a
     /// correction half-written, which the submission's single transaction makes impossible.
@@ -392,42 +395,36 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
             }
 
         member _.Reschedule(commandId, leaseToken, backoff, ct) =
-            Sql.write
+            Sql.writeProgramWith
                 context
-                (sqliteWrite {
-                    let! now = Sql.now
-
-                    let! changed =
-                        Sql.execute
-                            rescheduleCommand
+                (fun now ->
+                    CommandInboxProgram.leaseUpdate (
+                        ChangedRows(
+                            rescheduleCommand,
                             [ "@command_id", Param.Integer(CommandId.value commandId)
                               "@lease_token", Param.Integer(LeaseToken.value leaseToken)
                               "@now", Param.Integer now
                               "@base_us", Param.Integer(CommandMapping.micros (Backoff.baseDelay backoff))
                               "@cap_us", Param.Integer(CommandMapping.micros (Backoff.ceiling backoff)) ]
-
-                    return CommandMapping.leaseOutcome changed
-                })
+                        )
+                    ))
                 ct
 
         member _.ExtendLease(commandId, leaseToken, lease, ct) =
             if lease <= TimeSpan.Zero then
                 invalidArg (nameof lease) "A lease must be a positive duration."
 
-            Sql.write
+            Sql.writeProgramWith
                 context
-                (sqliteWrite {
-                    let! now = Sql.now
-
-                    let! changed =
-                        Sql.execute
-                            extendLease
+                (fun now ->
+                    CommandInboxProgram.leaseUpdate (
+                        ChangedRows(
+                            extendLease,
                             [ "@command_id", Param.Integer(CommandId.value commandId)
                               "@lease_token", Param.Integer(LeaseToken.value leaseToken)
                               "@deadline", Param.Integer(Instant.add now lease) ]
-
-                    return CommandMapping.leaseOutcome changed
-                })
+                        )
+                    ))
                 ct
 
         member _.TryGet(commandId, ct) =

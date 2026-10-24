@@ -5,6 +5,7 @@ open System.Collections.Generic
 open System.Threading
 open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
+open ByzantineSystems.Automata.Storage
 open ByzantineSystems.Automata.Storage.Internal
 open Expecto
 open FsToolkit.ErrorHandling
@@ -24,7 +25,7 @@ let private failed<'T> (failureAt: StatementKey option) (key: StatementKey) : Ta
         Some(Task.FromResult(Error(StoreError.Unexpected(InvalidOperationException(StatementKey.value key)))))
     | _ -> None
 
-type private RecordingInterpreter(rows: Map<string, string> list, ?failureAt: StatementKey) =
+type private RecordingInterpreter(rows: Map<string, string> list, ?failureAt: StatementKey, ?changedRows: int) =
     let instructions = ResizeArray<Instruction>()
     let mutable remaining = rows
 
@@ -38,7 +39,7 @@ type private RecordingInterpreter(rows: Map<string, string> list, ?failureAt: St
                 canceled cancellationToken
             else
                 failed<int> failureAt key
-                |> Option.defaultWith (fun () -> Task.FromResult(Ok 1))
+                |> Option.defaultWith (fun () -> Task.FromResult(Ok(defaultArg changedRows 1)))
 
         member _.QueryOneAsync<'T>(key, _, read, cancellationToken) =
             instructions.Add(QueryOne key)
@@ -104,6 +105,12 @@ let private readValue row =
     row
     |> Map.tryFind "value"
     |> Result.requireSome (StoreError.Serialization("value", InvalidOperationException("missing")))
+
+let private readLeaseOutcome row =
+    match Map.tryFind "outcome" row with
+    | Some "updated" -> Ok LeaseUpdateOutcome.Updated
+    | Some "lease_lost" -> Ok LeaseUpdateOutcome.LeaseLost
+    | value -> Error(StoreError.Serialization("outcome", InvalidOperationException($"%A{value}")))
 
 let tests =
     testList
@@ -179,4 +186,28 @@ let tests =
 
               Expect.isTrue canceled "the program remains canceled"
               Expect.equal interpreter.Instructions [ Execute first ] "the instruction observes caller cancellation"
+          }
+
+          testTask "lease updates normalize affected-row evidence" {
+              let updated = RecordingInterpreter([], changedRows = 1)
+              let lost = RecordingInterpreter([], changedRows = 0)
+              let program = CommandInboxProgram.leaseUpdate (ChangedRows(first, parameters))
+
+              let! updatedResult = StoreProgram.run updated CancellationToken.None program
+              let! lostResult = StoreProgram.run lost CancellationToken.None program
+
+              Expect.equal updatedResult (Ok LeaseUpdateOutcome.Updated) "one changed row retains the lease"
+              Expect.equal lostResult (Ok LeaseUpdateOutcome.LeaseLost) "no changed row loses the lease"
+          }
+
+          testTask "lease updates preserve returned outcome evidence" {
+              let interpreter = RecordingInterpreter([ Map [ "outcome", "lease_lost" ] ])
+
+              let program =
+                  CommandInboxProgram.leaseUpdate (ReturnedOutcome(first, parameters, readLeaseOutcome))
+
+              let! result = StoreProgram.run interpreter CancellationToken.None program
+
+              Expect.equal result (Ok LeaseUpdateOutcome.LeaseLost) "the returned outcome is authoritative"
+              Expect.equal interpreter.Instructions [ QueryOne first ] "returned evidence uses one query"
           } ]

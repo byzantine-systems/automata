@@ -1,6 +1,7 @@
 namespace ByzantineSystems.Automata.Storage.Sqlite
 
 open System
+open System.Collections.Concurrent
 open System.Data.Common
 open System.Threading
 open System.Threading.Tasks
@@ -289,3 +290,97 @@ module internal Sql =
         (ct: CancellationToken)
         : Task<Result<'T, StoreError>> =
         writeWith Db.protectOnce context op ct
+
+    let private programStatements = ConcurrentDictionary<StatementKey, Statement>()
+
+    let private programStatement key =
+        programStatements.GetOrAdd(
+            key,
+            fun key ->
+                let domain, operation = StatementKey.parts key
+                Statement.load domain operation
+        )
+
+    let prepareProgram (key: StatementKey) =
+        programStatement key |> ignore
+        key
+
+    let private sequenceRows rows =
+        let prepend row values =
+            match row, values with
+            | Ok head, Ok tail -> Ok(head :: tail)
+            | Error error, _
+            | _, Error error -> Error error
+
+        List.foldBack prepend rows (Ok [])
+
+    let private runWriteProgram
+        (protect:
+            (CancellationToken -> Task<Result<'T, StoreError>>) -> CancellationToken -> Task<Result<'T, StoreError>>)
+        (context: SqliteContext)
+        (program: int64 -> StoreProgram<(string * Param) list, SqliteDataReader, 'T>)
+        (ct: CancellationToken)
+        =
+        protect
+            (fun token ->
+                writeTransaction
+                    context.ConnectionString
+                    context.Clock
+                    (fun conn transaction now cancellationToken ->
+                        let session =
+                            { Connection = conn
+                              Transaction = transaction
+                              Now = now }
+
+                        let interpreter =
+                            { new IStoreInterpreter<(string * Param) list, SqliteDataReader> with
+                                member _.ExecuteAsync(key, parameters, cancel) =
+                                    Op.run (execute (programStatement key) parameters) session cancel
+
+                                member _.QueryOneAsync<'Row>
+                                    (key, parameters, read: Read<SqliteDataReader, 'Row>, cancel)
+                                    : Task<Result<'Row, StoreError>> =
+                                    one (StatementKey.value key) (programStatement key) parameters read
+                                    |> Op.bind Op.ofResult
+                                    |> fun op -> Op.run op session cancel
+
+                                member _.TryQueryOneAsync<'Row>
+                                    (key, parameters, read: Read<SqliteDataReader, 'Row>, cancel)
+                                    : Task<Result<'Row option, StoreError>> =
+                                    tryOne (StatementKey.value key) (programStatement key) parameters read
+                                    |> Op.bind (function
+                                        | Some result -> result |> Result.map Some |> Op.ofResult
+                                        | None -> Op.ok None)
+                                    |> fun op -> Op.run op session cancel
+
+                                member _.QueryRowsAsync<'Row>
+                                    (key, parameters, read: Read<SqliteDataReader, 'Row>, cancel)
+                                    : Task<Result<'Row list, StoreError>> =
+                                    rows (programStatement key) parameters read
+                                    |> Op.bind (sequenceRows >> Op.ofResult)
+                                    |> fun op -> Op.run op session cancel }
+
+                        StoreProgram.run interpreter cancellationToken (program now))
+                    token)
+            ct
+
+    let writeProgram
+        (context: SqliteContext)
+        (program: StoreProgram<(string * Param) list, SqliteDataReader, 'T>)
+        (ct: CancellationToken)
+        : Task<Result<'T, StoreError>> =
+        runWriteProgram (Db.protect context.Resilience) context (fun _ -> program) ct
+
+    let writeProgramWith
+        (context: SqliteContext)
+        (program: int64 -> StoreProgram<(string * Param) list, SqliteDataReader, 'T>)
+        (ct: CancellationToken)
+        : Task<Result<'T, StoreError>> =
+        runWriteProgram (Db.protect context.Resilience) context program ct
+
+    let writeProgramOnce
+        (context: SqliteContext)
+        (program: StoreProgram<(string * Param) list, SqliteDataReader, 'T>)
+        (ct: CancellationToken)
+        : Task<Result<'T, StoreError>> =
+        runWriteProgram Db.protectOnce context (fun _ -> program) ct

@@ -1,6 +1,7 @@
 namespace ByzantineSystems.Automata.Storage.Postgres
 
 open System
+open System.Collections.Concurrent
 open System.Threading
 open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
@@ -211,3 +212,81 @@ module internal Sql =
         (ct: CancellationToken)
         : Task<Result<'T, StoreError>> =
         Db.protectOnce (session context.DataSource op) ct
+
+    let private programStatements = ConcurrentDictionary<StatementKey, Statement>()
+
+    let private programStatement key =
+        programStatements.GetOrAdd(
+            key,
+            fun key ->
+                let domain, operation = StatementKey.parts key
+                Statement.load domain operation
+        )
+
+    let prepareProgram (key: StatementKey) =
+        programStatement key |> ignore
+        key
+
+    let private sequenceRows rows =
+        let prepend row values =
+            match row, values with
+            | Ok head, Ok tail -> Ok(head :: tail)
+            | Error error, _
+            | _, Error error -> Error error
+
+        List.foldBack prepend rows (Ok [])
+
+    let private programSession
+        (dataSource: NpgsqlDataSource)
+        (program: StoreProgram<(string * Param) list, NpgsqlDataReader, 'T>)
+        (ct: CancellationToken)
+        =
+        backgroundTask {
+            let! conn = dataSource.OpenConnectionAsync(ct).AsTask()
+            use query = new QueryContext(conn, PostgresEmitter())
+            let session = { Connection = conn; Query = query }
+
+            let interpreter =
+                { new IStoreInterpreter<(string * Param) list, NpgsqlDataReader> with
+                    member _.ExecuteAsync(key, parameters, cancellationToken) =
+                        Op.run (execute (programStatement key) parameters) session cancellationToken
+
+                    member _.QueryOneAsync<'Row>
+                        (key, parameters, read: Read<NpgsqlDataReader, 'Row>, cancellationToken)
+                        : Task<Result<'Row, StoreError>> =
+                        one (StatementKey.value key) (programStatement key) parameters read
+                        |> Op.bind Op.ofResult
+                        |> fun op -> Op.run op session cancellationToken
+
+                    member _.TryQueryOneAsync<'Row>
+                        (key, parameters, read: Read<NpgsqlDataReader, 'Row>, cancellationToken)
+                        : Task<Result<'Row option, StoreError>> =
+                        tryOne (StatementKey.value key) (programStatement key) parameters read
+                        |> Op.bind (function
+                            | Some result -> result |> Result.map Some |> Op.ofResult
+                            | None -> Op.ok None)
+                        |> fun op -> Op.run op session cancellationToken
+
+                    member _.QueryRowsAsync<'Row>
+                        (key, parameters, read: Read<NpgsqlDataReader, 'Row>, cancellationToken)
+                        : Task<Result<'Row list, StoreError>> =
+                        rows (programStatement key) parameters read
+                        |> Op.bind (sequenceRows >> Op.ofResult)
+                        |> fun op -> Op.run op session cancellationToken }
+
+            return! StoreProgram.run interpreter ct program
+        }
+
+    let runProgram
+        (context: PostgresContext)
+        (program: StoreProgram<(string * Param) list, NpgsqlDataReader, 'T>)
+        (ct: CancellationToken)
+        : Task<Result<'T, StoreError>> =
+        Db.protect context.Resilience (programSession context.DataSource program) ct
+
+    let runProgramOnce
+        (context: PostgresContext)
+        (program: StoreProgram<(string * Param) list, NpgsqlDataReader, 'T>)
+        (ct: CancellationToken)
+        : Task<Result<'T, StoreError>> =
+        Db.protectOnce (programSession context.DataSource program) ct
