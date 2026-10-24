@@ -115,13 +115,16 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
 
     let context = options.Context
 
-    let findByKey = Statement.load "command" "find_by_key"
-    let chartByVersion = Statement.load "chart" "by_version"
-    let submitCommand = Statement.load "command" "submit"
-    let submitCorrection = Statement.load "command" "submit_correction"
     let nextToken = Statement.load "system" "next_token"
     let claimCommands = Statement.load "command" "claim"
     let correctionsOf = Statement.load "command" "corrections"
+
+    let findByKey = StatementKey.create "command" "find_by_key" |> Sql.prepareProgram
+    let chartByVersion = StatementKey.create "chart" "by_version" |> Sql.prepareProgram
+    let submitCommand = StatementKey.create "command" "submit" |> Sql.prepareProgram
+
+    let submitCorrection =
+        StatementKey.create "command" "submit_correction" |> Sql.prepareProgram
 
     let rescheduleCommand =
         StatementKey.create "command" "reschedule" |> Sql.prepareProgram
@@ -247,91 +250,78 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
         (submission: CommandSubmission<'EntityId, 'Event>)
         (entityId: string)
         (encodedEvent: string)
-        : Op<WriteSession, SubmissionOutcome> =
-        sqliteWrite {
-            let machineId = MachineId.value submission.MachineId
-            let version = ChartVersion.value submission.ChartVersion
+        (now: int64)
+        : StoreProgram<(string * Param) list, SqliteDataReader, SubmissionOutcome> =
+        let machineId = MachineId.value submission.MachineId
+        let version = ChartVersion.value submission.ChartVersion
 
-            let! existing =
-                Sql.tryOne
-                    (nameof SubmissionOutcome)
-                    findByKey
-                    [ "@machine_id", Param.Text machineId
-                      "@entity_id", Param.Text entityId
-                      "@idempotency_key", Param.Text submission.IdempotencyKey ]
-                    (fun reader -> Row.int64 reader "command_id")
+        let existing =
+            StoreProgram.tryQueryOne
+                findByKey
+                [ "@machine_id", Param.Text machineId
+                  "@entity_id", Param.Text entityId
+                  "@idempotency_key", Param.Text submission.IdempotencyKey ]
+                (fun reader -> Ok(Row.int64 reader "command_id" |> CommandId.ofInt64))
 
-            match existing with
-            | Some commandId -> return AlreadySubmitted(CommandId.ofInt64 commandId)
-            | None ->
-                let! registered =
-                    Sql.tryOne
-                        "ChartFingerprint"
-                        chartByVersion
-                        [ "@machine_id", Param.Text machineId
-                          "@version", Param.Integer(int64 version) ]
-                        (fun reader -> Row.string reader "fingerprint")
+        let registered =
+            StoreProgram.tryQueryOne
+                chartByVersion
+                [ "@machine_id", Param.Text machineId
+                  "@version", Param.Integer(int64 version) ]
+                (fun reader -> Ok(Row.string reader "fingerprint"))
+            |> StoreProgram.map Option.isSome
 
-                match registered with
-                | None ->
-                    // The version this command pins was never registered, so nothing records
-                    // which chart it refers to and a replay could not resolve it. Asked rather
-                    // than caught: SQLite's foreign key failure names no constraint.
-                    return! Op.fail (StoreError.NotFound $"chart version %d{version} of machine %s{machineId}")
-                | Some _ ->
-                    let! now = Sql.now
+        let kind, correction =
+            match submission.Kind with
+            | CommandKind.Event -> "event", None
+            | CommandKind.Correction(at, policy) ->
+                "correction",
+                Some(fun commandId ->
+                    StoreProgram.executeDiscard
+                        submitCorrection
+                        [ "@command_id", Param.Integer(CommandId.value commandId)
+                          "@effective_at", Param.Integer(Instant.ofDateTimeOffset at)
+                          "@on_divergence", Param.Text(CommandMapping.divergenceToString policy.OnDivergence)
+                          "@replay_limit", Param.Integer(int64 policy.ReplayLimit) ])
 
-                    let kind =
-                        match submission.Kind with
-                        | CommandKind.Event -> "event"
-                        | CommandKind.Correction _ -> "correction"
+        // A correction is claimable at once and arrives now. Its effective time is stored beside it.
+        let visibleAt, receivedAt =
+            match submission.Kind with
+            | CommandKind.Event ->
+                submission.VisibleAt
+                |> Option.map Instant.ofDateTimeOffset
+                |> Option.defaultValue now,
+                submission.ReceivedAt
+                |> Option.map Instant.ofDateTimeOffset
+                |> Option.defaultValue now
+            | CommandKind.Correction _ -> now, now
 
-                    // A correction is claimable at once and arrives now. Its effective time is
-                    // the instant it corrects, stored beside it.
-                    let visibleAt, receivedAt =
-                        match submission.Kind with
-                        | CommandKind.Event ->
-                            submission.VisibleAt
-                            |> Option.map Instant.ofDateTimeOffset
-                            |> Option.defaultValue now,
-                            submission.ReceivedAt
-                            |> Option.map Instant.ofDateTimeOffset
-                            |> Option.defaultValue now
-                        | CommandKind.Correction _ -> now, now
+        let insert =
+            StoreProgram.queryOne
+                submitCommand
+                [ "@machine_id", Param.Text machineId
+                  "@entity_id", Param.Text entityId
+                  "@idempotency_key", Param.Text submission.IdempotencyKey
+                  "@chart_version", Param.Integer(int64 version)
+                  "@event", Param.Text encodedEvent
+                  "@kind", Param.Text kind
+                  "@visible_at", Param.Integer visibleAt
+                  "@received_at", Param.Integer receivedAt
+                  "@tenant", Param.Text(CommandMapping.audit submission.Audit.Tenant)
+                  "@principal", Param.Text(CommandMapping.audit submission.Audit.Principal)
+                  "@source", Param.Text(CommandMapping.audit submission.Audit.Source)
+                  "@correlation_id", Param.Text(CommandMapping.audit submission.Audit.CorrelationId)
+                  "@causation_id", Param.Text(CommandMapping.audit submission.Audit.CausationId) ]
+                (fun reader -> Ok(Row.int64 reader "command_id" |> CommandId.ofInt64))
 
-                    let! commandId =
-                        Sql.one
-                            (nameof SubmissionOutcome)
-                            submitCommand
-                            [ "@machine_id", Param.Text machineId
-                              "@entity_id", Param.Text entityId
-                              "@idempotency_key", Param.Text submission.IdempotencyKey
-                              "@chart_version", Param.Integer(int64 version)
-                              "@event", Param.Text encodedEvent
-                              "@kind", Param.Text kind
-                              "@visible_at", Param.Integer visibleAt
-                              "@received_at", Param.Integer receivedAt
-                              "@tenant", Param.Text(CommandMapping.audit submission.Audit.Tenant)
-                              "@principal", Param.Text(CommandMapping.audit submission.Audit.Principal)
-                              "@source", Param.Text(CommandMapping.audit submission.Audit.Source)
-                              "@correlation_id", Param.Text(CommandMapping.audit submission.Audit.CorrelationId)
-                              "@causation_id", Param.Text(CommandMapping.audit submission.Audit.CausationId) ]
-                            (fun reader -> Row.int64 reader "command_id")
-
-                    match submission.Kind with
-                    | CommandKind.Event -> return Accepted(CommandId.ofInt64 commandId)
-                    | CommandKind.Correction(at, policy) ->
-                        do!
-                            Sql.execute
-                                submitCorrection
-                                [ "@command_id", Param.Integer commandId
-                                  "@effective_at", Param.Integer(Instant.ofDateTimeOffset at)
-                                  "@on_divergence", Param.Text(CommandMapping.divergenceToString policy.OnDivergence)
-                                  "@replay_limit", Param.Integer(int64 policy.ReplayLimit) ]
-                            |> Op.discard
-
-                        return Accepted(CommandId.ofInt64 commandId)
-        }
+        CheckedSubmission(
+            existing,
+            registered,
+            StoreError.NotFound $"chart version %d{version} of machine %s{machineId}",
+            insert,
+            correction
+        )
+        |> CommandInboxProgram.submit
 
     /// The lease token, the claimed rows and their correction details, all in the claim's own
     /// transaction. Decoding waits until it has committed.
@@ -375,7 +365,7 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
             // Encoded before the write begins, so the transaction only writes.
             backgroundTaskResult {
                 let! encodedEvent = options.EventCodec.Encode submission.Event |> Result.mapError Db.toStoreError
-                return! Sql.write context (submit submission entityId encodedEvent) ct
+                return! Sql.writeProgramWith context (submit submission entityId encodedEvent) ct
             }
 
         member _.Claim(machineId, batch, lease, ct) =

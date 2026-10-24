@@ -100,6 +100,7 @@ type private RecordingInterpreter(rows: Map<string, string> list, ?failureAt: St
 let private parameters = Map.empty<string, string>
 let private first = StatementKey.create "command" "first"
 let private second = StatementKey.create "command" "second"
+let private third = StatementKey.create "command" "third"
 
 let private readValue row =
     row
@@ -111,6 +112,9 @@ let private readLeaseOutcome row =
     | Some "updated" -> Ok LeaseUpdateOutcome.Updated
     | Some "lease_lost" -> Ok LeaseUpdateOutcome.LeaseLost
     | value -> Error(StoreError.Serialization("outcome", InvalidOperationException($"%A{value}")))
+
+let private readCommandId row =
+    readValue row |> Result.map (int64 >> CommandId.ofInt64)
 
 let tests =
     testList
@@ -210,4 +214,56 @@ let tests =
 
               Expect.equal result (Ok LeaseUpdateOutcome.LeaseLost) "the returned outcome is authoritative"
               Expect.equal interpreter.Instructions [ QueryOne first ] "returned evidence uses one query"
+          }
+
+          testTask "existing submissions short circuit checked writes" {
+              let commandId = CommandId.ofInt64 17L
+              let interpreter = RecordingInterpreter([])
+
+              let program =
+                  CheckedSubmission(
+                      StoreProgram.ok (Some commandId),
+                      StoreProgram.fail (StoreError.NotFound "should not check registration"),
+                      StoreError.NotFound "unregistered",
+                      StoreProgram.fail (StoreError.NotFound "should not insert"),
+                      None
+                  )
+                  |> CommandInboxProgram.submit
+
+              let! result = StoreProgram.run interpreter CancellationToken.None program
+
+              Expect.equal result (Ok(AlreadySubmitted commandId)) "the original command wins"
+              Expect.isEmpty interpreter.Instructions "no write runs for an existing key"
+          }
+
+          testTask "new correction submissions run checked steps in order" {
+              let commandId = CommandId.ofInt64 23L
+              let interpreter = RecordingInterpreter([ Map [ "value", "23" ] ])
+
+              let registered =
+                  StoreProgram.executeCount first parameters |> StoreProgram.map ((=) 1)
+
+              let insert = StoreProgram.queryOne second parameters readCommandId
+
+              let correction _ =
+                  StoreProgram.executeDiscard third parameters
+
+              let program =
+                  CheckedSubmission(
+                      StoreProgram.ok None,
+                      registered,
+                      StoreError.NotFound "unregistered",
+                      insert,
+                      Some correction
+                  )
+                  |> CommandInboxProgram.submit
+
+              let! result = StoreProgram.run interpreter CancellationToken.None program
+
+              Expect.equal result (Ok(Accepted commandId)) "the inserted correction is accepted"
+
+              Expect.equal
+                  interpreter.Instructions
+                  [ Execute first; QueryOne second; Execute third ]
+                  "registration, insert, and correction detail writes stay sequential"
           } ]

@@ -81,9 +81,12 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
 
     let context = options.Context
 
-    let submitCommand = Statement.load "command" "submit"
-    let submitCorrection = Statement.load "command" "submit_correction"
     let claimCommands = Statement.load "command" "claim"
+
+    let submitCommand = StatementKey.create "command" "submit" |> Sql.prepareProgram
+
+    let submitCorrection =
+        StatementKey.create "command" "submit_correction" |> Sql.prepareProgram
 
     let rescheduleCommand =
         StatementKey.create "command" "reschedule" |> Sql.prepareProgram
@@ -295,13 +298,15 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
                     "on_divergence", Param.Text(CommandMapping.divergenceToString policy.OnDivergence)
                     "replay_limit", Param.Int policy.ReplayLimit ]
 
-        Sql.one (nameof SubmissionOutcome) statement values (fun reader ->
+        StoreProgram.queryOne statement values (fun reader ->
             let commandId = Row.int64 reader "command_id" |> CommandId.ofInt64
 
             if Row.bool reader "accepted" then
-                Accepted commandId
+                Ok(Accepted commandId)
             else
-                AlreadySubmitted commandId)
+                Ok(AlreadySubmitted commandId))
+        |> AtomicSubmission
+        |> CommandInboxProgram.submit
 
     let leaseUpdate statement values =
         CommandInboxProgram.leaseUpdate (
@@ -320,7 +325,7 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
             backgroundTaskResult {
                 let! encodedEvent = options.EventCodec.Encode submission.Event |> Result.mapError Db.toStoreError
 
-                match! Sql.attempt context (submit submission encodedEvent entityId) ct with
+                match! Sql.attemptProgram context (submit submission encodedEvent entityId) ct with
                 | Db.Answered outcome -> return! outcome
                 | Db.Refused(Db.ForeignKey "command_chart_version_fkey", _) ->
                     // The version this command pins was never registered, so nothing records

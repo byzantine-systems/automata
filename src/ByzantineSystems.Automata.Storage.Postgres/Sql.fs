@@ -284,6 +284,13 @@ module internal Sql =
         : Task<Result<'T, StoreError>> =
         Db.protect context.Resilience (programSession context.DataSource program) ct
 
+    let attemptProgram
+        (context: PostgresContext)
+        (program: StoreProgram<(string * Param) list, NpgsqlDataReader, 'T>)
+        (ct: CancellationToken)
+        : Task<Db.Attempt<'T>> =
+        Db.attempt context.Resilience (programSession context.DataSource program) ct
+
     let runProgramOnce
         (context: PostgresContext)
         (program: StoreProgram<(string * Param) list, NpgsqlDataReader, 'T>)
