@@ -16,7 +16,7 @@ Carried over from Phase A, still open:
 ### What changed from the previous plan
 
 1. **The CE work continues as Phase B**, rewritten around a **store algebra**. Phase A built the effect; Phase B gives both SQL providers one semantic instruction set, one `store { }` program per concern and one interpreter per provider, so the choreography that today exists twice (PostgreSQL and SQLite, already drifting) is written once.
-2. **New phases A2, A3 and A4, the core algebra track.** The chart and rule vocabulary gets an explicit law portfolio and generated tests (A2), a two-tier condition DSL with a faithful fingerprint (A3), and a public chart-equivalence API (A4). The A track touches only Core, so it runs before and alongside Phase B.
+2. **New phases A2, A3 and A4, the core algebra track.** The chart and rule vocabulary gets an explicit law portfolio and generated tests (A2), a two-tier condition DSL with a canonical syntax fingerprint (A3), and a public chart-equivalence API (A4). The A track touches only Core, so it runs before and alongside Phase B.
 3. **New Phase C, correctness fixes.** The review found real bugs: a maintenance wedge, an ordering race, and poison-row wedges. They get fixed before any structural change. **C0 also creates a provider-agnostic conformance suite**, so each fix is proven once against every store.
 4. **New Phase D, configurable schema.** The default stays `fsm`.
 5. **New Phase E, bitemporal opt-in.** The timeline moves to a sibling schema `<schema>_temporal`, installed only on request. The core schema keeps a plain snapshot table. Corrections ship with the temporal module. The infrastructure they need becomes public interfaces, so an application can implement corrections over the core store itself.
@@ -30,7 +30,7 @@ Carried over from Phase A, still open:
 | Phase | Changes schema | Changes public API | Depends on |
 |---|---|---|---|
 | A2. Core algebra: laws, generators, observations | no | no | A |
-| A3. Two-tier condition DSL, faithful fingerprint | no | yes (rule surface, additive + breaking) | A2 |
+| A3. Two-tier condition DSL, canonical syntax fingerprint | no | yes (additive API, fingerprint v2) | A2 |
 | A4. Public chart equivalence | no | yes, additive | A3 |
 | B. Store algebra, types, runtime loops, TAP | no | yes (constrained arguments, `Async` names) | A |
 | C. Correctness fixes, conformance suite | yes, in place | small (typed refusals) | B |
@@ -122,42 +122,44 @@ The generators in `ChartPropertyTests.fs` grow into the portfolio's engine, unde
 
 ---
 
-## Phase A3: the two-tier condition DSL, faithful fingerprint (no schema change; public rule surface)
+## Phase A3: the two-tier condition DSL, canonical syntax fingerprint (no schema change; public rule surface)
 
 ### A3.1 The condition language
 
-`Rule` today is a record of two halves: `Kind`, a syntax projection, and `Invoke`, a closure. The fingerprint can only see the first, which is why `Chart.fs` has to describe it as a tripwire rather than a proof. A3 closes that gap the way a restricted predicate language can: rules whose deciding parts are expressed as **terms** become inspectable, comparable and hashable, while genuinely opaque predicates keep the closure escape hatch.
+`Rule` starts with a coarse `Kind` projection and an opaque `Invoke` closure. A3 adds normalized condition and rule syntax while keeping predicate delegates executable. The syntax is inspectable and hashable; delegate behavior remains opaque.
 
 ```fsharp
-type Condition<'State, 'Event> =
+type ConditionSyntax =
     | Always
     | Never
-    | AllOf of Condition<'State, 'Event> list
-    | AnyOf of Condition<'State, 'Event> list
-    | Not of Condition<'State, 'Event>
-    | EventIs of predicate: 'Event -> bool * name: string
-    | StateIs of predicate: 'State -> bool * name: string
-    | Both of ('State -> 'Event -> bool) * name: string
-    | Custom of name: string * ('State -> 'Event -> bool)
+    | AllOf of ConditionSyntax list
+    | AnyOf of ConditionSyntax list
+    | Not of ConditionSyntax
+    | EventIs of name: string
+    | StateIs of name: string
+    | Both of name: string
+    | Custom of name: string
+
+type Condition<'State, 'Event> = private Condition of ConditionSyntax * ('State -> 'Event -> bool)
 ```
 
-- The named scrutinee cases carry a stable `name` so the fingerprint can see them; `Custom` carries a name for the same reason, but the fingerprint records only the name, never the behaviour, and the docs say so.
+- Every predicate carries a stable caller-supplied name. The fingerprint records syntax and names, never delegate behavior; reusing one name for different behavior is a broken caller contract.
 - `matches` is the observation, and it is a **homomorphism** onto the boolean algebra: `matches (AllOf [a; b]) s e = matches a s e && matches b s e`, `matches Always = true`, `matches Never = false`, `Not ∘ Not = id`, and De Morgan holds between `AllOf`/`AnyOf`/`Not`. `AllOf`/`Always` and `AnyOf`/`Never` are commutative monoids. These are laws, with properties.
-- Smart constructors normalize: `allOf [] = Always`, `anyOf [] = Never`, `anyOf [c] = c` (and the `AllOf` mirror), nesting is flattened, and normalization is idempotent. Normalization is what makes structural comparison meaningful.
-- On a finite toy domain (`'Event` a pair of bools, a handful of named scrutinees), a small exploratory harness enumerates well-typed terms and compares observations, QuickSpec-style: candidate equalities are printed for review, and the accepted ones become the named properties above. .NET has no QuickSpec; this harness is the honest substitute, and it runs only on that finite signature.
+- Smart constructors normalize empty and singleton groups, identities, annihilators, nesting, ordering, constants, and double negation. Callers cannot construct noncanonical syntax.
+- A finite toy signature enumerates terms and truth tables. Accepted equalities become named properties; a self-check rejects syntax collisions with different observations.
 
 ### A3.2 Rules over the DSL
 
-- `Rule.transition` (and friends) gain overloads taking a `Condition`; the closure overloads stay and build a `Custom`-shaped kind, so nothing existing breaks.
-- `RuleKind` and `Condition` merge into one syntax: the kind of a rule built from a condition **is** that condition. The `Kind`/`Invoke` duality collapses to syntax plus one interpreter (`invoke`), which is the shape the fingerprint always wanted.
+- `Rule.transitionWhen`, `attemptWhen`, `gotoWhen`, `internalWhen`, and `guardedWhen` take conditions. Existing closure functions stay source-compatible and use fixed legacy `Custom` syntax.
+- `RuleSyntax` combines the combinator, condition syntax, target, and guards. `RuleKind` stays as a compatibility projection.
 - `Fragment.prefix` and `Rule.retarget` become syntax rewrites; the A2 homomorphism laws now hold structurally, which is worth a comment on each.
-- The fingerprint scheme bumps `automata.chart.fingerprint/1` to `/2`: conditions and their names are hashed in normalized form. For charts whose rules are DSL-only, the fingerprint becomes **faithful**: same normalized structure means same resolution behaviour, and the tripwire caveat in `Chart.fs` is retired for those charts. Charts containing `Custom` keep today's caveat, stated once.
+- The fingerprint scheme bumps `automata.chart.fingerprint/1` to `/2`: normalized rule and condition syntax is hashed. It is exact for declared syntax, not resolution behavior; transforms, actions, classifiers, and predicate delegates remain opaque.
 - `docs/public-api.md` records the change. No version bump.
 
 ### Phase A3 verification
 
 - The full A2 portfolio passes unchanged: the laws did not move when the representation did, which is the point.
-- Fingerprint properties: DSL-only charts with equal normalized structure have equal fingerprints and equal traces (A2's observation); a `Custom` rule changes the fingerprint only through its name.
+- Fingerprint properties: equal normalized syntax has one fingerprint; condition categories and names are structural; `Custom` changes the fingerprint only through its name.
 - Normalization laws; mini-QuickSpec run reviewed and its accepted laws folded into the suite.
 - `dotnet build bs-automata.slnx`, `make test-unit`, `make fmt`.
 
@@ -175,19 +177,19 @@ module ChartEquivalence =
     val trace : Chart<'S,'E,'A,'Err> -> 'S -> 'E list -> Step list
     /// Trace equality over a caller-supplied suite of event sequences. Samples, never proves.
     val equivalentOn : 'E list list -> Chart<'S,'E,'A,'Err> * 'S -> Chart<'S,'E,'A,'Err> * 'S -> bool
-    /// Exact structural equivalence for DSL-only charts. Typed refusal for Custom-containing charts.
-    val structurallyEquivalent : Chart<'S,'E,'A,'Err> -> Chart<'S,'E,'A,'Err> -> Result<bool, EquivalenceLimit>
+    /// Exact equality of canonical declared syntax; not behavioral equivalence.
+    val declaredEquivalent : Chart<'S,'E,'A,'Err> -> Chart<'S,'E,'A,'Err> -> bool
 ```
 
 - The observation is deliberately **not** `'State` equality: two states that classify to the same leaf are observationally equal, so the trace compares leaves, terminal flags and actions. Representation does not leak.
-- `equivalentOn` documents that a finite suite is evidence, not proof; `structurallyEquivalent` is exact for DSL-only charts and refuses (typed, not boolean) charts containing `Custom`.
+- `equivalentOn` documents that a finite suite is evidence, not proof. `declaredEquivalent` compares canonical syntax only; predicate delegates and transforms remain outside it.
 - Minimization of charts is **considered and not adopted**: the trace algebra makes it possible later, and nothing today needs it.
 - `docs/public-api.md` records the addition.
 
 ### Phase A4 verification
 
-- Properties: equivalent charts (reordered siblings, renamed-but-equivalent spellings) agree on traces; `structurallyEquivalent` agrees with trace equivalence on DSL-only charts over generated suites.
-- The two observations disagree only where they must: on `Custom`-containing charts, where structural says nothing and trace still speaks.
+- Properties: reordered siblings and normalized condition spellings are declaration-equivalent; generated traces exercise behavioral agreement separately.
+- Tests pin the distinction between syntax equality and sampled behavior.
 
 ---
 
@@ -885,7 +887,7 @@ Added:
 | E54 | Library `task {}` resumes on a captured `SynchronizationContext`, so a caller that blocks deadlocks | 52 sites under `src/` | B11 (`backgroundTask`) |
 | E55 | Validation inside the task CE faults the task for a usage error, instead of throwing to the caller | store members | B11 |
 | E56 | An idle memory store allocates a task per poll per machine | new | **withdrawn with Phase F** |
-| E57 | The chart fingerprint sees only rule kinds, so a behaviour change behind closures is invisible to it | `Chart.fs` fingerprint | A3 (DSL-only charts become faithful) |
+| E57 | The chart fingerprint sees only rule kinds, so condition syntax changes are invisible to it | `Chart.fs` fingerprint | A3 (normalized condition syntax is hashed; callback behavior remains opaque) |
 | E58 | Finite-suite trace equivalence is evidence, not proof, and `Custom` rules defeat structural equivalence | new | A4 (typed refusal, documented bound) |
 | E59 | A generator that cannot reach a constructor family makes false laws pass | new | A2 (coverage asserted, not reported) |
 | E60 | Store choreography written per provider drifts, and the closure `Op` fuses program with session so nothing else can interpret it | both providers | B0 (store algebra) |

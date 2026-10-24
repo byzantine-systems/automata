@@ -11,17 +11,20 @@ A `Chart<'State,'Event,'Action,'Err>` can be created directly with `Chart.create
 - Top-level `root` and `classify` declarations.
 - `state` and `compound` nodes, with `initial` and `terminal` markers.
 - `onEntry` and `onExit` actions.
-- `on`, `attempt`, `goto`, and `internalOn` transition rules.
+- Closure rules: `on`, `attempt`, `goto`, and `internalOn`.
+- Condition rules: `onWhen`, `attemptWhen`, `gotoWhen`, and `internalWhen`.
 
 Both construction paths validate the hierarchy and return `Result<Chart<_,_,_,_>, ChartError list>`. A `goto` naming a node the chart does not declare is refused there, as `UnknownGotoTarget`, rather than on the first event that reaches it. `Chart.resolve` is pure and returns either a `Resolution` or a typed `TransitionError`. Query functions expose the root, classifier, nodes, children, and terminal or compound status.
 
 A `state` or `compound` block is a `NodeDraft` value, so fragments are reusable: yield one wherever it is needed, splice a list with `yield!` (in a chart or inside a compound), and give a second copy of the same fragment its own ids with `Fragment.prefix`, which renames every node the fragment declares along with the initial children and goto targets that name them. The classifier is the host's code and must return the prefixed ids; see [chart fragments](fragments.md).
 
-The lower-level `Rule` module provides `transition`, `attempt`, `goto`, `internalOn`, `guarded`, and `invoke`. `Rule.kind` reports the `RuleKind` that built a rule (`Transition`, `Attempt`, `Goto of StateId`, `Internal`, or `Guarded of reason * inner`), which is the part of a rule that is visible without calling it. `Codec<'T>` and its module functions provide typed encode/decode boundaries for stores.
+`Condition` builds normalized boolean syntax around named predicates. `Condition.matches` evaluates it and `Condition.syntax` exposes its function-free form. Predicate names are semantic identifiers; delegate behavior stays opaque.
 
-`Chart.fingerprint` returns a `ChartFingerprint`, a SHA-256 digest of the chart's structure: the root, and for every node its id, parent, initial child, terminal flag and the kind of each rule. Nodes are hashed in id order, because sibling declaration order changes nothing at resolution time; rules keep declaration order, because first-match-wins makes their order part of what the chart does.
+The lower-level `Rule` module keeps the closure constructors and adds `transitionWhen`, `attemptWhen`, `gotoWhen`, `internalWhen`, and `guardedWhen`. `Rule.syntax` exposes normalized `RuleSyntax`; `Rule.kind` remains the compatibility combinator projection. `Codec<'T>` and its module functions provide typed store boundaries.
 
-**The fingerprint is a tripwire, not a proof of equivalence.** Guards, transforms, entry and exit actions and the classifier are all closures, and nothing can see inside them. It catches a chart whose shape was edited without bumping its version; it cannot catch a behaviour change that leaves the shape alone. Replay correctness still rests on the developer bumping `ChartVersion`.
+`Chart.fingerprint` hashes the root, node structure, rule order, and normalized rule and condition syntax. Sibling order is normalized; rule order is retained.
+
+**The fingerprint describes declared syntax, not behavior.** Predicate delegates, transforms, entry and exit actions, and classifiers remain opaque. Reusing a predicate name for different behavior is a broken caller contract, and replay correctness still requires a new `ChartVersion` for any behavior change.
 
 ## Runtime
 
