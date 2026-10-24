@@ -113,6 +113,18 @@ let tests =
               Expect.isTrue equivalent "a chart agrees with itself over successful and failed samples"
           }
 
+          Property.property "equivalentOn agrees over generated event sequences" (fun (samples: int list list) ->
+              let eventOf seed =
+                  match Property.bounded 4 seed with
+                  | 0 -> Start
+                  | 1 -> Complete
+                  | 2 -> Refuse
+                  | _ -> Ignore
+
+              let eventSequences = samples |> List.map (List.map eventOf)
+
+              ChartEquivalence.equivalentOn (=) (=) eventSequences (chart, Waiting) (chart, Waiting))
+
           test "equivalentOn detects asymmetric failures" {
               let alwaysStart =
                   statechart<State, Event, string, string> {
