@@ -22,6 +22,8 @@
         <!-- The unit-of-work effect the bundled providers are written in. Internal: it is how this
              repository's stores are built, not part of the contract a provider implements. -->
         <Compile Include="Op.fs" />
+        <!-- Provider-generic store programs interpreted over each provider's row and parameter types. -->
+        <Compile Include="StoreProgram.fs" />
         <!-- How a leased command ends, shared by the bundled providers' finalize paths. -->
         <Compile Include="Finalize.fs" />
     </ItemGroup>
@@ -29,6 +31,7 @@
     <ItemGroup>
         <InternalsVisibleTo Include="ByzantineSystems.Automata.Storage.Postgres" />
         <InternalsVisibleTo Include="ByzantineSystems.Automata.Storage.Sqlite" />
+        <InternalsVisibleTo Include="ByzantineSystems.Automata.Storage.Tests" />
         <InternalsVisibleTo Include="ByzantineSystems.Automata.Storage.Postgres.Tests" />
         <InternalsVisibleTo Include="ByzantineSystems.Automata.Storage.Sqlite.Tests" />
     </ItemGroup>

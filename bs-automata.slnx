@@ -13,6 +13,7 @@
         <Project Path="tests/ByzantineSystems.Automata.Runtime.Tests/ByzantineSystems.Automata.Runtime.Tests.fsproj" />
         <Project Path="tests/ByzantineSystems.Automata.Resilience.Tests/ByzantineSystems.Automata.Resilience.Tests.fsproj" />
         <Project Path="tests/ByzantineSystems.Automata.Storage.Postgres.Tests/ByzantineSystems.Automata.Storage.Postgres.Tests.fsproj" />
+        <Project Path="tests/ByzantineSystems.Automata.Storage.Tests/ByzantineSystems.Automata.Storage.Tests.fsproj" />
         <Project Path="tests/ByzantineSystems.Automata.Storage.Sqlite.Tests/ByzantineSystems.Automata.Storage.Sqlite.Tests.fsproj" />
         <Project Path="tests/ByzantineSystems.Automata.DependencyInjection.Tests/ByzantineSystems.Automata.DependencyInjection.Tests.fsproj" />
     </Folder>
