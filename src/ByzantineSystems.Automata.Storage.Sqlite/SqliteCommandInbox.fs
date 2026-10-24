@@ -10,7 +10,6 @@ open ByzantineSystems.Automata.Storage.Internal
 open ByzantineSystems.Automata.Storage.Sqlite.Schema
 open FsToolkit.ErrorHandling
 open Microsoft.Data.Sqlite
-open SqlHydra.Query
 
 /// <summary>
 /// Everything the inbox needs to bridge the generic domain types to the columns of
@@ -116,6 +115,11 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
     let context = options.Context
 
     let findByKey = StatementKey.create "command" "find_by_key" |> Sql.prepareProgram
+    let commandById = StatementKey.create "command" "by_id" |> Sql.prepareProgram
+
+    let commandByKey =
+        StatementKey.create "command" "find_record_by_key" |> Sql.prepareProgram
+
     let chartByVersion = StatementKey.create "chart" "by_version" |> Sql.prepareProgram
     let submitCommand = StatementKey.create "command" "submit" |> Sql.prepareProgram
 
@@ -201,6 +205,21 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
         | _, _, _, Error error, _
         | _, _, _, _, Error error -> Error error
 
+    let recordRow (reader: SqliteDataReader) : Result<CommandRecord<'EntityId, 'Event>, StoreError> =
+        let marker = reader.GetOrdinal "correction_command_id"
+
+        let correction: main.fsm_command_correction option =
+            if reader.IsDBNull marker then
+                None
+            else
+                Some
+                    { command_id = reader.GetInt64 marker
+                      effective_at = Row.int64 reader "correction_effective_at"
+                      on_divergence = Row.string reader "correction_on_divergence"
+                      replay_limit = Row.int64 reader "correction_replay_limit" }
+
+        toRecord (CommandMapping.commandRow reader, correction)
+
     /// A claimed row carries its own lease: the token that fences it, the delivery count, and the
     /// deadline the claim assigned. visible_at means the lease deadline while a command is leased.
     let toLeased
@@ -214,38 +233,15 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
               DeliveryCount = int row.read_ct
               ExpiresAt = record.VisibleAt })
 
-    let single
-        (row: (main.fsm_command * main.fsm_command_correction option) option)
-        : Result<CommandRecord<'EntityId, 'Event> option, StoreError> =
-        match row with
-        | Some row -> toRecord row |> Result.map Some
-        | None -> Ok None
-
     let findExisting (machineId: MachineId) (entityId: string) (idempotencyKey: string) (ct: CancellationToken) =
-        let machine = MachineId.value machineId
-
-        Sql.read
+        Sql.readProgram
             context
-            (sqliteRead {
-                let! row =
-                    Sql.select (fun query token ->
-                        selectTask query {
-                            for c in main.fsm_command do
-                                leftJoin d in main.fsm_command_correction on (c.command_id = d.Value.command_id)
-
-                                where (
-                                    c.machine_id = machine
-                                    && c.entity_id = entityId
-                                    && c.idempotency_key = idempotencyKey
-                                )
-
-                                select (c, d)
-                                tryHead
-                                cancel token
-                        })
-
-                return! single row
-            })
+            (StoreProgram.tryQueryOne
+                commandByKey
+                [ "@machine_id", Param.Text(MachineId.value machineId)
+                  "@entity_id", Param.Text entityId
+                  "@idempotency_key", Param.Text idempotencyKey ]
+                recordRow)
             ct
 
     let submit
@@ -424,24 +420,12 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
                 ct
 
         member _.TryGet(commandId, ct) =
-            let id = CommandId.value commandId
-
-            Sql.read
+            Sql.readProgram
                 context
-                (sqliteRead {
-                    let! row =
-                        Sql.select (fun query token ->
-                            selectTask query {
-                                for c in main.fsm_command do
-                                    leftJoin d in main.fsm_command_correction on (c.command_id = d.Value.command_id)
-                                    where (c.command_id = id)
-                                    select (c, d)
-                                    tryHead
-                                    cancel token
-                            })
-
-                    return! single row
-                })
+                (StoreProgram.tryQueryOne
+                    commandById
+                    [ "@command_id", Param.Integer(CommandId.value commandId) ]
+                    recordRow)
                 ct
 
         member _.TryFind(machineId, entityId, idempotencyKey, ct) =

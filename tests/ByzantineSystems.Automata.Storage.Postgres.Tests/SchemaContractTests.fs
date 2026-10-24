@@ -32,6 +32,13 @@ let private commandColumns =
       "correlation_id"
       "causation_id" ]
 
+let private recordColumns =
+    commandColumns
+    @ [ "correction_command_id"
+        "correction_effective_at"
+        "correction_on_divergence"
+        "correction_replay_limit" ]
+
 /// Builds the plan probe from the routine's own body, read back out of the catalog. Copying the
 /// statement into the test instead would let the two drift, which is exactly the failure this
 /// test exists to catch.
@@ -82,6 +89,22 @@ let tests =
                         "lease", box (TimeSpan.FromSeconds 30.0) ]
 
               Expect.equal columns commandColumns "the claim result is the inbox reader's contract"
+          }
+
+          testTask "command lookups return the shared record shape" {
+              do! reset ()
+
+              let byId = columnsOf (SqlResources.get "command" "by_id") [ "command_id", box 0L ]
+
+              let byKey =
+                  columnsOf
+                      (SqlResources.get "command" "find_by_key")
+                      [ "machine_id", box "none"
+                        "entity_id", box "none"
+                        "idempotency_key", box "none" ]
+
+              Expect.equal byId recordColumns "id lookup matches the record reader"
+              Expect.equal byKey recordColumns "key lookup matches the record reader"
           }
 
           testTask "the chart version read returns exactly the column the reader expects" {

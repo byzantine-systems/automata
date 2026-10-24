@@ -9,7 +9,6 @@ open ByzantineSystems.Automata.Storage.Internal
 open ByzantineSystems.Automata.Storage.Postgres.Schema
 open Npgsql
 open FsToolkit.ErrorHandling
-open SqlHydra.Query
 
 /// <summary>
 /// Everything the inbox needs to bridge the generic domain types to the columns of
@@ -87,6 +86,10 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
         StatementKey.create "command" "submit_correction" |> Sql.prepareProgram
 
     let claimCommands = StatementKey.create "command" "claim" |> Sql.prepareProgram
+
+    let commandById = StatementKey.create "command" "by_id" |> Sql.prepareProgram
+
+    let commandByKey = StatementKey.create "command" "find_by_key" |> Sql.prepareProgram
 
     let correctionsOf =
         StatementKey.create "command" "corrections" |> Sql.prepareProgram
@@ -195,6 +198,21 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
           correlation_id = Row.string reader "correlation_id"
           causation_id = Row.string reader "causation_id" }
 
+    let correctionOption (reader: NpgsqlDataReader) : fsm.command_correction option =
+        let marker = reader.GetOrdinal "correction_command_id"
+
+        if reader.IsDBNull marker then
+            None
+        else
+            Some
+                { command_id = reader.GetInt64 marker
+                  effective_at = reader.GetDateTime(reader.GetOrdinal "correction_effective_at")
+                  on_divergence = Row.string reader "correction_on_divergence"
+                  replay_limit = Row.int32 reader "correction_replay_limit" }
+
+    let recordRow (reader: NpgsqlDataReader) : Result<CommandRecord<'EntityId, 'Event>, StoreError> =
+        toRecord (commandRow reader, correctionOption reader)
+
     let correctionRow (reader: NpgsqlDataReader) : Result<fsm.command_correction, StoreError> =
         Ok
             { command_id = Row.int64 reader "command_id"
@@ -216,44 +234,20 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
               DeliveryCount = row.read_ct
               ExpiresAt = record.VisibleAt })
 
-    /// At most one command, decoded.
-    let single
-        (rows: (fsm.command * fsm.command_correction option) option)
-        : Result<CommandRecord<'EntityId, 'Event> option, StoreError> =
-        match rows with
-        | Some row -> toRecord row |> Result.map Some
-        | None -> Ok None
-
     let findExisting
         (machineId: MachineId)
         (entityId: string)
         (idempotencyKey: string)
         (ct: CancellationToken)
         : Task<Result<CommandRecord<'EntityId, 'Event> option, StoreError>> =
-        let machine = MachineId.value machineId
-
-        Sql.run
+        Sql.readProgram
             context
-            (postgres {
-                let! row =
-                    Sql.select (fun query token ->
-                        selectTask query {
-                            for c in fsm.command do
-                                leftJoin d in fsm.command_correction on (c.command_id = d.Value.command_id)
-
-                                where (
-                                    c.machine_id = machine
-                                    && c.entity_id = entityId
-                                    && c.idempotency_key = idempotencyKey
-                                )
-
-                                select (c, d)
-                                tryHead
-                                cancel token
-                        })
-
-                return! single row
-            })
+            (StoreProgram.tryQueryOne
+                commandByKey
+                [ "machine_id", Param.Text(MachineId.value machineId)
+                  "entity_id", Param.Text entityId
+                  "idempotency_key", Param.Text idempotencyKey ]
+                recordRow)
             ct
 
     /// <summary>
@@ -408,24 +402,12 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
                 ct
 
         member _.TryGet(commandId, ct) =
-            let id = CommandId.value commandId
-
-            Sql.run
+            Sql.readProgram
                 context
-                (postgres {
-                    let! row =
-                        Sql.select (fun query token ->
-                            selectTask query {
-                                for c in fsm.command do
-                                    leftJoin d in fsm.command_correction on (c.command_id = d.Value.command_id)
-                                    where (c.command_id = id)
-                                    select (c, d)
-                                    tryHead
-                                    cancel token
-                            })
-
-                    return! single row
-                })
+                (StoreProgram.tryQueryOne
+                    commandById
+                    [ "command_id", Param.Bigint(CommandId.value commandId) ]
+                    recordRow)
                 ct
 
         member _.TryFind(machineId, entityId, idempotencyKey, ct) =

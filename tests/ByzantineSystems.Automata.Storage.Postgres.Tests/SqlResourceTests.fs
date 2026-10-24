@@ -10,6 +10,8 @@ let private expected =
     [ "command", "submit"
       "command", "claim"
       "command", "corrections"
+      "command", "by_id"
+      "command", "find_by_key"
       "command", "finalize"
       "command", "reschedule"
       "command", "extend_lease"
