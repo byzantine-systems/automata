@@ -24,7 +24,12 @@ SELECT
     c.principal,
     c.source,
     c.correlation_id,
-    c.causation_id
+    c.causation_id,
+    d.command_id AS correction_command_id,
+    d.effective_at AS correction_effective_at,
+    d.on_divergence AS correction_on_divergence,
+    d.replay_limit AS correction_replay_limit
 FROM
-    fsm.claim_commands (@machine_id, @batch, @lease::interval) c;
+    fsm.claim_commands (@machine_id, @batch, @lease::interval) c
+    LEFT JOIN fsm.command_correction d ON d.command_id = c.command_id;
 

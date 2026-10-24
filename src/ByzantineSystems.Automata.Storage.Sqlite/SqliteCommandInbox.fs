@@ -1,7 +1,6 @@
 namespace ByzantineSystems.Automata.Storage.Sqlite
 
 open System
-open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
@@ -93,12 +92,6 @@ module internal CommandMapping =
           correlation_id = Row.string reader "correlation_id"
           causation_id = Row.string reader "causation_id" }
 
-    let correctionRow (reader: SqliteDataReader) : main.fsm_command_correction =
-        { command_id = Row.int64 reader "command_id"
-          effective_at = Row.int64 reader "effective_at"
-          on_divergence = Row.string reader "on_divergence"
-          replay_limit = Row.int64 reader "replay_limit" }
-
 /// <summary>
 /// The SQLite command inbox.
 ///
@@ -128,9 +121,6 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
 
     let nextToken = StatementKey.create "system" "next_token" |> Sql.prepareProgram
     let claimCommands = StatementKey.create "command" "claim" |> Sql.prepareProgram
-
-    let correctionsOf =
-        StatementKey.create "command" "corrections" |> Sql.prepareProgram
 
     let rescheduleCommand =
         StatementKey.create "command" "reschedule" |> Sql.prepareProgram
@@ -205,28 +195,27 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
         | _, _, _, Error error, _
         | _, _, _, _, Error error -> Error error
 
-    let recordRow (reader: SqliteDataReader) : Result<CommandRecord<'EntityId, 'Event>, StoreError> =
+    let correctionOption (reader: SqliteDataReader) : main.fsm_command_correction option =
         let marker = reader.GetOrdinal "correction_command_id"
 
-        let correction: main.fsm_command_correction option =
-            if reader.IsDBNull marker then
-                None
-            else
-                Some
-                    { command_id = reader.GetInt64 marker
-                      effective_at = Row.int64 reader "correction_effective_at"
-                      on_divergence = Row.string reader "correction_on_divergence"
-                      replay_limit = Row.int64 reader "correction_replay_limit" }
+        if reader.IsDBNull marker then
+            None
+        else
+            Some
+                { command_id = reader.GetInt64 marker
+                  effective_at = Row.int64 reader "correction_effective_at"
+                  on_divergence = Row.string reader "correction_on_divergence"
+                  replay_limit = Row.int64 reader "correction_replay_limit" }
 
-        toRecord (CommandMapping.commandRow reader, correction)
+    let recordRow (reader: SqliteDataReader) : Result<CommandRecord<'EntityId, 'Event>, StoreError> =
+        toRecord (CommandMapping.commandRow reader, correctionOption reader)
 
     /// A claimed row carries its own lease: the token that fences it, the delivery count, and the
     /// deadline the claim assigned. visible_at means the lease deadline while a command is leased.
-    let toLeased
-        (corrections: Map<int64, main.fsm_command_correction>)
-        (row: main.fsm_command)
-        : Result<LeasedCommand<'EntityId, 'Event>, StoreError> =
-        toRecord (row, Map.tryFind row.command_id corrections)
+    let leasedRow (reader: SqliteDataReader) : Result<LeasedCommand<'EntityId, 'Event>, StoreError> =
+        let row = CommandMapping.commandRow reader
+
+        toRecord (row, correctionOption reader)
         |> Result.map (fun record ->
             { Work = record
               Token = LeaseToken.ofInt64 row.lease_token
@@ -321,8 +310,8 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
         )
         |> CommandInboxProgram.submit
 
-    /// The lease token, the claimed rows and their correction details, all in the claim's own
-    /// transaction. Decoding waits until it has committed.
+    /// The lease token and complete claimed rows, all in the claim's own transaction. Decoding
+    /// waits until it has committed.
     let claim (machineId: MachineId) (batch: int) (lease: TimeSpan) (now: int64) =
         let token =
             StoreProgram.queryOne nextToken [] (fun reader -> Ok(Row.int64 reader "value"))
@@ -331,28 +320,14 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
             let! token = token
 
             return!
-                CommandInboxProgram.claim
-                    { Claim =
-                        StoreProgram.queryRows
-                            claimCommands
-                            [ "@machine_id", Param.Text(MachineId.value machineId)
-                              "@batch", Param.Integer(int64 batch)
-                              "@now", Param.Integer now
-                              "@deadline", Param.Integer(Instant.add now lease)
-                              "@lease_token", Param.Integer token ]
-                            (CommandMapping.commandRow >> Ok)
-                      CorrectionId =
-                        (fun row ->
-                            if row.kind = "correction" then
-                                Some row.command_id
-                            else
-                                None)
-                      Corrections =
-                        (fun ids ->
-                            StoreProgram.queryRows
-                                correctionsOf
-                                [ "@ids", Param.Text(JsonSerializer.Serialize ids) ]
-                                (CommandMapping.correctionRow >> Ok)) }
+                StoreProgram.queryRows
+                    claimCommands
+                    [ "@machine_id", Param.Text(MachineId.value machineId)
+                      "@batch", Param.Integer(int64 batch)
+                      "@now", Param.Integer now
+                      "@deadline", Param.Integer(Instant.add now lease)
+                      "@lease_token", Param.Integer token ]
+                    leasedRow
         }
 
     interface ICommandInbox<'EntityId, 'Event> with
@@ -377,14 +352,7 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
             // outcome was lost may have leased a batch, and a retry would lease a second one
             // while the first stays invisible until its lease lapses. The worker polls again in a
             // moment, which recovers sooner than a retry would.
-            backgroundTaskResult {
-                let! rows, details = Sql.writeProgramOnceWith context (claim machineId batch lease) ct
-
-                let corrections =
-                    details |> List.map (fun detail -> detail.command_id, detail) |> Map.ofList
-
-                return! rows |> List.traverseResultM (toLeased corrections)
-            }
+            Sql.writeProgramOnceWith context (claim machineId batch lease) ct
 
         member _.Reschedule(commandId, leaseToken, backoff, ct) =
             Sql.writeProgramWith

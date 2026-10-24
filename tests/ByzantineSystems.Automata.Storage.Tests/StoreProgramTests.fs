@@ -280,46 +280,4 @@ let tests =
                   interpreter.Instructions
                   [ Execute first; QueryOne second; Execute third ]
                   "registration, insert, and correction detail writes stay sequential"
-          }
-
-          testTask "claims skip correction reads for event batches" {
-              let row = Map [ "kind", "event"; "id", "1" ]
-              let interpreter = RecordingInterpreter([ row ])
-
-              let program =
-                  CommandInboxProgram.claim
-                      { Claim = StoreProgram.queryRows first parameters Ok
-                        CorrectionId =
-                          (fun row ->
-                              if Map.find "kind" row = "correction" then
-                                  Some(Map.find "id" row)
-                              else
-                                  None)
-                        Corrections = (fun _ -> StoreProgram.fail (StoreError.NotFound "should not query")) }
-
-              let! result = StoreProgram.run interpreter CancellationToken.None program
-
-              Expect.equal result (Ok([ row ], [])) "event-only batches need no details"
-              Expect.equal interpreter.Instructions [ QueryRows first ] "only the claim statement runs"
-          }
-
-          testTask "claims fetch correction details after claimed rows" {
-              let row = Map [ "kind", "correction"; "id", "7" ]
-              let detail = Map [ "id", "7"; "policy", "fail" ]
-              let interpreter = RecordingInterpreter([], queryBatches = [ [ row ]; [ detail ] ])
-
-              let program =
-                  CommandInboxProgram.claim
-                      { Claim = StoreProgram.queryRows first parameters Ok
-                        CorrectionId = (fun row -> Some(Map.find "id" row))
-                        Corrections = (fun _ -> StoreProgram.queryRows second parameters Ok) }
-
-              let! result = StoreProgram.run interpreter CancellationToken.None program
-
-              Expect.equal result (Ok([ row ], [ detail ])) "details stay paired with the claim"
-
-              Expect.equal
-                  interpreter.Instructions
-                  [ QueryRows first; QueryRows second ]
-                  "claim and correction reads remain sequential"
           } ]

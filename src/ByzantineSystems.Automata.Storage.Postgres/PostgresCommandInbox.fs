@@ -91,9 +91,6 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
 
     let commandByKey = StatementKey.create "command" "find_by_key" |> Sql.prepareProgram
 
-    let correctionsOf =
-        StatementKey.create "command" "corrections" |> Sql.prepareProgram
-
     let rescheduleCommand =
         StatementKey.create "command" "reschedule" |> Sql.prepareProgram
 
@@ -213,21 +210,13 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
     let recordRow (reader: NpgsqlDataReader) : Result<CommandRecord<'EntityId, 'Event>, StoreError> =
         toRecord (commandRow reader, correctionOption reader)
 
-    let correctionRow (reader: NpgsqlDataReader) : Result<fsm.command_correction, StoreError> =
-        Ok
-            { command_id = Row.int64 reader "command_id"
-              effective_at = reader.GetDateTime(reader.GetOrdinal "effective_at")
-              on_divergence = Row.string reader "on_divergence"
-              replay_limit = Row.int32 reader "replay_limit" }
-
     /// A claimed row carries its own lease: the token that fences it, the delivery count, and the
     /// deadline the database assigned. visible_at means the lease deadline while a command is
     /// leased, which is the one place that dual reading of the column surfaces in F#.
-    let toLeased
-        (corrections: Map<int64, fsm.command_correction>)
-        (row: fsm.command)
-        : Result<LeasedCommand<'EntityId, 'Event>, StoreError> =
-        toRecord (row, Map.tryFind row.command_id corrections)
+    let leasedRow (reader: NpgsqlDataReader) : Result<LeasedCommand<'EntityId, 'Event>, StoreError> =
+        let row = commandRow reader
+
+        toRecord (row, correctionOption reader)
         |> Result.map (fun record ->
             { Work = record
               Token = LeaseToken.ofInt64 row.lease_token
@@ -348,34 +337,15 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
             // idempotent: a claim whose reply was lost has already leased a batch, and a retry
             // leases a second one while the first stays invisible until its lease lapses. The
             // worker polls again in a moment, which recovers sooner than a retry would.
-            let claim =
-                StoreProgram.queryRows
+            Sql.runProgramOnce
+                context
+                (StoreProgram.queryRows
                     claimCommands
                     [ "machine_id", Param.Text(MachineId.value machineId)
                       "batch", Param.Int batch
                       "lease", Param.Interval lease ]
-                    (commandRow >> Ok)
-
-            let program =
-                CommandInboxProgram.claim
-                    { Claim = claim
-                      CorrectionId =
-                        (fun row ->
-                            if row.kind = "correction" then
-                                Some row.command_id
-                            else
-                                None)
-                      Corrections =
-                        (fun ids -> StoreProgram.queryRows correctionsOf [ "ids", Param.BigintArray ids ] correctionRow) }
-
-            backgroundTaskResult {
-                let! rows, details = Sql.runProgramOnce context program ct
-
-                let corrections =
-                    details |> List.map (fun detail -> detail.command_id, detail) |> Map.ofList
-
-                return! rows |> List.traverseResultM (toLeased corrections)
-            }
+                    leasedRow)
+                ct
 
         member _.Reschedule(commandId, leaseToken, backoff, ct) =
             Sql.runProgram

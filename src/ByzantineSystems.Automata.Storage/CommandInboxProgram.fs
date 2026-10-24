@@ -18,27 +18,8 @@ type internal SubmitInstruction<'Params, 'Reader> =
         insert: StoreProgram<WriteAccess, 'Params, 'Reader, CommandId> *
         correction: (CommandId -> StoreProgram<WriteAccess, 'Params, 'Reader, unit>) option
 
-/// <summary>Provider statements and row evidence for one non-retriable claim.</summary>
-type internal ClaimInstruction<'Params, 'Reader, 'Row, 'Id, 'Correction> =
-    { Claim: StoreProgram<WriteAccess, 'Params, 'Reader, 'Row list>
-      CorrectionId: 'Row -> 'Id option
-      Corrections: 'Id list -> StoreProgram<WriteAccess, 'Params, 'Reader, 'Correction list> }
-
 [<RequireQualifiedAccess>]
 module internal CommandInboxProgram =
-
-    let claim
-        (instruction: ClaimInstruction<'Params, 'Reader, 'Row, 'Id, 'Correction>)
-        : StoreProgram<WriteAccess, 'Params, 'Reader, 'Row list * 'Correction list> =
-        store {
-            let! rows = instruction.Claim
-
-            match List.choose instruction.CorrectionId rows with
-            | [] -> return rows, []
-            | ids ->
-                let! corrections = instruction.Corrections ids
-                return rows, corrections
-        }
 
     let submit
         (instruction: SubmitInstruction<'Params, 'Reader>)

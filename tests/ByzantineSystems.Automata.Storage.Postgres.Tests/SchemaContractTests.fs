@@ -7,9 +7,7 @@ open Expecto
 open Npgsql
 open TestContext
 
-/// The columns a claim returns. Every other read of fsm.command is typed by the generated schema,
-/// but the claim is a routine SqlHydra cannot call, so its rows are read by name into the
-/// generated record. This list is the contract for that one read.
+/// The columns read into the generated command record.
 let private commandColumns =
     [ "command_id"
       "machine_id"
@@ -88,7 +86,7 @@ let tests =
                         "batch", box 1
                         "lease", box (TimeSpan.FromSeconds 30.0) ]
 
-              Expect.equal columns commandColumns "the claim result is the inbox reader's contract"
+              Expect.equal columns recordColumns "the claim result is the inbox reader's contract"
           }
 
           testTask "command lookups return the shared record shape" {
