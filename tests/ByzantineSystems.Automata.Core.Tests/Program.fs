@@ -13,6 +13,7 @@ let tests =
           ResolvePropertyTests.tests
           HierarchyPropertyTests.tests
           ChartFingerprintTests.tests
+          ChartEquivalenceTests.tests
           FragmentTests.tests
           FragmentTests.targetTests
           FragmentPropertyTests.tests

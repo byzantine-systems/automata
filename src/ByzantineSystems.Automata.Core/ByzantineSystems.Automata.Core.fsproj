@@ -17,6 +17,7 @@
         <Compile Include="Rules.fs" />
         <Compile Include="Resolution.fs" />
         <Compile Include="Chart.fs" />
+        <Compile Include="ChartEquivalence.fs" />
         <Compile Include="ChartBuilder.fs" />
     </ItemGroup>
 

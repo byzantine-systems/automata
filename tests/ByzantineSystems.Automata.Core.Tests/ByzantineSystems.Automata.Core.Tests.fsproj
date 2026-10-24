@@ -16,6 +16,7 @@
         <Compile Include="ResolvePropertyTests.fs" />
         <Compile Include="HierarchyPropertyTests.fs" />
         <Compile Include="ChartFingerprintTests.fs" />
+        <Compile Include="ChartEquivalenceTests.fs" />
         <Compile Include="FragmentTests.fs" />
         <Compile Include="FragmentPropertyTests.fs" />
         <Compile Include="RulePropertyTests.fs" />
