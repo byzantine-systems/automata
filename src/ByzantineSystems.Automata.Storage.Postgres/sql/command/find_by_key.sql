@@ -31,3 +31,4 @@ WHERE
     c.machine_id = @machine_id
     AND c.entity_id = @entity_id
     AND c.idempotency_key = @idempotency_key;
+

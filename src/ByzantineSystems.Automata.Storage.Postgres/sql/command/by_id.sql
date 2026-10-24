@@ -29,3 +29,4 @@ FROM
     LEFT JOIN fsm.command_correction d ON d.command_id = c.command_id
 WHERE
     c.command_id = @command_id;
+
