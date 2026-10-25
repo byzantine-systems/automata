@@ -8,6 +8,7 @@ open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
 open ByzantineSystems.Automata.Storage.Internal
 open Expecto
+open FsCheck
 open FsToolkit.ErrorHandling
 
 type private Instruction =
@@ -15,6 +16,10 @@ type private Instruction =
     | QueryOne of StatementKey
     | TryQueryOne of StatementKey
     | QueryRows of StatementKey
+
+type private ProgramStep =
+    | ExecuteStep
+    | QueryStep
 
 let private canceled<'T> (cancellationToken: CancellationToken) =
     Task.FromCanceled<Result<'T, StoreError>>(cancellationToken)
@@ -130,45 +135,66 @@ let private readLeaseOutcome row =
 let private readCommandId row =
     readValue row |> Result.map (int64 >> CommandId.ofInt64)
 
+let private keyAt index = StatementKey.create "generated" $"step-%d{index}"
+
+let private expectedInstruction index = function
+    | ExecuteStep -> Execute(keyAt index)
+    | QueryStep -> QueryOne(keyAt index)
+
+let rec private programFrom outcome = function
+    | [] -> StoreProgram.ok outcome
+    | (index, step) :: rest ->
+        store {
+            match step with
+            | ExecuteStep -> do! StoreProgram.executeDiscard (keyAt index) parameters
+            | QueryStep ->
+                let! _ = StoreProgram.queryOne (keyAt index) parameters readValue
+                ()
+
+            return! programFrom outcome rest
+        }
+
+let private rowsFor steps =
+    steps
+    |> List.choose (function
+        | QueryStep -> Some(Map [ "value", "read" ])
+        | ExecuteStep -> None)
+
+let private run interpreter program =
+    StoreProgram.run interpreter CancellationToken.None program
+    |> fun task -> task.GetAwaiter().GetResult()
+
 let tests =
     testList
         "store program"
-        [ testTask "instructions are cold and execute sequentially" {
-              let interpreter = RecordingInterpreter([ Map [ "value", "read" ] ])
+        [ Property.property "instructions are cold and execute sequentially" (fun (steps: ProgramStep list, outcome: int) ->
+              let indexed = List.indexed steps
+              let interpreter = RecordingInterpreter(rowsFor steps)
+              let program = programFrom outcome indexed
+              let cold = List.isEmpty interpreter.Instructions
+              let result = run interpreter program
 
-              let program =
-                  store {
-                      do! StoreProgram.executeDiscard first parameters
-                      let! value = StoreProgram.queryOne second parameters readValue
-                      return value
-                  }
+              cold
+              && result = Ok outcome
+              && interpreter.Instructions = (indexed |> List.map (fun (index, step) -> expectedInstruction index step)))
 
-              Expect.isEmpty interpreter.Instructions "constructing a program performs no work"
+          Property.property "a typed error stops the remaining program" (fun (generated: ProgramStep list, position: uint32) ->
+              let steps =
+                  match generated with
+                  | [] -> [ ExecuteStep ]
+                  | values -> values
 
-              let! result = StoreProgram.run interpreter CancellationToken.None program
-
-              Expect.equal result (Ok "read") "the query result remains typed"
-              Expect.equal interpreter.Instructions [ Execute first; QueryOne second ] "instructions retain order"
-          }
-
-          testTask "a typed error stops the remaining program" {
-              let interpreter = RecordingInterpreter([], failureAt = first)
-
-              let program =
-                  store {
-                      do! StoreProgram.executeDiscard first parameters
-                      return! StoreProgram.executeDiscard second parameters
-                  }
-
-              let! result = StoreProgram.run interpreter CancellationToken.None program
+              let indexed = List.indexed steps
+              let failureIndex = int (position % uint32 steps.Length)
+              let failureKey = keyAt failureIndex
+              let interpreter = RecordingInterpreter(rowsFor steps, failureAt = failureKey)
+              let result = programFrom () indexed |> run interpreter
+              let expected = indexed |> List.take (failureIndex + 1) |> List.map (fun (index, step) -> expectedInstruction index step)
 
               match result with
               | Error(StoreError.Unexpected error) ->
-                  Expect.equal error.Message (StatementKey.value first) "the interpreter owns error translation"
-              | other -> failtestf "expected an interpreter error, got %A" other
-
-              Expect.equal interpreter.Instructions [ Execute first ] "nothing runs after an error"
-          }
+                  error.Message = StatementKey.value failureKey && interpreter.Instructions = expected
+              | _ -> false)
 
           testTask "row decode errors stop the remaining program" {
               let interpreter = RecordingInterpreter([ Map.empty ])
