@@ -9,7 +9,7 @@ open TestContext
 
 let private entity name : Entity = entityId name
 type private Claimed = LeasedCommand<Entity, TestEvent>
-let private lease = TimeSpan.FromSeconds 30.0
+let private lease = LeaseDuration.create (TimeSpan.FromSeconds 30.0)
 let private effectiveAt = DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero)
 
 /// Submits one command and claims it, which is the state every test here starts from.
@@ -18,7 +18,7 @@ let private effectiveAt = DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero)
 /// entity: any other entity with a claimable head would otherwise be returned instead, silently.
 let private claimKey (inbox: Inbox) (key: string) : Task<Claimed> =
     task {
-        let! claimed = inbox.Claim(machine, 50, lease, noCancellation)
+        let! claimed = inbox.Claim(machine, ClaimBatch.create 50, lease, noCancellation)
 
         return
             claimed
@@ -101,10 +101,17 @@ let tests =
               let inbox = newInbox ()
               let! _ = inbox.Submit(submission (entity "e1") "k1" (Start 1), noCancellation)
 
-              let! first = inbox.Claim(machine, 1, TimeSpan.FromMilliseconds 1.0, noCancellation)
+              let! first =
+                  inbox.Claim(
+                      machine,
+                      ClaimBatch.create 1,
+                      LeaseDuration.create (TimeSpan.FromMilliseconds 1.0),
+                      noCancellation
+                  )
+
               let stale = (first |> expectOk "first claim") |> List.exactlyOne
               do! Task.Delay 60
-              let! second = inbox.Claim(machine, 1, lease, noCancellation)
+              let! second = inbox.Claim(machine, ClaimBatch.create 1, lease, noCancellation)
               let holder = (second |> expectOk "reclaim") |> List.exactlyOne
 
               Expect.isGreaterThan

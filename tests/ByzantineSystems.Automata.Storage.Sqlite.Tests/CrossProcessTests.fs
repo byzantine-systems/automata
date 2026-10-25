@@ -44,7 +44,14 @@ let runWorker (db: string) (go: string) : int =
 
     let rec loop () =
         task {
-            match! inbox.Claim(testMachine, 3, TimeSpan.FromSeconds 30.0, noCancellation) with
+            match!
+                inbox.Claim(
+                    testMachine,
+                    ClaimBatch.create 3,
+                    LeaseDuration.create (TimeSpan.FromSeconds 30.0),
+                    noCancellation
+                )
+            with
             | Error error -> return failwithf "the worker's claim failed: %A" error
             | Ok [] when openCommands db = "0" -> return ()
             | Ok [] ->

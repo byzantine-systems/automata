@@ -13,7 +13,7 @@ let private entity name : Entity = entityId name
 /// `leased.Work.IdempotencyKey` gives inference nothing to go on and F# resolves the field
 /// against whichever record declared it last.
 type private Claimed = LeasedCommand<Entity, TestEvent>
-let private lease = TimeSpan.FromSeconds 30.0
+let private lease = LeaseDuration.create (TimeSpan.FromSeconds 30.0)
 
 let private backoff =
     Backoff.create (TimeSpan.FromMilliseconds 50.0) (TimeSpan.FromSeconds 1.0)
@@ -26,7 +26,7 @@ let private submit (inbox: Inbox) entityName key event =
 
 let private claim (inbox: Inbox) batch : Task<Claimed list> =
     task {
-        let! claimed = inbox.Claim(machine, batch, lease, noCancellation)
+        let! claimed = inbox.Claim(machine, ClaimBatch.create batch, lease, noCancellation)
         return claimed |> expectOk "claim"
     }
 
@@ -197,7 +197,13 @@ let tests =
 
               let! _ = submit inbox "e1" "k1" (Start 1)
 
-              let! first = inbox.Claim(machine, 1, TimeSpan.FromMilliseconds 1.0, noCancellation)
+              let! first =
+                  inbox.Claim(
+                      machine,
+                      ClaimBatch.create 1,
+                      LeaseDuration.create (TimeSpan.FromMilliseconds 1.0),
+                      noCancellation
+                  )
 
               let first: Claimed =
                   match first |> expectOk "short claim" with
@@ -291,7 +297,12 @@ let tests =
               let! (head: Claimed) = claimOne inbox
 
               let! outcome =
-                  inbox.ExtendLease(head.Work.CommandId, head.Token, TimeSpan.FromMinutes 5.0, noCancellation)
+                  inbox.ExtendLease(
+                      head.Work.CommandId,
+                      head.Token,
+                      LeaseDuration.create (TimeSpan.FromMinutes 5.0),
+                      noCancellation
+                  )
 
               Expect.equal (outcome |> expectOk "extend") Updated "the holder may extend"
 
@@ -378,7 +389,7 @@ let tests =
                       let mutable working = true
 
                       while working do
-                          let! claimed = inbox.Claim(machine, 4, lease, noCancellation)
+                          let! claimed = inbox.Claim(machine, ClaimBatch.create 4, lease, noCancellation)
 
                           match claimed |> expectOk "worker claim" with
                           | [] -> working <- false

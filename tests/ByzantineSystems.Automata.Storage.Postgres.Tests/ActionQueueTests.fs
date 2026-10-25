@@ -9,14 +9,14 @@ open TestContext
 
 let private entity name : Entity = entityId name
 type private Claimed = LeasedCommand<Entity, TestEvent>
-let private lease = TimeSpan.FromSeconds 30.0
+let private lease = LeaseDuration.create (TimeSpan.FromSeconds 30.0)
 let private actionLease = TimeSpan.FromSeconds 30.0
 let private effectiveAt = DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero)
 
 let private leased (inbox: Inbox) (name: string) (key: string) : Task<Claimed> =
     task {
         let! _ = inbox.Submit(submission (entity name) key (Start 1), noCancellation)
-        let! claimed = inbox.Claim(machine, 50, lease, noCancellation)
+        let! claimed = inbox.Claim(machine, ClaimBatch.create 50, lease, noCancellation)
 
         return
             claimed

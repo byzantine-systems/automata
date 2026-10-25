@@ -195,7 +195,15 @@ let tests =
               let! built = seeded "queued"
               let inbox = newInbox ()
               let! _ = Machine.enqueue built (entity "queued") (at "queued" "s3" 5 13) noCancellation
-              let! claimed = inbox.Claim(machine, 1, TimeSpan.FromMinutes 1., noCancellation)
+
+              let! claimed =
+                  inbox.Claim(
+                      machine,
+                      ClaimBatch.create 1,
+                      LeaseDuration.create (TimeSpan.FromMinutes 1.),
+                      noCancellation
+                  )
+
               let head = claimed |> expectOk "claim" |> List.exactlyOne
 
               let! submitted =

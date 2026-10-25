@@ -302,7 +302,7 @@ type ICommandInbox<'EntityId, 'Event> =
     /// transaction, and the token is what protects the work meanwhile.
     /// </summary>
     abstract Claim:
-        machineId: MachineId * batch: int * lease: TimeSpan * ct: CancellationToken ->
+        machineId: MachineId * batch: ClaimBatch * lease: LeaseDuration * ct: CancellationToken ->
             Task<Result<LeasedCommand<'EntityId, 'Event> list, StoreError>>
 
     /// <summary>
@@ -315,7 +315,7 @@ type ICommandInbox<'EntityId, 'Event> =
 
     /// <summary>Pushes out the deadline of a lease still held, for work that runs long.</summary>
     abstract ExtendLease:
-        commandId: CommandId * token: LeaseToken<CommandWork> * lease: TimeSpan * ct: CancellationToken ->
+        commandId: CommandId * token: LeaseToken<CommandWork> * lease: LeaseDuration * ct: CancellationToken ->
             Task<Result<LeaseUpdateOutcome, StoreError>>
 
     /// <summary>Reads a command's current state without waiting for it.</summary>

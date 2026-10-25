@@ -33,7 +33,7 @@ let private submit (name: string) (key: string) =
 
 let private claimed (key: string) =
     task {
-        let! batch = (newInbox ()).Claim(machine, 50, lease, noCancellation)
+        let! batch = (newInbox ()).Claim(machine, ClaimBatch.create 50, LeaseDuration.create lease, noCancellation)
 
         return
             batch
@@ -464,7 +464,9 @@ let reaperTests =
               let! reports = run 100
               Expect.equal (reportFor reports).Reaped 0L "inside the grace period"
 
-              let! extended = (newInbox ()).ExtendLease(held.Work.CommandId, held.Token, lease, noCancellation)
+              let! extended =
+                  (newInbox ()).ExtendLease(held.Work.CommandId, held.Token, LeaseDuration.create lease, noCancellation)
+
               Expect.equal (extended |> expectOk "extend") Updated "its holder can still keep it"
           } ]
 

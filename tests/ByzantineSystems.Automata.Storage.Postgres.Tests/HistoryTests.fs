@@ -8,7 +8,7 @@ open Expecto
 open TestContext
 
 let private entity name : Entity = entityId name
-let private lease = TimeSpan.FromSeconds 30.0
+let private lease = LeaseDuration.create (TimeSpan.FromSeconds 30.0)
 let private effectiveAt = DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero)
 
 /// Submits, claims and commits one command, which is the only way a transition gets into the log.
@@ -16,7 +16,7 @@ let private commit (name: string) (key: string) (toState: TestState) =
     task {
         let inbox = newInbox ()
         let! _ = inbox.Submit(submission (entity name) key (Start 1), noCancellation)
-        let! claimed = inbox.Claim(machine, 50, lease, noCancellation)
+        let! claimed = inbox.Claim(machine, ClaimBatch.create 50, lease, noCancellation)
 
         let held =
             claimed

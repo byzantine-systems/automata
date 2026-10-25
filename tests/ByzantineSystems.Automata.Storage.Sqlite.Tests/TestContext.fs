@@ -331,7 +331,14 @@ let submit (inbox: Inbox) (entity: Entity) (key: string) (event: TestEvent) : Ta
 /// Claims up to a batch of commands with a lease the test does not expect to lapse.
 let claim (inbox: Inbox) (batch: int) : Task<Claimed list> =
     task {
-        let! claimed = inbox.Claim(testMachine, batch, TimeSpan.FromSeconds 30.0, noCancellation)
+        let! claimed =
+            inbox.Claim(
+                testMachine,
+                ClaimBatch.create batch,
+                LeaseDuration.create (TimeSpan.FromSeconds 30.0),
+                noCancellation
+            )
+
         return claimed |> expectOk "claim"
     }
 

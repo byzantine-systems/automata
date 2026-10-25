@@ -303,12 +303,6 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
             }
 
         member _.Claim(machineId, batch, lease, ct) =
-            if batch < 1 then
-                invalidArg (nameof batch) "A claim batch size must be positive."
-
-            if lease <= TimeSpan.Zero then
-                invalidArg (nameof lease) "A lease must be a positive duration."
-
             // Claiming is the one call here that must not be repeated automatically. It is not
             // idempotent: a claim whose reply was lost has already leased a batch, and a retry
             // leases a second one while the first stays invisible until its lease lapses. The
@@ -318,8 +312,8 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
                 (StoreProgram.queryRows
                     claimCommands
                     [ Params.machineId "machine_id" machineId
-                      "batch", Param.Int batch
-                      "lease", Param.Interval lease ]
+                      "batch", Param.Int(ClaimBatch.value batch)
+                      "lease", Param.Interval(LeaseDuration.value lease) ]
                     leasedRow)
                 ct
 
@@ -335,16 +329,13 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
                 ct
 
         member _.ExtendLease(commandId, leaseToken, lease, ct) =
-            if lease <= TimeSpan.Zero then
-                invalidArg (nameof lease) "A lease must be a positive duration."
-
             Sql.runProgram
                 context
                 (leaseUpdate
                     extendLease
                     [ Params.commandId "command_id" commandId
                       Params.commandLease "lease_token" leaseToken
-                      "lease", Param.Interval lease ])
+                      "lease", Param.Interval(LeaseDuration.value lease) ])
                 ct
 
         member _.TryGet(commandId, ct) =

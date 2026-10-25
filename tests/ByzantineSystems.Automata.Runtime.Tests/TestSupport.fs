@@ -135,7 +135,7 @@ type StubStore<'Err>() =
                 let drained = ResizeArray()
                 let mutable taking = true
 
-                while taking && drained.Count < batch do
+                while taking && drained.Count < ClaimBatch.value batch do
                     match pending.TryDequeue() with
                     | true, leased -> drained.Add leased
                     | _ -> taking <- false

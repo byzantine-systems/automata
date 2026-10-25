@@ -231,7 +231,14 @@ let tests =
               let! rescheduled = inbox.Reschedule(head.Work.CommandId, stale, backoff, noCancellation)
               Expect.equal (rescheduled |> expectOk "reschedule") LeaseLost "rescheduling is fenced"
 
-              let! extended = inbox.ExtendLease(head.Work.CommandId, stale, TimeSpan.FromMinutes 1.0, noCancellation)
+              let! extended =
+                  inbox.ExtendLease(
+                      head.Work.CommandId,
+                      stale,
+                      LeaseDuration.create (TimeSpan.FromMinutes 1.0),
+                      noCancellation
+                  )
+
               Expect.equal (extended |> expectOk "extend") LeaseLost "extending is fenced"
 
               let! record = readBack inbox head.Work.CommandId
@@ -272,7 +279,12 @@ let tests =
               let! head = claimOne inbox
 
               let! outcome =
-                  inbox.ExtendLease(head.Work.CommandId, head.Token, TimeSpan.FromMinutes 5.0, noCancellation)
+                  inbox.ExtendLease(
+                      head.Work.CommandId,
+                      head.Token,
+                      LeaseDuration.create (TimeSpan.FromMinutes 5.0),
+                      noCancellation
+                  )
 
               Expect.equal (outcome |> expectOk "extend") Updated "the holder may extend"
 

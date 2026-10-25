@@ -337,17 +337,11 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
             }
 
         member _.Claim(machineId, batch, lease, ct) =
-            if batch < 1 then
-                invalidArg (nameof batch) "A claim batch size must be positive."
-
-            if lease <= TimeSpan.Zero then
-                invalidArg (nameof lease) "A lease must be a positive duration."
-
             // Claiming is the one call that must not be repeated automatically. A claim whose
             // outcome was lost may have leased a batch, and a retry would lease a second one
             // while the first stays invisible until its lease lapses. The worker polls again in a
             // moment, which recovers sooner than a retry would.
-            Sql.writeProgramOnceWith context (claim machineId batch lease) ct
+            Sql.writeProgramOnceWith context (claim machineId (ClaimBatch.value batch) (LeaseDuration.value lease)) ct
 
         member _.Reschedule(commandId, leaseToken, backoff, ct) =
             Sql.writeProgramWith
@@ -366,9 +360,6 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
                 ct
 
         member _.ExtendLease(commandId, leaseToken, lease, ct) =
-            if lease <= TimeSpan.Zero then
-                invalidArg (nameof lease) "A lease must be a positive duration."
-
             Sql.writeProgramWith
                 context
                 (fun now ->
@@ -377,7 +368,7 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
                             extendLease,
                             [ Params.commandId "@command_id" commandId
                               Params.commandLease "@lease_token" leaseToken
-                              "@deadline", Param.Integer(Instant.add now lease) ]
+                              "@deadline", Param.Integer(Instant.add now (LeaseDuration.value lease)) ]
                         )
                     ))
                 ct
