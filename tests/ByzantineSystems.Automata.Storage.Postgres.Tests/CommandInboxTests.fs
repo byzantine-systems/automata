@@ -4,6 +4,8 @@ open System
 open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
+open ByzantineSystems.Automata.Storage.Postgres
+open ByzantineSystems.Automata.Storage.ContractProperties
 open Expecto
 open TestContext
 
@@ -14,9 +16,6 @@ let private entity name : Entity = entityId name
 /// against whichever record declared it last.
 type private Claimed = LeasedCommand<Entity, TestEvent>
 let private lease = LeaseDuration.create (TimeSpan.FromSeconds 30.0)
-
-let private backoff =
-    Backoff.create (TimeSpan.FromMilliseconds 50.0) (TimeSpan.FromSeconds 1.0)
 
 let private submit (inbox: Inbox) entityName key event =
     task {
@@ -30,35 +29,77 @@ let private claim (inbox: Inbox) batch : Task<Claimed list> =
         return claimed |> expectOk "claim"
     }
 
-let private claimOne (inbox: Inbox) : Task<Claimed> =
-    task {
-        let! (claimed: Claimed list) = claim inbox 1
+// The shared inbox state machine, over this provider: one truncate-and-reseed per generated
+// case, and the database's own clock, so time moves by sleeping. Lease deadlines are stamped
+// by the database, which is why the model is given a deadband around them.
+let private contractEnv () : ContractInboxEnv =
+    let encode, decode = EntityKey.forEntityId<ContractEntity>
 
-        return
-            match claimed with
-            | [ single ] -> single
-            | other -> failtestf "expected exactly one claimed command, got %i" (List.length other)
-    }
+    let stores () =
+        { Inbox =
+            PostgresCommandInbox<ContractEntityId, ContractEvent>(
+                { Context = context ()
+                  EventCodec = Serialization.systemTextJson<ContractEvent> ()
+                  EntityIdEncode = encode
+                  EntityIdDecode = decode }
+            )
+            :> ContractInbox
+          Processor =
+            PostgresCommandProcessorStore<ContractEntityId, ContractState, ContractEvent, ContractAction, ContractError>(
+                { Context = context ()
+                  ActionQueue = actionQueue
+                  StateCodec = Serialization.systemTextJson<ContractState> ()
+                  EventCodec = Serialization.systemTextJson<ContractEvent> ()
+                  ActionCodec = Serialization.systemTextJson<ContractAction list> ()
+                  ErrorCodec = Serialization.systemTextJson<ContractError> ()
+                  EntityIdEncode = encode
+                  EntityIdDecode = decode }
+            )
+            :> ContractProcessor
+          Now = fun () -> DateTimeOffset.UtcNow
+          Advance = fun span -> Task.Delay(span + TimeSpan.FromMilliseconds 20.0) }
+
+    { Machine = machine
+      Version = version
+      ClaimLease = LeaseDuration.create (TimeSpan.FromMilliseconds 50.0)
+      Backoff = Backoff.create (TimeSpan.FromMilliseconds 5.0) (TimeSpan.FromMilliseconds 40.0)
+      Margin = TimeSpan.FromMilliseconds 25.0
+      Ticks = fun ms -> TimeSpan.FromMilliseconds(float ms)
+      Fresh =
+        fun () ->
+            task {
+                do! reset ()
+                return stores ()
+            } }
+
+let private behaviorClasses =
+    [ "resubmit"
+      "empty-claim"
+      "batch-limited"
+      "blocked-sibling"
+      "delay-not-yet"
+      "delay-elapsed"
+      "expiry-reclaimed"
+      "reject-releases"
+      "deadletter-releases"
+      "retry-deferred"
+      "renew-held"
+      "stale-reject"
+      "stale-deadletter"
+      "stale-retry"
+      "stale-renew"
+      "lookup-hit"
+      "lookup-miss" ]
 
 let tests =
     testList
         "Postgres ICommandInbox"
-        [
+        [ ContractProperties.inboxProperty "the inbox follows the shared state machine" 12 25 (contractEnv ())
 
-          testTask "a repeated idempotency key returns the original command" {
-              do! reset ()
-              let inbox = newInbox ()
-
-              let! first = submit inbox "e1" "k1" (Start 1)
-              let! again = submit inbox "e1" "k1" (Start 1)
-
-              match first, again with
-              | Accepted original, AlreadySubmitted existing ->
-                  Expect.equal existing original "the repeat should carry the original command's id"
-              | other -> failtestf "expected Accepted then AlreadySubmitted, got %A" other
-
-              Expect.equal (scalar<int64> "SELECT count(*) FROM fsm.command") 1L "only one command should exist"
-          }
+          ContractProperties.inboxReachability
+              "the generated inbox traces reach every behavior class"
+              (contractEnv ())
+              behaviorClasses
 
           testTask "sequence numbers are gapless per entity and independent across entities" {
               do! reset ()
@@ -80,20 +121,6 @@ let tests =
               Expect.equal (sequenceOf "e2") "1,2" "the second entity should number independently"
           }
 
-          testTask "only the first command of an entity is unblocked" {
-              do! reset ()
-              let inbox = newInbox ()
-
-              let! _ = submit inbox "e1" "k1" (Start 1)
-              let! _ = submit inbox "e1" "k2" (Start 2)
-              let! _ = submit inbox "e1" "k3" Finish
-
-              Expect.equal
-                  (scalar<string> "SELECT string_agg(blocked::text, ',' ORDER BY seq) FROM fsm.command")
-                  "false,true,true"
-                  "the head is claimable and everything behind it waits"
-          }
-
           // The regression that motivates the materialised CTE. Written as a plain IN (SELECT ...
           // LIMIT n) subquery, the planner rescans the candidate set per outer row, LIMIT bounds
           // each rescan rather than the statement, and this claim returns all ten.
@@ -113,223 +140,6 @@ let tests =
                   (scalar<int64> "SELECT count(*) FROM fsm.command WHERE status = 'ready'")
                   9L
                   "the rest of the queue must be untouched"
-          }
-
-          testTask "a batch never contains two commands for one entity" {
-              do! reset ()
-              let inbox = newInbox ()
-
-              for index in 1..4 do
-                  let! _ = submit inbox "e1" $"k{index}" (Start index)
-                  ()
-
-              for index in 1..3 do
-                  let! _ = submit inbox $"other{index}" $"o{index}" Finish
-                  ()
-
-              let! (claimed: Claimed list) = claim inbox 50
-              let entities = claimed |> List.map (fun leased -> leased.Work.EntityId)
-
-              Expect.equal
-                  (List.distinct entities |> List.length)
-                  (List.length entities)
-                  "each entity appears at most once"
-
-              Expect.hasLength claimed 4 "one head per entity, and there are four entities"
-          }
-
-          testTask "commands for one entity are delivered in submission order" {
-              do! reset ()
-              let inbox = newInbox ()
-
-              let! _ = submit inbox "e1" "first" (Start 1)
-              let! _ = submit inbox "e1" "second" Finish
-
-              let! (head: Claimed) = claimOne inbox
-              Expect.equal head.Work.IdempotencyKey "first" "the earliest command comes first"
-
-              let! (blocked: Claimed list) = claim inbox 10
-              Expect.isEmpty blocked "nothing else for the entity is claimable while its head is leased"
-
-              let! outcome =
-                  (newProcessor ())
-                      .Reject(head.Work.CommandId, head.Token, CommandFailure.Domain(Refused "done"), noCancellation)
-
-              Expect.equal
-                  (outcome |> expectOk "finalize")
-                  (Finalized Epoch.initial)
-                  "the fenced terminal write should succeed"
-
-              let! (next: Claimed) = claimOne inbox
-              Expect.equal next.Work.IdempotencyKey "second" "finishing the head releases the entity"
-          }
-
-          testTask "dead-lettering releases the entity rather than wedging it" {
-              do! reset ()
-              let inbox = newInbox ()
-
-              let! _ = submit inbox "e1" "poison" (Start 1)
-              let! _ = submit inbox "e1" "healthy" Finish
-
-              let! (head: Claimed) = claimOne inbox
-
-              let! outcome =
-                  (newProcessor ())
-                      .DeadLetter(
-                          head.Work.CommandId,
-                          head.Token,
-                          CommandFailure.Domain(Refused "poison"),
-                          noCancellation
-                      )
-
-              Expect.equal
-                  (outcome |> expectOk "dead letter")
-                  (Finalized Epoch.initial)
-                  "dead-lettering is a terminal write"
-
-              let! (next: Claimed) = claimOne inbox
-              Expect.equal next.Work.IdempotencyKey "healthy" "the entity keeps moving after a command is abandoned"
-          }
-
-          testTask "an expired lease is redelivered with a higher token" {
-              do! reset ()
-              let inbox = newInbox ()
-
-              let! _ = submit inbox "e1" "k1" (Start 1)
-
-              let! first =
-                  inbox.Claim(
-                      machine,
-                      ClaimBatch.create 1,
-                      LeaseDuration.create (TimeSpan.FromMilliseconds 1.0),
-                      noCancellation
-                  )
-
-              let first: Claimed =
-                  match first |> expectOk "short claim" with
-                  | [ single ] -> single
-                  | other -> failtestf "expected one command, got %i" (List.length other)
-
-              do! Task.Delay(TimeSpan.FromMilliseconds 50.0)
-
-              let! (second: Claimed) = claimOne inbox
-
-              Expect.equal second.Work.CommandId first.Work.CommandId "the same command comes back"
-              Expect.equal second.DeliveryCount 2 "the delivery count counts redeliveries"
-
-              Expect.isGreaterThan
-                  (LeaseToken.value second.Token)
-                  (LeaseToken.value first.Token)
-                  "tokens are monotone, so a stale one is strictly lower"
-
-              let! stale =
-                  (newProcessor ())
-                      .Reject(first.Work.CommandId, first.Token, CommandFailure.Domain(Refused "stale"), noCancellation)
-
-              Expect.equal
-                  (stale |> expectOk "stale finalize")
-                  FinalizeOutcome.LeaseLost
-                  "the reclaimed worker cannot finish the command"
-          }
-
-          testTask "a stale token cannot acknowledge, reschedule or extend" {
-              do! reset ()
-              let inbox = newInbox ()
-
-              let! _ = submit inbox "e1" "k1" (Start 1)
-              let! (head: Claimed) = claimOne inbox
-
-              let stale: LeaseToken<CommandWork> =
-                  LeaseToken.ofInt64 (LeaseToken.value head.Token - 1L)
-
-              let! finalized =
-                  (newProcessor ())
-                      .Reject(head.Work.CommandId, stale, CommandFailure.Domain(Refused "stale"), noCancellation)
-
-              Expect.equal (finalized |> expectOk "finalize") FinalizeOutcome.LeaseLost "finishing a command is fenced"
-
-              let! rescheduled = inbox.Reschedule(head.Work.CommandId, stale, backoff, noCancellation)
-              Expect.equal (rescheduled |> expectOk "reschedule") LeaseLost "rescheduling is fenced"
-
-              let! extended = inbox.ExtendLease(head.Work.CommandId, stale, lease, noCancellation)
-              Expect.equal (extended |> expectOk "extend") LeaseLost "extending is fenced"
-
-              let! current = inbox.TryGet(head.Work.CommandId, noCancellation)
-
-              match current |> expectOk "read back" with
-              | Some record ->
-                  Expect.equal record.Status CommandStatus.Leased "the command is untouched by the stale worker"
-                  Expect.equal record.Attempts 0 "a rejected reschedule must not count an attempt"
-              | None -> failtest "the command should still exist"
-          }
-
-          testTask "rescheduling returns the command to ready and counts the attempt" {
-              do! reset ()
-              let inbox = newInbox ()
-
-              let! _ = submit inbox "e1" "k1" (Start 1)
-              let! (head: Claimed) = claimOne inbox
-
-              let! outcome = inbox.Reschedule(head.Work.CommandId, head.Token, backoff, noCancellation)
-              Expect.equal (outcome |> expectOk "reschedule") Updated "the holder may reschedule"
-
-              let! current = inbox.TryGet(head.Work.CommandId, noCancellation)
-
-              match current |> expectOk "read back" with
-              | Some record ->
-                  Expect.equal record.Status CommandStatus.Ready "a rescheduled command is ready again"
-                  Expect.equal record.Attempts 1 "the failed attempt is recorded"
-                  Expect.isFalse record.Blocked "it keeps its place at the head of the entity"
-              | None -> failtest "the command should still exist"
-
-              // Full jitter may legally choose no delay. The envelope only promises an upper
-              // bound, so assert eventual claimability after that bound instead of racing it.
-              do! Task.Delay(TimeSpan.FromMilliseconds 1200.0)
-              let! (retried: Claimed list) = claim inbox 10
-              Expect.hasLength retried 1 "the retry becomes claimable once the backoff elapses"
-          }
-
-          testTask "extending a held lease keeps the command claimed" {
-              do! reset ()
-              let inbox = newInbox ()
-
-              let! _ = submit inbox "e1" "k1" (Start 1)
-              let! (head: Claimed) = claimOne inbox
-
-              let! outcome =
-                  inbox.ExtendLease(
-                      head.Work.CommandId,
-                      head.Token,
-                      LeaseDuration.create (TimeSpan.FromMinutes 5.0),
-                      noCancellation
-                  )
-
-              Expect.equal (outcome |> expectOk "extend") Updated "the holder may extend"
-
-              Expect.equal
-                  (scalar<int64> "SELECT count(*) FROM fsm.command WHERE visible_at > now() + interval '4 minutes'")
-                  1L
-                  "the deadline moved out"
-          }
-
-          testTask "a command can be found by the key it was submitted under" {
-              do! reset ()
-              let inbox = newInbox ()
-
-              let! outcome = submit inbox "e1" "k1" (Start 7)
-              let expectedId = commandIdOf outcome
-
-              let! found = inbox.TryFind(machine, entity "e1", "k1", noCancellation)
-
-              match found |> expectOk "find" with
-              | Some record ->
-                  Expect.equal record.CommandId expectedId "the same command"
-                  Expect.equal record.Event (Start 7) "the event round-trips through jsonb"
-                  Expect.equal record.ChartVersion version "the pinned chart version round-trips"
-              | None -> failtest "the command should be found"
-
-              let! missing = inbox.TryFind(machine, entity "e1", "absent", noCancellation)
-              Expect.isNone (missing |> expectOk "find missing") "an unknown key finds nothing"
           }
 
           testTask "audit context round-trips, and absent fields stay absent" {
