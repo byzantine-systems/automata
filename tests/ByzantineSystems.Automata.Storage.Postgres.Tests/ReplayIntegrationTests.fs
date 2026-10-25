@@ -303,9 +303,10 @@ let tests =
                       noCancellation
 
               let plan = preview |> expectOk "preview"
+              let head, tail = plan.Commit.Beliefs
 
               Expect.equal
-                  (plan.Commit.Beliefs |> List.map _.Asserted.State)
+                  ((head :: tail) |> List.map _.Asserted.State)
                   [ Active 11; Active 13 ]
                   "the timeline it would write"
 

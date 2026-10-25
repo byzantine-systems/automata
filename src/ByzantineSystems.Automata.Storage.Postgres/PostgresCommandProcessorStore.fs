@@ -521,7 +521,8 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                 // Everything is encoded before anything is sent, so a state that will not encode
                 // fails the correction rather than half-writing it.
                 let! encoded = encodeDraft commit.Transition
-                let! beliefs = BeliefPayload.encode options.StateCodec commit.Beliefs
+                let head, tail = commit.Beliefs
+                let! beliefs = BeliefPayload.encode options.StateCodec (head :: tail)
                 let draft = commit.Transition
 
                 return!

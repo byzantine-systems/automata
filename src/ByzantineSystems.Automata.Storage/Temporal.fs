@@ -173,10 +173,12 @@ type CorrectionCommit<'EntityId, 'State, 'Event, 'Action> =
         /// <summary>The instant the belief timeline is rewritten from.</summary>
         ValidFrom: DateTimeOffset
         /// <summary>
-        /// The rewritten timeline. The last belief is attributed to the correction's own epoch,
+        /// The rewritten timeline, never empty: at least the correction's own belief is written,
+        /// or the next ordinary command would read a missing live belief and an epoch of zero.
+        /// The first belief is the earliest; the last is attributed to the correction's own epoch,
         /// which is what the next ordinary command expects.
         /// </summary>
-        Beliefs: CorrectedBelief<'State> list
+        Beliefs: CorrectedBelief<'State> * CorrectedBelief<'State> list
     }
 
 /// <summary>

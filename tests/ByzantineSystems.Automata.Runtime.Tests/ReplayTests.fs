@@ -357,7 +357,7 @@ let private planSatisfies (scenario: Scenario) (plan: ReplayPlan<EntityId<Entity
 
     plan.Inserted = inserted
     && plan.Commit.ValidFrom = at 2
-    && plan.Commit.Beliefs = beliefsOf scenario inserted reference
+    && (let head, tail = plan.Commit.Beliefs in head :: tail) = beliefsOf scenario inserted reference
     && plan.Commit.Transition = commitOf scenario inserted reference
     && (plan.Replayed, reference)
        ||> List.forall2 (fun (_, actual) (_, expected) -> actual = expected)

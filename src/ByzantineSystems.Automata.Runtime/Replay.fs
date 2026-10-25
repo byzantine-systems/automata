@@ -190,4 +190,7 @@ module Replay =
                                 Status = final.Status
                                 Actions = [] }
                           ValidFrom = input.At
-                          Beliefs = beliefs } }))
+                          Beliefs =
+                            match beliefs with
+                            | head :: tail -> head, tail
+                            | [] -> invalidOp "a replayed correction always carries its inserted belief" } }))
