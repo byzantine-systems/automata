@@ -84,17 +84,38 @@ let private behaviorClasses =
       "deadletter-releases"
       "retry-deferred"
       "renew-held"
+      "commit-finalized"
+      "commit-conflict"
+      "commit-already"
+      "commit-stale-fenced"
+      "terminal-stale-commit"
+      "ready-zero-token-fenced"
+      "expired-unreclaimed"
+      "reject-already"
+      "deadletter-already"
       "stale-reject"
       "stale-deadletter"
       "stale-retry"
       "stale-renew"
       "lookup-hit"
-      "lookup-miss" ]
+      "lookup-miss"
+      "result-pending"
+      "result-committed"
+      "result-rejected"
+      "result-deadlettered"
+      "result-missing" ]
 
 let tests =
     testList
         "Postgres ICommandInbox"
         [ ContractProperties.inboxProperty "the inbox follows the shared state machine" 12 25 (contractEnv ())
+
+          ContractProperties.finalizeProperty "finalization obeys the shared equations" 3 (contractEnv ())
+
+          ContractProperties.readyTokenProperty
+              "a ready command's sentinel token never authorizes finalization"
+              9
+              (contractEnv ())
 
           ContractProperties.inboxReachability
               "the generated inbox traces reach every behavior class"

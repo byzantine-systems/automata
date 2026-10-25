@@ -91,17 +91,38 @@ let private behaviorClasses =
       "deadletter-releases"
       "retry-deferred"
       "renew-held"
+      "commit-finalized"
+      "commit-conflict"
+      "commit-already"
+      "commit-stale-fenced"
+      "terminal-stale-commit"
+      "ready-zero-token-fenced"
+      "expired-unreclaimed"
+      "reject-already"
+      "deadletter-already"
       "stale-reject"
       "stale-deadletter"
       "stale-retry"
       "stale-renew"
       "lookup-hit"
-      "lookup-miss" ]
+      "lookup-miss"
+      "result-pending"
+      "result-committed"
+      "result-rejected"
+      "result-deadlettered"
+      "result-missing" ]
 
 let tests =
     testList
         "ICommandInbox"
         [ ContractProperties.inboxProperty "the inbox follows the shared state machine" 25 30 (contractEnv ())
+
+          ContractProperties.finalizeProperty "finalization obeys the shared equations" 8 (contractEnv ())
+
+          ContractProperties.readyTokenProperty
+              "a ready command's sentinel token never authorizes finalization"
+              12
+              (contractEnv ())
 
           ContractProperties.inboxReachability
               "the generated inbox traces reach every behavior class"

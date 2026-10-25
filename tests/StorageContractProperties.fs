@@ -100,8 +100,11 @@ type ContractEvent =
     | Ping of int
     | Pong
 
-type ContractState = Idle
-type ContractAction = Fired
+type ContractState =
+    | Idle
+    | Active of int
+
+type ContractAction = Fired of int
 type ContractError = Refused of string
 
 type ContractEntityId = EntityId<ContractEntity>
@@ -145,9 +148,12 @@ type InboxChoice =
     | Submit of entity: byte * key: byte * event: byte * delay: byte
     | Claim of batch: byte
     | Finish of kind: byte * claim: byte
+    | Commit of claim: byte * expected: byte * state: byte * token: byte
+    | Repeat of claim: byte
     | Stale of kind: byte * claim: byte
     | Advance of ticks: byte
     | Lookup of entity: byte * key: byte
+    | Result of entity: byte * key: byte
 
 let private entityName (raw: byte) = $"e{int raw % 3}"
 
@@ -168,6 +174,39 @@ let private advanceOf (raw: byte) = advanceTable[int raw % 8]
 /// What a fenced write does: 0 rejects, 1 dead-letters, 2 reschedules, 3 extends the lease.
 let private finishKindOf (raw: byte) = int raw % 4
 
+let private failureOf (raw: byte) : CommandFailure<ContractError> =
+    match int raw / 4 % 4 with
+    | 0 -> CommandFailure.Domain(Refused "the trace refused it")
+    | 1 -> CommandFailure.Machine "the trace could not process it"
+    | 2 -> CommandFailure.Replay(ReplayError.Diverged(Epoch.ofUInt64 3UL, "the trace diverged"))
+    | _ -> CommandFailure.Replay ReplayError.HistoryPurged
+
+let private contractSubmission env entity key event =
+    { MachineId = env.Machine
+      EntityId = entity
+      IdempotencyKey = key
+      ChartVersion = env.Version
+      Kind = CommandKind.Event
+      Event = event
+      VisibleAt = None
+      ReceivedAt = None
+      Audit = AuditContext.empty }
+
+let private contractDraft env entity event raw fromState =
+    let state = Active(1 + int raw % 7)
+
+    { MachineId = env.Machine
+      EntityId = entity
+      Event = event
+      Actions = [ Fired(1 + int raw % 5) ]
+      FromState = fromState
+      ToState = state
+      HandledBy = stateId "contract"
+      Exited = [ stateId "from" ]
+      Entered = [ stateId "to" ]
+      Status = Running
+      EffectiveAt = DateTimeOffset(2026, 1, 1, 0, 0, int raw % 60, TimeSpan.Zero) }
+
 let private staleKindName =
     function
     | 0 -> "stale-reject"
@@ -180,7 +219,17 @@ let private staleKindName =
 type private ModelStatus =
     | Waiting of visibleAt: DateTimeOffset * uncertainUntil: DateTimeOffset option
     | Leased of deadline: DateTimeOffset
-    | Finished of CommandStatus
+    | Finished of ModelTerminal
+
+and private ModelTerminal =
+    | CommittedResult of
+        expected: Epoch *
+        committed: Epoch *
+        draft: TransitionDraft<ContractEntityId, ContractState, ContractEvent, ContractAction> *
+        before: DateTimeOffset *
+        after: DateTimeOffset
+    | RejectedResult of CommandFailure<ContractError>
+    | DeadLetterResult of CommandFailure<ContractError>
 
 type private Tracked =
     { Index: int
@@ -222,6 +271,8 @@ let private runInboxTrace
         let commands = ResizeArray<Tracked>()
         // Every claim the trace observed, in observation order, as (command index, token).
         let claims = ResizeArray<int * int64>()
+        let mutable entityEpochs: Map<string, Epoch> = Map.empty
+        let mutable entityStates: Map<string, ContractState> = Map.empty
         let ct = CancellationToken.None
 
         let finished (tracked: Tracked) =
@@ -233,7 +284,39 @@ let private runInboxTrace
             match tracked.Status with
             | Waiting _ -> CommandStatus.Ready
             | Leased _ -> CommandStatus.Leased
-            | Finished status -> status
+            | Finished(CommittedResult _) -> CommandStatus.Succeeded
+            | Finished(RejectedResult _) -> CommandStatus.Rejected
+            | Finished(DeadLetterResult _) -> CommandStatus.DeadLettered
+
+        let currentEpoch entity =
+            Map.tryFind entity entityEpochs |> Option.defaultValue Epoch.initial
+
+        let currentState entity =
+            Map.tryFind entity entityStates |> Option.defaultValue Idle
+
+        let expectedEpoch raw actual =
+            match int raw % 3 with
+            | 0 -> actual
+            | 1 -> Epoch.next actual
+            | _ -> Epoch.initial
+
+        let draftOf (tracked: Tracked) raw =
+            contractDraft env tracked.EntityId tracked.Event raw (currentState tracked.Entity)
+
+        let resultMatches (tracked: Tracked) observed =
+            match tracked.Status, observed with
+            | Waiting _, Some CommandResult.Pending
+            | Leased _, Some CommandResult.Pending -> true
+            | Finished(RejectedResult failure), Some(CommandResult.Rejected actual) -> actual = failure
+            | Finished(DeadLetterResult failure), Some(CommandResult.DeadLettered actual) -> actual = failure
+            | Finished(CommittedResult(_, epoch, draft, before, after)), Some(CommandResult.Committed actual) ->
+                actual.CommandId = tracked.Id
+                && actual.ChartVersion = env.Version
+                && actual.Epoch = epoch
+                && actual.Draft = draft
+                && actual.CommittedAt >= before - receivedTolerance
+                && actual.CommittedAt <= after + receivedTolerance
+            | _ -> false
 
         let blocked (tracked: Tracked) =
             commands
@@ -461,7 +544,7 @@ let private runInboxTrace
                                 return! loop rest
                             else
                                 let tokenId = LeaseToken.ofInt64 token
-                                let failure = CommandFailure.Domain(Refused "the trace refused it")
+                                let failure = failureOf kind
 
                                 match finishKindOf kind with
                                 | 0 ->
@@ -469,7 +552,7 @@ let private runInboxTrace
 
                                     match outcome with
                                     | Ok(Finalized committed) when committed = Epoch.initial ->
-                                        tracked.Status <- Finished CommandStatus.Rejected
+                                        tracked.Status <- Finished(RejectedResult failure)
                                         tracked.LiveClaim <- None
                                         classes.Add "reject-releases"
                                         return! loop rest
@@ -479,7 +562,7 @@ let private runInboxTrace
 
                                     match outcome with
                                     | Ok(Finalized committed) when committed = Epoch.initial ->
-                                        tracked.Status <- Finished CommandStatus.DeadLettered
+                                        tracked.Status <- Finished(DeadLetterResult failure)
                                         tracked.LiveClaim <- None
                                         classes.Add "deadletter-releases"
                                         return! loop rest
@@ -522,6 +605,131 @@ let private runInboxTrace
                                         classes.Add "renew-held"
                                         return! loop rest
                                     | _ -> return false
+
+                    | Commit(claim, expected, state, tokenKind) ->
+                        if claims.Count = 0 then
+                            return! loop rest
+                        else
+                            let claimIndex = int claim % claims.Count
+                            let commandIndex, claimedToken = claims[claimIndex]
+                            let tracked = commands[commandIndex]
+
+                            let token =
+                                match int tokenKind % 3 with
+                                | 0 -> claimedToken
+                                | 1 -> 0L
+                                | _ -> max 0L (claimedToken - 1L)
+
+                            match tracked.Status with
+                            | Finished(RejectedResult _)
+                            | Finished(DeadLetterResult _) when token = tracked.RowToken ->
+                                // A cross-resolution retry has underspecified epoch reporting.
+                                // Repeat exercises idempotence without changing the resolution.
+                                return! loop rest
+                            | status ->
+                                let actual = currentEpoch tracked.Entity
+                                let expected = expectedEpoch expected actual
+                                let draft = draftOf tracked state
+                                let before = stores.Now()
+
+                                let! outcome =
+                                    stores.Processor.Commit(tracked.Id, LeaseToken.ofInt64 token, expected, draft, ct)
+
+                                let after = stores.Now()
+
+                                match status with
+                                | Finished(CommittedResult(_, committed, _, _, _)) when token = tracked.RowToken ->
+                                    if outcome = Ok(AlreadyFinalized committed) then
+                                        classes.Add "commit-already"
+                                        return! loop rest
+                                    else
+                                        return false
+                                | Finished _ ->
+                                    if outcome = Ok FinalizeOutcome.LeaseLost then
+                                        classes.Add "terminal-stale-commit"
+                                        return! loop rest
+                                    else
+                                        return false
+                                | Waiting _ ->
+                                    if outcome = Ok FinalizeOutcome.LeaseLost then
+                                        if token = 0L then
+                                            classes.Add "ready-zero-token-fenced"
+                                        else
+                                            classes.Add "commit-stale-fenced"
+
+                                        return! loop rest
+                                    else
+                                        return false
+                                | Leased _ when token <> tracked.RowToken ->
+                                    if outcome = Ok FinalizeOutcome.LeaseLost then
+                                        classes.Add "commit-stale-fenced"
+                                        return! loop rest
+                                    else
+                                        return false
+                                | Leased _ when expected <> actual ->
+                                    if outcome = Ok(Conflict(expected, actual)) then
+                                        classes.Add "commit-conflict"
+                                        return! loop rest
+                                    else
+                                        return false
+                                | Leased deadline ->
+                                    let committed = Epoch.next expected
+
+                                    if outcome = Ok(Finalized committed) then
+                                        if before >= deadline then
+                                            classes.Add "expired-unreclaimed"
+
+                                        entityEpochs <- Map.add tracked.Entity committed entityEpochs
+                                        entityStates <- Map.add tracked.Entity draft.ToState entityStates
+
+                                        tracked.Status <-
+                                            Finished(CommittedResult(expected, committed, draft, before, after))
+
+                                        tracked.LiveClaim <- None
+                                        classes.Add "commit-finalized"
+                                        return! loop rest
+                                    else
+                                        return false
+
+                    | Repeat(claim) ->
+                        if claims.Count = 0 then
+                            return! loop rest
+                        else
+                            let claimIndex = int claim % claims.Count
+                            let commandIndex, token = claims[claimIndex]
+                            let tracked = commands[commandIndex]
+
+                            if token <> tracked.RowToken then
+                                return! loop rest
+                            else
+                                let token = LeaseToken.ofInt64 token
+
+                                match tracked.Status with
+                                | Finished(CommittedResult(expected, committed, draft, _, _)) ->
+                                    let! outcome = stores.Processor.Commit(tracked.Id, token, expected, draft, ct)
+
+                                    if outcome = Ok(AlreadyFinalized committed) then
+                                        classes.Add "commit-already"
+                                        return! loop rest
+                                    else
+                                        return false
+                                | Finished(RejectedResult failure) ->
+                                    let! outcome = stores.Processor.Reject(tracked.Id, token, failure, ct)
+
+                                    if outcome = Ok(AlreadyFinalized Epoch.initial) then
+                                        classes.Add "reject-already"
+                                        return! loop rest
+                                    else
+                                        return false
+                                | Finished(DeadLetterResult failure) ->
+                                    let! outcome = stores.Processor.DeadLetter(tracked.Id, token, failure, ct)
+
+                                    if outcome = Ok(AlreadyFinalized Epoch.initial) then
+                                        classes.Add "deadletter-already"
+                                        return! loop rest
+                                    else
+                                        return false
+                                | _ -> return! loop rest
 
                     | Stale(kind, claim) ->
                         if claims.Count = 0 then
@@ -624,6 +832,37 @@ let private runInboxTrace
                                 classes.Add "lookup-miss"
                                 return! loop rest
                             | _ -> return false
+
+                    | Result(entity, key) ->
+                        let name = entityName entity
+                        let idempotencyKey = keyName key
+
+                        match
+                            commands
+                            |> Seq.tryFind (fun tracked -> tracked.Entity = name && tracked.Key = idempotencyKey)
+                        with
+                        | Some tracked ->
+                            let! observed = stores.Processor.TryGetResult(tracked.Id, ct)
+
+                            match observed with
+                            | Ok result when resultMatches tracked result ->
+                                match tracked.Status with
+                                | Waiting _
+                                | Leased _ -> classes.Add "result-pending"
+                                | Finished(CommittedResult _) -> classes.Add "result-committed"
+                                | Finished(RejectedResult _) -> classes.Add "result-rejected"
+                                | Finished(DeadLetterResult _) -> classes.Add "result-deadlettered"
+
+                                return! loop rest
+                            | _ -> return false
+                        | None ->
+                            let! observed = stores.Processor.TryGetResult(CommandId.ofInt64 404L, ct)
+
+                            match observed with
+                            | Ok None ->
+                                classes.Add "result-missing"
+                                return! loop rest
+                            | _ -> return false
             }
 
         let! verdict = loop (List.truncate 14 choices)
@@ -631,13 +870,14 @@ let private runInboxTrace
     }
 
 // ---------------------------------------------------------------------------------------------
-// An in-memory reference store, so a thousand simulated traces can prove the generated shapes
-// reach every behavior class before any database is asked to run them.
+// An in-memory reference store, so simulated traces can prove the generated shapes reach every
+// behavior class before any database is asked to run them.
 // ---------------------------------------------------------------------------------------------
 
 type private FakeStatus =
     | Ready
     | Leased
+    | Succeeded
     | Rejected
     | Dead
 
@@ -654,6 +894,8 @@ type private FakeRow =
       mutable Token: int64
       mutable Deliveries: int
       mutable Attempts: int
+      mutable Result:
+          CommandResult<ContractEntityId, ContractState, ContractEvent, ContractAction, ContractError> option
       ReceivedAt: DateTimeOffset }
 
 /// The contract as the reference sees it: exactly the behavior the runner asserts, nothing more.
@@ -661,6 +903,7 @@ type FakeInbox(env: ContractInboxEnv) =
     let mutable now = DateTimeOffset(2026, 10, 1, 8, 0, 0, TimeSpan.Zero)
     let mutable nextId = 0L
     let mutable nextToken = 0L
+    let mutable entityEpochs: Map<string, Epoch> = Map.empty
     let rows = ResizeArray<FakeRow>()
     // Grouping wants a comparison-friendly name per entity, assigned in first-seen order.
     let entityNames = ResizeArray<ContractEntityId>()
@@ -694,6 +937,7 @@ type FakeInbox(env: ContractInboxEnv) =
             (match row.Status with
              | Ready -> CommandStatus.Ready
              | Leased -> CommandStatus.Leased
+             | Succeeded -> CommandStatus.Succeeded
              | Rejected -> CommandStatus.Rejected
              | Dead -> CommandStatus.DeadLettered)
           Blocked = blocked row
@@ -748,6 +992,7 @@ type FakeInbox(env: ContractInboxEnv) =
                       Token = 0L
                       Deliveries = 0
                       Attempts = 0
+                      Result = None
                       ReceivedAt = now }
 
                 rows.Add row
@@ -792,6 +1037,7 @@ type FakeInbox(env: ContractInboxEnv) =
             match rows |> Seq.tryFind (fun row -> row.Id = commandId) with
             | Some row when live row token ->
                 row.Status <- Ready
+                row.Token <- 0L
                 row.Attempts <- row.Attempts + 1
                 row.VisibleAt <- now
                 Task.FromResult(Ok Updated)
@@ -820,38 +1066,83 @@ type FakeInbox(env: ContractInboxEnv) =
 
     interface ContractProcessor with
 
-        member _.Commit(_commandId, _token, _expected, _draft, _ct) =
-            failwith "the reference store does not serve commits"
-
-        member _.Reject(commandId: CommandId, token: LeaseToken<CommandWork>, _failure, _ct) =
+        member _.Commit(commandId, token, expected, draft, _ct) =
             match rows |> Seq.tryFind (fun row -> row.Id = commandId) with
-            | Some row when live row token ->
+            | Some row when row.Status = Succeeded || row.Status = Rejected || row.Status = Dead ->
+                if row.Token <> LeaseToken.value token then
+                    Task.FromResult(Ok FinalizeOutcome.LeaseLost)
+                else
+                    let stored =
+                        match row.Result with
+                        | Some(CommandResult.Committed committed) -> committed.Epoch
+                        | _ -> expected
+
+                    Task.FromResult(Ok(AlreadyFinalized stored))
+            | Some row when row.Status = Leased && row.Token = LeaseToken.value token ->
+                let actual =
+                    Map.tryFind row.Entity entityEpochs |> Option.defaultValue Epoch.initial
+
+                if expected <> actual then
+                    Task.FromResult(Ok(Conflict(expected, actual)))
+                else
+                    let committed = Epoch.next expected
+
+                    row.Result <-
+                        Some(
+                            CommandResult.Committed
+                                { Draft = draft
+                                  Epoch = committed
+                                  CommandId = row.Id
+                                  ChartVersion = env.Version
+                                  CommittedAt = now }
+                        )
+
+                    row.Status <- Succeeded
+                    entityEpochs <- Map.add row.Entity committed entityEpochs
+                    Task.FromResult(Ok(Finalized committed))
+            | _ -> Task.FromResult(Ok FinalizeOutcome.LeaseLost)
+
+        member _.Reject(commandId: CommandId, token: LeaseToken<CommandWork>, failure, _ct) =
+            match rows |> Seq.tryFind (fun row -> row.Id = commandId) with
+            | Some row when row.Status = Rejected && row.Token = LeaseToken.value token ->
+                Task.FromResult(Ok(AlreadyFinalized Epoch.initial))
+            | Some row when row.Status = Leased && row.Token = LeaseToken.value token ->
                 row.Status <- Rejected
+                row.Result <- Some(CommandResult.Rejected failure)
                 Task.FromResult(Ok(Finalized Epoch.initial))
             | _ -> Task.FromResult(Ok FinalizeOutcome.LeaseLost)
 
-        member _.DeadLetter(commandId: CommandId, token: LeaseToken<CommandWork>, _failure, _ct) =
+        member _.DeadLetter(commandId: CommandId, token: LeaseToken<CommandWork>, failure, _ct) =
             match rows |> Seq.tryFind (fun row -> row.Id = commandId) with
-            | Some row when live row token ->
+            | Some row when row.Status = Dead && row.Token = LeaseToken.value token ->
+                Task.FromResult(Ok(AlreadyFinalized Epoch.initial))
+            | Some row when row.Status = Leased && row.Token = LeaseToken.value token ->
                 row.Status <- Dead
+                row.Result <- Some(CommandResult.DeadLettered failure)
                 Task.FromResult(Ok(Finalized Epoch.initial))
             | _ -> Task.FromResult(Ok FinalizeOutcome.LeaseLost)
 
-        member _.TryGetResult(_commandId, _ct) =
-            failwith "the reference store does not serve results"
+        member _.TryGetResult(commandId, _ct) =
+            rows
+            |> Seq.tryFind (fun row -> row.Id = commandId)
+            |> Option.map (fun row -> defaultArg row.Result CommandResult.Pending)
+            |> fun found -> Task.FromResult(Ok found)
 
 /// Raw choices for a simulated trace, three to sixteen steps long.
 let randomInboxChoices (seed: int) : InboxChoice list =
     let rng = Random seed
 
     let next () : InboxChoice =
-        match rng.Next 6 with
+        match rng.Next 9 with
         | 0 -> Submit(byte (rng.Next()), byte (rng.Next()), byte (rng.Next()), byte (rng.Next()))
         | 1 -> Claim(byte (rng.Next()))
         | 2 -> Finish(byte (rng.Next()), byte (rng.Next()))
-        | 3 -> Stale(byte (rng.Next()), byte (rng.Next()))
-        | 4 -> Advance(byte (rng.Next()))
-        | _ -> Lookup(byte (rng.Next()), byte (rng.Next()))
+        | 3 -> Commit(byte (rng.Next()), byte (rng.Next()), byte (rng.Next()), byte (rng.Next()))
+        | 4 -> Repeat(byte (rng.Next()))
+        | 5 -> Stale(byte (rng.Next()), byte (rng.Next()))
+        | 6 -> Advance(byte (rng.Next()))
+        | 7 -> Lookup(byte (rng.Next()), byte (rng.Next()))
+        | _ -> Result(byte (rng.Next()), byte (rng.Next()))
 
     List.init (3 + rng.Next 14) (fun _ -> next ())
 
@@ -884,9 +1175,13 @@ let renderTrace (choices: InboxChoice list) : string =
                 $"submit {entityName entity} {keyName key} {eventText} delay={delayOf delay}ms"
             | Claim batch -> $"claim batch {batchOf batch}"
             | Finish(kind, claim) -> $"finish {finishKind (finishKindOf kind)} ref {int claim}"
+            | Commit(claim, expected, state, token) ->
+                $"commit ref {int claim} expected={int expected % 3} state={1 + int state % 7} token={int token % 3}"
+            | Repeat claim -> $"repeat ref {int claim}"
             | Stale(kind, claim) -> $"stale {finishKind (finishKindOf kind)} ref {int claim}"
             | Advance ticks -> $"advance {advanceOf ticks}ms"
-            | Lookup(entity, key) -> $"lookup {entityName entity} {keyName key}")
+            | Lookup(entity, key) -> $"lookup {entityName entity} {keyName key}"
+            | Result(entity, key) -> $"result {entityName entity} {keyName key}")
 
     let counts =
         choices
@@ -895,9 +1190,12 @@ let renderTrace (choices: InboxChoice list) : string =
             | Submit _ -> "submit"
             | Claim _ -> "claim"
             | Finish _ -> "finish"
+            | Commit _ -> "commit"
+            | Repeat _ -> "repeat"
             | Stale _ -> "stale"
             | Advance _ -> "advance"
-            | Lookup _ -> "lookup")
+            | Lookup _ -> "lookup"
+            | Result _ -> "result")
         |> List.map (fun (kind, count) -> $"{kind}={count}")
         |> String.concat " "
 
@@ -924,12 +1222,373 @@ let inboxProperty name maxTests endSize (env: ContractInboxEnv) =
                 }
         ))
 
-/// Asserts that a thousand simulated traces cover every behavior class the property can assert.
+/// The finalize equations through public observations. Every generated case runs every semantic
+/// branch against fresh stores; the generated payload varies codecs and transition data without
+/// leaving critical outcomes to a low-probability command sequence.
+let finalizeProperty name maxTests (env: ContractInboxEnv) =
+    testCase name (fun () ->
+        let config = Config.QuickThrowOnFailure.WithMaxTest(maxTests).WithEndSize(20)
+        let ct = CancellationToken.None
+
+        let claimKey (stores: ContractStores) key =
+            task {
+                match! stores.Inbox.Claim(env.Machine, ClaimBatch.create 2, env.ClaimLease, ct) with
+                | Ok claimed -> return claimed |> List.tryFind (fun held -> held.Work.IdempotencyKey = key)
+                | Error _ -> return None
+            }
+
+        let setup payload withSibling =
+            task {
+                let! stores = env.Fresh()
+                let entity: ContractEntityId = entityId "finalize"
+                let event = eventOf payload
+                let target = contractSubmission env entity "target" event
+
+                match! stores.Inbox.Submit(target, ct) with
+                | Error _ -> return None
+                | Ok _ ->
+                    let! siblingSubmitted =
+                        if withSibling then
+                            task {
+                                let siblingPayload = byte ((int payload + 1) % 256)
+
+                                let! outcome =
+                                    stores.Inbox.Submit(
+                                        contractSubmission env entity "sibling" (eventOf siblingPayload),
+                                        ct
+                                    )
+
+                                return Some outcome
+                            }
+                        else
+                            Task.FromResult None
+
+                    match siblingSubmitted with
+                    | Some(Error _) -> return None
+                    | _ ->
+                        let! held = claimKey stores "target"
+                        return held |> Option.map (fun target -> stores, target)
+            }
+
+        let committedResultMatches held draft epoch (before: DateTimeOffset) (after: DateTimeOffset) =
+            function
+            | Ok(Some(CommandResult.Committed committed)) ->
+                committed.CommandId = held.Work.CommandId
+                && committed.ChartVersion = env.Version
+                && committed.Epoch = epoch
+                && committed.Draft = draft
+                && committed.CommittedAt >= before - receivedTolerance
+                && committed.CommittedAt <= after + receivedTolerance
+            | _ -> false
+
+        let commitLaw payload =
+            task {
+                match! setup payload true with
+                | None -> return false
+                | Some(stores, first) ->
+                    let firstDraft = contractDraft env first.Work.EntityId first.Work.Event payload Idle
+                    let before = stores.Now()
+
+                    let! firstOutcome =
+                        stores.Processor.Commit(first.Work.CommandId, first.Token, Epoch.initial, firstDraft, ct)
+
+                    let after = stores.Now()
+                    let! firstResult = stores.Processor.TryGetResult(first.Work.CommandId, ct)
+                    let! second = claimKey stores "sibling"
+
+                    match second with
+                    | None -> return false
+                    | Some second ->
+                        let firstEpoch = Epoch.next Epoch.initial
+                        let secondPayload = byte ((int payload + 1) % 256)
+
+                        let secondDraft =
+                            contractDraft env second.Work.EntityId second.Work.Event secondPayload firstDraft.ToState
+
+                        let! secondOutcome =
+                            stores.Processor.Commit(second.Work.CommandId, second.Token, firstEpoch, secondDraft, ct)
+
+                        let! repeated =
+                            stores.Processor.Commit(first.Work.CommandId, first.Token, Epoch.initial, firstDraft, ct)
+
+                        return
+                            firstOutcome = Ok(Finalized firstEpoch)
+                            && committedResultMatches first firstDraft firstEpoch before after firstResult
+                            && secondOutcome = Ok(Finalized(Epoch.next firstEpoch))
+                            && repeated = Ok(AlreadyFinalized firstEpoch)
+            }
+
+        let conflictLaw payload =
+            task {
+                match! setup payload false with
+                | None -> return false
+                | Some(stores, held) ->
+                    let draft = contractDraft env held.Work.EntityId held.Work.Event payload Idle
+                    let ahead = Epoch.next Epoch.initial
+                    let! conflict = stores.Processor.Commit(held.Work.CommandId, held.Token, ahead, draft, ct)
+                    let! pending = stores.Processor.TryGetResult(held.Work.CommandId, ct)
+                    let! recovered = stores.Processor.Commit(held.Work.CommandId, held.Token, Epoch.initial, draft, ct)
+
+                    return
+                        conflict = Ok(Conflict(ahead, Epoch.initial))
+                        && pending = Ok(Some CommandResult.Pending)
+                        && recovered = Ok(Finalized ahead)
+            }
+
+        let failureLaw payload reject failure =
+            task {
+                match! setup payload true with
+                | None -> return false
+                | Some(stores, held) ->
+                    let finalize () =
+                        if reject then
+                            stores.Processor.Reject(held.Work.CommandId, held.Token, failure, ct)
+                        else
+                            stores.Processor.DeadLetter(held.Work.CommandId, held.Token, failure, ct)
+
+                    let! first = finalize ()
+                    let! repeated = finalize ()
+                    let! result = stores.Processor.TryGetResult(held.Work.CommandId, ct)
+                    let! sibling = claimKey stores "sibling"
+
+                    let expectedResult =
+                        if reject then
+                            Some(CommandResult.Rejected failure)
+                        else
+                            Some(CommandResult.DeadLettered failure)
+
+                    return
+                        first = Ok(Finalized Epoch.initial)
+                        && repeated = Ok(AlreadyFinalized Epoch.initial)
+                        && result = Ok expectedResult
+                        && sibling.IsSome
+            }
+
+        let failureLaws payload =
+            task {
+                let failures =
+                    [ true, CommandFailure.Domain(Refused $"domain-{payload}")
+                      false, CommandFailure.Machine $"machine-{payload}"
+                      true, CommandFailure.Replay(ReplayError.Diverged(Epoch.ofUInt64 3UL, $"diverged-{payload}"))
+                      false, CommandFailure.Replay ReplayError.HistoryPurged ]
+
+                let mutable valid = true
+
+                for index, (reject, failure) in List.indexed failures do
+                    let varied = byte ((int payload + index) % 256)
+                    let! observed = failureLaw varied reject failure
+                    valid <- valid && observed
+
+                return valid
+            }
+
+        let staleLaw payload =
+            task {
+                match! setup payload false with
+                | None -> return false
+                | Some(stores, held) ->
+                    let draft = contractDraft env held.Work.EntityId held.Work.Event payload Idle
+                    let stale = LeaseToken.ofInt64 (max 0L (LeaseToken.value held.Token - 1L))
+                    let! fenced = stores.Processor.Commit(held.Work.CommandId, stale, Epoch.initial, draft, ct)
+                    let! pending = stores.Processor.TryGetResult(held.Work.CommandId, ct)
+                    let! recovered = stores.Processor.Commit(held.Work.CommandId, held.Token, Epoch.initial, draft, ct)
+
+                    return
+                        fenced = Ok FinalizeOutcome.LeaseLost
+                        && pending = Ok(Some CommandResult.Pending)
+                        && recovered = Ok(Finalized(Epoch.next Epoch.initial))
+            }
+
+        let expiredLaw payload =
+            task {
+                match! setup payload false with
+                | None -> return false
+                | Some(stores, held) ->
+                    do! stores.Advance(LeaseDuration.value env.ClaimLease + env.Margin + env.Ticks 20)
+
+                    let draft = contractDraft env held.Work.EntityId held.Work.Event payload Idle
+                    let! outcome = stores.Processor.Commit(held.Work.CommandId, held.Token, Epoch.initial, draft, ct)
+                    return outcome = Ok(Finalized(Epoch.next Epoch.initial))
+            }
+
+        let reclaimedLaw payload =
+            task {
+                match! setup payload false with
+                | None -> return false
+                | Some(stores, stale) ->
+                    do! stores.Advance(LeaseDuration.value env.ClaimLease + env.Margin + env.Ticks 20)
+
+                    let! reclaimed = claimKey stores "target"
+
+                    match reclaimed with
+                    | None -> return false
+                    | Some holder ->
+                        let draft = contractDraft env holder.Work.EntityId holder.Work.Event payload Idle
+                        let before = stores.Now()
+
+                        let! fenced =
+                            stores.Processor.Commit(stale.Work.CommandId, stale.Token, Epoch.initial, draft, ct)
+
+                        let! committed =
+                            stores.Processor.Commit(holder.Work.CommandId, holder.Token, Epoch.initial, draft, ct)
+
+                        let after = stores.Now()
+
+                        let! terminalFenced =
+                            stores.Processor.Commit(stale.Work.CommandId, stale.Token, Epoch.initial, draft, ct)
+
+                        let! result = stores.Processor.TryGetResult(holder.Work.CommandId, ct)
+                        let epoch = Epoch.next Epoch.initial
+
+                        return
+                            LeaseToken.value holder.Token > LeaseToken.value stale.Token
+                            && fenced = Ok FinalizeOutcome.LeaseLost
+                            && committed = Ok(Finalized epoch)
+                            && terminalFenced = Ok FinalizeOutcome.LeaseLost
+                            && committedResultMatches holder draft epoch before after result
+            }
+
+        Check.One(
+            config,
+            fun (payload: byte) ->
+                task {
+                    let! committed = commitLaw payload
+                    let! conflicted = conflictLaw payload
+                    let! failed = failureLaws payload
+                    let! stale = staleLaw payload
+                    let! expired = expiredLaw payload
+                    let! reclaimed = reclaimedLaw payload
+                    return committed && conflicted && failed && stale && expired && reclaimed
+                }
+        ))
+
+/// A ready row carries token zero as a nobody-holds sentinel. Rescheduling releases the real
+/// lease, so no finalize operation may turn that sentinel back into authority.
+let readyTokenProperty name maxTests (env: ContractInboxEnv) =
+    testCase name (fun () ->
+        let config = Config.QuickThrowOnFailure.WithMaxTest(maxTests).WithEndSize(20)
+
+        Check.One(
+            config,
+            fun (ending: byte, payload: byte) ->
+                task {
+                    let! stores = env.Fresh()
+                    let entity: ContractEntityId = entityId "ready-token"
+
+                    let submission: CommandSubmission<ContractEntityId, ContractEvent> =
+                        { MachineId = env.Machine
+                          EntityId = entity
+                          IdempotencyKey = "ready-token"
+                          ChartVersion = env.Version
+                          Kind = CommandKind.Event
+                          Event = eventOf payload
+                          VisibleAt = None
+                          ReceivedAt = None
+                          Audit = AuditContext.empty }
+
+                    match! stores.Inbox.Submit(submission, CancellationToken.None) with
+                    | Error _ -> return false
+                    | Ok _ ->
+                        match!
+                            stores.Inbox.Claim(
+                                env.Machine,
+                                ClaimBatch.create 1,
+                                env.ClaimLease,
+                                CancellationToken.None
+                            )
+                        with
+                        | Error _
+                        | Ok [] -> return false
+                        | Ok(held :: _) ->
+                            match!
+                                stores.Inbox.Reschedule(
+                                    held.Work.CommandId,
+                                    held.Token,
+                                    env.Backoff,
+                                    CancellationToken.None
+                                )
+                            with
+                            | Error _
+                            | Ok LeaseUpdateOutcome.LeaseLost -> return false
+                            | Ok Updated ->
+                                let nobody = LeaseToken.ofInt64 0L
+                                let failure = failureOf payload
+
+                                let! outcome =
+                                    match int ending % 3 with
+                                    | 0 ->
+                                        let state = Active(1 + int payload % 7)
+
+                                        let draft =
+                                            { MachineId = env.Machine
+                                              EntityId = entity
+                                              Event = submission.Event
+                                              Actions = [ Fired(1 + int payload % 5) ]
+                                              FromState = Idle
+                                              ToState = state
+                                              HandledBy = stateId "contract"
+                                              Exited = []
+                                              Entered = []
+                                              Status = Running
+                                              EffectiveAt = DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero) }
+
+                                        stores.Processor.Commit(
+                                            held.Work.CommandId,
+                                            nobody,
+                                            Epoch.initial,
+                                            draft,
+                                            CancellationToken.None
+                                        )
+                                    | 1 ->
+                                        stores.Processor.Reject(
+                                            held.Work.CommandId,
+                                            nobody,
+                                            failure,
+                                            CancellationToken.None
+                                        )
+                                    | _ ->
+                                        stores.Processor.DeadLetter(
+                                            held.Work.CommandId,
+                                            nobody,
+                                            failure,
+                                            CancellationToken.None
+                                        )
+
+                                let! result =
+                                    stores.Processor.TryGetResult(held.Work.CommandId, CancellationToken.None)
+
+                                return
+                                    outcome = Ok FinalizeOutcome.LeaseLost
+                                    && result = Ok(Some CommandResult.Pending)
+                }
+        ))
+
+/// Asserts that broad random traces plus constructively reachable result paths cover every
+/// behavior class the property can assert.
 let inboxReachability name (env: ContractInboxEnv) (expected: string list) =
     testCase name (fun () ->
+        let directed =
+            [ [ Submit(0uy, 0uy, 0uy, 0uy); Result(0uy, 0uy) ]
+              [ Submit(0uy, 0uy, 0uy, 0uy)
+                Claim 0uy
+                Commit(0uy, 0uy, 0uy, 0uy)
+                Result(0uy, 0uy) ]
+              [ Submit(0uy, 0uy, 0uy, 0uy); Claim 0uy; Finish(0uy, 0uy); Result(0uy, 0uy) ]
+              [ Submit(0uy, 0uy, 0uy, 0uy); Claim 0uy; Finish(1uy, 0uy); Result(0uy, 0uy) ] ]
+
         let classes =
-            seq { 0..999 }
-            |> Seq.collect (fun seed -> inboxClasses env (randomInboxChoices seed))
+            seq {
+                for seed in 0..999 do
+                    yield randomInboxChoices seed
+
+                yield! directed
+            }
+            |> Seq.collect (inboxClasses env)
             |> Set.ofSeq
 
-        Expect.equal classes (set expected) "every behavior class is reachable from a thousand simulated traces")
+        let expected = set expected
+
+        Expect.equal
+            (Set.difference expected classes, Set.difference classes expected)
+            (Set.empty, Set.empty)
+            "every behavior class is reachable from generated traces (missing, unexpected)")

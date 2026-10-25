@@ -130,7 +130,7 @@ module internal LeaseStanding =
             | CommandStatus.Succeeded
             | CommandStatus.Rejected
             | CommandStatus.DeadLettered -> if callerHolds then FinishedByCaller else FinishedByAnother
-            | CommandStatus.Ready
+            | CommandStatus.Ready -> HeldByAnother
             | CommandStatus.Leased -> if callerHolds then HeldByCaller target else HeldByAnother
 
 /// <summary>

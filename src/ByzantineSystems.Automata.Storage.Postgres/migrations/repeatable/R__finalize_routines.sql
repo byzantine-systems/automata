@@ -112,12 +112,13 @@ BEGIN
         END IF;
         RETURN;
     END IF;
-    -- Still open, but held by somebody else. Note that an expired lease is not
-    -- checked here: the token is the fence. A worker past its deadline whose
-    -- command nobody has reclaimed still holds the only token, and rejecting it
-    -- would discard work that is safe to commit. Once another worker claims the
-    -- command, the token differs and this test catches it.
-    IF v_token <> p_lease_token THEN
+    -- Still open, but either not leased at all or held by somebody else. Note
+    -- that an expired lease is not checked here: the token is the fence. A
+    -- worker past its deadline whose command nobody has reclaimed still holds
+    -- the only token, and rejecting it would discard work that is safe to
+    -- commit. A ready command's zero token is the nobody-holds sentinel, never
+    -- an active lease a caller may use to finalize it.
+    IF v_status <> 'leased' OR v_token <> p_lease_token THEN
         RETURN QUERY
         SELECT
             'lease_lost'::fsm.finalize_outcome,
