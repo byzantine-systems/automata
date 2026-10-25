@@ -15,6 +15,7 @@ let private expected =
       "command", "reschedule"
       "command", "extend_lease"
       "command", "repair_blocked"
+      "command", "blocked_drift"
       "command", "submit_correction"
       "command", "finalize_correction"
       "belief", "as_of"
