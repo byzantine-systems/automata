@@ -196,20 +196,26 @@ let tests =
               Expect.equal (states plan) [ Counting 3 ] "and nothing after it"
           }
 
-          test "a suffix longer than the budget is refused" {
+          Property.property "the replay budget accepts exactly its cardinality bound" (fun (seed: byte) ->
+              let limit = int seed % 31
+
               let policy =
                   { CorrectionPolicy.defaults with
-                      ReplayLimit = 1 }
+                      ReplayLimit = limit }
 
-              match
-                  Replay.plan
-                      onlyV1
-                      (input (Counting 0) (Add 1) 2 3 policy)
-                      [ committed 1 (Add 1) 3 v1; committed 2 (Add 1) 4 v1 ]
-              with
-              | Error(ReplayError.BudgetExceeded limit) -> Expect.equal limit 1 "the limit"
-              | other -> failtestf "expected the budget to be exceeded, got %A" other
-          }
+              let suffix length =
+                  [ 1..length ]
+                  |> List.map (fun epoch -> committed epoch (Add 1) 3 v1)
+
+              let atLimit = Replay.plan onlyV1 (input (Counting 0) (Add 1) 2 (limit + 2) policy) (suffix limit)
+
+              let overLimit =
+                  suffix (limit + 1)
+                  |> List.rev
+                  |> Replay.plan onlyV1 (input (Counting 0) (Add 1) 2 (limit + 2) policy)
+
+              Result.isOk atLimit
+              && overLimit = Error(ReplayError.BudgetExceeded limit))
 
           test "an instance the correction ends accepts nothing after it" {
               match
