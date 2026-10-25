@@ -1651,8 +1651,8 @@ let private historyStatus (raw: byte) : InstanceStatus =
     | 1 -> Suspended
     | _ -> Terminated
 
-let private historyEffectiveAt (raw: byte) : DateTimeOffset =
-    DateTimeOffset(2026, 1, 1, 0, 0, int raw % 60, TimeSpan.Zero)
+let private historyEffectiveAt (index: int) (raw: byte) : DateTimeOffset =
+    DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero).AddSeconds(float (index * 60 + int raw % 60))
 
 let private historyDraft
     (env: ContractHistoryEnv)
@@ -1764,7 +1764,7 @@ let private runHistory (env: ContractHistoryEnv) (stores: ContractHistoryStores)
                         event
                         append.Payload
                         append.Status
-                        (historyEffectiveAt append.EffectiveAt)
+                        (historyEffectiveAt index append.EffectiveAt)
                         fromState
 
                 let submission: CommandSubmission<ContractEntityId, ContractEvent> =
