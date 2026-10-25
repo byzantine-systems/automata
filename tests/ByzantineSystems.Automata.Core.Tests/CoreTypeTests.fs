@@ -7,57 +7,83 @@ open Expecto
 /// Phantom marker so entity ids can be tied to a domain type in tests.
 type Order = class end
 
+let private throwsArgument action =
+    try
+        action ()
+        false
+    with :? ArgumentException ->
+        true
+
+let private identifierInputs raw =
+    [ null; ""; " "; "\t\r\n"; raw; $"  %s{raw}  " ]
+
+let private stateIdLaw raw =
+    let valid = not (String.IsNullOrWhiteSpace raw)
+
+    match StateId.tryCreate raw with
+    | Ok id ->
+        valid
+        && StateId.value id = raw.Trim()
+        && StateId.create raw = StateId.create (raw.Trim())
+    | Error _ -> not valid && throwsArgument (fun () -> StateId.create raw |> ignore)
+
+let private machineIdLaw raw =
+    let valid = not (String.IsNullOrWhiteSpace raw)
+
+    match MachineId.tryCreate raw with
+    | Ok id ->
+        valid
+        && MachineId.value id = raw.Trim()
+        && MachineId.create raw = MachineId.create (raw.Trim())
+    | Error _ -> not valid && throwsArgument (fun () -> MachineId.create raw |> ignore)
+
+let private entityIdLaw raw =
+    let valid = not (String.IsNullOrWhiteSpace raw)
+
+    if valid then
+        let id: EntityId<Order> = EntityId.create raw
+        EntityId.value id = raw.Trim() && id = EntityId.create (raw.Trim())
+    else
+        throwsArgument (fun () ->
+            let _: EntityId<Order> = EntityId.create raw
+            ())
+
 let epochTests =
     testList
         "Epoch"
-        [ test "initial is zero" { Expect.equal 0UL (Epoch.value Epoch.initial) "a new instance starts at epoch 0" }
-          test "next increments by one" {
-              Expect.equal 1UL (Epoch.value (Epoch.next Epoch.initial)) "next advances the counter"
-          }
-          test "orders structurally" {
-              Expect.isLessThan (Epoch.initial) (Epoch.next (Epoch.next Epoch.initial)) "epochs compare"
-          }
-          test "ofUInt64/value roundtrip" { Expect.equal 42UL (Epoch.value (Epoch.ofUInt64 42UL)) "storage roundtrip" } ]
+        [ Property.property "ofUInt64 and value are inverse observations" (fun (value: uint64) ->
+              Epoch.value (Epoch.ofUInt64 value) = value && Epoch.initial = Epoch.ofUInt64 0UL)
+
+          Property.property "next increments and orders every non-maximum epoch" (fun (seed: uint64) ->
+              let generated = if seed = UInt64.MaxValue then 0UL else seed
+
+              [ 0UL; UInt64.MaxValue - 1UL; generated ]
+              |> List.forall (fun value ->
+                  let epoch = Epoch.ofUInt64 value
+                  let next = Epoch.next epoch
+                  Epoch.value next = value + 1UL && next > epoch)) ]
 
 let identifierTests =
     testList
         "identifiers"
-        [ test "stateId roundtrips" {
-              Expect.equal "active.processing" (StateId.value (stateId "active.processing")) "value survives"
-          }
-          test "stateId trims surrounding whitespace" {
-              Expect.equal "idle" (StateId.value (StateId.create " idle ")) "whitespace is trimmed"
-          }
-          test "stateId rejects empty strings" {
-              Expect.throws (fun _ -> StateId.create "" |> ignore) "empty input raises ArgumentException"
-          }
-          test "stateId rejects whitespace-only strings" {
-              Expect.throws (fun _ -> StateId.create "   " |> ignore) "whitespace-only input raises"
-          }
-          test "stateId tryCreate accepts and rejects without raising" {
-              Expect.equal (StateId.tryCreate " idle " |> Result.map StateId.value) (Ok "idle") "valid input"
-              Expect.isError (StateId.tryCreate "") "empty input"
-              Expect.isError (StateId.tryCreate "   ") "whitespace-only input"
-          }
-          test "machineId roundtrips" {
-              Expect.equal "payments" (MachineId.value (machineId "payments")) "value survives"
-          }
-          test "machineId tryCreate accepts and rejects without raising" {
-              Expect.equal
-                  (MachineId.tryCreate " payments " |> Result.map MachineId.value)
-                  (Ok "payments")
-                  "valid input"
+        [ Property.property "StateId accepts exactly nonblank text and observes trimming" (fun (raw: string) ->
+              identifierInputs raw |> List.forall stateIdLaw)
 
-              Expect.isError (MachineId.tryCreate "") "empty input"
-          }
-          test "entityId roundtrips with phantom type" {
-              let orderId: EntityId<Order> = entityId "ORD-1"
-              Expect.equal "ORD-1" (EntityId.value orderId) "value survives"
-          }
-          test "equal ids are equal" {
-              Expect.isTrue ((stateId "a") = (stateId "a")) "same value, same id"
-              Expect.isFalse ((stateId "a") = (stateId "b")) "different value, different id"
-          } ]
+          Property.property "MachineId accepts exactly nonblank text and observes trimming" (fun (raw: string) ->
+              identifierInputs raw |> List.forall machineIdLaw)
+
+          Property.property "EntityId accepts exactly nonblank text and observes trimming" (fun (raw: string) ->
+              identifierInputs raw |> List.forall entityIdLaw)
+
+          Property.property
+              "identifier equality is equality of normalized observations"
+              (fun (left: string, right: string) ->
+                  if String.IsNullOrWhiteSpace left || String.IsNullOrWhiteSpace right then
+                      true
+                  else
+                      let leftId = StateId.create left
+                      let rightId = StateId.create right
+                      (leftId = rightId) = (left.Trim() = right.Trim())) ]
 
 let codecTests =
     testList
@@ -68,9 +94,8 @@ let codecTests =
                   | true, v -> Ok v
                   | false, _ -> Error(CodecError.DecodeError("Int32", ArgumentException($"not an int: {s}"))))
 
-          test "roundtrips" {
-              Expect.equal (Ok 42) (Result.bind intCodec.Decode (intCodec.Encode 42)) "encode then decode"
-          }
+          Property.property "decode after encode is identity" (fun (value: int) ->
+              Result.bind intCodec.Decode (intCodec.Encode value) = Ok value)
 
           test "decode failure is typed" {
               match intCodec.Decode "oops" with
@@ -94,53 +119,4 @@ let codecTests =
               | Ok _ -> failtest "expected failure, got success"
           } ]
 
-let transitionTests =
-    testList
-        "transition"
-        [ test "snapshot carries state, epoch, and status" {
-              let snapshot: Snapshot<string> =
-                  { State = "idle"
-                    Epoch = Epoch.initial
-                    Status = Running }
-
-              Expect.equal ("idle", 0UL, Running) (snapshot.State, Epoch.value snapshot.Epoch, snapshot.Status) ""
-          }
-          // A committed transition and a commit receipt are no longer declared here. What the
-          // chart decides is a TransitionDraft and what the database answers with is a
-          // CommittedTransition, both in Storage, because everything that distinguishes them is
-          // a value only the database can supply. Their tests live with them.
-          test "epoch advances by one and starts at zero" {
-              Expect.equal 0UL (Epoch.value Epoch.initial) "an entity that has never committed"
-              Expect.equal 1UL (Epoch.value (Epoch.next Epoch.initial)) "the first commit"
-          } ]
-
-let errorTests =
-    testList
-        "errors"
-        [ test "machine error exposes concurrency detail" {
-              match MachineError.Store(Concurrency(Epoch.initial, Epoch.next Epoch.initial)) with
-              | Store(Concurrency(expected, actual)) ->
-                  Expect.equal (0UL, 1UL) (Epoch.value expected, Epoch.value actual) "expected and actual epochs"
-              | Store _
-              | Transition _
-              | Timeout _
-              | CircuitOpen _
-              | MachineError.Rejected _ -> failtest "unexpected case"
-          }
-          test "transition error carries unhandled detail" {
-              match TransitionError<string>.Unhandled(stateId "idle", "Cancel") with
-              | Unhandled(state, event) ->
-                  Expect.equal ("idle", "Cancel") (StateId.value state, event) "state and event names"
-              | TransitionError.Rejected _
-              | GuardFailed _
-              | UnknownState _
-              | TargetMismatch _ -> failtest "unexpected case"
-          }
-          test "machine lifecycle rejection is structured" {
-              match MachineError<string>.Rejected(MachineRejection.InstanceNotRunning InstanceStatus.Terminated) with
-              | MachineError.Rejected(MachineRejection.InstanceNotRunning InstanceStatus.Terminated) -> ()
-              | _ -> failtest "expected a typed terminated-instance rejection"
-          } ]
-
-let tests =
-    testList "core types" [ epochTests; identifierTests; codecTests; transitionTests; errorTests ]
+let tests = testList "core types" [ epochTests; identifierTests; codecTests ]

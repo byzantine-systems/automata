@@ -4,75 +4,111 @@ open System
 open ByzantineSystems.Automata.Storage
 open Expecto
 
-let private expectError result message =
-    Expect.isTrue (Result.isError result) message
+let private bounded count value = int (uint32 value % uint32 count)
+
+let private bounded64 count value = int64 (uint64 value % uint64 count)
+
+let private throwsArgument action =
+    try
+        action ()
+        false
+    with :? ArgumentException ->
+        true
+
+let private claimBatchLaw raw =
+    let valid = raw >= 1 && raw <= 1000
+
+    match ClaimBatch.tryCreate raw with
+    | Ok batch ->
+        valid
+        && ClaimBatch.value batch = raw
+        && ClaimBatch.value (ClaimBatch.create raw) = raw
+    | Error _ -> not valid && throwsArgument (fun () -> ClaimBatch.create raw |> ignore)
+
+let private leaseDurationLaw raw =
+    let valid = raw > TimeSpan.Zero && raw <= LeaseDuration.maximum
+
+    match LeaseDuration.tryCreate raw with
+    | Ok lease ->
+        valid
+        && LeaseDuration.value lease = raw
+        && LeaseDuration.value (LeaseDuration.create raw) = raw
+    | Error _ -> not valid && throwsArgument (fun () -> LeaseDuration.create raw |> ignore)
+
+let private reasonLaw raw =
+    let valid = not (String.IsNullOrWhiteSpace raw)
+
+    match Reason.tryCreate raw with
+    | Ok reason ->
+        valid
+        && Reason.value reason = raw.Trim()
+        && Reason.value (Reason.create raw) = raw.Trim()
+    | Error _ -> not valid && throwsArgument (fun () -> Reason.create raw |> ignore)
+
+let private backoffLaw (baseDelay, ceiling) =
+    let valid =
+        baseDelay > TimeSpan.Zero
+        && ceiling >= baseDelay
+        && ceiling <= LeaseDuration.maximum
+
+    match Backoff.tryCreate baseDelay ceiling with
+    | Ok backoff ->
+        valid
+        && Backoff.baseDelay backoff = baseDelay
+        && Backoff.ceiling backoff = ceiling
+        && Backoff.create baseDelay ceiling = backoff
+    | Error _ ->
+        not valid
+        && throwsArgument (fun () -> Backoff.create baseDelay ceiling |> ignore)
 
 [<Tests>]
 let tests =
     testList
         "constrained arguments"
-        [ testCase "claim batches accept only the inclusive supported range"
-          <| fun _ ->
-              expectError (ClaimBatch.tryCreate -1) "negative batches are rejected"
-              expectError (ClaimBatch.tryCreate 0) "empty batches are rejected"
-              Expect.equal (ClaimBatch.create 1 |> ClaimBatch.value) 1 "the lower bound is accepted"
-              Expect.equal (ClaimBatch.create 1000 |> ClaimBatch.value) 1000 "the upper bound is accepted"
-              expectError (ClaimBatch.tryCreate 1001) "batches above the upper bound are rejected"
+        [ Property.property "ClaimBatch accepts exactly 1 through 1000 and round-trips" (fun (seed: int) ->
+              [ Int32.MinValue
+                -1
+                0
+                1
+                1000
+                1001
+                Int32.MaxValue
+                seed
+                1 + bounded 1000 seed ]
+              |> List.forall claimBatchLaw)
 
-          testCase "claim batch create rejects invalid input"
-          <| fun _ ->
-              Expect.throwsT<ArgumentException>
-                  (fun () -> ClaimBatch.create 0 |> ignore)
-                  "the throwing constructor reports invalid input"
+          Property.property
+              "LeaseDuration accepts exactly the positive provider-safe range and round-trips"
+              (fun (seed: int64) ->
+                  let maximumTicks = LeaseDuration.maximum.Ticks
+                  let generatedValid = TimeSpan.FromTicks(1L + bounded64 maximumTicks seed)
 
-          testCase "lease durations accept only the inclusive supported range"
-          <| fun _ ->
-              expectError (LeaseDuration.tryCreate (TimeSpan.FromTicks -1L)) "negative durations are rejected"
-              expectError (LeaseDuration.tryCreate TimeSpan.Zero) "zero durations are rejected"
+                  [ TimeSpan.MinValue
+                    TimeSpan.FromTicks -1L
+                    TimeSpan.Zero
+                    TimeSpan.FromTicks 1L
+                    LeaseDuration.maximum - TimeSpan.FromTicks 1L
+                    LeaseDuration.maximum
+                    LeaseDuration.maximum + TimeSpan.FromTicks 1L
+                    TimeSpan.MaxValue
+                    TimeSpan.FromTicks seed
+                    generatedValid ]
+                  |> List.forall leaseDurationLaw)
 
-              Expect.equal
-                  (LeaseDuration.create (TimeSpan.FromTicks 1L) |> LeaseDuration.value)
-                  (TimeSpan.FromTicks 1L)
-                  "the smallest positive duration is accepted"
+          Property.property "Reason accepts exactly nonblank text and observes trimming" (fun (raw: string) ->
+              [ null; ""; " "; "\t\r\n"; raw; $"  %s{raw}  " ] |> List.forall reasonLaw)
 
-              Expect.equal
-                  (LeaseDuration.create LeaseDuration.maximum |> LeaseDuration.value)
-                  LeaseDuration.maximum
-                  "the upper bound is accepted"
+          Property.property "Backoff accepts exactly ordered provider-safe envelopes" (fun (a: int64, b: int64) ->
+              let maximumTicks = LeaseDuration.maximum.Ticks
+              let baseTicks = 1L + bounded64 maximumTicks a
+              let ceilingTicks = baseTicks + bounded64 (maximumTicks - baseTicks + 1L) b
 
-              expectError
-                  (LeaseDuration.tryCreate (LeaseDuration.maximum + TimeSpan.FromTicks 1L))
-                  "durations above the upper bound are rejected"
-
-          testCase "lease duration create rejects invalid input"
-          <| fun _ ->
-              Expect.throwsT<ArgumentException>
-                  (fun () -> LeaseDuration.create TimeSpan.Zero |> ignore)
-                  "the throwing constructor reports invalid input"
-
-          testCase "reasons reject blank text and trim accepted text"
-          <| fun _ ->
-              expectError (Reason.tryCreate null) "null reasons are rejected"
-              expectError (Reason.tryCreate "") "empty reasons are rejected"
-              expectError (Reason.tryCreate "   ") "whitespace reasons are rejected"
-              Expect.equal (Reason.create "  failed  " |> Reason.value) "failed" "accepted reasons are trimmed"
-
-          testCase "reason create rejects invalid input"
-          <| fun _ ->
-              Expect.throwsT<ArgumentException>
-                  (fun () -> Reason.create " " |> ignore)
-                  "the throwing constructor reports invalid input"
-
-          testCase "backoff ceilings fit the provider millisecond range"
-          <| fun _ ->
-              Expect.isOk
-                  (Backoff.tryCreate (TimeSpan.FromTicks 1L) LeaseDuration.maximum)
-                  "the upper bound is accepted"
-
-              expectError
-                  (Backoff.tryCreate (TimeSpan.FromTicks 1L) (LeaseDuration.maximum + TimeSpan.FromTicks 1L))
-                  "ceilings above the upper bound are rejected"
-
-              expectError
-                  (Backoff.tryCreate (TimeSpan.FromSeconds 2.0) (TimeSpan.FromSeconds 1.0))
-                  "the existing envelope ordering remains enforced" ]
+              [ TimeSpan.Zero, TimeSpan.FromTicks 1L
+                TimeSpan.FromTicks 1L, TimeSpan.Zero
+                TimeSpan.FromTicks 1L, LeaseDuration.maximum
+                TimeSpan.FromTicks 1L, LeaseDuration.maximum + TimeSpan.FromTicks 1L
+                LeaseDuration.maximum, LeaseDuration.maximum
+                LeaseDuration.maximum + TimeSpan.FromTicks 1L, LeaseDuration.maximum + TimeSpan.FromTicks 1L
+                TimeSpan.FromTicks a, TimeSpan.FromTicks b
+                TimeSpan.FromTicks baseTicks, TimeSpan.FromTicks ceilingTicks ]
+              |> List.forall backoffLaw) ]

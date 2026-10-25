@@ -8,6 +8,7 @@
     </PropertyGroup>
 
     <ItemGroup>
+        <Compile Include="Property.fs" />
         <Compile Include="ArgumentTests.fs" />
         <Compile Include="StoreProgramTests.fs" />
         <Compile Include="EnumCodecTests.fs" />
@@ -16,6 +17,7 @@
 
     <ItemGroup>
         <PackageReference Include="Expecto" />
+        <PackageReference Include="FsCheck" />
         <PackageReference Include="FsToolkit.ErrorHandling" />
         <PackageReference Include="Microsoft.NET.Test.Sdk" PrivateAssets="all" />
         <PackageReference Include="YoloDev.Expecto.TestSdk" PrivateAssets="all" />
