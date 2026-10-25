@@ -200,4 +200,27 @@ let tests =
               match outcome with
               | Error(StoreError.Unexpected _) -> ()
               | other -> failtestf "expected the routine to refuse a belief behind the instant, got %A" other
+          }
+
+          testTask "a correction whose first belief starts after the instant is refused atomically" {
+              // A timeline must be contiguous from the corrected instant, or an as-of query can
+              // land in the hole the correction opened. Starting later is a leading gap, and it
+              // is just as wrong as starting earlier; accepting it rewrites the suffix while
+              // leaving nothing to answer for [cut, first).
+              do! reset ()
+              believe "e1" (jan 10) (Active 1) 1L
+
+              let! outcome =
+                  (newCorrections ())
+                      .Correct(machine, entity "e1", jan 12, [ corrected (jan 13) (Active 7) 1L ], noCancellation)
+
+              match outcome with
+              | Error(StoreError.Unexpected _) -> ()
+              | other -> failtestf "expected the routine to refuse a leading gap, got %A" other
+
+              // Refused before anything was written, which is why the original belief is intact.
+              Expect.equal
+                  (Some((jan 10).UtcDateTime, DateTime.MaxValue))
+                  (liveBeliefs () |> List.tryHead |> Option.map (fun (_, vfrom, vto) -> vfrom, vto))
+                  "the timeline was left alone"
           } ]

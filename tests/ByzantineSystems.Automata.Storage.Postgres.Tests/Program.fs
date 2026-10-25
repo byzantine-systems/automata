@@ -23,6 +23,7 @@ let tests =
                     TemporalTests.tests
                     TemporalReaderTests.tests
                     CorrectionTests.tests
+                    TemporalProperties.tests
                     HistoryTests.tests
                     FinalizeTests.tests
                     ActionQueueTests.tests
