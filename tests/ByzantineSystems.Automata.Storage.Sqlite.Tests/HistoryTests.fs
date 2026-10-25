@@ -4,6 +4,8 @@ open System
 open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
+open ByzantineSystems.Automata.Storage.Sqlite
+open ByzantineSystems.Automata.Storage.ContractProperties
 open ByzantineSystems.Automata.Storage.Sqlite.Tests.TestContext
 open Expecto
 
@@ -43,93 +45,55 @@ let private page (fixture: Fixture) (name: string) (paging: Page) : Task<Committ
         return rows |> expectOk "history"
     }
 
-let private epochsOf (rows: Committed list) =
-    rows |> List.map (_.Epoch >> Epoch.value)
+// The shared history equations, over this provider's fixture: a fresh migrated file per
+// generated case, and the fixture's frozen clock, so commit instants are exact rather than
+// bounded.
+let private contractHistoryEnv () : ContractHistoryEnv =
+    let encode, decode = EntityKey.forEntityId<ContractEntity>
+
+    let stores () =
+        let db = fixture "contract-history"
+
+        let processor =
+            SqliteCommandProcessorStore<ContractEntityId, ContractState, ContractEvent, ContractAction, ContractError>(
+                { Context = db.Context
+                  StateCodec = Serialization.systemTextJson<ContractState> ()
+                  EventCodec = Serialization.systemTextJson<ContractEvent> ()
+                  ActionCodec = Serialization.systemTextJson<ContractAction list> ()
+                  ErrorCodec = Serialization.systemTextJson<ContractError> ()
+                  EntityIdEncode = encode
+                  EntityIdDecode = decode }
+            )
+
+        { Inbox =
+            SqliteCommandInbox<ContractEntityId, ContractEvent>(
+                { Context = db.Context
+                  EventCodec = Serialization.systemTextJson<ContractEvent> ()
+                  EntityIdEncode = encode
+                  EntityIdDecode = decode }
+            )
+            :> ContractInbox
+          Processor = processor :> ContractProcessor
+          Reader = processor :> ContractReader
+          Now = fun () -> db.Clock.GetUtcNow() }
+
+    { Machine = testMachine
+      Version = version
+      CommittedAtTolerance = TimeSpan.Zero
+      Fresh = fun () -> Task.FromResult(stores ()) }
 
 let tests =
     testList
         "IStateReader"
-        [ testTask "an entity that never committed has no snapshot and an empty history" {
-              let db = fixture "history"
-              let! snapshot = (readerOf db).TryGetSnapshot(testMachine, entity "missing", noCancellation)
-              Expect.isNone (snapshot |> expectOk "snapshot") "no commit, no snapshot"
+        [ ContractProperties.historyProperty "the shared history equations" 30 (contractHistoryEnv ())
 
-              let! rows = page db "missing" (Page.create 10)
-              Expect.isEmpty rows "no log, no page"
-          }
-
-          testTask "the snapshot is the latest commit's state, epoch and status" {
+          testTask "the snapshot table holds one row, replaced in place, stamped by the frozen clock" {
               let db = fixture "history"
               do! commit db "e1" "k1" (Active 1)
               do! commit db "e1" "k2" (Active 2)
 
-              let! snapshot = (readerOf db).TryGetSnapshot(testMachine, entity "e1", noCancellation)
-
-              match snapshot |> expectOk "snapshot" with
-              | Some current ->
-                  Expect.equal current.State (Active 2) "the latest state"
-                  Expect.equal current.Epoch (Epoch.ofUInt64 2UL) "the latest epoch"
-                  Expect.equal current.Status Running "the latest status"
-              | None -> failtest "the entity has committed"
+              let! rows = page db "e1" (Page.create 10)
 
               Expect.equal (scalar db.Db "SELECT count(*) FROM fsm_entity_snapshot;") "1" "one row, replaced in place"
-          }
-
-          testTask "transitions page back oldest first" {
-              let db = fixture "history"
-              do! commit db "e1" "k1" (Active 1)
-              do! commit db "e1" "k2" (Active 2)
-              do! commit db "e1" "k3" (Active 3)
-
-              let! rows = page db "e1" (Page.create 10)
-              Expect.equal (epochsOf rows) [ 1UL; 2UL; 3UL ] "ascending, because this is a log"
-          }
-
-          testTask "a limit bounds the page" {
-              let db = fixture "history"
-              do! commit db "e1" "k1" (Active 1)
-              do! commit db "e1" "k2" (Active 2)
-              do! commit db "e1" "k3" (Active 3)
-
-              let! rows = page db "e1" (Page.create 2)
-              Expect.equal (epochsOf rows) [ 1UL; 2UL ] "only what was asked for, from the start"
-          }
-
-          testTask "the cursor is exclusive and does not move as the log grows" {
-              let db = fixture "history"
-              do! commit db "e1" "k1" (Active 1)
-              do! commit db "e1" "k2" (Active 2)
-
-              let! before = page db "e1" (Page.after (Epoch.ofUInt64 1UL) 10)
-              do! commit db "e1" "k3" (Active 3)
-              let! after = page db "e1" (Page.after (Epoch.ofUInt64 1UL) 10)
-
-              Expect.equal (epochsOf before) [ 2UL ] "the cursor epoch itself is not repeated"
-              Expect.equal (epochsOf after) [ 2UL; 3UL ] "and a page pinned to it only grows at the end"
-          }
-
-          testTask "one entity's log does not contain another's" {
-              let db = fixture "history"
-              do! commit db "e1" "k1" (Active 1)
-              do! commit db "e2" "k2" (Active 2)
-
-              let! rows = page db "e1" (Page.create 10)
-              Expect.equal (rows |> List.map _.Draft.EntityId) [ entity "e1" ] "only this entity's transitions"
-          }
-
-          testTask "a paged transition round-trips what was committed" {
-              let db = fixture "history"
-              do! commit db "e1" "k1" (Active 7)
-
-              let! rows = page db "e1" (Page.create 10)
-              let committed = List.exactlyOne rows
-
-              Expect.equal committed.Draft.Event Finish "the event"
-              Expect.equal committed.Draft.Actions [ Notify "done" ] "the actions"
-              Expect.equal committed.Draft.FromState Idle "the state it resolved from"
-              Expect.equal committed.Draft.ToState (Active 7) "the state it produced"
-              Expect.equal committed.Draft.HandledBy (stateId "root") "the node that handled it"
-              Expect.equal committed.Draft.EffectiveAt effectiveAt "business time, as supplied"
-              Expect.equal committed.ChartVersion version "the chart version it was decided under"
-              Expect.equal committed.CommittedAt startTime "commit time, from the store's clock"
+              Expect.equal (List.last rows).CommittedAt startTime "commit time, from the frozen clock"
           } ]

@@ -1,6 +1,7 @@
 module ByzantineSystems.Automata.Storage.Tests.ArgumentTests
 
 open System
+open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
 open Expecto
 
@@ -44,6 +45,23 @@ let private reasonLaw raw =
         && Reason.value reason = raw.Trim()
         && Reason.value (Reason.create raw) = raw.Trim()
     | Error _ -> not valid && throwsArgument (fun () -> Reason.create raw |> ignore)
+
+let private tryPage (build: unit -> Page) : Result<Page, unit> =
+    try
+        Ok(build ())
+    with :? ArgumentException ->
+        Error()
+
+let private pageLaw epoch n =
+    let valid = n >= 1
+
+    let check build cursor =
+        match tryPage build with
+        | Ok page -> valid && Page.limit page = n && Page.cursor page = cursor
+        | Error _ -> not valid && throwsArgument (fun () -> build () |> ignore)
+
+    check (fun () -> Page.create n) None
+    && check (fun () -> Page.after epoch n) (Some epoch)
 
 let private backoffLaw (baseDelay, ceiling) =
     let valid =
@@ -111,4 +129,10 @@ let tests =
                 LeaseDuration.maximum + TimeSpan.FromTicks 1L, LeaseDuration.maximum + TimeSpan.FromTicks 1L
                 TimeSpan.FromTicks a, TimeSpan.FromTicks b
                 TimeSpan.FromTicks baseTicks, TimeSpan.FromTicks ceilingTicks ]
-              |> List.forall backoffLaw) ]
+              |> List.forall backoffLaw)
+
+          Property.property "Page accepts exactly positive limits and observes them" (fun (seed: int) ->
+              let epoch = Epoch.ofUInt64 (uint64 (bounded 1000 seed) + 1UL)
+
+              [ Int32.MinValue; -1; 0; 1; 2; seed; Int32.MaxValue ]
+              |> List.forall (pageLaw epoch)) ]

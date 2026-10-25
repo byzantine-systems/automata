@@ -1592,3 +1592,390 @@ let inboxReachability name (env: ContractInboxEnv) (expected: string list) =
             (Set.difference expected classes, Set.difference classes expected)
             (Set.empty, Set.empty)
             "every behavior class is reachable from generated traces (missing, unexpected)")
+
+// ---------------------------------------------------------------------------------------------
+// The history equations.
+//
+// A finite per-entity log, built only through Submit, Claim and Commit, drives the durable
+// snapshot and the paged history of both readers. A model that knows only the documented
+// contract predicts every answer: the snapshot is the latest transition's state, epoch and
+// status, a page is the log filtered by an exclusive epoch cursor and truncated by the limit,
+// and a page pinned to a cursor does not move as the log grows behind it.
+// ---------------------------------------------------------------------------------------------
+
+type ContractReader = IStateReader<ContractEntityId, ContractState, ContractEvent, ContractAction>
+
+/// The stores one provider supplies per generated history case, plus its view of now.
+type ContractHistoryStores =
+    {
+        Inbox: ContractInbox
+        Processor: ContractProcessor
+        Reader: ContractReader
+        /// The effective now for bounding commit times: the fixture's frozen clock, or the real one.
+        Now: unit -> DateTimeOffset
+    }
+
+/// Everything a provider fills in to run the shared history property.
+type ContractHistoryEnv =
+    {
+        Machine: MachineId
+        Version: ChartVersion
+        /// Commit instants are stamped by the database, so read-backs compare against a
+        /// tolerance that covers the difference between the caller's clock and the store's.
+        CommittedAtTolerance: TimeSpan
+        /// A fixture with nothing in it, once per generated case, shrinking reruns included.
+        Fresh: unit -> Task<ContractHistoryStores>
+    }
+
+type private ContractTransition = CommittedTransition<ContractEntityId, ContractState, ContractEvent, ContractAction>
+
+type private AppendSeed =
+    { Entity: byte
+      Payload: byte
+      Status: byte
+      EffectiveAt: byte }
+
+type private PageSeed =
+    { Entity: byte
+      Cursor: byte
+      Limit: byte }
+
+type private HistoryCase =
+    { Appends: AppendSeed list
+      GrowthSplit: byte
+      Pages: PageSeed list }
+
+let private historyStatus (raw: byte) : InstanceStatus =
+    match int raw % 3 with
+    | 0 -> Running
+    | 1 -> Suspended
+    | _ -> Terminated
+
+let private historyEffectiveAt (raw: byte) : DateTimeOffset =
+    DateTimeOffset(2026, 1, 1, 0, 0, int raw % 60, TimeSpan.Zero)
+
+let private historyDraft
+    (env: ContractHistoryEnv)
+    (entity: ContractEntityId)
+    (event: ContractEvent)
+    (payload: byte)
+    (status: byte)
+    (effectiveAt: DateTimeOffset)
+    (fromState: ContractState)
+    : TransitionDraft<ContractEntityId, ContractState, ContractEvent, ContractAction> =
+    { MachineId = env.Machine
+      EntityId = entity
+      Event = event
+      Actions = [ Fired(1 + int payload % 5) ]
+      FromState = fromState
+      ToState = Active(1 + int payload % 7)
+      HandledBy = stateId "contract"
+      Exited = [ stateId "from" ]
+      Entered = [ stateId "to" ]
+      Status = historyStatus status
+      EffectiveAt = effectiveAt }
+
+/// One compiled append: everything the model predicts the store wrote, except the commit instant
+/// the database stamps, which is bounded rather than predicted.
+type private CompiledRow =
+    { Draft: TransitionDraft<ContractEntityId, ContractState, ContractEvent, ContractAction>
+      Epoch: Epoch
+      CommandId: CommandId
+      Before: DateTimeOffset
+      After: DateTimeOffset }
+
+let private expectedSnapshot (log: CompiledRow list) : Snapshot<ContractState> option =
+    match List.tryLast log with
+    | None -> None
+    | Some last ->
+        Some
+            { State = last.Draft.ToState
+              Epoch = last.Epoch
+              Status = last.Draft.Status }
+
+let private expectedPage (page: Page) (log: CompiledRow list) : CompiledRow list =
+    let after =
+        match Page.cursor page with
+        | None -> log
+        | Some cursor -> log |> List.filter (fun row -> row.Epoch > cursor)
+
+    after |> List.truncate (Page.limit page)
+
+let private rowsMatch (env: ContractHistoryEnv) (rows: ContractTransition list) (expected: CompiledRow list) =
+    rows.Length = expected.Length
+    && List.forall2
+        (fun (row: ContractTransition) (exp: CompiledRow) ->
+            row.Draft = exp.Draft
+            && row.Epoch = exp.Epoch
+            && row.CommandId = exp.CommandId
+            && row.ChartVersion = env.Version
+            && row.CommittedAt >= exp.Before - env.CommittedAtTolerance
+            && row.CommittedAt <= exp.After + env.CommittedAtTolerance)
+        rows
+        expected
+
+/// Commits the generated appends against the store while compiling the model, and then checks
+/// every observation the contract promises. Answers the verdict and never throws on a mismatch.
+let private runHistory (env: ContractHistoryEnv) (stores: ContractHistoryStores) (case: HistoryCase) : Task<bool> =
+    task {
+        let ct = CancellationToken.None
+        let appends = List.truncate 8 case.Appends
+        let lease = LeaseDuration.create (TimeSpan.FromSeconds 30.0)
+        let mutable logs: Map<string, CompiledRow list> = Map.empty
+        let mutable states: Map<string, ContractState> = Map.empty
+        let mutable epochs: Map<string, Epoch> = Map.empty
+
+        let observePage
+            (machine: MachineId)
+            (entity: ContractEntityId)
+            (page: Page)
+            (expected: CompiledRow list)
+            : Task<bool> =
+            task {
+                match! stores.Reader.History(machine, entity, page, ct) with
+                | Ok rows -> return rowsMatch env rows expected
+                | Error _ -> return false
+            }
+
+        let observeSnapshot
+            (machine: MachineId)
+            (entity: ContractEntityId)
+            (expected: Snapshot<ContractState> option)
+            : Task<bool> =
+            task {
+                match! stores.Reader.TryGetSnapshot(machine, entity, ct) with
+                | Ok actual -> return actual = expected
+                | Error _ -> return false
+            }
+
+        let commitAppend (index: int) (append: AppendSeed) : Task<bool> =
+            task {
+                let name = entityName append.Entity
+                let entity: ContractEntityId = entityId name
+                let event = eventOf append.Payload
+                let key = $"h{index}"
+                let fromState = Map.tryFind name states |> Option.defaultValue Idle
+                let expected = Map.tryFind name epochs |> Option.defaultValue Epoch.initial
+
+                let draft =
+                    historyDraft
+                        env
+                        entity
+                        event
+                        append.Payload
+                        append.Status
+                        (historyEffectiveAt append.EffectiveAt)
+                        fromState
+
+                let submission: CommandSubmission<ContractEntityId, ContractEvent> =
+                    { MachineId = env.Machine
+                      EntityId = entity
+                      IdempotencyKey = key
+                      ChartVersion = env.Version
+                      Kind = CommandKind.Event
+                      Event = event
+                      VisibleAt = None
+                      ReceivedAt = None
+                      Audit = AuditContext.empty }
+
+                match! stores.Inbox.Submit(submission, ct) with
+                | Error _ -> return false
+                | Ok _ ->
+                    let before = stores.Now()
+
+                    match! stores.Inbox.Claim(env.Machine, ClaimBatch.create 1, lease, ct) with
+                    | Error _ -> return false
+                    | Ok [] -> return false
+                    | Ok(held :: _) when held.Work.IdempotencyKey = key ->
+                        match! stores.Processor.Commit(held.Work.CommandId, held.Token, expected, draft, ct) with
+                        | Ok(Finalized committed) when committed = Epoch.next expected ->
+                            let after = stores.Now()
+
+                            let row: CompiledRow =
+                                { Draft = draft
+                                  Epoch = committed
+                                  CommandId = held.Work.CommandId
+                                  Before = before
+                                  After = after }
+
+                            logs <- Map.add name ((Map.tryFind name logs |> Option.defaultValue []) @ [ row ]) logs
+                            states <- Map.add name draft.ToState states
+                            epochs <- Map.add name committed epochs
+                            return true
+                        | _ -> return false
+                    | Ok _ -> return false
+            }
+
+        let rec appendLoop (nextIndex: int) (remaining: AppendSeed list) : Task<bool> =
+            task {
+                match remaining with
+                | [] -> return true
+                | append :: rest ->
+                    let! ok = commitAppend nextIndex append
+
+                    if ok then
+                        return! appendLoop (nextIndex + 1) rest
+                    else
+                        return false
+            }
+
+        let checkEntity (name: string) (log: CompiledRow list) : Task<bool> =
+            task {
+                let entity: ContractEntityId = entityId name
+                let! snapOk = observeSnapshot env.Machine entity (expectedSnapshot log)
+                let epochValues = log |> List.map (_.Epoch >> Epoch.value)
+                let epochsOk = epochValues = [ 1UL .. uint64 (List.length log) ]
+                let! fullOk = observePage env.Machine entity (Page.create 10) log
+                let! oneOk = observePage env.Machine entity (Page.create 1) (List.truncate 1 log)
+
+                let! cursorOk =
+                    match List.tryHead log with
+                    | Some first ->
+                        let page = Page.after first.Epoch 10
+                        observePage env.Machine entity page (expectedPage page log)
+                    | None -> Task.FromResult true
+
+                return snapOk && epochsOk && fullOk && oneOk && cursorOk
+            }
+
+        let rec checkEntities (entities: (string * CompiledRow list) list) : Task<bool> =
+            task {
+                match entities with
+                | [] -> return true
+                | (name, log) :: rest ->
+                    let! ok = checkEntity name log
+
+                    if ok then return! checkEntities rest else return false
+            }
+
+        let beforePages = ResizeArray<string * Page * ContractTransition list>()
+
+        let rec checkPrefixPages (entities: (string * CompiledRow list) list) : Task<bool> =
+            task {
+                match entities with
+                | [] -> return true
+                | (name, log) :: rest ->
+                    let page = Page.create 3
+                    let expected = expectedPage page log
+
+                    match! stores.Reader.History(env.Machine, entityId name, page, ct) with
+                    | Ok rows ->
+                        if rowsMatch env rows expected then
+                            beforePages.Add(name, page, rows)
+                            return! checkPrefixPages rest
+                        else
+                            return false
+                    | Error _ -> return false
+            }
+
+        let rec checkStability (pinned: (string * Page * ContractTransition list) list) : Task<bool> =
+            task {
+                match pinned with
+                | [] -> return true
+                | (name, page, beforeRows) :: rest ->
+                    match! stores.Reader.History(env.Machine, entityId name, page, ct) with
+                    | Ok afterRows ->
+                        let stable =
+                            if List.length beforeRows >= Page.limit page then
+                                afterRows = beforeRows
+                            else
+                                List.truncate (List.length beforeRows) afterRows = beforeRows
+
+                        if stable then return! checkStability rest else return false
+                    | Error _ -> return false
+            }
+
+        let rec checkPageSeeds (seeds: PageSeed list) : Task<bool> =
+            task {
+                match seeds with
+                | [] -> return true
+                | seed :: rest ->
+                    let name = entityName seed.Entity
+                    let log = Map.tryFind name logs |> Option.defaultValue []
+                    let limit = 1 + int seed.Limit % 6
+
+                    let page =
+                        match int seed.Cursor % 3 with
+                        | 0 -> Page.create limit
+                        | 1 ->
+                            match log with
+                            | [] -> Page.create limit
+                            | _ -> Page.after log[int seed.Cursor % List.length log].Epoch limit
+                        | _ ->
+                            match List.tryLast log with
+                            | Some row -> Page.after row.Epoch limit
+                            | None -> Page.create limit
+
+                    let expected = expectedPage page log
+
+                    match! stores.Reader.History(env.Machine, entityId name, page, ct) with
+                    | Ok rows when rowsMatch env rows expected -> return! checkPageSeeds rest
+                    | _ -> return false
+            }
+
+        // A never-committed entity, and a machine that never wrote anything, answer nothing.
+        let! missingSnap = observeSnapshot env.Machine (entityId "missing") None
+        let! missingPage = observePage env.Machine (entityId "missing") (Page.create 10) []
+        let! otherSnap = observeSnapshot (machineId "other-machine") (entityId "e0") None
+        let! otherPage = observePage (machineId "other-machine") (entityId "e0") (Page.create 10) []
+
+        let emptyOk = missingSnap && missingPage && otherSnap && otherPage
+
+        // Commit the prefix, page it, then commit the suffix and prove the page is stable.
+        let split = int case.GrowthSplit % (List.length appends + 1)
+        let prefixAppends = List.take split appends
+        let suffixAppends = List.skip split appends
+
+        let! prefixOk = appendLoop 0 prefixAppends
+        let! prefixPagesOk = checkPrefixPages (Map.toList logs)
+        let! suffixOk = appendLoop split suffixAppends
+        let! stableOk = checkStability (List.ofSeq beforePages)
+        let! pageSeedsOk = checkPageSeeds (List.truncate 3 case.Pages)
+        let! entitiesOk = checkEntities (Map.toList logs)
+
+        return
+            emptyOk
+            && prefixOk
+            && prefixPagesOk
+            && suffixOk
+            && stableOk
+            && pageSeedsOk
+            && entitiesOk
+    }
+
+/// Renders a shrunk counterexample.
+let private renderHistory (case: HistoryCase) : string =
+    let appends =
+        case.Appends
+        |> List.truncate 8
+        |> List.map (fun a -> $"({a.Entity},{a.Payload},{a.Status},{a.EffectiveAt})")
+
+    let pages =
+        case.Pages
+        |> List.truncate 3
+        |> List.map (fun p -> $"({p.Entity},{p.Cursor},{p.Limit})")
+
+    let appendsText = String.concat " " appends
+    let pagesText = String.concat " " pages
+
+    $"appends=[{appendsText}] split={case.GrowthSplit} pages=[{pagesText}]"
+
+/// The shared history property. The law is a task, so every generated case, and every rerun a
+/// shrunk counterexample produces, takes a fresh fixture and runs against it for real.
+let historyProperty name maxTests (env: ContractHistoryEnv) =
+    testCase name (fun () ->
+        let config = Config.QuickThrowOnFailure.WithMaxTest(maxTests).WithEndSize(12)
+
+        Check.One(
+            config,
+            fun (case: HistoryCase) ->
+                task {
+                    let! stores = env.Fresh()
+                    let! verdict = runHistory env stores case
+
+                    if not verdict then
+                        eprintfn "history case falsified:\n%s" (renderHistory case)
+
+                    return verdict
+                }
+        ))
