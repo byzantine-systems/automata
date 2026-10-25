@@ -10,7 +10,6 @@ open ByzantineSystems.Automata.Storage.Internal
 open ByzantineSystems.Automata.Storage.Sqlite.Schema
 open FsToolkit.ErrorHandling
 open Microsoft.Data.Sqlite
-open SqlHydra.Query
 
 /// <summary>
 /// Everything the processor needs to bridge the generic domain types to the columns of
@@ -166,6 +165,12 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     let closeCommand = Statement.load "command" "close"
     let promoteHead = Statement.load "command" "promote_head"
 
+    let entitySnapshot = StatementKey.create "command" "snapshot" |> Sql.prepareProgram
+
+    let historyPage = StatementKey.create "command" "history_page" |> Sql.prepareProgram
+
+    let commandResult = StatementKey.create "command" "result" |> Sql.prepareProgram
+
     let encodeDraft
         (draft: TransitionDraft<'EntityId, 'State, 'Event, 'Action>)
         : Result<EncodedDraft<'EntityId, 'State, 'Event, 'Action>, StoreError> =
@@ -235,6 +240,29 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
         with :? JsonException as error ->
             Error(StoreError.Serialization("StateId list", error))
 
+    /// <summary>
+    /// A committed transition's columns, read into the generated record by name. Building the
+    /// record here, where every field is required, is what turns a column added to the table
+    /// into a compile error in this reader rather than a value it silently leaves out. Shared
+    /// by the history page and the result read, so one row shape has one reader.
+    /// </summary>
+    let transitionRow (reader: SqliteDataReader) : main.fsm_transition =
+        { machine_id = Row.string reader "machine_id"
+          entity_id = Row.string reader "entity_id"
+          epoch = Row.int64 reader "epoch"
+          command_id = Row.int64 reader "command_id"
+          chart_version = Row.int64 reader "chart_version"
+          event = Row.string reader "event"
+          actions = Row.string reader "actions"
+          from_state = Row.string reader "from_state"
+          to_state = Row.string reader "to_state"
+          handled_by = Row.string reader "handled_by"
+          exited = Row.string reader "exited"
+          entered = Row.string reader "entered"
+          status = Row.string reader "status"
+          effective_at = Row.int64 reader "effective_at"
+          committed_at = Row.int64 reader "committed_at" }
+
     let toTransition
         (row: main.fsm_transition)
         : Result<CommittedTransition<'EntityId, 'State, 'Event, 'Action>, StoreError> =
@@ -279,26 +307,47 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                   CommittedAt = Instant.toDateTimeOffset row.committed_at }
         }
 
-    let toSnapshot (row: main.fsm_entity_snapshot) : Result<Snapshot<'State>, StoreError> =
+    let snapshotRow (reader: SqliteDataReader) : Result<Snapshot<'State>, StoreError> =
         result {
-            let! state = options.StateCodec.Decode row.state |> Result.mapError Db.toStoreError
-            let! status = Db.instanceStatusFromString row.status
+            let! state =
+                options.StateCodec.Decode(Row.string reader "state")
+                |> Result.mapError Db.toStoreError
+
+            let! status = Db.instanceStatusFromString (Row.string reader "status")
 
             return
                 { State = state
-                  Epoch = Db.epochOf row.epoch
+                  Epoch = Db.epochOf (Row.int64 reader "epoch")
                   Status = status }
         }
 
-    let toResult
-        (command: main.fsm_command, transition: main.fsm_transition option, error: main.fsm_command_error option)
+    /// What became of one command, from its status, its transition if it committed, and its
+    /// error if it failed.
+    let resultRow
+        (reader: SqliteDataReader)
         : Result<CommandResult<'EntityId, 'State, 'Event, 'Action, 'Err>, StoreError> =
+        let transition =
+            let marker = reader.GetOrdinal "command_id"
+
+            if reader.IsDBNull marker then
+                None
+            else
+                Some(transitionRow reader)
+
+        let error =
+            let marker = reader.GetOrdinal "error"
+
+            if reader.IsDBNull marker then
+                None
+            else
+                Some(Row.string reader "error")
+
         let failure () =
             match error with
-            | Some error -> readFailure error.error
+            | Some error -> readFailure error
             | None -> Error(Db.decodeFailure (nameof CommandResult) "a failed command has no recorded error")
 
-        CommandMapping.statusFromString command.status
+        CommandMapping.statusFromString (Row.string reader "command_status")
         |> Result.bind (fun status ->
             match status, transition with
             | CommandStatus.Ready, _
@@ -493,30 +542,16 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     interface IStateReader<'EntityId, 'State, 'Event, 'Action> with
 
         member _.TryGetSnapshot(machineId, entityId, ct) =
-            let machine = MachineId.value machineId
-            let entity = options.EntityIdEncode entityId
-
-            Sql.read
+            Sql.readProgram
                 context
-                (sqliteRead {
-                    let! row =
-                        Sql.select (fun query token ->
-                            selectTask query {
-                                for s in main.fsm_entity_snapshot do
-                                    where (s.machine_id = machine && s.entity_id = entity)
-                                    select s
-                                    tryHead
-                                    cancel token
-                            })
-
-                    return! row |> Option.traverseResult toSnapshot
-                })
+                (StoreProgram.tryQueryOne
+                    entitySnapshot
+                    [ "@machine_id", Param.Text(MachineId.value machineId)
+                      "@entity_id", Param.Text(options.EntityIdEncode entityId) ]
+                    snapshotRow)
                 ct
 
         member _.History(machineId, entityId, paging, ct) =
-            let machine = MachineId.value machineId
-            let entity = options.EntityIdEncode entityId
-
             // An absent cursor is zero, which transition_epoch_positive makes smaller than any
             // stored epoch, so one query shape serves every page.
             let after =
@@ -524,25 +559,15 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                 |> Option.map (Epoch.value >> int64)
                 |> Option.defaultValue 0L
 
-            let limit = Page.limit paging
-
-            Sql.read
+            Sql.readProgram
                 context
-                (sqliteRead {
-                    let! rows =
-                        Sql.select (fun query token ->
-                            selectTask query {
-                                for t in main.fsm_transition do
-                                    where (t.machine_id = machine && t.entity_id = entity && t.epoch > after)
-                                    orderBy t.epoch
-                                    take limit
-                                    select t
-                                    toList
-                                    cancel token
-                            })
-
-                    return! rows |> List.traverseResultM toTransition
-                })
+                (StoreProgram.queryRows
+                    historyPage
+                    [ "@machine_id", Param.Text(MachineId.value machineId)
+                      "@entity_id", Param.Text(options.EntityIdEncode entityId)
+                      "@after", Param.Integer after
+                      "@limit", Param.Integer(int64 (Page.limit paging)) ]
+                    (transitionRow >> toTransition))
                 ct
 
     interface ICommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err> with
@@ -561,23 +586,10 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
             fail DeadLetter commandId token error ct
 
         member _.TryGetResult(commandId, ct) =
-            let id = CommandId.value commandId
-
-            Sql.read
+            Sql.readProgram
                 context
-                (sqliteRead {
-                    let! row =
-                        Sql.select (fun query token ->
-                            selectTask query {
-                                for c in main.fsm_command do
-                                    leftJoin t in main.fsm_transition on (c.command_id = t.Value.command_id)
-                                    leftJoin e in main.fsm_command_error on (c.command_id = e.Value.command_id)
-                                    where (c.command_id = id)
-                                    select (c, t, e)
-                                    tryHead
-                                    cancel token
-                            })
-
-                    return! row |> Option.traverseResult toResult
-                })
+                (StoreProgram.tryQueryOne
+                    commandResult
+                    [ "@command_id", Param.Integer(CommandId.value commandId) ]
+                    resultRow)
                 ct

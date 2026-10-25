@@ -9,7 +9,7 @@ open ByzantineSystems.Automata.Storage
 open ByzantineSystems.Automata.Storage.Internal
 open ByzantineSystems.Automata.Storage.Postgres.Schema
 open FsToolkit.ErrorHandling
-open SqlHydra.Query
+open Npgsql
 
 /// <summary>
 /// Everything the processor needs to bridge the generic domain types to the columns of
@@ -110,6 +110,20 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
 
     let finalizeCommand = Statement.load "command" "finalize"
     let finalizeCorrection = Statement.load "command" "finalize_correction"
+
+    let currentBelief = StatementKey.create "belief" "current" |> Sql.prepareProgram
+
+    let historyPage =
+        StatementKey.create "transition" "history_page" |> Sql.prepareProgram
+
+    let transitionResult =
+        StatementKey.create "transition" "result" |> Sql.prepareProgram
+
+    let transitionSuffix =
+        StatementKey.create "transition" "suffix" |> Sql.prepareProgram
+
+    let transitionOldest =
+        StatementKey.create "transition" "oldest" |> Sql.prepareProgram
 
     /// What a commit sends beyond the command's identity: the draft and its four encoded
     /// payloads, encoded before anything is sent.
@@ -248,10 +262,32 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
             return! Sql.run context (finalize commandId token (resolve encoded)) ct
         }
 
-    /// Rebuilds a committed transition from its generated row. Seven decodes can fail
-    /// independently, and none of them is expected: each means the row is not what this code was
-    /// compiled for. Shared by the command-result read and the history page, so one row shape
-    /// has one decoder.
+    /// <summary>
+    /// A committed transition's columns, read into the generated record by name. Building the
+    /// record here, where every field is required, is what turns a column added to the table
+    /// into a compile error in this reader rather than a value it silently leaves out. Shared
+    /// by the history page, the result read and the replay suffix, so one row shape has one
+    /// reader.
+    /// </summary>
+    let transitionRow (reader: NpgsqlDataReader) : fsm.transition =
+        { machine_id = Row.string reader "machine_id"
+          entity_id = Row.string reader "entity_id"
+          epoch = Row.int64 reader "epoch"
+          command_id = Row.int64 reader "command_id"
+          chart_version = Row.int32 reader "chart_version"
+          event = Row.string reader "event"
+          actions = Row.string reader "actions"
+          from_state = Row.string reader "from_state"
+          to_state = Row.string reader "to_state"
+          handled_by = Row.string reader "handled_by"
+          exited = reader.GetFieldValue<string[]>(reader.GetOrdinal "exited")
+          entered = reader.GetFieldValue<string[]>(reader.GetOrdinal "entered")
+          status = Row.string reader "status"
+          effective_at = reader.GetDateTime(reader.GetOrdinal "effective_at")
+          committed_at = reader.GetDateTime(reader.GetOrdinal "committed_at") }
+
+    /// Rebuilds a committed transition from its row. Seven decodes can fail independently, and
+    /// none of them is expected: each means the row is not what this code was compiled for.
     let toTransition
         (row: fsm.transition)
         : Result<CommittedTransition<'EntityId, 'State, 'Event, 'Action>, StoreError> =
@@ -305,13 +341,18 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
 
     /// The current belief, from the view's nullable columns. The view cannot carry NOT NULL, so
     /// each column is required here instead of assumed.
-    let toSnapshot (row: fsm.current_belief) : Result<Snapshot<'State>, StoreError> =
-        let column name value = Db.required "Snapshot" name value
+    let snapshotRow (reader: NpgsqlDataReader) : Result<Snapshot<'State>, StoreError> =
+        let optional (read: int -> _) (column: string) =
+            let ordinal = reader.GetOrdinal column
+
+            if reader.IsDBNull ordinal then None else Some(read ordinal)
 
         result {
-            let! state = column "state" row.state
-            let! status = column "status" row.status
-            let! epoch = column "epoch" row.epoch
+            let! state = Db.required "Snapshot" "state" (optional reader.GetString "state")
+
+            let! status = Db.required "Snapshot" "status" (optional reader.GetString "status")
+
+            let! epoch = Db.required "Snapshot" "epoch" (optional reader.GetInt64 "epoch")
             let! state = options.StateCodec.Decode state |> Result.mapError Db.toStoreError
             let! status = Db.instanceStatusFromString status
 
@@ -321,17 +362,33 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                   Status = status }
         }
 
-    /// What became of one command, from the command, its transition if it committed, and its
+    /// What became of one command, from its status, its transition if it committed, and its
     /// error if it failed.
-    let toResult
-        (command: fsm.command, transition: fsm.transition option, error: fsm.command_error option)
+    let resultRow
+        (reader: NpgsqlDataReader)
         : Result<CommandResult<'EntityId, 'State, 'Event, 'Action, 'Err>, StoreError> =
+        let transition =
+            let marker = reader.GetOrdinal "command_id"
+
+            if reader.IsDBNull marker then
+                None
+            else
+                Some(transitionRow reader)
+
+        let error =
+            let marker = reader.GetOrdinal "error"
+
+            if reader.IsDBNull marker then
+                None
+            else
+                Some(Row.string reader "error")
+
         let failure () =
             match error with
-            | Some error -> readFailure error.error
+            | Some error -> readFailure error
             | None -> Error(Db.decodeFailure (nameof CommandResult) "a failed command has no recorded error")
 
-        match command.status, transition with
+        match Row.string reader "command_status", transition with
         | ("ready" | "leased"), _ -> Ok CommandResult.Pending
         | "succeeded", Some transition -> toTransition transition |> Result.map CommandResult.Committed
         | "succeeded", None -> Error(Db.decodeFailure (nameof CommandResult) "a succeeded command has no transition")
@@ -342,30 +399,16 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     interface IStateReader<'EntityId, 'State, 'Event, 'Action> with
 
         member _.TryGetSnapshot(machineId, entityId, ct) =
-            let machine = Some(MachineId.value machineId)
-            let entity = Some(options.EntityIdEncode entityId)
-
-            Sql.run
+            Sql.readProgram
                 context
-                (postgres {
-                    let! row =
-                        Sql.select (fun query token ->
-                            selectTask query {
-                                for b in fsm.current_belief do
-                                    where (b.machine_id = machine && b.entity_id = entity)
-                                    select b
-                                    tryHead
-                                    cancel token
-                            })
-
-                    return! row |> Option.traverseResult toSnapshot
-                })
+                (StoreProgram.tryQueryOne
+                    currentBelief
+                    [ "machine_id", Param.Text(MachineId.value machineId)
+                      "entity_id", Param.Text(options.EntityIdEncode entityId) ]
+                    snapshotRow)
                 ct
 
         member _.History(machineId, entityId, paging, ct) =
-            let machine = MachineId.value machineId
-            let entity = options.EntityIdEncode entityId
-
             // An absent cursor is zero rather than a null, because transition_epoch_positive
             // forbids a stored epoch of zero. One query shape then serves every page.
             let after =
@@ -373,25 +416,15 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                 |> Option.map (Epoch.value >> int64)
                 |> Option.defaultValue 0L
 
-            let limit = Page.limit paging
-
-            Sql.run
+            Sql.readProgram
                 context
-                (postgres {
-                    let! rows =
-                        Sql.select (fun query token ->
-                            selectTask query {
-                                for t in fsm.transition do
-                                    where (t.machine_id = machine && t.entity_id = entity && t.epoch > after)
-                                    orderBy t.epoch
-                                    take limit
-                                    select t
-                                    toList
-                                    cancel token
-                            })
-
-                    return! rows |> List.traverseResultM toTransition
-                })
+                (StoreProgram.queryRows
+                    historyPage
+                    [ "machine_id", Param.Text(MachineId.value machineId)
+                      "entity_id", Param.Text(options.EntityIdEncode entityId)
+                      "after", Param.Bigint after
+                      "limit", Param.Int(Page.limit paging) ]
+                    (transitionRow >> toTransition))
                 ct
 
     interface ICommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err> with
@@ -408,73 +441,46 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
             fail DeadLetter commandId token error ct
 
         member _.TryGetResult(commandId, ct) =
-            let id = CommandId.value commandId
-
-            Sql.run
+            Sql.readProgram
                 context
-                (postgres {
-                    let! row =
-                        Sql.select (fun query token ->
-                            selectTask query {
-                                for c in fsm.command do
-                                    leftJoin t in fsm.transition on (c.command_id = t.Value.command_id)
-                                    leftJoin e in fsm.command_error on (c.command_id = e.Value.command_id)
-                                    where (c.command_id = id)
-                                    select (c, t, e)
-                                    tryHead
-                                    cancel token
-                            })
-
-                    return! row |> Option.traverseResult toResult
-                })
+                (StoreProgram.tryQueryOne
+                    transitionResult
+                    [ "command_id", Param.Bigint(CommandId.value commandId) ]
+                    resultRow)
                 ct
 
     interface IReplayStore<'EntityId, 'State, 'Event, 'Action> with
 
         member _.Suffix(machineId, entityId, from, limit, ct) =
-            let machine = MachineId.value machineId
-            let entity = options.EntityIdEncode entityId
-            let since = Db.timestamp from
-
-            Sql.run
+            Sql.readProgram
                 context
-                (postgres {
+                (store {
                     let! suffix =
-                        Sql.select (fun query token ->
-                            selectTask query {
-                                for t in fsm.transition do
-                                    where (t.machine_id = machine && t.entity_id = entity && t.effective_at >= since)
-                                    orderBy t.effective_at
-                                    thenBy t.epoch
-                                    take limit
-                                    select t
-                                    toList
-                                    cancel token
-                            })
+                        StoreProgram.queryRows
+                            transitionSuffix
+                            [ "machine_id", Param.Text(MachineId.value machineId)
+                              "entity_id", Param.Text(options.EntityIdEncode entityId)
+                              "from", Param.Timestamp from
+                              "limit", Param.Int limit ]
+                            (transitionRow >> toTransition)
 
                     // Retention purges an entity's oldest commands with their transitions, so a
                     // log that no longer starts at epoch 1, and whose oldest survivor is already
                     // past the corrected instant, may have lost events after it.
                     let! oldest =
-                        Sql.select (fun query token ->
-                            selectTask query {
-                                for t in fsm.transition do
-                                    where (t.machine_id = machine && t.entity_id = entity)
-                                    orderBy t.epoch
-                                    select t
-                                    tryHead
-                                    cancel token
-                            })
+                        StoreProgram.tryQueryOne
+                            transitionOldest
+                            [ "machine_id", Param.Text(MachineId.value machineId)
+                              "entity_id", Param.Text(options.EntityIdEncode entityId) ]
+                            (transitionRow >> Ok)
 
                     let incomplete =
                         match oldest with
-                        | Some first -> first.epoch > 1L && first.effective_at > since
+                        | Some first -> first.epoch > 1L && first.effective_at > Db.timestamp from
                         | None -> false
 
-                    let! transitions = suffix |> List.traverseResultM toTransition
-
                     return
-                        { Transitions = transitions
+                        { Transitions = suffix
                           Incomplete = incomplete }
                 })
                 ct

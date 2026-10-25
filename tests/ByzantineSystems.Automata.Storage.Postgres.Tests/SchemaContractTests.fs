@@ -37,6 +37,25 @@ let private recordColumns =
         "correction_on_divergence"
         "correction_replay_limit" ]
 
+let private transitionColumns =
+    [ "machine_id"
+      "entity_id"
+      "epoch"
+      "command_id"
+      "chart_version"
+      "event"
+      "actions"
+      "from_state"
+      "to_state"
+      "handled_by"
+      "exited"
+      "entered"
+      "status"
+      "effective_at"
+      "committed_at" ]
+
+let private resultColumns = [ "command_status" ] @ transitionColumns @ [ "error" ]
+
 /// Builds the plan probe from the routine's own body, read back out of the catalog. Copying the
 /// statement into the test instead would let the two drift, which is exactly the failure this
 /// test exists to catch.
@@ -114,6 +133,58 @@ let tests =
               Expect.equal columns [ "fingerprint" ] "the registry reads this column by name"
           }
 
+          testTask "processor lookups return the shared row shapes" {
+              do! reset ()
+
+              let belief =
+                  columnsOf (SqlResources.get "belief" "current") [ "machine_id", box "none"; "entity_id", box "none" ]
+
+              let beliefColumns =
+                  [ "machine_id"
+                    "entity_id"
+                    "state"
+                    "status"
+                    "epoch"
+                    "command_id"
+                    "chart_version"
+                    "valid_from"
+                    "known_from" ]
+
+              Expect.equal belief beliefColumns "the snapshot reader requires these columns"
+
+              let page =
+                  columnsOf
+                      (SqlResources.get "transition" "history_page")
+                      [ "machine_id", box "none"
+                        "entity_id", box "none"
+                        "after", box 0L
+                        "limit", box 1 ]
+
+              Expect.equal page transitionColumns "the history reader maps these columns by name"
+
+              let result =
+                  columnsOf (SqlResources.get "transition" "result") [ "command_id", box 0L ]
+
+              Expect.equal result resultColumns "the result reader maps these columns by name"
+
+              let suffix =
+                  columnsOf
+                      (SqlResources.get "transition" "suffix")
+                      [ "machine_id", box "none"
+                        "entity_id", box "none"
+                        "from", box (DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero))
+                        "limit", box 1 ]
+
+              Expect.equal suffix transitionColumns "the replay suffix shares the transition shape"
+
+              let oldest =
+                  columnsOf
+                      (SqlResources.get "transition" "oldest")
+                      [ "machine_id", box "none"; "entity_id", box "none" ]
+
+              Expect.equal oldest transitionColumns "the oldest probe shares the transition shape"
+          }
+
           testTask "the current belief view uses its partial index" {
               do! reset ()
 
@@ -146,11 +217,12 @@ let tests =
 
                   use cmd =
                       new NpgsqlCommand(
-                          "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "
-                          + "SELECT * FROM fsm.current_belief WHERE machine_id = 'plan-probe' AND entity_id = 'e1234'",
+                          "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + SqlResources.get "belief" "current",
                           conn
                       )
 
+                  cmd.Parameters.AddWithValue("machine_id", "plan-probe") |> ignore
+                  cmd.Parameters.AddWithValue("entity_id", "e1234") |> ignore
                   cmd.ExecuteScalar() |> string
 
               Expect.stringContains plan "instance_state_live_idx" "the current-state read must use the partial index"
