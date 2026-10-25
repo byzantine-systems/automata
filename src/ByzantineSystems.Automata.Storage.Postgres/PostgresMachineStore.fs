@@ -38,7 +38,7 @@ type MachineStoreOptions<'EntityId, 'State, 'Event, 'Action, 'Err> =
         /// expired and was not reclaimed may still be extended by its holder, and reaping takes
         /// that away. Minutes, not seconds.
         /// </summary>
-        ReapAfter: TimeSpan
+        ReapAfter: LeaseDuration
         /// <summary>
         /// Where this machine listens for work announced by other processes.
         /// <c>SameDataSource</c> unless the data source goes through a transaction-mode pooler,
@@ -80,7 +80,7 @@ module MachineStoreOptions =
           EntityIdEncode = encode
           EntityIdDecode = decode
           Retention = RetentionPolicy.keepEverything
-          ReapAfter = TimeSpan.FromMinutes 5.
+          ReapAfter = LeaseDuration.create (TimeSpan.FromMinutes 5.)
           Listener = ListenerConnection.SameDataSource }
 
 /// <summary>

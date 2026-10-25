@@ -380,7 +380,7 @@ let newMachineStore (retention: RetentionPolicy) =
           EntityIdEncode = encode
           EntityIdDecode = decode
           Retention = retention
-          ReapAfter = TimeSpan.FromMinutes 5.
+          ReapAfter = LeaseDuration.create (TimeSpan.FromMinutes 5.)
           Listener = ListenerConnection.SameDataSource }
     )
 

@@ -141,12 +141,9 @@ module internal Boot =
         (machineId: MachineId)
         (queue: string)
         (retention: RetentionPolicy)
-        (reapAfter: TimeSpan)
+        (reapAfter: LeaseDuration)
         (ct: CancellationToken)
         : Task<Result<unit, StoreError>> =
-        if reapAfter <= TimeSpan.Zero then
-            invalidArg (nameof reapAfter) "The reaping grace period must be a positive duration."
-
         Sql.runProgram
             context
             (StoreProgram.executeDiscard
@@ -156,7 +153,7 @@ module internal Boot =
                   "keep_commands", Param.Text(interval retention.Commands)
                   "keep_belief_history", Param.Text(interval retention.BeliefHistory)
                   "keep_action_archive", Param.Text(interval retention.ActionArchive)
-                  "reap_after", Param.Interval reapAfter ])
+                  "reap_after", Param.Interval(LeaseDuration.value reapAfter) ])
             ct
 
 /// <summary>

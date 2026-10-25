@@ -74,7 +74,7 @@ let private ownStore () =
           EntityIdEncode = encode
           EntityIdDecode = decode
           Retention = RetentionPolicy.keepEverything
-          ReapAfter = TimeSpan.FromMinutes 5.
+          ReapAfter = LeaseDuration.create (TimeSpan.FromMinutes 5.)
           Listener = ListenerConnection.SameDataSource }
     )
 

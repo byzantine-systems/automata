@@ -48,12 +48,9 @@ module PostgresSupervisionQueries =
     /// <summary>Lists the newest audit facts first.</summary>
     let listRecent
         (context: PostgresContext)
-        (limit: int)
+        (limit: ClaimBatch)
         (ct: CancellationToken)
         : Task<Result<SupervisionRecord list, StoreError>> =
-        if limit < 1 then
-            invalidArg (nameof limit) "The supervision query limit must be positive."
-
         let toRecord (reader: NpgsqlDataReader) : Result<SupervisionRecord, StoreError> =
             result {
                 let! kind = EnumCodec.read Row.string EnumCodec.supervisionKind "kind" reader
@@ -81,4 +78,7 @@ module PostgresSupervisionQueries =
 
         // Newest first is the only order this table is ever read in, and it is what
         // supervision_event_recent_idx is built for.
-        Sql.readProgram context (StoreProgram.queryRows recent [ "limit", Param.Int limit ] toRecord) ct
+        Sql.readProgram
+            context
+            (StoreProgram.queryRows recent [ "limit", Param.Int(ClaimBatch.value limit) ] toRecord)
+            ct
