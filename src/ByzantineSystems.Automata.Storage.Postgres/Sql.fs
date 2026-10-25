@@ -8,17 +8,6 @@ open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage.Internal
 open Npgsql
 open NpgsqlTypes
-open SqlHydra.Query
-
-/// <summary>
-/// What a unit of work sees: one pooled connection and a query context over it. There is no
-/// transaction here on purpose. Atomicity belongs to the <c>fsm.*</c> routines, so a unit of
-/// several statements is neither atomic nor reads one snapshot, and anything that needs either
-/// belongs in a routine.
-/// </summary>
-type internal PgSession =
-    { Connection: NpgsqlConnection
-      Query: QueryContext }
 
 /// <summary>
 /// An embedded statement, resolved once when the store is built. A missing resource fails at
@@ -57,12 +46,6 @@ type internal Param =
     | TimestampOrNull of DateTimeOffset option
     | TextArrayOrNull of string list option
 
-/// <summary>The builder PostgreSQL units of work are written in.</summary>
-[<AutoOpen>]
-module internal Builders =
-
-    let postgres = OpBuilder<PgSession>()
-
 /// <summary>The statements, reads and runners the PostgreSQL stores are written with.</summary>
 [<RequireQualifiedAccess>]
 module internal Sql =
@@ -100,118 +83,85 @@ module internal Sql =
 
         cmd.Parameters.Add(NpgsqlParameter(name, dbType, Value = boxed)) |> ignore
 
-    let private command (session: PgSession) (statement: Statement) (values: (string * Param) list) : NpgsqlCommand =
-        let cmd = new NpgsqlCommand(Statement.text statement, session.Connection)
+    let private command
+        (connection: NpgsqlConnection)
+        (statement: Statement)
+        (values: (string * Param) list)
+        : NpgsqlCommand =
+        let cmd = new NpgsqlCommand(Statement.text statement, connection)
         values |> List.iter (bind cmd)
         cmd
 
-    /// <summary>Runs a statement for its effect and answers how many rows it changed.</summary>
-    let execute (statement: Statement) (values: (string * Param) list) : Op<PgSession, int> =
-        Op.ofDriver (fun session ct ->
-            backgroundTask {
-                use cmd = command session statement values
-                let! changed = cmd.ExecuteNonQueryAsync ct
-                return Ok changed
-            })
+    let private sequenceRows rows =
+        let prepend row values =
+            match row, values with
+            | Ok head, Ok tail -> Ok(head :: tail)
+            | Error error, _
+            | _, Error error -> Error error
 
-    /// <summary>Every row a statement returns, read through <paramref name="read" />, in result order.</summary>
-    let rows
+        List.foldBack prepend rows (Ok [])
+
+    let private execute
+        (connection: NpgsqlConnection)
         (statement: Statement)
         (values: (string * Param) list)
-        (read: NpgsqlDataReader -> 'T)
-        : Op<PgSession, 'T list> =
-        Op.ofDriver (fun session ct ->
-            backgroundTask {
-                use cmd = command session statement values
-                use! reader = cmd.ExecuteReaderAsync ct
-                let! all = Row.all read reader ct
-                return Ok all
-            })
-
-    /// <summary>
-    /// The row a statement returns, if it returns one. A second row is an error rather than
-    /// something to ignore: the statement and its caller disagree about what it selects.
-    /// </summary>
-    let tryOne
-        (typeName: string)
-        (statement: Statement)
-        (values: (string * Param) list)
-        (read: NpgsqlDataReader -> 'T)
-        : Op<PgSession, 'T option> =
-        Op.ofDriver (fun session ct ->
-            backgroundTask {
-                use cmd = command session statement values
-                use! reader = cmd.ExecuteReaderAsync ct
-
-                match! reader.ReadAsync ct with
-                | false -> return Ok None
-                | true ->
-                    let value = read reader
-
-                    match! reader.ReadAsync ct with
-                    | true ->
-                        return
-                            Error(Db.decodeFailure typeName $"%s{Statement.key statement} returned more than one row")
-                    | false -> return Ok(Some value)
-            })
-
-    /// <summary>The one row a statement returns. None, or more than one, is an error.</summary>
-    let one
-        (typeName: string)
-        (statement: Statement)
-        (values: (string * Param) list)
-        (read: NpgsqlDataReader -> 'T)
-        : Op<PgSession, 'T> =
-        tryOne typeName statement values read
-        |> Op.bind (function
-            | Some value -> Op.ok value
-            | None -> Op.fail (Db.decodeFailure typeName $"%s{Statement.key statement} returned no row"))
-
-    /// <summary>
-    /// A typed read through SqlHydra, against the session's query context. The work must hand
-    /// back materialised values, never a lazy sequence, because the connection closes when the
-    /// unit ends; and it must never call a runner, which would take a second pooled connection.
-    /// </summary>
-    let select (work: QueryContext -> CancellationToken -> Task<'T>) : Op<PgSession, 'T> =
-        Op.ofDriver (fun session ct ->
-            backgroundTask {
-                let! value = work session.Query ct
-                return Ok value
-            })
-
-    /// <summary>One pooled connection for the whole unit; the query context closes it.</summary>
-    let private session (dataSource: NpgsqlDataSource) (op: Op<PgSession, 'T>) (ct: CancellationToken) =
+        (ct: CancellationToken)
+        : Task<Result<int, StoreError>> =
         backgroundTask {
-            use! conn = dataSource.OpenConnectionAsync(ct).AsTask()
-            use query = new QueryContext(conn, PostgresEmitter())
-            return! Op.run op { Connection = conn; Query = query } ct
+            use cmd = command connection statement values
+            let! changed = cmd.ExecuteNonQueryAsync ct
+            return Ok changed
         }
 
-    /// <summary>
-    /// Runs a unit, distinguishing a refusal under a named constraint from every other answer,
-    /// for the one caller that expects a particular violation and has something to do about it.
-    /// </summary>
-    let attempt (context: PostgresContext) (op: Op<PgSession, 'T>) (ct: CancellationToken) : Task<Db.Attempt<'T>> =
-        Db.attempt context.Resilience (session context.DataSource op) ct
-
-    /// <summary>
-    /// Runs a unit that is safe to repeat, with the pipeline applied. A retry runs the whole unit
-    /// again on a fresh connection, so every statement in it must be idempotent: the routines
-    /// are, by construction.
-    /// </summary>
-    let run (context: PostgresContext) (op: Op<PgSession, 'T>) (ct: CancellationToken) : Task<Result<'T, StoreError>> =
-        Db.protect context.Resilience (session context.DataSource op) ct
-
-    /// <summary>
-    /// Runs a unit exactly once, for claims: a claim whose reply was lost has already leased a
-    /// batch, and the worker's next poll recovers sooner than a retry would.
-    /// </summary>
-    let runOnce
-        (context: PostgresContext)
-        (op: Op<PgSession, 'T>)
+    let private queryRows
+        (connection: NpgsqlConnection)
+        (statement: Statement)
+        (values: (string * Param) list)
+        (read: Read<NpgsqlDataReader, 'T>)
         (ct: CancellationToken)
-        : Task<Result<'T, StoreError>> =
-        Db.protectOnce (session context.DataSource op) ct
+        : Task<Result<'T list, StoreError>> =
+        backgroundTask {
+            use cmd = command connection statement values
+            use! reader = cmd.ExecuteReaderAsync ct
+            let! rows = Row.all read reader ct
+            return sequenceRows rows
+        }
+
+    let private tryQueryOne
+        (connection: NpgsqlConnection)
+        (statement: Statement)
+        (values: (string * Param) list)
+        (read: Read<NpgsqlDataReader, 'T>)
+        (ct: CancellationToken)
+        : Task<Result<'T option, StoreError>> =
+        backgroundTask {
+            use cmd = command connection statement values
+            use! reader = cmd.ExecuteReaderAsync ct
+
+            match! reader.ReadAsync ct with
+            | false -> return Ok None
+            | true ->
+                let value = read reader
+
+                match! reader.ReadAsync ct with
+                | true ->
+                    return
+                        Error(
+                            Db.decodeFailure
+                                (Statement.key statement)
+                                $"%s{Statement.key statement} returned more than one row"
+                        )
+                | false -> return value |> Result.map Some
+        }
+
+    let private queryOne connection statement values read ct =
+        backgroundTask {
+            match! tryQueryOne connection statement values read ct with
+            | Ok(Some value) -> return Ok value
+            | Ok None ->
+                return Error(Db.decodeFailure (Statement.key statement) $"%s{Statement.key statement} returned no row")
+            | Error error -> return Error error
+        }
 
     let private programStatements = ConcurrentDictionary<StatementKey, Statement>()
 
@@ -227,15 +177,6 @@ module internal Sql =
         programStatement key |> ignore
         key
 
-    let private sequenceRows rows =
-        let prepend row values =
-            match row, values with
-            | Ok head, Ok tail -> Ok(head :: tail)
-            | Error error, _
-            | _, Error error -> Error error
-
-        List.foldBack prepend rows (Ok [])
-
     let private programSession
         (dataSource: NpgsqlDataSource)
         (program: StoreProgram<'Access, (string * Param) list, NpgsqlDataReader, 'T>)
@@ -243,36 +184,26 @@ module internal Sql =
         =
         backgroundTask {
             use! conn = dataSource.OpenConnectionAsync(ct).AsTask()
-            use query = new QueryContext(conn, PostgresEmitter())
-            let session = { Connection = conn; Query = query }
 
             let interpreter =
                 { new IStoreInterpreter<(string * Param) list, NpgsqlDataReader> with
                     member _.ExecuteAsync(key, parameters, cancellationToken) =
-                        Op.run (execute (programStatement key) parameters) session cancellationToken
+                        execute conn (programStatement key) parameters cancellationToken
 
                     member _.QueryOneAsync<'Row>
                         (key, parameters, read: Read<NpgsqlDataReader, 'Row>, cancellationToken)
                         : Task<Result<'Row, StoreError>> =
-                        one (StatementKey.value key) (programStatement key) parameters read
-                        |> Op.bind Op.ofResult
-                        |> fun op -> Op.run op session cancellationToken
+                        queryOne conn (programStatement key) parameters read cancellationToken
 
                     member _.TryQueryOneAsync<'Row>
                         (key, parameters, read: Read<NpgsqlDataReader, 'Row>, cancellationToken)
                         : Task<Result<'Row option, StoreError>> =
-                        tryOne (StatementKey.value key) (programStatement key) parameters read
-                        |> Op.bind (function
-                            | Some result -> result |> Result.map Some |> Op.ofResult
-                            | None -> Op.ok None)
-                        |> fun op -> Op.run op session cancellationToken
+                        tryQueryOne conn (programStatement key) parameters read cancellationToken
 
                     member _.QueryRowsAsync<'Row>
                         (key, parameters, read: Read<NpgsqlDataReader, 'Row>, cancellationToken)
                         : Task<Result<'Row list, StoreError>> =
-                        rows (programStatement key) parameters read
-                        |> Op.bind (sequenceRows >> Op.ofResult)
-                        |> fun op -> Op.run op session cancellationToken }
+                        queryRows conn (programStatement key) parameters read cancellationToken }
 
             return! StoreProgram.run interpreter ct program
         }
