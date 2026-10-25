@@ -36,8 +36,8 @@
   },
   {
     "pname": "FsCheck",
-    "version": "3.4.0",
-    "hash": "sha256-absipRfuHzCFiQgfNKTZ65qO5mzbd7ixTpCjbvZjd7Q="
+    "version": "3.6.0",
+    "hash": "sha256-xKKfCM928GWwBFu4hRJVVnf0OC/hIrXojwBILwuzfA0="
   },
   {
     "pname": "FSharp.Core",
