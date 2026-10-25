@@ -38,6 +38,7 @@ let private expected =
       "system", "refresh_belief_cold"
       "system", "mark_belief_cold"
       "supervision", "record"
+      "supervision", "recent"
       "action", "ensure_queue"
       "action", "claim"
       "action", "complete"

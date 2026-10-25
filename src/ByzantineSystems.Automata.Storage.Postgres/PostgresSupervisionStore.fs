@@ -7,54 +7,13 @@ open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
 open ByzantineSystems.Automata.Storage.Internal
-open ByzantineSystems.Automata.Storage.Postgres.Schema
 open FsToolkit.ErrorHandling
-open SqlHydra.Query
+open Npgsql
 
 [<RequireQualifiedAccess>]
 module private SupervisionMapping =
 
     let private reasonCodec = Serialization.systemTextJson<string> ()
-
-    let kindToString =
-        function
-        | SupervisionAuditKind.Started -> "Started"
-        | SupervisionAuditKind.Restarted -> "Restarted"
-        | SupervisionAuditKind.Escalated -> "Escalated"
-        | SupervisionAuditKind.Stopped -> "Stopped"
-
-    let kindFromString value =
-        match value with
-        | "Started" -> Ok SupervisionAuditKind.Started
-        | "Restarted" -> Ok SupervisionAuditKind.Restarted
-        | "Escalated" -> Ok SupervisionAuditKind.Escalated
-        | "Stopped" -> Ok SupervisionAuditKind.Stopped
-        | other ->
-            Error(
-                StoreError.Serialization(
-                    typeof<SupervisionAuditKind>.Name,
-                    FormatException $"unknown supervision audit kind {other}"
-                )
-            )
-
-    let strategyToString =
-        function
-        | SupervisionAuditStrategy.OneForOne -> "OneForOne"
-        | SupervisionAuditStrategy.OneForAll -> "OneForAll"
-        | SupervisionAuditStrategy.RestForOne -> "RestForOne"
-
-    let strategyFromString value =
-        match value with
-        | "OneForOne" -> Ok SupervisionAuditStrategy.OneForOne
-        | "OneForAll" -> Ok SupervisionAuditStrategy.OneForAll
-        | "RestForOne" -> Ok SupervisionAuditStrategy.RestForOne
-        | other ->
-            Error(
-                StoreError.Serialization(
-                    typeof<SupervisionAuditStrategy>.Name,
-                    FormatException $"unknown supervision audit strategy {other}"
-                )
-            )
 
     let reasonFromJson (json: string) =
         reasonCodec.Decode json |> Result.mapError Db.toStoreError
@@ -62,27 +21,29 @@ module private SupervisionMapping =
 /// <summary>PostgreSQL append-only supervision audit writer backed by a pooled data source.</summary>
 type PostgresSupervisionStore(context: PostgresContext) =
 
-    let record = Statement.load "supervision" "record"
+    let record = StatementKey.create "supervision" "record" |> Sql.prepareProgram
 
     interface ISupervisionEventStore with
 
         member _.Record(entry, ct) =
-            Sql.run
+            Sql.runProgram
                 context
-                (Sql.execute
+                (StoreProgram.executeDiscard
                     record
                     [ "supervisor", Param.Text(SupervisorName.value entry.Supervisor)
                       "child_id", Param.Text(SupervisedChildId.value entry.ChildId)
-                      "kind", Param.Text(SupervisionMapping.kindToString entry.Kind)
-                      "strategy", Param.Text(SupervisionMapping.strategyToString entry.Strategy)
+                      "kind", Param.Text(EnumCodec.encode EnumCodec.supervisionKind entry.Kind)
+                      "strategy", Param.Text(EnumCodec.encode EnumCodec.supervisionStrategy entry.Strategy)
                       "reason", Param.Jsonb(JsonSerializer.Serialize entry.Reason)
-                      "at", Param.Timestamp entry.At ]
-                 |> Op.discard)
+                      "at", Param.Timestamp entry.At ])
                 ct
 
 /// <summary>Read-side query adapters for the supervision audit log.</summary>
 [<RequireQualifiedAccess>]
 module PostgresSupervisionQueries =
+
+    let private recent =
+        StatementKey.create "supervision" "recent" |> Sql.prepareProgram
 
     /// <summary>Lists the newest audit facts first.</summary>
     let listRecent
@@ -93,41 +54,21 @@ module PostgresSupervisionQueries =
         if limit < 1 then
             invalidArg (nameof limit) "The supervision query limit must be positive."
 
-        let toRecord (row: fsm.supervision_event) : Result<SupervisionRecord, StoreError> =
-            match
-                SupervisionMapping.kindFromString row.kind,
-                SupervisionMapping.strategyFromString row.strategy,
-                SupervisionMapping.reasonFromJson row.reason
-            with
-            | Ok kind, Ok strategy, Ok reason ->
-                Ok
-                    { Supervisor = SupervisorName.create row.supervisor
-                      ChildId = SupervisedChildId.create row.child_id
+        let toRecord (reader: NpgsqlDataReader) : Result<SupervisionRecord, StoreError> =
+            result {
+                let! kind = EnumCodec.read Row.string EnumCodec.supervisionKind "kind" reader
+                let! strategy = EnumCodec.read Row.string EnumCodec.supervisionStrategy "strategy" reader
+                let! reason = SupervisionMapping.reasonFromJson (Row.string reader "reason")
+
+                return
+                    { Supervisor = SupervisorName.create (Row.string reader "supervisor")
+                      ChildId = SupervisedChildId.create (Row.string reader "child_id")
                       Kind = kind
                       Strategy = strategy
                       Reason = reason
-                      At = Db.fromTimestamp row.at }
-            | Error error, _, _
-            | _, Error error, _
-            | _, _, Error error -> Error error
+                      At = Db.fromTimestamp (reader.GetDateTime(reader.GetOrdinal "at")) }
+            }
 
         // Newest first is the only order this table is ever read in, and it is what
         // supervision_event_recent_idx is built for.
-        Sql.run
-            context
-            (postgres {
-                let! rows =
-                    Sql.select (fun query token ->
-                        selectTask query {
-                            for e in fsm.supervision_event do
-                                orderByDescending e.at
-                                thenByDescending e.id
-                                take limit
-                                select e
-                                toList
-                                cancel token
-                        })
-
-                return! rows |> List.traverseResultM toRecord
-            })
-            ct
+        Sql.readProgram context (StoreProgram.queryRows recent [ "limit", Param.Int limit ] toRecord) ct

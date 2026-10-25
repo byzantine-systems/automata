@@ -7,7 +7,7 @@ open ByzantineSystems.Automata.Storage
 open ByzantineSystems.Automata.Storage.Internal
 
 /// Texts no shipped codec accepts, so every one of them must read back as an error. Case is part
-/// of it: the schemas code lowercase, and a folded or upper-cased copy must not decode.
+/// of it: schema enum texts are case-sensitive, and a differently-cased copy must not decode.
 let private unknownTexts = [ ""; "  "; "nope"; "READY"; "0" ]
 
 /// Everything the contract claims about one codec, checked exhaustively over its finite universe:
@@ -69,6 +69,18 @@ let tests =
 
           testCase "the supervision strategy codec is bijective"
           <| fun _ -> expectBijective EnumCodec.supervisionStrategy
+
+          testCase "supervision codecs preserve the v1 stored spellings"
+          <| fun _ ->
+              Expect.equal
+                  (EnumCodec.encode EnumCodec.supervisionKind SupervisionAuditKind.Started)
+                  "Started"
+                  "existing audit rows use the union case spelling"
+
+              Expect.equal
+                  (EnumCodec.encode EnumCodec.supervisionStrategy SupervisionAuditStrategy.OneForOne)
+                  "OneForOne"
+                  "existing audit rows use the union case spelling"
 
           testCase "read decodes a column through the codec"
           <| fun _ ->

@@ -122,10 +122,10 @@ module internal EnumCodec =
               SupervisionAuditKind.Escalated
               SupervisionAuditKind.Stopped ]
             (function
-             | SupervisionAuditKind.Started -> "started"
-             | SupervisionAuditKind.Restarted -> "restarted"
-             | SupervisionAuditKind.Escalated -> "escalated"
-             | SupervisionAuditKind.Stopped -> "stopped")
+             | SupervisionAuditKind.Started -> "Started"
+             | SupervisionAuditKind.Restarted -> "Restarted"
+             | SupervisionAuditKind.Escalated -> "Escalated"
+             | SupervisionAuditKind.Stopped -> "Stopped")
 
     /// <summary>Which children a restart affects, as the audit log's <c>strategy</c> codes it.</summary>
     let supervisionStrategy: EnumCodec<SupervisionAuditStrategy> =
@@ -135,6 +135,6 @@ module internal EnumCodec =
               SupervisionAuditStrategy.OneForAll
               SupervisionAuditStrategy.RestForOne ]
             (function
-             | SupervisionAuditStrategy.OneForOne -> "one_for_one"
-             | SupervisionAuditStrategy.OneForAll -> "one_for_all"
-             | SupervisionAuditStrategy.RestForOne -> "rest_for_one")
+             | SupervisionAuditStrategy.OneForOne -> "OneForOne"
+             | SupervisionAuditStrategy.OneForAll -> "OneForAll"
+             | SupervisionAuditStrategy.RestForOne -> "RestForOne")
