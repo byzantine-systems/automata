@@ -115,9 +115,6 @@ let private expectPlan result =
     | Ok plan -> plan
     | Error error -> failtestf "the replay should have planned, but failed with %A" error
 
-let private states (plan: ReplayPlan<_, Tally, _, _>) =
-    plan.Commit.Beliefs |> List.map (fun belief -> belief.Asserted.State)
-
 // A correction scenario is generated as raw choices, which FsCheck can generate and shrink,
 // and compiled into a suffix every event of which resolves when replayed. The tally model
 // below decides what replay must produce; it is written from the chart's declared arithmetic,
@@ -274,6 +271,149 @@ let private compileTrace (choices: TraceChoices) : Scenario =
       NextEpoch = Epoch.ofUInt64 (uint64 (suffix.Length + 1 + max 0 (choices.NextDelta % 3)))
       Suffix = suffix }
 
+/// The reference fold, decided by the tally contract rather than by replay: the missed event
+/// under the current chart, then each logged event under the version that first decided it,
+/// from the state the previous one leaves.
+let private referenceOf (scenario: Scenario) =
+    let insertedNext =
+        applyFactor (factorOf scenario.Current) scenario.Start scenario.Missed
+
+    let inserted = decided scenario.Start scenario.Missed insertedNext (at 2)
+
+    let reference =
+        scenario.Suffix
+        |> List.fold
+            (fun (state, drafts) (logged: CommittedTransition<EntityId<Entity>, Tally, Change, string>) ->
+                let next = applyFactor (factorOf logged.ChartVersion) state logged.Draft.Event
+
+                let draft = decided state logged.Draft.Event next logged.Draft.EffectiveAt
+                next, (logged, draft) :: drafts)
+            (insertedNext, [])
+        |> snd
+        |> List.rev
+
+    inserted, reference
+
+/// The beliefs the fold owes: one per instant with the later decision winning, and the final
+/// one the correction's own.
+let private beliefsOf
+    (scenario: Scenario)
+    (inserted: TransitionDraft<EntityId<Entity>, Tally, Change, string>)
+    reference
+    =
+    let replayed =
+        reference
+        |> List.map (fun (logged, draft) ->
+            { Asserted = snapshotOf draft.ToState logged.Epoch
+              ValidFrom = draft.EffectiveAt
+              CommandId = logged.CommandId
+              ChartVersion = logged.ChartVersion })
+
+    let insertedBelief =
+        { Asserted = snapshotOf inserted.ToState scenario.NextEpoch
+          ValidFrom = at 2
+          CommandId = correction
+          ChartVersion = scenario.Current }
+
+    let compacted =
+        insertedBelief :: replayed
+        |> List.groupBy (fun (belief: CorrectedBelief<Tally>) -> belief.ValidFrom)
+        |> List.map (snd >> List.last)
+
+    match List.rev compacted with
+    | [] -> []
+    | last :: earlier ->
+        { last with
+            Asserted =
+                { last.Asserted with
+                    Epoch = scenario.NextEpoch }
+            CommandId = correction
+            ChartVersion = scenario.Current }
+        :: earlier
+        |> List.rev
+
+/// The commit transition: the missed event, from the live state to the fold's final state,
+/// with no actions of its own.
+let private commitOf
+    (scenario: Scenario)
+    (inserted: TransitionDraft<EntityId<Entity>, Tally, Change, string>)
+    reference
+    =
+    let finalState, finalStatus =
+        match reference |> List.tryLast |> Option.map snd with
+        | Some draft -> draft.ToState, draft.Status
+        | None -> inserted.ToState, inserted.Status
+
+    { inserted with
+        FromState = scenario.Live
+        ToState = finalState
+        Status = finalStatus
+        Actions = [] }
+
+/// Everything a plan owes the reference fold: the inserted draft, each replayed draft, the
+/// beliefs, and the commit transition.
+let private planSatisfies (scenario: Scenario) (plan: ReplayPlan<EntityId<Entity>, Tally, Change, string>) =
+    let inserted, reference = referenceOf scenario
+
+    plan.Inserted = inserted
+    && plan.Commit.ValidFrom = at 2
+    && plan.Commit.Beliefs = beliefsOf scenario inserted reference
+    && plan.Commit.Transition = commitOf scenario inserted reference
+    && (plan.Replayed, reference)
+       ||> List.forall2 (fun (_, actual) (_, expected) -> actual = expected)
+
+/// A scenario whose suffix stops resolving: one event replay refuses at a known epoch, then
+/// events it must never reach.
+type private DivergentScenario =
+    { Scenario: Scenario
+      Log: CommittedTransition<EntityId<Entity>, Tally, Change, string> list
+      At: Epoch
+      Kind: string }
+
+/// Extends a resolving scenario past the point where it stops resolving, either because the
+/// tally is odd when a halve arrives or because the instance already ended.
+let private compileDivergence (choices: TraceChoices) : DivergentScenario =
+    let scenario = compileTrace choices
+
+    let after =
+        scenario.Suffix
+        |> List.fold
+            (fun state (logged: CommittedTransition<EntityId<Entity>, Tally, Change, string>) ->
+                applyFactor (factorOf logged.ChartVersion) state logged.Draft.Event)
+            (applyFactor (factorOf scenario.Current) scenario.Start scenario.Missed)
+
+    let rankAfter = (choices.Steps |> List.truncate 12).Length + 1
+
+    // The appended events land past every generated hour, so replay meets them in the order
+    // they were appended in.
+    let prefix, divergentRank, divergent, hour, kind =
+        match after with
+        | Closed -> scenario.Suffix, rankAfter, Add 1, 9, "terminal"
+        | Counting n when n % 2 <> 0 -> scenario.Suffix, rankAfter, Halve, 9, "guard"
+        | Counting _ -> scenario.Suffix @ [ committed rankAfter (Add 1) 9 v1 ], rankAfter + 1, Halve, 10, "guard"
+
+    let tailLength = ((choices.NextDelta % 4) + 4) % 4
+
+    let tail =
+        [ 1..tailLength ]
+        |> List.map (fun i -> committed (divergentRank + i) (Add 1) (hour + i) v1)
+
+    { Scenario =
+        { scenario with
+            Suffix = prefix
+            NextEpoch = Epoch.ofUInt64 (uint64 (divergentRank + tailLength + 1 + max 0 (choices.NextDelta % 3))) }
+      Log = prefix @ [ committed divergentRank divergent hour v1 ] @ tail
+      At = Epoch.ofUInt64 (uint64 divergentRank)
+      Kind = kind }
+
+let private divergenceClassesOf (divergent: DivergentScenario) =
+    [ "guard-divergence", divergent.Kind = "guard"
+      "terminal-divergence", divergent.Kind = "terminal"
+      "empty-prefix", divergent.Scenario.Suffix.IsEmpty
+      "non-empty-tail", divergent.Log.Length > divergent.Scenario.Suffix.Length + 1 ]
+    |> List.filter snd
+    |> List.map fst
+
 let private randomChoices (seed: int) : TraceChoices =
     let rng = Random seed
 
@@ -319,34 +459,6 @@ let tests =
               with
               | Error(ReplayError.UnknownChartVersion version) -> Expect.equal version v2 "the missing version"
               | other -> failtestf "expected an unknown version, got %A" other
-          }
-
-          test "an event that no longer resolves fails the correction by default" {
-              // Halve was fine on 2. After a missed Add 1 the tally is 3, and 3 does not halve.
-              match
-                  Replay.plan
-                      onlyV1
-                      (input (Counting 2) (Add 1) 2 2 CorrectionPolicy.defaults)
-                      [ committed 1 Halve 3 v1 ]
-              with
-              | Error(ReplayError.Diverged(epoch, _)) -> Expect.equal (Epoch.value epoch) 1UL "the epoch that diverged"
-              | other -> failtestf "expected a divergence, got %A" other
-          }
-
-          test "truncating keeps the timeline up to the divergence" {
-              let policy =
-                  { CorrectionPolicy.defaults with
-                      OnDivergence = Divergence.Truncate }
-
-              let plan =
-                  Replay.plan
-                      onlyV1
-                      (input (Counting 2) (Add 1) 2 3 policy)
-                      [ committed 1 Halve 3 v1; committed 2 (Add 1) 4 v1 ]
-                  |> expectPlan
-
-              Expect.equal plan.Truncated (Some(Epoch.ofUInt64 1UL)) "where it stopped"
-              Expect.equal (states plan) [ Counting 3 ] "and nothing after it"
           }
 
           Property.property "the replay budget accepts exactly its cardinality bound" (fun (seed: byte) ->
@@ -412,87 +524,43 @@ let tests =
 
               match Replay.plan bothVersions replayInput scenario.Suffix with
               | Error _ -> false
-              | Ok plan ->
-                  // The reference fold, decided by the tally contract rather than by replay: the
-                  // missed event under the current chart, then each logged event under the
-                  // version that first decided it, from the state the previous one leaves.
-                  let insertedNext =
-                      applyFactor (factorOf scenario.Current) scenario.Start scenario.Missed
+              | Ok plan -> planSatisfies scenario plan && plan.Truncated = None)
 
-                  let inserted = decided scenario.Start scenario.Missed insertedNext (at 2)
+          Property.property "a divergence stops the fold where it happened" (fun (choices: TraceChoices) ->
+              let divergent = compileDivergence choices
 
-                  let reference =
-                      scenario.Suffix
-                      |> List.fold
-                          (fun (state, drafts) (logged: CommittedTransition<EntityId<Entity>, Tally, Change, string>) ->
-                              let next = applyFactor (factorOf logged.ChartVersion) state logged.Draft.Event
+              let inputFor policy =
+                  { input
+                        divergent.Scenario.Start
+                        divergent.Scenario.Missed
+                        2
+                        (int (Epoch.value divergent.Scenario.NextEpoch))
+                        policy with
+                      Live = divergent.Scenario.Live
+                      Current = divergent.Scenario.Current }
 
-                              let draft = decided state logged.Draft.Event next logged.Draft.EffectiveAt
-                              next, (logged, draft) :: drafts)
-                          (insertedNext, [])
-                      |> snd
-                      |> List.rev
+              let truncating =
+                  { CorrectionPolicy.defaults with
+                      OnDivergence = Divergence.Truncate }
 
-                  let beliefs =
-                      let replayed =
-                          reference
-                          |> List.map (fun (logged, draft) ->
-                              { Asserted = snapshotOf draft.ToState logged.Epoch
-                                ValidFrom = draft.EffectiveAt
-                                CommandId = logged.CommandId
-                                ChartVersion = logged.ChartVersion })
-
-                      let insertedBelief =
-                          { Asserted = snapshotOf insertedNext scenario.NextEpoch
-                            ValidFrom = at 2
-                            CommandId = correction
-                            ChartVersion = scenario.Current }
-
-                      // Two beliefs at one instant are one: the later one, since it was decided
-                      // after the other.
-                      insertedBelief :: replayed
-                      |> List.groupBy (fun (belief: CorrectedBelief<Tally>) -> belief.ValidFrom)
-                      |> List.map (snd >> List.last)
-
-                  // The final belief is the entity's live one, so the correction owns it.
-                  let attributed =
-                      match List.rev beliefs with
-                      | [] -> []
-                      | last :: earlier ->
-                          { last with
-                              Asserted =
-                                  { last.Asserted with
-                                      Epoch = scenario.NextEpoch }
-                              CommandId = correction
-                              ChartVersion = scenario.Current }
-                          :: earlier
-                          |> List.rev
-
-                  let finalState, finalStatus =
-                      match reference |> List.tryLast |> Option.map snd with
-                      | Some draft -> draft.ToState, draft.Status
-                      | None -> inserted.ToState, inserted.Status
-
-                  let transition =
-                      { inserted with
-                          FromState = scenario.Live
-                          ToState = finalState
-                          Status = finalStatus
-                          Actions = [] }
-
-                  plan.Truncated = None
-                  && plan.Inserted = inserted
-                  && plan.Commit.ValidFrom = at 2
-                  && plan.Commit.Beliefs = attributed
-                  && plan.Commit.Transition = transition
-                  && (plan.Replayed, reference)
-                     ||> List.forall2 (fun (_, actual) (_, expected) -> actual = expected))
+              match
+                  Replay.plan bothVersions (inputFor CorrectionPolicy.defaults) divergent.Log,
+                  Replay.plan bothVersions (inputFor truncating) divergent.Log
+              with
+              | Error(ReplayError.Diverged(epoch, _)), Ok plan ->
+                  epoch = divergent.At
+                  && plan.Truncated = Some divergent.At
+                  && planSatisfies divergent.Scenario plan
+              | _ -> false)
 
           test "the generated traces reach every replay behavior class" {
-              let classes =
-                  seq { 0..499 }
-                  |> Seq.collect (fun seed -> classesOf (compileTrace (randomChoices seed)))
-                  |> Set.ofSeq
+              let classesOf' seed =
+                  let choices = randomChoices seed
+
+                  classesOf (compileTrace choices)
+                  @ divergenceClassesOf (compileDivergence choices)
+
+              let classes = seq { 0..499 } |> Seq.collect classesOf' |> Set.ofSeq
 
               Expect.equal
                   classes
@@ -504,6 +572,10 @@ let tests =
                         "current-v2"
                         "mixed-versions"
                         "halve"
-                        "close" ])
+                        "close"
+                        "guard-divergence"
+                        "terminal-divergence"
+                        "empty-prefix"
+                        "non-empty-tail" ])
                   "every class is reachable from five hundred random inputs"
           } ]
