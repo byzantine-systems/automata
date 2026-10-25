@@ -17,6 +17,7 @@ let private expected =
       "command", "repair_blocked"
       "command", "submit_correction"
       "command", "finalize_correction"
+      "belief", "as_of"
       "belief", "correct"
       "belief", "current"
       "transition", "history_page"
