@@ -33,7 +33,9 @@ type CommandDisposition<'Err> =
 /// <summary>Structural defects in a <see cref="T:ByzantineSystems.Automata.Runtime.ProcessorPolicy`1" />.</summary>
 type ProcessorPolicyError =
     | BatchBelowOne of int
+    | BatchAboveMaximum of int
     | LeaseNotPositive of TimeSpan
+    | LeaseAboveMaximum of TimeSpan
     | RenewAfterNotPositive of TimeSpan
     | RenewAfterNotBelowLease of renewAfter: TimeSpan * lease: TimeSpan
     | PollingIntervalNotPositive of TimeSpan
@@ -88,7 +90,11 @@ type ProcessorPolicy<'Err> =
     }
 
 /// <summary>A processor policy whose structural invariants have been checked.</summary>
-type ValidatedProcessorPolicy<'Err> = private ValidatedProcessorPolicy of ProcessorPolicy<'Err>
+type ValidatedProcessorPolicy<'Err> =
+    private
+        { Policy: ProcessorPolicy<'Err>
+          Batch: ClaimBatch
+          Lease: LeaseDuration }
 
 /// <summary>Construction and validation of <see cref="T:ByzantineSystems.Automata.Runtime.ProcessorPolicy`1" />.</summary>
 [<RequireQualifiedAccess>]
@@ -148,12 +154,21 @@ module ProcessorPolicy =
 
     /// <summary>Accumulates every defect rather than stopping at the first.</summary>
     let validate (policy: ProcessorPolicy<'Err>) : Result<ValidatedProcessorPolicy<'Err>, ProcessorPolicyError list> =
-        let errors =
-            [ if policy.Batch < 1 then
-                  BatchBelowOne policy.Batch
+        let batch = ClaimBatch.tryCreate policy.Batch
+        let lease = LeaseDuration.tryCreate policy.Lease
 
-              if policy.Lease <= TimeSpan.Zero then
-                  LeaseNotPositive policy.Lease
+        let errors =
+            [ if Result.isError batch then
+                  if policy.Batch < 1 then
+                      BatchBelowOne policy.Batch
+                  else
+                      BatchAboveMaximum policy.Batch
+
+              if Result.isError lease then
+                  if policy.Lease <= TimeSpan.Zero then
+                      LeaseNotPositive policy.Lease
+                  else
+                      LeaseAboveMaximum policy.Lease
 
               if policy.RenewAfter <= TimeSpan.Zero then
                   RenewAfterNotPositive policy.RenewAfter
@@ -169,15 +184,23 @@ module ProcessorPolicy =
               if policy.MaxAttempts < 1 then
                   MaxAttemptsBelowOne policy.MaxAttempts ]
 
-        match errors with
-        | [] -> Ok(ValidatedProcessorPolicy policy)
-        | errors -> Error errors
+        match errors, batch, lease with
+        | [], Ok batch, Ok lease ->
+            Ok
+                { Policy = policy
+                  Batch = batch
+                  Lease = lease }
+        | errors, _, _ -> Error errors
 
 /// <summary>Operations on a validated processor policy.</summary>
 [<RequireQualifiedAccess>]
 module ValidatedProcessorPolicy =
 
-    let internal value (ValidatedProcessorPolicy policy) = policy
+    let internal value (policy: ValidatedProcessorPolicy<'Err>) = policy.Policy
+
+    let internal batch (policy: ValidatedProcessorPolicy<'Err>) = policy.Batch
+
+    let internal lease (policy: ValidatedProcessorPolicy<'Err>) = policy.Lease
 
 /// <summary>What one poll of the command processor did.</summary>
 type PollSummary =

@@ -35,8 +35,7 @@ type LeaseDuration = private LeaseDuration of TimeSpan
 [<RequireQualifiedAccess>]
 module LeaseDuration =
 
-    /// <summary>The greatest lease duration supported by every bundled provider.</summary>
-    let maximum: TimeSpan = TimeSpan.FromMilliseconds(float Int32.MaxValue)
+    let internal maximum: TimeSpan = TimeSpan.FromMilliseconds(float Int32.MaxValue)
 
     /// <summary>Constructs a positive duration no greater than <see cref="P:System.Int32.MaxValue" /> milliseconds.</summary>
     let tryCreate (value: TimeSpan) : Result<LeaseDuration, string> =

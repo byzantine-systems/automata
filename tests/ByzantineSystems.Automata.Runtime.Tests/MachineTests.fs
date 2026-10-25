@@ -89,6 +89,32 @@ let configurationTests =
                       (RenewAfterNotBelowLease(TimeSpan.FromSeconds 60., TimeSpan.FromSeconds 30.))
                       "the renewal has to happen inside the lease"
               | other -> failtestf "expected one policy defect, got %A" other
+          }
+
+          test "processor claim arguments are validated when the machine is built" {
+              let stub = StubStore<TestError>()
+
+              let excessiveLease =
+                  TimeSpan.FromMilliseconds(float Int32.MaxValue) + TimeSpan.FromTicks 1L
+
+              let result =
+                  machine<EntityId<TestEntity>, TestState, TestEvent, TestAction, TestError> testMachine {
+                      chart testChart
+                      chartVersion 1
+                      initialState Idle
+                      store (stub :> IMachineStore<_, _, _, _, _>)
+
+                      processor
+                          { ProcessorPolicy.defaults with
+                              Batch = 1001
+                              Lease = excessiveLease }
+                  }
+
+              match result with
+              | Error [ InvalidProcessorPolicy defects ] ->
+                  Expect.contains defects (BatchAboveMaximum 1001) "the claim batch has a provider-safe maximum"
+                  Expect.contains defects (LeaseAboveMaximum excessiveLease) "the lease has a provider-safe maximum"
+              | other -> failtestf "expected claim argument defects, got %A" other
           } ]
 
 let lifecycleTests =
