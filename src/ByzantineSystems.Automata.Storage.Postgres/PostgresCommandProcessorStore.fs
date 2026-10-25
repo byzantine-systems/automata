@@ -37,13 +37,25 @@ type CommandProcessorOptions<'EntityId, 'State, 'Event, 'Action, 'Err> =
 [<RequireQualifiedAccess>]
 module private ProcessorMapping =
 
-    let outcomeFromString (value: string) (epoch: int64) (expected: Epoch) : Result<FinalizeOutcome, StoreError> =
-        match value with
-        | "finalized" -> Ok(Finalized(Db.epochOf epoch))
-        | "already_finalized" -> Ok(AlreadyFinalized(Db.epochOf epoch))
-        | "conflict" -> Ok(Conflict(expected, Db.epochOf epoch))
-        | "lease_lost" -> Ok FinalizeOutcome.LeaseLost
-        | other -> Error(Db.decodeFailure (nameof FinalizeOutcome) $"unknown finalize outcome {other}")
+    type FinalizeTag =
+        | Finalized
+        | AlreadyFinalized
+        | Conflict
+        | LeaseLost
+
+    let finalizeTag =
+        EnumCodec.create "finalize outcome" [ Finalized; AlreadyFinalized; Conflict; LeaseLost ] (function
+            | Finalized -> "finalized"
+            | AlreadyFinalized -> "already_finalized"
+            | Conflict -> "conflict"
+            | LeaseLost -> "lease_lost")
+
+    let outcome (tag: FinalizeTag) (epoch: int64) (expected: Epoch) : FinalizeOutcome =
+        match tag with
+        | Finalized -> FinalizeOutcome.Finalized(Db.epochOf epoch)
+        | AlreadyFinalized -> FinalizeOutcome.AlreadyFinalized(Db.epochOf epoch)
+        | Conflict -> FinalizeOutcome.Conflict(expected, Db.epochOf epoch)
+        | LeaseLost -> FinalizeOutcome.LeaseLost
 
 /// <summary>
 /// The PostgreSQL end of processing a command.
@@ -108,8 +120,10 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
 
     let context = options.Context
 
-    let finalizeCommand = Statement.load "command" "finalize"
-    let finalizeCorrection = Statement.load "command" "finalize_correction"
+    let finalizeCommand = StatementKey.create "command" "finalize" |> Sql.prepareProgram
+
+    let finalizeCorrection =
+        StatementKey.create "command" "finalize_correction" |> Sql.prepareProgram
 
     let currentBelief = StatementKey.create "belief" "current" |> Sql.prepareProgram
 
@@ -150,6 +164,10 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
 
     let states (ids: StateId list) : string list = ids |> List.map StateId.value
 
+    let finalizeOutcome expected reader =
+        EnumCodec.read Row.string ProcessorMapping.finalizeTag "outcome" reader
+        |> Result.map (fun tag -> ProcessorMapping.outcome tag (Row.int64 reader "epoch") expected)
+
     /// <summary>
     /// One call to <c>fsm.finalize_command</c>. Which half of its parameters is filled follows
     /// from how the command ends, so the two shapes cannot be half-filled or mixed: a commit
@@ -162,7 +180,7 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
         (commandId: CommandId)
         (token: LeaseToken<CommandWork>)
         (resolution: Resolution<'EntityId, 'State, 'Event, 'Action>)
-        : Op<PgSession, FinalizeOutcome> =
+        : StoreProgram<WriteAccess, (string * Param) list, NpgsqlDataReader, FinalizeOutcome> =
         let expected = Resolution.unmoved resolution
 
         let ending =
@@ -195,21 +213,15 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                   "exited", Param.TextArrayOrNull None
                   "entered", Param.TextArrayOrNull None ]
 
-        postgres {
-            let! outcome, epoch =
-                Sql.one
-                    (nameof FinalizeOutcome)
-                    finalizeCommand
-                    ([ "command_id", Param.Bigint(CommandId.value commandId)
-                       "lease_token", Param.Bigint(LeaseToken.value token)
-                       "expected_epoch", Param.Bigint(int64 (Epoch.value expected))
-                       "status", Param.Text(Resolution.status resolution)
-                       "action_queue", Param.Text options.ActionQueue ]
-                     @ ending)
-                    (fun reader -> Row.string reader "outcome", Row.int64 reader "epoch")
-
-            return! ProcessorMapping.outcomeFromString outcome epoch expected
-        }
+        StoreProgram.queryOne
+            finalizeCommand
+            ([ "command_id", Param.Bigint(CommandId.value commandId)
+               "lease_token", Param.Bigint(LeaseToken.value token)
+               "expected_epoch", Param.Bigint(int64 (Epoch.value expected))
+               "status", Param.Text(Resolution.status resolution)
+               "action_queue", Param.Text options.ActionQueue ]
+             @ ending)
+            (finalizeOutcome expected)
 
     /// <summary>
     /// The failure column is a tagged envelope rather than the bare domain error, because the
@@ -259,7 +271,7 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
         =
         backgroundTaskResult {
             let! encoded = encodeFailure failure
-            return! Sql.run context (finalize commandId token (resolve encoded)) ct
+            return! Sql.runProgram context (finalize commandId token (resolve encoded)) ct
         }
 
     /// <summary>
@@ -432,7 +444,7 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
         member _.Commit(commandId, token, expected, draft, ct) =
             backgroundTaskResult {
                 let! encoded = encodeDraft draft
-                return! Sql.run context (finalize commandId token (Commit(expected, encoded))) ct
+                return! Sql.runProgram context (finalize commandId token (Commit(expected, encoded))) ct
             }
 
         member _.Reject(commandId, token, error, ct) = fail Reject commandId token error ct
@@ -494,28 +506,22 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                 let draft = commit.Transition
 
                 return!
-                    Sql.run
+                    Sql.runProgram
                         context
-                        (postgres {
-                            let! outcome, epoch =
-                                Sql.one
-                                    (nameof FinalizeOutcome)
-                                    finalizeCorrection
-                                    [ "command_id", Param.Bigint(CommandId.value commandId)
-                                      "lease_token", Param.Bigint(LeaseToken.value token)
-                                      "expected_epoch", Param.Bigint(int64 (Epoch.value expected))
-                                      "valid_from", Param.Timestamp commit.ValidFrom
-                                      "beliefs", Param.Jsonb beliefs
-                                      "instance_status", Param.Text(Db.instanceStatusToString draft.Status)
-                                      "event", Param.Jsonb encoded.EventJson
-                                      "from_state", Param.Jsonb encoded.FromJson
-                                      "to_state", Param.Jsonb encoded.ToJson
-                                      "handled_by", Param.Text(StateId.value draft.HandledBy)
-                                      "exited", Param.TextArray(states draft.Exited)
-                                      "entered", Param.TextArray(states draft.Entered) ]
-                                    (fun reader -> Row.string reader "outcome", Row.int64 reader "epoch")
-
-                            return! ProcessorMapping.outcomeFromString outcome epoch expected
-                        })
+                        (StoreProgram.queryOne
+                            finalizeCorrection
+                            [ "command_id", Param.Bigint(CommandId.value commandId)
+                              "lease_token", Param.Bigint(LeaseToken.value token)
+                              "expected_epoch", Param.Bigint(int64 (Epoch.value expected))
+                              "valid_from", Param.Timestamp commit.ValidFrom
+                              "beliefs", Param.Jsonb beliefs
+                              "instance_status", Param.Text(Db.instanceStatusToString draft.Status)
+                              "event", Param.Jsonb encoded.EventJson
+                              "from_state", Param.Jsonb encoded.FromJson
+                              "to_state", Param.Jsonb encoded.ToJson
+                              "handled_by", Param.Text(StateId.value draft.HandledBy)
+                              "exited", Param.TextArray(states draft.Exited)
+                              "entered", Param.TextArray(states draft.Entered) ]
+                            (finalizeOutcome expected))
                         ct
             }
