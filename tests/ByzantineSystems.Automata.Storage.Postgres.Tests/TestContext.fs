@@ -166,6 +166,10 @@ let newProcessor () : Processor = processorStore () :> Processor
 
 let newReader () : Reader = processorStore () :> Reader
 
+type Replay = IReplayStore<Entity, TestState, TestEvent, TestAction>
+
+let newReplayStore () : Replay = processorStore () :> Replay
+
 /// A minimal committed transition, for tests that care about what finalize does to the inbox and
 /// the log rather than about the chart that produced it.
 let draft (entity: Entity) (fromState: TestState) (toState: TestState) (effectiveAt: DateTimeOffset) =

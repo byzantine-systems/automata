@@ -349,4 +349,74 @@ let tests =
               match! Machine.startAsync built (newRegistry ()) noCancellation with
               | Ok(Startup.Refused [ BootDefect.Misconfigured _ ]) -> ()
               | other -> failtestf "expected the start to be refused, got %A" other
+          }
+
+          testTask "a rescheduled correction's sentinel token never authorizes finalization" {
+              // Rescheduling releases the lease and puts token zero back on the row. A caller
+              // presenting that sentinel must be fenced out, exactly as an ordinary command is:
+              // zero means nobody holds the work, not that anyone may finish it.
+              do! reset ()
+              let inbox = newInbox ()
+              let at = hour 11
+
+              let correction =
+                  { submission (entity "e1") "c1" (Start 10) with
+                      Kind = CommandKind.Correction(at, CorrectionPolicy.defaults) }
+
+              let! _ = inbox.Submit(correction, noCancellation)
+
+              let! claimed =
+                  inbox.Claim(
+                      machine,
+                      ClaimBatch.create 1,
+                      LeaseDuration.create (TimeSpan.FromMinutes 1.),
+                      noCancellation
+                  )
+
+              let held = claimed |> expectOk "claim" |> List.exactlyOne
+
+              let! rescheduled =
+                  inbox.Reschedule(
+                      held.Work.CommandId,
+                      held.Token,
+                      Backoff.create (TimeSpan.FromMilliseconds 1.) (TimeSpan.FromMilliseconds 1.),
+                      noCancellation
+                  )
+
+              Expect.equal (rescheduled |> expectOk "reschedule") LeaseUpdateOutcome.Updated "back to ready"
+
+              let commit: CorrectionCommit<Entity, TestState, TestEvent, TestAction> =
+                  { Transition = draft (entity "e1") Idle (Active 1) at
+                    ValidFrom = at
+                    Beliefs =
+                      ({ Asserted =
+                          { State = Active 1
+                            Status = Running
+                            Epoch = Epoch.initial }
+                         ValidFrom = at
+                         CommandId = CommandId.ofInt64 1L
+                         ChartVersion = version },
+                       []) }
+
+              let! outcome =
+                  (newReplayStore ())
+                      .CommitCorrection(
+                          held.Work.CommandId,
+                          LeaseToken.ofInt64 0L,
+                          Epoch.initial,
+                          commit,
+                          noCancellation
+                      )
+
+              Expect.equal
+                  (outcome |> expectOk "finalize")
+                  FinalizeOutcome.LeaseLost
+                  "token zero is nobody, not authority"
+
+              Expect.equal (transitions "e1").Length 0 "no transition was written"
+
+              Expect.equal
+                  (scalar<int64> "SELECT count(*) FROM fsm.command WHERE status = 'ready'")
+                  1L
+                  "the command is still ready"
           } ]

@@ -116,6 +116,7 @@ BEGIN
 END
 $$;
 
+
 -- ---------------------------------------------------------------------------
 -- fsm.submit_correction: a correction enters the inbox like any command.
 --
@@ -249,7 +250,7 @@ BEGIN
         END IF;
         RETURN;
     END IF;
-    IF v_token <> p_lease_token THEN
+    IF v_status <> 'leased' OR v_token <> p_lease_token THEN
         RETURN QUERY
         SELECT
             'lease_lost'::fsm.finalize_outcome,
@@ -307,4 +308,3 @@ BEGIN
         p_expected_epoch + 1;
 END
 $$;
-
