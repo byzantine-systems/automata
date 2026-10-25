@@ -31,6 +31,16 @@ let private submit (name: string) (key: string) =
         return outcome |> expectOk "submit" |> commandIdOf
     }
 
+let private submitCorrection (name: string) (key: string) =
+    task {
+        let correction =
+            { submission (entity name) key (Start 1) with
+                Kind = CommandKind.Correction(effectiveAt, CorrectionPolicy.defaults) }
+
+        let! outcome = (newInbox ()).Submit(correction, noCancellation)
+        return outcome |> expectOk "submit correction" |> commandIdOf
+    }
+
 let private claimed (key: string) =
     task {
         let! batch = (newInbox ()).Claim(machine, ClaimBatch.create 50, LeaseDuration.create lease, noCancellation)
@@ -317,6 +327,26 @@ let retentionTests =
                   (count "SELECT count(*) FROM fsm.command WHERE idempotency_key = 'k3'")
                   1L
                   "an open command is work, not history, and is never purged"
+          }
+
+          testTask "a terminal correction is purged with its correction metadata" {
+              do! reset ()
+              do! boot (keepCommandsFor hour)
+              let! _ = submitCorrection "corrected" "c1"
+              let! _ = submit "corrected" "later"
+              let! correction = claimed "c1"
+              do! reject correction
+              ageCommands ()
+
+              let! reports = run 100
+
+              Expect.equal (reportFor reports).PurgedCommands 1L "the correction command"
+              Expect.equal (count "SELECT count(*) FROM fsm.command_correction") 0L "its metadata went with it"
+
+              Expect.equal
+                  (count "SELECT count(*) FROM fsm.command WHERE idempotency_key = 'later'")
+                  1L
+                  "the entity's newest command remains"
           }
 
           testTask "an entity's newest command is kept, so its sequence never restarts" {

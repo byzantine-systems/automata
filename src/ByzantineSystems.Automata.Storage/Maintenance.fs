@@ -85,10 +85,12 @@ type Retain =
 type RetentionPolicy =
     {
         /// <summary>
-        /// A terminal command together with its transition, its error and its undelivered
-        /// actions, measured from when the command was received. An entity's newest command is
-        /// always kept. A purged idempotency key is forgotten, so this must exceed any client's
-        /// retry horizon.
+        /// A terminal command together with its transition, its correction metadata, its error
+        /// and its undelivered actions, measured from when the command was received. An entity's
+        /// newest command is always kept. A purged idempotency key is forgotten, so this must
+        /// exceed any client's retry horizon. Purging a transition permanently advances the
+        /// replay completeness watermark: a correction that needs what was removed is refused
+        /// with <c>ReplayError.HistoryPurged</c>.
         /// </summary>
         Commands: Retain
         /// <summary>

@@ -105,11 +105,16 @@ $$;
 -- ---------------------------------------------------------------------------
 -- fsm.purge_commands: retention for a command's whole record.
 --
--- A command, its transition, its error and its undelivered actions are deleted
--- together, because together they are one account of one decision and every
--- one of those children references the command. The foreign keys are NO
--- ACTION, which is checked at the end of the statement rather than per row, so
--- deleting parent and children in sibling CTEs of one statement satisfies them.
+-- A command, its correction metadata, its transition, its error and its
+-- undelivered actions are deleted together, because together they are one
+-- account of one decision and every one of those children references the
+-- command. The foreign keys are NO ACTION, which is checked at the end of the
+-- statement rather than per row, so deleting parent and children in sibling
+-- CTEs of one statement satisfies them.
+--
+-- Purging a transition advances fsm.entity_purge, the watermark replay reads to
+-- decide whether a suffix is complete. Only transitions matter: a rejected or
+-- dead-lettered command never changed the timeline, so it contributes nothing.
 --
 -- Three things are never purged:
 --
@@ -137,7 +142,9 @@ CREATE OR REPLACE FUNCTION fsm.purge_commands (p_machine_id text, p_before times
     AS $$
     WITH doomed AS MATERIALIZED (
         SELECT
-            c.command_id
+            c.command_id,
+            c.machine_id,
+            c.entity_id
         FROM
             fsm.command c
         WHERE
@@ -162,22 +169,40 @@ CREATE OR REPLACE FUNCTION fsm.purge_commands (p_machine_id text, p_before times
             FOR UPDATE
                 SKIP LOCKED
 ),
-        transitions AS (
-            DELETE FROM fsm.transition t USING doomed d
-WHERE t.command_id = d.command_id), errors AS (
-    DELETE FROM fsm.command_error e USING doomed d
-WHERE e.command_id = d.command_id), undelivered AS (
-    DELETE FROM fsm.action_dead_letter a USING doomed d
-WHERE a.command_id = d.command_id), purged AS (
-    DELETE FROM fsm.command c USING doomed d
+        corrections AS (
+            DELETE FROM fsm.command_correction cc USING doomed d
+WHERE cc.command_id = d.command_id), transitions AS (
+    DELETE FROM fsm.transition t USING doomed d
+WHERE t.command_id = d.command_id
+RETURNING
+    d.machine_id, d.entity_id, t.effective_at), watermark AS (
+INSERT INTO fsm.entity_purge (machine_id, entity_id, max_purged_effective_at)
+    SELECT
+        machine_id,
+        entity_id,
+        MAX(effective_at)
+    FROM
+        transitions
+    GROUP BY
+        machine_id,
+        entity_id
+    ON CONFLICT (machine_id,
+        entity_id)
+        DO UPDATE SET
+            max_purged_effective_at = GREATEST (fsm.entity_purge.max_purged_effective_at, EXCLUDED.max_purged_effective_at)), errors AS (
+            DELETE FROM fsm.command_error e
+            USING doomed d
+            WHERE e.command_id = d.command_id), undelivered AS (
+                    DELETE
+                        FROM fsm.action_dead_letter a USING doomed d
+            WHERE a.command_id = d.command_id), purged AS (
+        DELETE
+            FROM fsm.command c USING doomed d
 WHERE c.command_id = d.command_id
 RETURNING
-    1
-)
-SELECT
-    COUNT(*)
-FROM
-    purged;
+    1)
+        SELECT
+            COUNT(*) FROM purged;
 $$;
 
 -- ---------------------------------------------------------------------------

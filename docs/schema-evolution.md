@@ -59,3 +59,9 @@ CREATE OR REPLACE TRIGGER <t>_versioning_trigger
 
 - **`fsm.command.kind`**: `'event'` or `'correction'`.
 - **`fsm.command_correction`**: a correction's instant, divergence policy and replay limit, one row per correction command.
+
+## Command retention and the replay watermark
+
+`fsm.purge_commands` removes a terminal command and, in one statement, its `command_correction`, transition, error and undelivered actions. Deleting a transition advances `fsm.entity_purge.max_purged_effective_at` to the greatest effective instant of the transitions removed, so the value is a monotonic watermark: a purge never makes replay see further back. It has no foreign key, because it must survive the history it describes.
+
+`IReplayStore.Suffix` reads the transition suffix and then the watermark. A suffix whose requested start is at or before the watermark may have lost events, so it reports `Incomplete`; one that starts strictly after is complete. This is exact under corrections, which back-date transitions: what matters is the effective instant a purged transition carried, not the epoch it held.

@@ -24,7 +24,7 @@ let private expected =
       "transition", "history_page"
       "transition", "result"
       "transition", "suffix"
-      "transition", "oldest"
+      "transition", "purge_watermark"
       "chart", "register"
       "chart", "by_version"
       "system", "command_metrics"

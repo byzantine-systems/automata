@@ -177,12 +177,12 @@ let tests =
 
               Expect.equal suffix transitionColumns "the replay suffix shares the transition shape"
 
-              let oldest =
+              let watermark =
                   columnsOf
-                      (SqlResources.get "transition" "oldest")
+                      (SqlResources.get "transition" "purge_watermark")
                       [ "machine_id", box "none"; "entity_id", box "none" ]
 
-              Expect.equal oldest transitionColumns "the oldest probe shares the transition shape"
+              Expect.equal watermark [ "max_purged_effective_at" ] "the watermark probe reads one column"
           }
 
           testTask "the current belief view uses its partial index" {

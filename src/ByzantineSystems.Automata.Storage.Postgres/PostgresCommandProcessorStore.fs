@@ -143,8 +143,8 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     let transitionSuffix =
         StatementKey.create "transition" "suffix" |> Sql.prepareProgram
 
-    let transitionOldest =
-        StatementKey.create "transition" "oldest" |> Sql.prepareProgram
+    let transitionWatermark =
+        StatementKey.create "transition" "purge_watermark" |> Sql.prepareProgram
 
     /// What a commit sends beyond the command's identity: the draft and its four encoded
     /// payloads, encoded before anything is sent.
@@ -495,19 +495,21 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                               "limit", Param.Int limit ]
                             (transitionRow >> toTransition)
 
-                    // Retention purges an entity's oldest commands with their transitions, so a
-                    // log that no longer starts at epoch 1, and whose oldest survivor is already
-                    // past the corrected instant, may have lost events after it.
-                    let! oldest =
+                    // Retention purges an entity's oldest commands with their transitions, and
+                    // records the greatest effective instant it removed as a watermark. A suffix
+                    // whose start is at or before that watermark may have lost events; one that
+                    // starts strictly after it has not. The suffix is read first, so a concurrent
+                    // purge cannot pair a post-purge suffix with a stale pre-purge watermark.
+                    let! watermark =
                         StoreProgram.tryQueryOne
-                            transitionOldest
+                            transitionWatermark
                             [ Params.machineId "machine_id" machineId
                               Params.entityKey "entity_id" (encodeEntityId entityId) ]
-                            (transitionRow >> Ok)
+                            (fun reader -> Row.timestamp reader "max_purged_effective_at" |> Ok)
 
                     let incomplete =
-                        match oldest with
-                        | Some first -> first.epoch > 1L && first.effective_at > Db.timestamp from
+                        match watermark with
+                        | Some maxPurged -> maxPurged >= from
                         | None -> false
 
                     return

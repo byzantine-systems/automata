@@ -29,6 +29,7 @@ let tests =
                     ActionQueueTests.tests
                     ProcessorIntegrationTests.tests
                     ReplayIntegrationTests.tests
+                    ReplayRetentionProperties.tests
                     SchemaContractTests.tests
                     MaintenanceTests.integration
                     PostgresSupervisionStoreTests.tests ]

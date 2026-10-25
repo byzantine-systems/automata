@@ -55,16 +55,17 @@ let private cappedChart =
         | Ok c -> c
         | Error errors -> failwithf "the capped chart is invalid: %A" errors
 
-let private build (catalog: ChartCatalog<TestState, TestEvent, TestAction, TestError> option) (current: int) =
+let private buildWith
+    (retention: RetentionPolicy)
+    (catalog: ChartCatalog<TestState, TestEvent, TestAction, TestError> option)
+    (current: int)
+    =
     MachineCE.machine<Entity, TestState, TestEvent, TestAction, TestError> machine {
         chart cappedChart
         chartVersion current
         initialState Idle
 
-        store (
-            newMachineStore RetentionPolicy.keepEverything
-            :> IMachineStore<Entity, TestState, TestEvent, TestAction, TestError>
-        )
+        store (newMachineStore retention :> IMachineStore<Entity, TestState, TestEvent, TestAction, TestError>)
 
         chartCatalog (catalog |> Option.defaultValue ChartCatalog.empty)
 
@@ -75,6 +76,9 @@ let private build (catalog: ChartCatalog<TestState, TestEvent, TestAction, TestE
     |> function
         | Ok built -> built
         | Error errors -> failtestf "the correction machine did not build: %A" errors
+
+let private build catalog current =
+    buildWith RetentionPolicy.keepEverything catalog current
 
 let private transitions name =
     rows
@@ -108,6 +112,18 @@ let private seeded name =
     task {
         do! reset ()
         let built = build None 1
+        let! _ = Machine.startAsync built (newRegistry ()) noCancellation
+        let! _ = Machine.enqueue built (entity name) (at name "s1" 1 10) noCancellation
+        let! _ = Machine.enqueue built (entity name) (at name "s2" 2 12) noCancellation
+        do! drainUntil built (fun () -> (transitions name).Length = 2)
+        return built
+    }
+
+/// The same shared history, on a machine registered for a finite command retention.
+let private seededRetained name retention =
+    task {
+        do! reset ()
+        let built = buildWith retention None 1
         let! _ = Machine.startAsync built (newRegistry ()) noCancellation
         let! _ = Machine.enqueue built (entity name) (at name "s1" 1 10) noCancellation
         let! _ = Machine.enqueue built (entity name) (at name "s2" 2 12) noCancellation
@@ -272,13 +288,24 @@ let tests =
           }
 
           testTask "history the correction needs but retention removed is reported" {
-              let! built = seeded "purged"
-              arrange "DELETE FROM fsm.transition WHERE entity_id = 'purged' AND epoch = 1"
+              let retention =
+                  { RetentionPolicy.keepEverything with
+                      Commands = Retain.For(TimeSpan.FromHours 1.) }
+
+              let! built = seededRetained "retained" retention
+
+              // Age the first command so retention removes it and its transition, while the
+              // newest command is kept.
+              arrange
+                  "UPDATE fsm.command SET received_at = now() - interval '2 hours' WHERE entity_id = 'retained' AND seq = 1"
+
+              let! reports = (newMaintenance ()).Run(ClaimBatch.create 100, noCancellation)
+              reports |> expectOk "maintenance" |> ignore
 
               match!
                   Machine.previewCorrection
                       built
-                      (entity "purged")
+                      (entity "retained")
                       (Start 10)
                       (hour 9)
                       CorrectionPolicy.defaults
@@ -286,6 +313,19 @@ let tests =
               with
               | Error(CorrectionError.Replay ReplayError.HistoryPurged) -> ()
               | other -> failtestf "expected the purge to be reported, got %A" other
+
+              // A correction starting after the purged instant still has everything it needs.
+              match!
+                  Machine.previewCorrection
+                      built
+                      (entity "retained")
+                      (Start 10)
+                      (hour 11)
+                      CorrectionPolicy.defaults
+                      noCancellation
+              with
+              | Ok _ -> ()
+              | other -> failtestf "expected a correction after the watermark to plan, got %A" other
 
               do! Machine.stopAsync built noCancellation
           }

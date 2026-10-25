@@ -114,7 +114,7 @@ let reset () : Task =
                 "TRUNCATE fsm.command, fsm.command_error, fsm.transition, fsm.machine_chart_version,
                           fsm.supervision_event, fsm.instance_state, fsm.instance_state_history,
                           fsm.action_dead_letter, fsm.machine_maintenance, fsm.belief_cold_state,
-                          fsm.command_correction
+                          fsm.command_correction, fsm.entity_purge
                           RESTART IDENTITY;
                  -- A materialized view cannot be truncated; refreshed over the emptied history,
                  -- it is empty too.
