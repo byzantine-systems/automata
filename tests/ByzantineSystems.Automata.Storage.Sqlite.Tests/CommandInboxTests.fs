@@ -264,28 +264,6 @@ let tests =
               Expect.hasLength retried 1 "the retry is claimable once the backoff elapses"
           }
 
-          testTask "a huge backoff does not overflow the delay" {
-              let db = fixture "inbox"
-              let inbox = inboxOf db
-
-              let! _ = submit inbox (entity "e1") "k1" (Start 1)
-              let huge = Backoff.create (TimeSpan.FromDays 3650.0) (TimeSpan.FromDays 3650.0)
-
-              // Enough failed attempts that base << attempts would pass int64 many times over.
-              for _ in 1..40 do
-                  db.Clock.Advance(TimeSpan.FromDays 3651.0)
-                  let! head = claimOne inbox
-                  let! outcome = inbox.Reschedule(head.Work.CommandId, head.Token, huge, noCancellation)
-                  Expect.equal (outcome |> expectOk "reschedule") Updated "every reschedule lands"
-
-              let! record = readBack inbox (CommandId.ofInt64 1L)
-
-              Expect.isGreaterThanOrEqual
-                  record.VisibleAt
-                  (db.Clock.GetUtcNow())
-                  "the delay is never negative, however large the shift would have been"
-          }
-
           testTask "extending a held lease keeps the command claimed" {
               let db = fixture "inbox"
               let inbox = inboxOf db

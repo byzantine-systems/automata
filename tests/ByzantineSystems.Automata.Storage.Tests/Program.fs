@@ -4,4 +4,7 @@ open Expecto
 
 [<EntryPoint>]
 let main argv =
-    runTestsWithCLIArgs [] argv (testList "storage" [ StoreProgramTests.tests; EnumCodecTests.tests ])
+    runTestsWithCLIArgs
+        []
+        argv
+        (testList "storage" [ ArgumentTests.tests; StoreProgramTests.tests; EnumCodecTests.tests ])

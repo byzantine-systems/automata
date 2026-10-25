@@ -250,12 +250,17 @@ type Backoff =
 [<RequireQualifiedAccess>]
 module Backoff =
 
-    /// <summary>Builds an envelope, rejecting a non-positive base or a ceiling below it.</summary>
+    /// <summary>
+    /// Builds an envelope, rejecting a non-positive base, a ceiling below it, or a ceiling above
+    /// <see cref="P:System.Int32.MaxValue" /> milliseconds.
+    /// </summary>
     let tryCreate (baseDelay: TimeSpan) (ceiling: TimeSpan) : Result<Backoff, string> =
         if baseDelay <= TimeSpan.Zero then
             Error "A backoff base delay must be positive."
         elif ceiling < baseDelay then
             Error "A backoff ceiling must be at least the base delay."
+        elif ceiling > LeaseDuration.maximum then
+            Error $"A backoff ceiling cannot exceed {Int32.MaxValue} milliseconds."
         else
             Ok { Base = baseDelay; Ceiling = ceiling }
 

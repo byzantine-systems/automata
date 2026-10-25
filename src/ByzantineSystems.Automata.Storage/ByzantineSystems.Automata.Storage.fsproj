@@ -8,6 +8,7 @@
     </PropertyGroup>
 
     <ItemGroup>
+        <Compile Include="Arguments.fs" />
         <!-- Command.fs precedes Envelope.fs: an envelope carries an AuditContext, which is
              part of what the inbox records, so the inbox's vocabulary is declared first. -->
         <Compile Include="Command.fs" />
