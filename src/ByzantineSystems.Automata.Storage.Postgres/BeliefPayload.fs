@@ -1,5 +1,6 @@
 namespace ByzantineSystems.Automata.Storage.Postgres
 
+open System.Text.Json
 open System.Text.Json.Nodes
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
@@ -23,15 +24,18 @@ module internal BeliefPayload =
     let private node (codec: Codec<'State>) (belief: CorrectedBelief<'State>) : Result<JsonNode, StoreError> =
         codec.Encode belief.Asserted.State
         |> Result.mapError Db.toStoreError
-        |> Result.map (fun state ->
-            let node = JsonObject()
-            node["state"] <- JsonNode.Parse state
-            node["status"] <- JsonValue.Create(EnumCodec.encode EnumCodec.instanceStatus belief.Asserted.Status)
-            node["valid_from"] <- JsonValue.Create(Db.timestamp belief.ValidFrom)
-            node["epoch"] <- JsonValue.Create(int64 (Epoch.value belief.Asserted.Epoch))
-            node["command_id"] <- JsonValue.Create(CommandId.value belief.CommandId)
-            node["chart_version"] <- JsonValue.Create(ChartVersion.value belief.ChartVersion)
-            node :> JsonNode)
+        |> Result.bind (fun state ->
+            try
+                let node = JsonObject()
+                node["state"] <- JsonNode.Parse state
+                node["status"] <- JsonValue.Create(EnumCodec.encode EnumCodec.instanceStatus belief.Asserted.Status)
+                node["valid_from"] <- JsonValue.Create(Db.timestamp belief.ValidFrom)
+                node["epoch"] <- JsonValue.Create(int64 (Epoch.value belief.Asserted.Epoch))
+                node["command_id"] <- JsonValue.Create(CommandId.value belief.CommandId)
+                node["chart_version"] <- JsonValue.Create(ChartVersion.value belief.ChartVersion)
+                Ok(node :> JsonNode)
+            with :? JsonException as error ->
+                Error(StoreError.Serialization(nameof CorrectedBelief, error)))
 
     /// The whole timeline is encoded before anything is sent, so a state that will not encode
     /// fails the correction rather than half-writing it.

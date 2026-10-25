@@ -55,54 +55,59 @@ type PostgresActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'Entity
     /// was not written by this library's finalize, and guessing what it meant would be worse
     /// than refusing it.
     let readMessage (json: string) : Result<ActionRecord<'EntityId, 'Action>, StoreError> =
-        use document = JsonDocument.Parse json
-        let root = document.RootElement
+        match Db.parseJson (nameof ActionRecord) json with
+        | Error error -> Error error
+        | Ok parsed ->
+            use document = parsed
+            let root = document.RootElement
 
-        let field (name: string) : Result<JsonElement, StoreError> =
-            match root.TryGetProperty name with
-            | true, value -> Ok value
-            | _ -> Error(Db.decodeFailure (nameof ActionRecord) $"an action message carried no {name}")
+            let field (name: string) : Result<JsonElement, StoreError> =
+                match root.TryGetProperty name with
+                | true, value -> Ok value
+                | _ -> Error(Db.decodeFailure (nameof ActionRecord) $"an action message carried no {name}")
 
-        let text (name: string) : Result<string, StoreError> =
-            field name
-            |> Result.bind (fun value ->
-                match value.ValueKind with
-                | JsonValueKind.String -> Ok(value.GetString())
-                | _ -> Error(Db.decodeFailure (nameof ActionRecord) $"{name} was not a string"))
-
-        let number (name: string) : Result<int64, StoreError> =
-            field name
-            |> Result.bind (fun value ->
-                match value.ValueKind with
-                | JsonValueKind.Number -> Ok(value.GetInt64())
-                | _ -> Error(Db.decodeFailure (nameof ActionRecord) $"{name} was not a number"))
-
-        result {
-            let! machineId = text "machine_id"
-
-            let! entityId =
-                text "entity_id"
-                |> Result.bind (options.EntityIdDecode >> Result.mapError (Db.decodeFailure "EntityId"))
-
-            let! commandId = number "command_id"
-            let! epoch = number "epoch"
-            let! ordinal = number "ordinal"
-
-            let! action =
-                field "action"
+            let text (name: string) : Result<string, StoreError> =
+                field name
                 |> Result.bind (fun value ->
-                    value.GetRawText()
-                    |> options.ActionCodec.Decode
-                    |> Result.mapError Db.toStoreError)
+                    match value.ValueKind with
+                    | JsonValueKind.String -> Ok(value.GetString())
+                    | _ -> Error(Db.decodeFailure (nameof ActionRecord) $"{name} was not a string"))
 
-            return
-                { MachineId = MachineId.create machineId
-                  EntityId = entityId
-                  CommandId = CommandId.ofInt64 commandId
-                  Epoch = Epoch.ofUInt64 (uint64 epoch)
-                  Ordinal = int ordinal
-                  Action = action }
-        }
+            let number (name: string) : Result<int64, StoreError> =
+                field name
+                |> Result.bind (fun value ->
+                    match value.ValueKind with
+                    | JsonValueKind.Number -> Ok(value.GetInt64())
+                    | _ -> Error(Db.decodeFailure (nameof ActionRecord) $"{name} was not a number"))
+
+            result {
+                let! machineId =
+                    text "machine_id"
+                    |> Result.bind (MachineId.tryCreate >> Result.mapError (Db.decodeFailure "MachineId"))
+
+                let! entityId =
+                    text "entity_id"
+                    |> Result.bind (options.EntityIdDecode >> Result.mapError (Db.decodeFailure "EntityId"))
+
+                let! commandId = number "command_id"
+                let! epoch = number "epoch"
+                let! ordinal = number "ordinal"
+
+                let! action =
+                    field "action"
+                    |> Result.bind (fun value ->
+                        value.GetRawText()
+                        |> options.ActionCodec.Decode
+                        |> Result.mapError Db.toStoreError)
+
+                return
+                    { MachineId = machineId
+                      EntityId = entityId
+                      CommandId = CommandId.ofInt64 commandId
+                      Epoch = Epoch.ofUInt64 (uint64 epoch)
+                      Ordinal = int ordinal
+                      Action = action }
+            }
 
     /// <summary>
     /// The two halves of a pgmq claim, both carried on the lease.

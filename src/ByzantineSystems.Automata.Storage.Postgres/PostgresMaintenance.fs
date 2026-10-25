@@ -219,7 +219,11 @@ type PostgresMaintenance(context: PostgresContext) =
 
         result {
             let! commandId = required reader.GetInt64 "command_id"
-            let! machineId = required reader.GetString "machine_id"
+
+            let! machineId =
+                required reader.GetString "machine_id"
+                |> Result.bind (MachineId.tryCreate >> Result.mapError (Db.decodeFailure "MachineId"))
+
             let! entityId = required reader.GetString "entity_id"
             let! sequence = required reader.GetInt64 "seq"
             let! blocked = required reader.GetBoolean "blocked"
@@ -227,7 +231,7 @@ type PostgresMaintenance(context: PostgresContext) =
 
             return
                 { BlockedDrift.CommandId = CommandId.ofInt64 commandId
-                  MachineId = MachineId.create machineId
+                  MachineId = machineId
                   EntityId = entityId
                   Sequence = sequence
                   Blocked = blocked
@@ -257,13 +261,20 @@ type PostgresMaintenance(context: PostgresContext) =
                     Sql.runProgram
                         context
                         (StoreProgram.queryRows runMaintenance [ "batch", Param.Int batch ] (fun row ->
-                            Ok
-                                { MachineId = MachineId.create (Row.string row "machine_id")
-                                  Reaped = Row.int64 row "reaped"
-                                  PurgedCommands = Row.int64 row "purged_commands"
-                                  PurgedBeliefs = Row.int64 row "purged_beliefs"
-                                  PurgedActions = Row.int64 row "purged_actions"
-                                  Drifted = Row.int64 row "drifted" }))
+                            result {
+                                let! machineId =
+                                    Row.string row "machine_id"
+                                    |> MachineId.tryCreate
+                                    |> Result.mapError (Db.decodeFailure "MachineId")
+
+                                return
+                                    { MachineId = machineId
+                                      Reaped = Row.int64 row "reaped"
+                                      PurgedCommands = Row.int64 row "purged_commands"
+                                      PurgedBeliefs = Row.int64 row "purged_beliefs"
+                                      PurgedActions = Row.int64 row "purged_actions"
+                                      Drifted = Row.int64 row "drifted" }
+                            }))
                         ct
 
                 do! refreshColdBeliefs ct

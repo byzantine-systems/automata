@@ -34,8 +34,21 @@ let identifierTests =
           test "stateId rejects whitespace-only strings" {
               Expect.throws (fun _ -> StateId.create "   " |> ignore) "whitespace-only input raises"
           }
+          test "stateId tryCreate accepts and rejects without raising" {
+              Expect.equal (StateId.tryCreate " idle " |> Result.map StateId.value) (Ok "idle") "valid input"
+              Expect.isError (StateId.tryCreate "") "empty input"
+              Expect.isError (StateId.tryCreate "   ") "whitespace-only input"
+          }
           test "machineId roundtrips" {
               Expect.equal "payments" (MachineId.value (machineId "payments")) "value survives"
+          }
+          test "machineId tryCreate accepts and rejects without raising" {
+              Expect.equal
+                  (MachineId.tryCreate " payments " |> Result.map MachineId.value)
+                  (Ok "payments")
+                  "valid input"
+
+              Expect.isError (MachineId.tryCreate "") "empty input"
           }
           test "entityId roundtrips with phantom type" {
               let orderId: EntityId<Order> = entityId "ORD-1"

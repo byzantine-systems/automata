@@ -53,7 +53,10 @@ type PostgresTemporalStore<'EntityId, 'State>(options: TemporalOptions<'EntityId
                 Ok(read ordinal)
 
         result {
-            let! machineId = required reader.GetString "machine_id"
+            let! machineId =
+                required reader.GetString "machine_id"
+                |> Result.bind (MachineId.tryCreate >> Result.mapError (Db.decodeFailure "MachineId"))
+
             let! entity = required reader.GetString "entity_id"
             let! state = required reader.GetString "state"
             let! status = required reader.GetString "status"
@@ -80,7 +83,7 @@ type PostgresTemporalStore<'EntityId, 'State>(options: TemporalOptions<'EntityId
                 |> Result.mapError (Db.decodeFailure "ChartVersion")
 
             return
-                { MachineId = MachineId.create machineId
+                { MachineId = machineId
                   EntityId = entityId
                   Snapshot =
                     { State = state

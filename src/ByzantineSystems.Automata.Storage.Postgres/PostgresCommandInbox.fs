@@ -97,17 +97,22 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
             |> ChartVersion.tryCreate
             |> Result.mapError (Db.decodeFailure "ChartVersion")
 
+        let machineId =
+            row.machine_id
+            |> MachineId.tryCreate
+            |> Result.mapError (Db.decodeFailure "MachineId")
+
         let event =
             row.event |> options.EventCodec.Decode |> Result.mapError Db.toStoreError
 
         let status = row.status |> EnumCodec.decode EnumCodec.commandStatus
         let kind = kindOf row correction
 
-        match entityId, chartVersion, event, status, kind with
-        | Ok entityId, Ok chartVersion, Ok event, Ok status, Ok kind ->
+        match machineId, entityId, chartVersion, event, status, kind with
+        | Ok machineId, Ok entityId, Ok chartVersion, Ok event, Ok status, Ok kind ->
             Ok
                 { CommandId = CommandId.ofInt64 row.command_id
-                  MachineId = MachineId.create row.machine_id
+                  MachineId = machineId
                   EntityId = entityId
                   Sequence = row.seq
                   IdempotencyKey = row.idempotency_key
@@ -125,11 +130,12 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
                       Source = optional row.source
                       CorrelationId = optional row.correlation_id
                       CausationId = optional row.causation_id } }
-        | Error error, _, _, _, _
-        | _, Error error, _, _, _
-        | _, _, Error error, _, _
-        | _, _, _, Error error, _
-        | _, _, _, _, Error error -> Error error
+        | Error error, _, _, _, _, _
+        | _, Error error, _, _, _, _
+        | _, _, Error error, _, _, _
+        | _, _, _, Error error, _, _
+        | _, _, _, _, Error error, _
+        | _, _, _, _, _, Error error -> Error error
 
     /// <summary>
     /// A claimed row, read into the generated <c>fsm.command</c> type.

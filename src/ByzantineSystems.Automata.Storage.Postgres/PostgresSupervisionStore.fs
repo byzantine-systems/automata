@@ -60,9 +60,19 @@ module PostgresSupervisionQueries =
                 let! strategy = EnumCodec.read Row.string EnumCodec.supervisionStrategy "strategy" reader
                 let! reason = SupervisionMapping.reasonFromJson (Row.string reader "reason")
 
+                let! supervisor =
+                    Row.string reader "supervisor"
+                    |> SupervisorName.tryCreate
+                    |> Result.mapError (Db.decodeFailure "SupervisorName")
+
+                let! childId =
+                    Row.string reader "child_id"
+                    |> SupervisedChildId.tryCreate
+                    |> Result.mapError (Db.decodeFailure "SupervisedChildId")
+
                 return
-                    { Supervisor = SupervisorName.create (Row.string reader "supervisor")
-                      ChildId = SupervisedChildId.create (Row.string reader "child_id")
+                    { Supervisor = supervisor
+                      ChildId = childId
                       Kind = kind
                       Strategy = strategy
                       Reason = reason

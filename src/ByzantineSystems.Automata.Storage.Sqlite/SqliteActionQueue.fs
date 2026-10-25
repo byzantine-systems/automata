@@ -65,9 +65,14 @@ type SqliteActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'EntityId
 
             let! action = options.ActionCodec.Decode row.action |> Result.mapError Db.toStoreError
 
+            let! machineId =
+                row.machine_id
+                |> MachineId.tryCreate
+                |> Result.mapError (Db.decodeFailure "MachineId")
+
             return
                 { Work =
-                    { MachineId = MachineId.create row.machine_id
+                    { MachineId = machineId
                       EntityId = entityId
                       CommandId = CommandId.ofInt64 row.command_id
                       Epoch = Db.epochOf row.epoch

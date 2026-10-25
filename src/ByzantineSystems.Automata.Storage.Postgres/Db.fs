@@ -1,6 +1,7 @@
 namespace ByzantineSystems.Automata.Storage.Postgres
 
 open System
+open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
@@ -200,6 +201,30 @@ module internal Db =
     /// projection reports, as the serialization error the contract promises.</summary>
     let decodeFailure (typeName: string) (message: string) : StoreError =
         StoreError.Serialization(typeName, FormatException message)
+
+    /// <summary>
+    /// Whether an exception signals the process cannot continue, rather than a failure this
+    /// boundary can classify. These propagate past a decoder's catch: turning
+    /// <see cref="T:System.OutOfMemoryException" /> into <c>StoreError.Serialization</c> would
+    /// report a dying process as bad data.
+    /// </summary>
+    let isFatal (error: exn) : bool =
+        match error with
+        | :? OutOfMemoryException
+        | :? InsufficientExecutionStackException
+        | :? StackOverflowException
+        | :? AccessViolationException -> true
+        | _ -> false
+
+    /// <summary>
+    /// Parses a JSON document, mapping malformed input to a serialization failure rather than
+    /// letting the exception escape a decoder.
+    /// </summary>
+    let parseJson (typeName: string) (json: string) : Result<JsonDocument, StoreError> =
+        try
+            Ok(JsonDocument.Parse json)
+        with :? JsonException as error ->
+            Error(StoreError.Serialization(typeName, error))
 
 /// <summary>
 /// Column access by name.

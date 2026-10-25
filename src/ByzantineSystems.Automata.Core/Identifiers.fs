@@ -34,13 +34,22 @@ type ChartFingerprint = private ChartFingerprint of string
 [<RequireQualifiedAccess>]
 module StateId =
 
+    /// <summary>
+    /// Parses a state id, returning the reason rather than raising. A corrupt row read back out
+    /// of storage becomes a typed failure at the store boundary instead of an exception escaping it.
+    /// </summary>
+    let tryCreate (value: string) : Result<StateId, string> =
+        if String.IsNullOrWhiteSpace value then
+            Error "A state id must be a non-empty string."
+        else
+            Ok(StateId(value.Trim()))
+
     /// <summary>Constructs a state id from a non-empty string, trimming surrounding whitespace.</summary>
     /// <exception cref="T:System.ArgumentException">The input is null, empty, or whitespace.</exception>
     let create (value: string) : StateId =
-        if String.IsNullOrWhiteSpace value then
-            invalidArg (nameof value) "A state id must be a non-empty string."
-
-        StateId(value.Trim())
+        match tryCreate value with
+        | Ok stateId -> stateId
+        | Error message -> invalidArg (nameof value) message
 
     /// <summary>Returns the underlying string.</summary>
     let value (StateId value) : string = value
@@ -49,13 +58,23 @@ module StateId =
 [<RequireQualifiedAccess>]
 module MachineId =
 
+    /// <summary>
+    /// Parses a machine id, returning the reason rather than raising. A corrupt row read back
+    /// out of storage becomes a typed failure at the store boundary instead of an exception
+    /// escaping it.
+    /// </summary>
+    let tryCreate (value: string) : Result<MachineId, string> =
+        if String.IsNullOrWhiteSpace value then
+            Error "A machine id must be a non-empty string."
+        else
+            Ok(MachineId(value.Trim()))
+
     /// <summary>Constructs a machine id from a non-empty string, trimming surrounding whitespace.</summary>
     /// <exception cref="T:System.ArgumentException">The input is null, empty, or whitespace.</exception>
     let create (value: string) : MachineId =
-        if String.IsNullOrWhiteSpace value then
-            invalidArg (nameof value) "A machine id must be a non-empty string."
-
-        MachineId(value.Trim())
+        match tryCreate value with
+        | Ok machineId -> machineId
+        | Error message -> invalidArg (nameof value) message
 
     /// <summary>Returns the underlying string.</summary>
     let value (MachineId value) : string = value

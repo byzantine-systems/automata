@@ -16,7 +16,7 @@ module Serialization =
     let private protect error work =
         try
             Ok(work ())
-        with exceptionRaised ->
+        with exceptionRaised when not (Db.isFatal exceptionRaised) ->
             Error(error exceptionRaised)
 
     /// <summary>Builds a codec for one value, serializing unions with adjacent tags.</summary>

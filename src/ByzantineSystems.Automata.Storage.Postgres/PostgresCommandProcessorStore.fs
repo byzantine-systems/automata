@@ -104,7 +104,10 @@ module private ReplayMapping =
             match kind.GetString() with
             | "unknown_chart_version" ->
                 field "version" _.GetInt32()
-                |> Result.map (ChartVersion.create >> ReplayError.UnknownChartVersion)
+                |> Result.bind (fun version ->
+                    ChartVersion.tryCreate version
+                    |> Result.mapError (Db.decodeFailure "ChartVersion"))
+                |> Result.map ReplayError.UnknownChartVersion
             | "diverged" ->
                 Result.map2
                     (fun epoch reason -> ReplayError.Diverged(Db.epochOf epoch, reason))
@@ -240,26 +243,29 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
         | CommandFailure.Replay error -> Ok $"""{{"replay":%s{ReplayMapping.toJson error}}}"""
 
     let readFailure (json: string) : Result<CommandFailure<'Err>, StoreError> =
-        // The column is jsonb, so the server has already proved this parses. What it has not
-        // proved is that the shape is one this version writes.
-        use document = JsonDocument.Parse json
-        let root = document.RootElement
+        match Db.parseJson (nameof CommandFailure) json with
+        | Error error -> Error error
+        | Ok parsed ->
+            use document = parsed
+            let root = document.RootElement
 
-        match root.TryGetProperty "domain" with
-        | true, domain ->
-            domain.GetRawText()
-            |> options.ErrorCodec.Decode
-            |> Result.mapError Db.toStoreError
-            |> Result.map CommandFailure.Domain
-        | _ ->
-            match root.TryGetProperty "machine", root.TryGetProperty "replay" with
-            | (true, machine), _ when machine.ValueKind = JsonValueKind.String ->
-                Ok(CommandFailure.Machine(machine.GetString()))
-            | _, (true, replay) -> ReplayMapping.ofJson replay |> Result.map CommandFailure.Replay
+            match root.TryGetProperty "domain" with
+            | true, domain ->
+                domain.GetRawText()
+                |> options.ErrorCodec.Decode
+                |> Result.mapError Db.toStoreError
+                |> Result.map CommandFailure.Domain
             | _ ->
-                Error(
-                    Db.decodeFailure (nameof CommandFailure) "a command error carried no domain, machine or replay tag"
-                )
+                match root.TryGetProperty "machine", root.TryGetProperty "replay" with
+                | (true, machine), _ when machine.ValueKind = JsonValueKind.String ->
+                    Ok(CommandFailure.Machine(machine.GetString()))
+                | _, (true, replay) -> ReplayMapping.ofJson replay |> Result.map CommandFailure.Replay
+                | _ ->
+                    Error(
+                        Db.decodeFailure
+                            (nameof CommandFailure)
+                            "a command error carried no domain, machine or replay tag"
+                    )
 
     /// A rejection or a dead letter, encoded before anything is sent.
     let fail
@@ -306,6 +312,12 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
         let decode (codec: Codec<'T>) (json: string) =
             codec.Decode json |> Result.mapError Db.toStoreError
 
+        let decodeStateIds (values: string[]) : Result<StateId list, StoreError> =
+            values
+            |> Array.toList
+            |> List.traverseResultM (fun value ->
+                StateId.tryCreate value |> Result.mapError (Db.decodeFailure "StateId"))
+
         result {
             let! entityId =
                 row.entity_id
@@ -317,23 +329,35 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
             let! fromState = decode options.StateCodec row.from_state
             let! toState = decode options.StateCodec row.to_state
             let! status = EnumCodec.decode EnumCodec.instanceStatus row.status
+            let! exited = decodeStateIds row.exited
+            let! entered = decodeStateIds row.entered
 
             let! chartVersion =
                 row.chart_version
                 |> ChartVersion.tryCreate
                 |> Result.mapError (Db.decodeFailure "ChartVersion")
 
+            let! machineId =
+                row.machine_id
+                |> MachineId.tryCreate
+                |> Result.mapError (Db.decodeFailure "MachineId")
+
+            let! handledBy =
+                row.handled_by
+                |> StateId.tryCreate
+                |> Result.mapError (Db.decodeFailure "StateId")
+
             return
                 { Draft =
-                    { MachineId = MachineId.create row.machine_id
+                    { MachineId = machineId
                       EntityId = entityId
                       Event = event
                       Actions = actions
                       FromState = fromState
                       ToState = toState
-                      HandledBy = StateId.create row.handled_by
-                      Exited = row.exited |> Array.map StateId.create |> List.ofArray
-                      Entered = row.entered |> Array.map StateId.create |> List.ofArray
+                      HandledBy = handledBy
+                      Exited = exited
+                      Entered = entered
                       Status = status
                       EffectiveAt = Db.fromTimestamp row.effective_at }
                   Epoch = Db.epochOf row.epoch
