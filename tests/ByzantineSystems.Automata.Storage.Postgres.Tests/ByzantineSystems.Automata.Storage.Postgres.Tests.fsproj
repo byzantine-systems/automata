@@ -19,6 +19,7 @@
         <Compile Include="CorrectionTests.fs" />
         <Compile Include="TemporalProperties.fs" />
         <Compile Include="ReplayRetentionProperties.fs" />
+        <Compile Include="ReplayFinalizeProperties.fs" />
         <Compile Include="HistoryTests.fs" />
         <Compile Include="FinalizeTests.fs" />
         <Compile Include="ActionQueueTests.fs" />

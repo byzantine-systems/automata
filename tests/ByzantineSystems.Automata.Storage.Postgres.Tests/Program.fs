@@ -30,6 +30,7 @@ let tests =
                     ProcessorIntegrationTests.tests
                     ReplayIntegrationTests.tests
                     ReplayRetentionProperties.tests
+                    ReplayFinalizeProperties.tests
                     SchemaContractTests.tests
                     MaintenanceTests.integration
                     PostgresSupervisionStoreTests.tests ]
