@@ -10,7 +10,7 @@ open TestContext
 let private entity name : Entity = entityId name
 type private Claimed = LeasedCommand<Entity, TestEvent>
 let private lease = LeaseDuration.create (TimeSpan.FromSeconds 30.0)
-let private actionLease = TimeSpan.FromSeconds 30.0
+let private actionLease = LeaseDuration.create (TimeSpan.FromSeconds 30.0)
 let private effectiveAt = DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero)
 
 let private leased (inbox: Inbox) (name: string) (key: string) : Task<Claimed> =
@@ -42,7 +42,7 @@ let private commit (processor: Processor) (held: Claimed) =
 
 let private claimActions (queue: Actions) =
     task {
-        let! claimed = queue.Claim(machine, 50, actionLease, noCancellation)
+        let! claimed = queue.Claim(machine, ClaimBatch.create 50, actionLease, noCancellation)
         return claimed |> expectOk "claim actions"
     }
 
@@ -191,7 +191,7 @@ let tests =
                   { action with
                       DeliveryCount = action.DeliveryCount - 1 }
 
-              let! outcome = queue.Abandon(stale, "gave up", noCancellation)
+              let! outcome = queue.Abandon(stale, Reason.create "gave up", noCancellation)
               Expect.equal LeaseUpdateOutcome.LeaseLost (outcome |> expectOk "abandon") "fenced out"
               Expect.equal 0L (deadLetterCount ()) "and nothing was recorded"
           }
@@ -206,7 +206,7 @@ let tests =
               let! claimed = claimActions queue
               let action: LeasedAction<Entity, TestAction> = List.exactlyOne claimed
 
-              let! outcome = queue.Abandon(action, "the destination refused it", noCancellation)
+              let! outcome = queue.Abandon(action, Reason.create "the destination refused it", noCancellation)
               Expect.equal Updated (outcome |> expectOk "abandon") "given up on"
               Expect.equal 0L (queueDepth ()) "the message left the queue"
               Expect.equal 1L (deadLetterCount ()) "and the fact was recorded"

@@ -56,7 +56,7 @@ type IActionQueue<'EntityId, 'Action> =
     /// a slow destination's actions in that order would stall every other entity behind it.
     /// </summary>
     abstract Claim:
-        machineId: MachineId * batch: int * lease: TimeSpan * ct: CancellationToken ->
+        machineId: MachineId * batch: ClaimBatch * lease: LeaseDuration * ct: CancellationToken ->
             Task<Result<LeasedAction<'EntityId, 'Action> list, StoreError>>
 
     /// <summary>Marks an action delivered. Fenced: a lease that was taken over cannot complete it.</summary>
@@ -74,5 +74,5 @@ type IActionQueue<'EntityId, 'Action> =
     /// fact that an effect the machine asked for never happened.
     /// </summary>
     abstract Abandon:
-        action: LeasedAction<'EntityId, 'Action> * reason: string * ct: CancellationToken ->
+        action: LeasedAction<'EntityId, 'Action> * reason: Reason * ct: CancellationToken ->
             Task<Result<LeaseUpdateOutcome, StoreError>>

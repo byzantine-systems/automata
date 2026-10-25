@@ -144,19 +144,15 @@ type PostgresActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'Entity
     interface IActionQueue<'EntityId, 'Action> with
 
         member _.Claim(_, batch, lease, ct) =
-            if batch < 1 then
-                invalidArg (nameof batch) "A claim batch size must be positive."
-
-            if lease <= TimeSpan.Zero then
-                invalidArg (nameof lease) "A lease must be a positive duration."
-
             // Not idempotent, like the command claim: a claim whose reply was lost has already
             // leased the messages, and repeating it leases more while the first batch stays
             // invisible. The dispatcher polls again shortly, which recovers faster.
             let claim =
                 StoreProgram.queryRows
                     claimActions
-                    (queue @ [ "batch", Param.Int batch; "lease", Param.Interval lease ])
+                    (queue
+                     @ [ "batch", Param.Int(ClaimBatch.value batch)
+                         "lease", Param.Interval(LeaseDuration.value lease) ])
                     (fun reader ->
                         Ok(
                             Row.string reader "message",
@@ -194,4 +190,4 @@ type PostgresActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'Entity
                 ct
 
         member _.Abandon(action, reason, ct) =
-            fenced abandonAction (fence action @ [ "reason", Param.Text reason ]) ct
+            fenced abandonAction (fence action @ [ "reason", Param.Text(Reason.value reason) ]) ct

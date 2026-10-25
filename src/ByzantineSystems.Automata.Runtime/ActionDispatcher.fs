@@ -80,6 +80,8 @@ type ActionDispatcher<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectError whe
     ) =
 
     let policy = ValidatedProcessorPolicy.value config.Processor
+    let claimBatch = ValidatedProcessorPolicy.batch config.Processor
+    let leaseDuration = ValidatedProcessorPolicy.lease config.Processor
     let queue = config.Store :> IActionQueue<'EntityId, 'Action>
     let machineId = config.MachineId
     let machineName = MachineId.value machineId
@@ -128,7 +130,10 @@ type ActionDispatcher<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectError whe
     let deliver (action: LeasedAction<'EntityId, 'Action>) (ct: CancellationToken) =
         task {
             if poisoned action then
-                let! outcome = queue.Abandon(action, $"delivered %d{action.DeliveryCount} times without an outcome", ct)
+                let reason =
+                    Reason.create $"delivered %d{action.DeliveryCount} times without an outcome"
+
+                let! outcome = queue.Abandon(action, reason, ct)
 
                 return fenced outcome GaveUp
             else
@@ -150,7 +155,8 @@ type ActionDispatcher<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectError whe
                     let! outcome = queue.Complete(action, ct)
                     return fenced outcome Delivered
                 elif action.DeliveryCount >= policy.MaxAttempts then
-                    let! outcome = queue.Abandon(action, $"undelivered after %d{action.DeliveryCount} attempts", ct)
+                    let reason = Reason.create $"undelivered after %d{action.DeliveryCount} attempts"
+                    let! outcome = queue.Abandon(action, reason, ct)
                     return fenced outcome GaveUp
                 else
                     let! outcome = queue.Reschedule(action, policy.Backoff, ct)
@@ -220,7 +226,7 @@ type ActionDispatcher<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectError whe
     member _.PollAsync(ct: CancellationToken) : Task<Result<DeliveryReport, MachineError<'Err>>> =
         taskResult {
             let! batch =
-                queue.Claim(machineId, policy.Batch, policy.Lease, ct)
+                queue.Claim(machineId, claimBatch, leaseDuration, ct)
                 |> TaskResult.mapError MachineError.Store
 
             match batch with
@@ -293,7 +299,7 @@ type ActionDispatcher<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectError whe
                             totals
 
                     match outcome with
-                    | Ok report when report.Claimed = policy.Batch -> return! loop totals
+                    | Ok report when report.Claimed = ClaimBatch.value claimBatch -> return! loop totals
                     | _ ->
                         match! waitForWork () with
                         | true -> return! loop totals

@@ -109,17 +109,16 @@ type SqliteActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'EntityId
     interface IActionQueue<'EntityId, 'Action> with
 
         member _.Claim(machineId, batch, lease, ct) =
-            if batch < 1 then
-                invalidArg (nameof batch) "A claim batch size must be positive."
-
-            if lease <= TimeSpan.Zero then
-                invalidArg (nameof lease) "A lease must be a positive duration."
-
             // Not idempotent, like the command claim: a claim whose outcome was lost may have
             // leased the rows, and repeating it leases more while the first batch stays invisible.
             // The dispatcher polls again shortly, which recovers faster.
             backgroundTaskResult {
-                let! rows = Sql.writeProgramOnceWith context (claim machineId batch lease) ct
+                let! rows =
+                    Sql.writeProgramOnceWith
+                        context
+                        (claim machineId (ClaimBatch.value batch) (LeaseDuration.value lease))
+                        ct
+
                 return! rows |> List.traverseResultM toLeased
             }
 
@@ -144,9 +143,6 @@ type SqliteActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'EntityId
                 ct
 
         member _.Abandon(action, reason, ct) =
-            if String.IsNullOrWhiteSpace reason then
-                invalidArg (nameof reason) "An abandoned delivery must say why."
-
             Sql.writeProgramWith
                 context
                 (fun now ->
@@ -154,7 +150,8 @@ type SqliteActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'EntityId
                         let! recorded =
                             StoreProgram.executeCount
                                 abandonAction
-                                (fence action @ [ "@reason", Param.Text reason; "@now", Param.Integer now ])
+                                (fence action
+                                 @ [ "@reason", Param.Text(Reason.value reason); "@now", Param.Integer now ])
 
                         match CommandMapping.leaseOutcome recorded with
                         | LeaseUpdateOutcome.LeaseLost -> return LeaseUpdateOutcome.LeaseLost

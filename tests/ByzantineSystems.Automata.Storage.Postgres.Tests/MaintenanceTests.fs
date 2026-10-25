@@ -414,7 +414,9 @@ let retentionTests =
               let! _ = submit "e1" "k1"
               let! first = claimed "k1"
               let! _ = commit first Epoch.initial
-              let! actions = (newActionQueue ()).Claim(machine, 10, lease, noCancellation)
+
+              let! actions =
+                  (newActionQueue ()).Claim(machine, ClaimBatch.create 10, LeaseDuration.create lease, noCancellation)
 
               for action in actions |> expectOk "claim actions" do
                   let! _ = (newActionQueue ()).Complete(action, noCancellation)

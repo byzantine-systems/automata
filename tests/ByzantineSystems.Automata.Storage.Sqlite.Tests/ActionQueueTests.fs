@@ -9,6 +9,7 @@ open Expecto
 
 let private entity name : Entity = entityId name
 let private actionLease = TimeSpan.FromSeconds 30.0
+let private leaseDuration = LeaseDuration.create actionLease
 let private effectiveAt = DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero)
 
 /// Commits one command, which is what puts actions in the queue.
@@ -32,7 +33,7 @@ let private committed (fixture: Fixture) (key: string) =
 
 let private claimActions (queue: Actions) : Threading.Tasks.Task<ClaimedAction list> =
     task {
-        let! claimed = queue.Claim(testMachine, 50, actionLease, noCancellation)
+        let! claimed = queue.Claim(testMachine, ClaimBatch.create 50, leaseDuration, noCancellation)
         return claimed |> expectOk "claim actions"
     }
 
@@ -106,7 +107,9 @@ let tests =
               let db = fixture "actions"
               let! _ = committed db "k1"
 
-              let! other = (actionsOf db).Claim(machineId "other-machine", 50, actionLease, noCancellation)
+              let! other =
+                  (actionsOf db).Claim(machineId "other-machine", ClaimBatch.create 50, leaseDuration, noCancellation)
+
               Expect.isEmpty (other |> expectOk "claim") "the queue is shared, the claim is not"
           }
 
@@ -158,7 +161,7 @@ let tests =
 
               let! completed = queue.Complete(forged, noCancellation)
               let! rescheduled = queue.Reschedule(forged, Backoff.defaults, noCancellation)
-              let! abandoned = queue.Abandon(forged, "gave up", noCancellation)
+              let! abandoned = queue.Abandon(forged, Reason.create "gave up", noCancellation)
 
               Expect.equal (completed |> expectOk "complete") LeaseLost "completion is fenced"
               Expect.equal (rescheduled |> expectOk "reschedule") LeaseLost "rescheduling is fenced"
@@ -205,7 +208,7 @@ let tests =
               let queue = actionsOf db
               let! (action: ClaimedAction) = claimOnly queue
 
-              let! outcome = queue.Abandon(action, "the destination refused it", noCancellation)
+              let! outcome = queue.Abandon(action, Reason.create "the destination refused it", noCancellation)
               Expect.equal (outcome |> expectOk "abandon") Updated "given up on"
               Expect.equal (depth db) "0" "the action left the queue"
 
@@ -226,25 +229,10 @@ let tests =
                   "and the action exactly as the commit queued it"
           }
 
-          test "an abandonment must say why" {
-              let db = fixture "actions"
-              let queue = actionsOf db
-
-              let action: ClaimedAction =
-                  { Work =
-                      { MachineId = testMachine
-                        EntityId = entity "e1"
-                        CommandId = CommandId.ofInt64 1L
-                        Epoch = Epoch.ofUInt64 1UL
-                        Ordinal = 0
-                        Action = Notify "x" }
-                    Token = LeaseToken.ofInt64 1L
-                    DeliveryCount = 1
-                    ExpiresAt = startTime }
-
+          test "an abandonment reason must say why" {
               Expect.throwsT<ArgumentException>
-                  (fun () -> queue.Abandon(action, "  ", noCancellation) |> ignore)
-                  "a blank reason is refused before anything is sent"
+                  (fun () -> Reason.create "  " |> ignore)
+                  "a blank reason cannot reach a queue"
           }
 
           // json_each's value column unquotes a JSON string, so an action codec that emits one
@@ -276,7 +264,7 @@ let tests =
 
               Expect.equal (outcome |> expectOk "commit") (Finalized(Epoch.ofUInt64 1UL)) "the commit lands"
 
-              let! claimed = queue.Claim(testMachine, 50, actionLease, noCancellation)
+              let! claimed = queue.Claim(testMachine, ClaimBatch.create 50, leaseDuration, noCancellation)
 
               Expect.equal
                   (claimed

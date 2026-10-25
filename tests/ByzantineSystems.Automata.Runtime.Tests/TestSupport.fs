@@ -179,7 +179,7 @@ type StubStore<'Err>() =
             let drained = ResizeArray()
             let mutable taking = true
 
-            while taking && drained.Count < batch do
+            while taking && drained.Count < ClaimBatch.value batch do
                 match actions.TryDequeue() with
                 | true, leased -> drained.Add leased
                 | _ -> taking <- false
@@ -193,7 +193,7 @@ type StubStore<'Err>() =
         member _.Reschedule(_, _, _) = Task.FromResult(Ok Updated)
 
         member this.Abandon(action, reason, _) =
-            lock this.Abandonments (fun () -> this.Abandonments.Add(action.Work.CommandId, reason))
+            lock this.Abandonments (fun () -> this.Abandonments.Add(action.Work.CommandId, Reason.value reason))
             Task.FromResult(Ok Updated)
 
     interface IMachineStore<EntityId<TestEntity>, TestState, TestEvent, TestAction, 'Err>
