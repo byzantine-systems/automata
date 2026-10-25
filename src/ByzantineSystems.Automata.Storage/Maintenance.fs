@@ -184,7 +184,7 @@ type IDatabaseMaintenance =
     /// without repairing it. Each task is bounded by <paramref name="batch" />. An empty list
     /// means another process is running a pass right now.
     /// </summary>
-    abstract Run: batch: int * ct: CancellationToken -> Task<Result<MaintenanceReport list, StoreError>>
+    abstract Run: batch: ClaimBatch * ct: CancellationToken -> Task<Result<MaintenanceReport list, StoreError>>
 
     /// <summary>Every open command whose blocked flag has drifted. Empty means healthy.</summary>
     abstract DetectDrift: ct: CancellationToken -> Task<Result<BlockedDrift list, StoreError>>
@@ -200,7 +200,7 @@ type IDatabaseMaintenance =
     /// rather than adding a second one.
     /// </summary>
     abstract Schedule:
-        notifyEvery: TimeSpan * runEvery: TimeSpan * batch: int * ct: CancellationToken ->
+        notifyEvery: TimeSpan * runEvery: TimeSpan * batch: ClaimBatch * ct: CancellationToken ->
             Task<Result<Scheduling, StoreError>>
 
     /// <summary>Removes both scheduled ticks. Returns how many were removed.</summary>

@@ -187,4 +187,17 @@ let tests =
               Expect.throwsT<ArgumentException>
                   (fun () -> ServiceCollection().AddAutomataMaintenance(options) |> ignore)
                   "a zero interval is a loop with no pause"
+          }
+
+          test "an unsupported maintenance batch is refused at registration" {
+              let stub = StubMaintenance(Scheduling.Unavailable)
+
+              for batch in [ 0; 1001 ] do
+                  let options =
+                      { fast stub MaintenanceScheduler.InProcess with
+                          Batch = batch }
+
+                  Expect.throwsT<ArgumentException>
+                      (fun () -> ServiceCollection().AddAutomataMaintenance(options) |> ignore)
+                      $"batch {batch} cannot reach the maintenance service"
           } ]

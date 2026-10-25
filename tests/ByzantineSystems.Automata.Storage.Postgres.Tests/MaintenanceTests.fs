@@ -68,7 +68,7 @@ let private reject (leased: LeasedCommand<Entity, TestEvent>) =
 
 let private run (batch: int) =
     task {
-        let! reports = (newMaintenance ()).Run(batch, noCancellation)
+        let! reports = (newMaintenance ()).Run(ClaimBatch.create batch, noCancellation)
         return reports |> expectOk "run"
     }
 
@@ -715,7 +715,12 @@ let cronTests =
               let maintenance = newMaintenance ()
 
               let! scheduling =
-                  maintenance.Schedule(TimeSpan.FromSeconds 1., TimeSpan.FromMinutes 1., 100, noCancellation)
+                  maintenance.Schedule(
+                      TimeSpan.FromSeconds 1.,
+                      TimeSpan.FromMinutes 1.,
+                      ClaimBatch.create 100,
+                      noCancellation
+                  )
 
               let expected =
                   if cronInstalled () then
@@ -762,7 +767,12 @@ let cronTests =
 
               for _ in 1..2 do
                   let! scheduled =
-                      maintenance.Schedule(TimeSpan.FromSeconds 1., TimeSpan.FromMinutes 1., 100, noCancellation)
+                      maintenance.Schedule(
+                          TimeSpan.FromSeconds 1.,
+                          TimeSpan.FromMinutes 1.,
+                          ClaimBatch.create 100,
+                          noCancellation
+                      )
 
                   Expect.equal (scheduled |> expectOk "schedule") Scheduling.Scheduled "scheduled"
 

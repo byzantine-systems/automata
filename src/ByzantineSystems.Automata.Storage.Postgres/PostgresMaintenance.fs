@@ -238,10 +238,6 @@ type PostgresMaintenance(context: PostgresContext) =
                   Expected = expected }
         }
 
-    let positiveBatch (batch: int) =
-        if batch < 1 then
-            invalidArg (nameof batch) "A maintenance batch size must be positive."
-
     interface IDatabaseMaintenance with
 
         member _.NotifyPending(ct) =
@@ -254,27 +250,28 @@ type PostgresMaintenance(context: PostgresContext) =
                 ct
 
         member _.Run(batch, ct) =
-            positiveBatch batch
-
             backgroundTaskResult {
                 let! reports =
                     Sql.runProgram
                         context
-                        (StoreProgram.queryRows runMaintenance [ "batch", Param.Int batch ] (fun row ->
-                            result {
-                                let! machineId =
-                                    Row.string row "machine_id"
-                                    |> MachineId.tryCreate
-                                    |> Result.mapError (Db.decodeFailure "MachineId")
+                        (StoreProgram.queryRows
+                            runMaintenance
+                            [ "batch", Param.Int(ClaimBatch.value batch) ]
+                            (fun row ->
+                                result {
+                                    let! machineId =
+                                        Row.string row "machine_id"
+                                        |> MachineId.tryCreate
+                                        |> Result.mapError (Db.decodeFailure "MachineId")
 
-                                return
-                                    { MachineId = machineId
-                                      Reaped = Row.int64 row "reaped"
-                                      PurgedCommands = Row.int64 row "purged_commands"
-                                      PurgedBeliefs = Row.int64 row "purged_beliefs"
-                                      PurgedActions = Row.int64 row "purged_actions"
-                                      Drifted = Row.int64 row "drifted" }
-                            }))
+                                    return
+                                        { MachineId = machineId
+                                          Reaped = Row.int64 row "reaped"
+                                          PurgedCommands = Row.int64 row "purged_commands"
+                                          PurgedBeliefs = Row.int64 row "purged_beliefs"
+                                          PurgedActions = Row.int64 row "purged_actions"
+                                          Drifted = Row.int64 row "drifted" }
+                                }))
                         ct
 
                 do! refreshColdBeliefs ct
@@ -294,15 +291,13 @@ type PostgresMaintenance(context: PostgresContext) =
                 ct
 
         member _.Schedule(notifyEvery, runEvery, batch, ct) =
-            positiveBatch batch
-
             Sql.runProgram
                 context
                 (StoreProgram.queryOne
                     scheduleMaintenance
                     [ "notify_every", Param.Interval notifyEvery
                       "run_every", Param.Interval runEvery
-                      "batch", Param.Int batch ]
+                      "batch", Param.Int(ClaimBatch.value batch) ]
                     (fun row -> Row.string row "scheduling" |> schedulingOf))
                 ct
 

@@ -191,7 +191,12 @@ module internal Loops =
 /// server log is where pg_cron's output lands, and it is not where an application looks.
 /// </summary>
 type internal MaintenanceService
-    (options: MaintenanceOptions, maintenance: IDatabaseMaintenance, logger: ILogger<MaintenanceService>) =
+    (
+        options: MaintenanceOptions,
+        batch: ClaimBatch,
+        maintenance: IDatabaseMaintenance,
+        logger: ILogger<MaintenanceService>
+    ) =
     inherit BackgroundService()
 
     let every (interval: TimeSpan) (tick: CancellationToken -> Task) =
@@ -233,7 +238,7 @@ type internal MaintenanceService
 
     let pass ct : Task =
         backgroundTask {
-            do! attempt "run" (fun ct -> maintenance.Run(options.Batch, ct)) (logAll MaintenanceLog.pass) ct
+            do! attempt "run" (fun ct -> maintenance.Run(batch, ct)) (logAll MaintenanceLog.pass) ct
             do! checkDrift ct
         }
 
@@ -255,7 +260,7 @@ type internal MaintenanceService
         match options.Scheduler with
         | MaintenanceScheduler.InProcess -> Task.FromResult MaintenanceScheduler.InProcess
         | MaintenanceScheduler.InDatabase ->
-            maintenance.Schedule(options.NotifyEvery, options.RunEvery, options.Batch, ct)
+            maintenance.Schedule(options.NotifyEvery, options.RunEvery, batch, ct)
             |> Task.map scheduling
 
     let run (scheduler: MaintenanceScheduler) (ct: CancellationToken) : Task<unit> =
