@@ -3,6 +3,7 @@ namespace ByzantineSystems.Automata.Storage.Postgres
 open System.Text.Json.Nodes
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
+open ByzantineSystems.Automata.Storage.Internal
 open FsToolkit.ErrorHandling
 
 /// <summary>
@@ -25,7 +26,7 @@ module internal BeliefPayload =
         |> Result.map (fun state ->
             let node = JsonObject()
             node["state"] <- JsonNode.Parse state
-            node["status"] <- JsonValue.Create(Db.instanceStatusToString belief.Asserted.Status)
+            node["status"] <- JsonValue.Create(EnumCodec.encode EnumCodec.instanceStatus belief.Asserted.Status)
             node["valid_from"] <- JsonValue.Create(Db.timestamp belief.ValidFrom)
             node["epoch"] <- JsonValue.Create(int64 (Epoch.value belief.Asserted.Epoch))
             node["command_id"] <- JsonValue.Create(CommandId.value belief.CommandId)

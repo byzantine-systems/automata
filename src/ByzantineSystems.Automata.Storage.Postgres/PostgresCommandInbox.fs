@@ -31,42 +31,8 @@ type CommandInboxOptions<'EntityId, 'Event> =
 [<RequireQualifiedAccess>]
 module private CommandMapping =
 
-    let statusToString (status: CommandStatus) : string =
-        match status with
-        | CommandStatus.Ready -> "ready"
-        | CommandStatus.Leased -> "leased"
-        | CommandStatus.Succeeded -> "succeeded"
-        | CommandStatus.Rejected -> "rejected"
-        | CommandStatus.DeadLettered -> "dead_letter"
-
-    let statusFromString (value: string) : Result<CommandStatus, StoreError> =
-        match value with
-        | "ready" -> Ok CommandStatus.Ready
-        | "leased" -> Ok CommandStatus.Leased
-        | "succeeded" -> Ok CommandStatus.Succeeded
-        | "rejected" -> Ok CommandStatus.Rejected
-        | "dead_letter" -> Ok CommandStatus.DeadLettered
-        | other -> Error(Db.decodeFailure (nameof CommandStatus) $"unknown command status {other}")
-
-    let outcomeFromString (value: string) : Result<LeaseUpdateOutcome, StoreError> =
-        match value with
-        | "updated" -> Ok Updated
-        | "lease_lost" -> Ok LeaseLost
-        | other -> Error(Db.decodeFailure (nameof LeaseUpdateOutcome) $"unknown lease outcome {other}")
-
     /// The schema stores the empty string for an unsupplied audit field.
     let audit (value: string option) : string = defaultArg value ""
-
-    let divergenceToString (divergence: Divergence) : string =
-        match divergence with
-        | Divergence.Fail -> "fail"
-        | Divergence.Truncate -> "truncate"
-
-    let divergenceFromString (value: string) : Result<Divergence, StoreError> =
-        match value with
-        | "fail" -> Ok Divergence.Fail
-        | "truncate" -> Ok Divergence.Truncate
-        | other -> Error(Db.decodeFailure (nameof Divergence) $"unknown divergence policy {other}")
 
 /// <summary>
 /// The PostgreSQL command inbox.
@@ -108,7 +74,7 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
         match row.kind, correction with
         | "event", _ -> Ok CommandKind.Event
         | "correction", Some details ->
-            CommandMapping.divergenceFromString details.on_divergence
+            EnumCodec.decode EnumCodec.divergence details.on_divergence
             |> Result.map (fun divergence ->
                 CommandKind.Correction(
                     Db.fromTimestamp details.effective_at,
@@ -134,7 +100,7 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
         let event =
             row.event |> options.EventCodec.Decode |> Result.mapError Db.toStoreError
 
-        let status = row.status |> CommandMapping.statusFromString
+        let status = row.status |> EnumCodec.decode EnumCodec.commandStatus
         let kind = kindOf row correction
 
         match entityId, chartVersion, event, status, kind with
@@ -268,7 +234,7 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
                 submitCorrection,
                 common
                 @ [ "effective_at", Param.Timestamp at
-                    "on_divergence", Param.Text(CommandMapping.divergenceToString policy.OnDivergence)
+                    "on_divergence", Param.Text(EnumCodec.encode EnumCodec.divergence policy.OnDivergence)
                     "replay_limit", Param.Int policy.ReplayLimit ]
 
         StoreProgram.queryOne statement values (fun reader ->
@@ -283,11 +249,7 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
 
     let leaseUpdate statement values =
         CommandInboxProgram.leaseUpdate (
-            ReturnedOutcome(
-                statement,
-                values,
-                fun reader -> Row.string reader "outcome" |> CommandMapping.outcomeFromString
-            )
+            ReturnedOutcome(statement, values, EnumCodec.read Row.string EnumCodec.leaseOutcome "outcome")
         )
 
     interface ICommandInbox<'EntityId, 'Event> with

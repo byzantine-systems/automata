@@ -282,7 +282,7 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
             let! actions = decode options.ActionCodec row.actions
             let! fromState = decode options.StateCodec row.from_state
             let! toState = decode options.StateCodec row.to_state
-            let! status = Db.instanceStatusFromString row.status
+            let! status = EnumCodec.decode EnumCodec.instanceStatus row.status
             let! exited = decodePath "exited" row.exited
             let! entered = decodePath "entered" row.entered
 
@@ -316,7 +316,7 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                 options.StateCodec.Decode(Row.string reader "state")
                 |> Result.mapError Db.toStoreError
 
-            let! status = Db.instanceStatusFromString (Row.string reader "status")
+            let! status = EnumCodec.read Row.string EnumCodec.instanceStatus "status" reader
 
             return
                 { State = state
@@ -350,7 +350,7 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
             | Some error -> readFailure error
             | None -> Error(Db.decodeFailure (nameof CommandResult) "a failed command has no recorded error")
 
-        CommandMapping.statusFromString (Row.string reader "command_status")
+        EnumCodec.read Row.string EnumCodec.commandStatus "command_status" reader
         |> Result.bind (fun status ->
             match status, transition with
             | CommandStatus.Ready, _
@@ -366,8 +366,7 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
           "@entity_id", Param.Text target.Entity ]
 
     let finalizeTargetRow reader =
-        Row.string reader "status"
-        |> CommandMapping.statusFromString
+        EnumCodec.read Row.string EnumCodec.commandStatus "status" reader
         |> Result.map (fun status ->
             { Machine = Row.string reader "machine_id"
               Entity = Row.string reader "entity_id"
@@ -404,7 +403,7 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                 @ [ "@command_id", Param.Integer commandId
                     "@epoch", Param.Integer(int64 (Epoch.value epoch))
                     "@chart_version", Param.Integer target.Version
-                    "@status", Param.Text(Db.instanceStatusToString draft.Status)
+                    "@status", Param.Text(EnumCodec.encode EnumCodec.instanceStatus draft.Status)
                     "@effective_at", Param.Integer(Instant.ofDateTimeOffset draft.EffectiveAt)
                     "@now", Param.Integer now ]
 
@@ -459,7 +458,7 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                 StoreProgram.executeDiscard
                     closeCommand
                     [ "@command_id", Param.Integer commandId
-                      "@status", Param.Text(Resolution.status resolution) ]
+                      "@status", Param.Text(EnumCodec.encode EnumCodec.commandStatus (Resolution.status resolution)) ]
 
             do! StoreProgram.executeDiscard promoteHead (entityOf target)
         }

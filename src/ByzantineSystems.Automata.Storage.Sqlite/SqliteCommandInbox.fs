@@ -31,31 +31,11 @@ type CommandInboxOptions<'EntityId, 'Event> =
 [<RequireQualifiedAccess>]
 module internal CommandMapping =
 
-    let statusFromString (value: string) : Result<CommandStatus, StoreError> =
-        match value with
-        | "ready" -> Ok CommandStatus.Ready
-        | "leased" -> Ok CommandStatus.Leased
-        | "succeeded" -> Ok CommandStatus.Succeeded
-        | "rejected" -> Ok CommandStatus.Rejected
-        | "dead_letter" -> Ok CommandStatus.DeadLettered
-        | other -> Error(Db.decodeFailure (nameof CommandStatus) $"unknown command status {other}")
-
     /// The schema stores the empty string for an unsupplied audit field.
     let audit (value: string option) : string = defaultArg value ""
 
     /// The schema stores the empty string for an unsupplied audit field.
     let optional (value: string) : string option = if value = "" then None else Some value
-
-    let divergenceToString (divergence: Divergence) : string =
-        match divergence with
-        | Divergence.Fail -> "fail"
-        | Divergence.Truncate -> "truncate"
-
-    let divergenceFromString (value: string) : Result<Divergence, StoreError> =
-        match value with
-        | "fail" -> Ok Divergence.Fail
-        | "truncate" -> Ok Divergence.Truncate
-        | other -> Error(Db.decodeFailure (nameof Divergence) $"unknown divergence policy {other}")
 
     /// A fenced write changed one row or none, and none means the fence refused the caller.
     let leaseOutcome (changed: int) : LeaseUpdateOutcome =
@@ -136,7 +116,7 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
         match row.kind, correction with
         | "event", _ -> Ok CommandKind.Event
         | "correction", Some details ->
-            CommandMapping.divergenceFromString details.on_divergence
+            EnumCodec.decode EnumCodec.divergence details.on_divergence
             |> Result.map (fun divergence ->
                 CommandKind.Correction(
                     Instant.toDateTimeOffset details.effective_at,
@@ -164,7 +144,7 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
         let event =
             row.event |> options.EventCodec.Decode |> Result.mapError Db.toStoreError
 
-        let status = row.status |> CommandMapping.statusFromString
+        let status = row.status |> EnumCodec.decode EnumCodec.commandStatus
         let kind = kindOf row correction
 
         match entityId, chartVersion, event, status, kind with
@@ -268,7 +248,7 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
                         submitCorrection
                         [ "@command_id", Param.Integer(CommandId.value commandId)
                           "@effective_at", Param.Integer(Instant.ofDateTimeOffset at)
-                          "@on_divergence", Param.Text(CommandMapping.divergenceToString policy.OnDivergence)
+                          "@on_divergence", Param.Text(EnumCodec.encode EnumCodec.divergence policy.OnDivergence)
                           "@replay_limit", Param.Integer(int64 policy.ReplayLimit) ])
 
         // A correction is claimable at once and arrives now. Its effective time is stored beside it.

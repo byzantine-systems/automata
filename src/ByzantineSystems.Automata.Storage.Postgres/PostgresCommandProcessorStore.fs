@@ -190,7 +190,7 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
 
                 [ "error", Param.JsonbOrNull None
                   "state", Param.JsonbOrNull(Some encoded.ToJson)
-                  "instance_status", Param.TextOrNull(Some(Db.instanceStatusToString draft.Status))
+                  "instance_status", Param.TextOrNull(Some(EnumCodec.encode EnumCodec.instanceStatus draft.Status))
                   "effective_at", Param.TimestampOrNull(Some draft.EffectiveAt)
                   "event", Param.JsonbOrNull(Some encoded.EventJson)
                   "actions", Param.JsonbOrNull(Some encoded.ActionsJson)
@@ -218,7 +218,7 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
             ([ "command_id", Param.Bigint(CommandId.value commandId)
                "lease_token", Param.Bigint(LeaseToken.value token)
                "expected_epoch", Param.Bigint(int64 (Epoch.value expected))
-               "status", Param.Text(Resolution.status resolution)
+               "status", Param.Text(EnumCodec.encode EnumCodec.commandStatus (Resolution.status resolution))
                "action_queue", Param.Text options.ActionQueue ]
              @ ending)
             (finalizeOutcome expected)
@@ -303,30 +303,27 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     let toTransition
         (row: fsm.transition)
         : Result<CommittedTransition<'EntityId, 'State, 'Event, 'Action>, StoreError> =
-        let entityId =
-            row.entity_id
-            |> options.EntityIdDecode
-            |> Result.mapError (Db.decodeFailure "EntityId")
-
         let decode (codec: Codec<'T>) (json: string) =
             codec.Decode json |> Result.mapError Db.toStoreError
 
-        let chartVersion =
-            row.chart_version
-            |> ChartVersion.tryCreate
-            |> Result.mapError (Db.decodeFailure "ChartVersion")
+        result {
+            let! entityId =
+                row.entity_id
+                |> options.EntityIdDecode
+                |> Result.mapError (Db.decodeFailure "EntityId")
 
-        match
-            entityId,
-            decode options.EventCodec row.event,
-            decode options.ActionCodec row.actions,
-            decode options.StateCodec row.from_state,
-            decode options.StateCodec row.to_state,
-            Db.instanceStatusFromString row.status,
-            chartVersion
-        with
-        | Ok entityId, Ok event, Ok actions, Ok fromState, Ok toState, Ok status, Ok chartVersion ->
-            Ok
+            let! event = decode options.EventCodec row.event
+            let! actions = decode options.ActionCodec row.actions
+            let! fromState = decode options.StateCodec row.from_state
+            let! toState = decode options.StateCodec row.to_state
+            let! status = EnumCodec.decode EnumCodec.instanceStatus row.status
+
+            let! chartVersion =
+                row.chart_version
+                |> ChartVersion.tryCreate
+                |> Result.mapError (Db.decodeFailure "ChartVersion")
+
+            return
                 { Draft =
                     { MachineId = MachineId.create row.machine_id
                       EntityId = entityId
@@ -343,13 +340,7 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                   CommandId = CommandId.ofInt64 row.command_id
                   ChartVersion = chartVersion
                   CommittedAt = Db.fromTimestamp row.committed_at }
-        | Error error, _, _, _, _, _, _
-        | _, Error error, _, _, _, _, _
-        | _, _, Error error, _, _, _, _
-        | _, _, _, Error error, _, _, _
-        | _, _, _, _, Error error, _, _
-        | _, _, _, _, _, Error error, _
-        | _, _, _, _, _, _, Error error -> Error error
+        }
 
     /// The current belief, from the view's nullable columns. The view cannot carry NOT NULL, so
     /// each column is required here instead of assumed.
@@ -366,7 +357,7 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
 
             let! epoch = Db.required "Snapshot" "epoch" (optional reader.GetInt64 "epoch")
             let! state = options.StateCodec.Decode state |> Result.mapError Db.toStoreError
-            let! status = Db.instanceStatusFromString status
+            let! status = EnumCodec.decode EnumCodec.instanceStatus status
 
             return
                 { State = state
@@ -400,13 +391,16 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
             | Some error -> readFailure error
             | None -> Error(Db.decodeFailure (nameof CommandResult) "a failed command has no recorded error")
 
-        match Row.string reader "command_status", transition with
-        | ("ready" | "leased"), _ -> Ok CommandResult.Pending
-        | "succeeded", Some transition -> toTransition transition |> Result.map CommandResult.Committed
-        | "succeeded", None -> Error(Db.decodeFailure (nameof CommandResult) "a succeeded command has no transition")
-        | "rejected", _ -> failure () |> Result.map CommandResult.Rejected
-        | "dead_letter", _ -> failure () |> Result.map CommandResult.DeadLettered
-        | other, _ -> Error(Db.decodeFailure (nameof CommandResult) $"unknown command status {other}")
+        EnumCodec.read Row.string EnumCodec.commandStatus "command_status" reader
+        |> Result.bind (fun status ->
+            match status, transition with
+            | CommandStatus.Ready, _
+            | CommandStatus.Leased, _ -> Ok CommandResult.Pending
+            | CommandStatus.Succeeded, Some transition -> toTransition transition |> Result.map CommandResult.Committed
+            | CommandStatus.Succeeded, None ->
+                Error(Db.decodeFailure (nameof CommandResult) "a succeeded command has no transition")
+            | CommandStatus.Rejected, _ -> failure () |> Result.map CommandResult.Rejected
+            | CommandStatus.DeadLettered, _ -> failure () |> Result.map CommandResult.DeadLettered)
 
     interface IStateReader<'EntityId, 'State, 'Event, 'Action> with
 
@@ -515,7 +509,7 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                               "expected_epoch", Param.Bigint(int64 (Epoch.value expected))
                               "valid_from", Param.Timestamp commit.ValidFrom
                               "beliefs", Param.Jsonb beliefs
-                              "instance_status", Param.Text(Db.instanceStatusToString draft.Status)
+                              "instance_status", Param.Text(EnumCodec.encode EnumCodec.instanceStatus draft.Status)
                               "event", Param.Jsonb encoded.EventJson
                               "from_state", Param.Jsonb encoded.FromJson
                               "to_state", Param.Jsonb encoded.ToJson

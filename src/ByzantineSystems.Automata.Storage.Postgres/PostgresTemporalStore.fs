@@ -61,7 +61,7 @@ type PostgresTemporalStore<'EntityId, 'State>(options: TemporalOptions<'EntityId
 
             let! entityId = options.EntityIdDecode entity |> Result.mapError (Db.decodeFailure "EntityId")
             let! state = options.StateCodec.Decode state |> Result.mapError Db.toStoreError
-            let! status = Db.instanceStatusFromString status
+            let! status = EnumCodec.decode EnumCodec.instanceStatus status
 
             let! chartVersion =
                 ChartVersion.tryCreate chartVersion

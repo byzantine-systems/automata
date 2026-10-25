@@ -260,13 +260,6 @@ module internal Db =
     /// <summary>A boolean as the schema stores it. STRICT tables have no boolean type.</summary>
     let flag (value: bool) : int64 = if value then 1L else 0L
 
-    /// <summary>The instance lifecycle, as the status CHECK spells it.</summary>
-    let instanceStatusToString (status: InstanceStatus) : string =
-        match status with
-        | Running -> "running"
-        | Suspended -> "suspended"
-        | Terminated -> "terminated"
-
     let epochOf (value: int64) : Epoch = Epoch.ofUInt64 (uint64 value)
 
     let toStoreError (error: CodecError) : StoreError =
@@ -277,14 +270,6 @@ module internal Db =
     /// <summary>Wraps a decode failure carrying only a message as the serialization error the contract promises.</summary>
     let decodeFailure (typeName: string) (message: string) : StoreError =
         StoreError.Serialization(typeName, FormatException message)
-
-    /// <summary>The instance lifecycle, read back from the status CHECK's spelling.</summary>
-    let instanceStatusFromString (value: string) : Result<InstanceStatus, StoreError> =
-        match value with
-        | "running" -> Ok Running
-        | "suspended" -> Ok Suspended
-        | "terminated" -> Ok Terminated
-        | other -> Error(decodeFailure (nameof InstanceStatus) $"unknown instance status {other}")
 
 /// <summary>
 /// Column access by name.
