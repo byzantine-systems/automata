@@ -36,7 +36,10 @@ type MaintenanceOptions =
         NotifyEvery: TimeSpan
         /// <summary>How often a maintenance pass runs.</summary>
         RunEvery: TimeSpan
-        /// <summary>The most rows one pass deletes per task, so each pass is a short transaction.</summary>
+        /// <summary>
+        /// The most rows one pass deletes per task, from 1 through 1000, so each pass is a short
+        /// transaction.
+        /// </summary>
         Batch: int
         /// <summary>
         /// Whether drift in the derived blocked column is repaired as well as reported. Off by

@@ -36,7 +36,7 @@ type MachineStoreOptions<'EntityId, 'State, 'Event, 'Action, 'Err> =
         /// How long past its expiry a lease is left alone before maintenance hands it back to
         /// ready. It must exceed the processor's lease renewal margin, because a lease that
         /// expired and was not reclaimed may still be extended by its holder, and reaping takes
-        /// that away. Minutes, not seconds.
+        /// that away. Positive and provider-safe by construction; use minutes, not seconds.
         /// </summary>
         ReapAfter: LeaseDuration
         /// <summary>

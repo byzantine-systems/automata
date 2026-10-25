@@ -51,10 +51,15 @@ type ProcessorPolicyError =
 /// </summary>
 type ProcessorPolicy<'Err> =
     {
-        /// <summary>How many commands one poll claims. Never two for the same entity.</summary>
+        /// <summary>
+        /// How many commands one poll claims, from 1 through 1000. Never two for the same entity.
+        /// </summary>
         Batch: int
 
-        /// <summary>How long a claim is held before the database considers it abandoned.</summary>
+        /// <summary>
+        /// How long a claim is held before the database considers it abandoned. Positive and no
+        /// greater than <see cref="P:System.Int32.MaxValue" /> milliseconds.
+        /// </summary>
         Lease: TimeSpan
 
         /// <summary>

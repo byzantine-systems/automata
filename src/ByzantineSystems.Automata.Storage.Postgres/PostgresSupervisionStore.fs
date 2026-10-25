@@ -45,7 +45,7 @@ module PostgresSupervisionQueries =
     let private recent =
         StatementKey.create "supervision" "recent" |> Sql.prepareProgram
 
-    /// <summary>Lists the newest audit facts first.</summary>
+    /// <summary>Lists up to 1000 of the newest audit facts first.</summary>
     let listRecent
         (context: PostgresContext)
         (limit: ClaimBatch)
