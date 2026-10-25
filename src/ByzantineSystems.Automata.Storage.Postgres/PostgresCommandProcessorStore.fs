@@ -123,6 +123,10 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
 
     let context = options.Context
 
+    let encodeEntityId entityId =
+        options.EntityIdEncode entityId
+        |> ByzantineSystems.Automata.Storage.Internal.EntityKey.ofString
+
     let finalizeCommand = StatementKey.create "command" "finalize" |> Sql.prepareProgram
 
     let finalizeCorrection =
@@ -218,8 +222,8 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
 
         StoreProgram.queryOne
             finalizeCommand
-            ([ "command_id", Param.Bigint(CommandId.value commandId)
-               "lease_token", Param.Bigint(LeaseToken.value token)
+            ([ Params.commandId "command_id" commandId
+               Params.commandLease "lease_token" token
                "expected_epoch", Param.Bigint(int64 (Epoch.value expected))
                "status", Param.Text(EnumCodec.encode EnumCodec.commandStatus (Resolution.status resolution))
                "action_queue", Param.Text options.ActionQueue ]
@@ -433,8 +437,8 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                 context
                 (StoreProgram.tryQueryOne
                     currentBelief
-                    [ "machine_id", Param.Text(MachineId.value machineId)
-                      "entity_id", Param.Text(options.EntityIdEncode entityId) ]
+                    [ Params.machineId "machine_id" machineId
+                      Params.entityKey "entity_id" (encodeEntityId entityId) ]
                     snapshotRow)
                 ct
 
@@ -450,8 +454,8 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                 context
                 (StoreProgram.queryRows
                     historyPage
-                    [ "machine_id", Param.Text(MachineId.value machineId)
-                      "entity_id", Param.Text(options.EntityIdEncode entityId)
+                    [ Params.machineId "machine_id" machineId
+                      Params.entityKey "entity_id" (encodeEntityId entityId)
                       "after", Param.Bigint after
                       "limit", Param.Int(Page.limit paging) ]
                     (transitionRow >> toTransition))
@@ -473,10 +477,7 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
         member _.TryGetResult(commandId, ct) =
             Sql.readProgram
                 context
-                (StoreProgram.tryQueryOne
-                    transitionResult
-                    [ "command_id", Param.Bigint(CommandId.value commandId) ]
-                    resultRow)
+                (StoreProgram.tryQueryOne transitionResult [ Params.commandId "command_id" commandId ] resultRow)
                 ct
 
     interface IReplayStore<'EntityId, 'State, 'Event, 'Action> with
@@ -488,8 +489,8 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                     let! suffix =
                         StoreProgram.queryRows
                             transitionSuffix
-                            [ "machine_id", Param.Text(MachineId.value machineId)
-                              "entity_id", Param.Text(options.EntityIdEncode entityId)
+                            [ Params.machineId "machine_id" machineId
+                              Params.entityKey "entity_id" (encodeEntityId entityId)
                               "from", Param.Timestamp from
                               "limit", Param.Int limit ]
                             (transitionRow >> toTransition)
@@ -500,8 +501,8 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                     let! oldest =
                         StoreProgram.tryQueryOne
                             transitionOldest
-                            [ "machine_id", Param.Text(MachineId.value machineId)
-                              "entity_id", Param.Text(options.EntityIdEncode entityId) ]
+                            [ Params.machineId "machine_id" machineId
+                              Params.entityKey "entity_id" (encodeEntityId entityId) ]
                             (transitionRow >> Ok)
 
                     let incomplete =
@@ -528,8 +529,8 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                         context
                         (StoreProgram.queryOne
                             finalizeCorrection
-                            [ "command_id", Param.Bigint(CommandId.value commandId)
-                              "lease_token", Param.Bigint(LeaseToken.value token)
+                            [ Params.commandId "command_id" commandId
+                              Params.commandLease "lease_token" token
                               "expected_epoch", Param.Bigint(int64 (Epoch.value expected))
                               "valid_from", Param.Timestamp commit.ValidFrom
                               "beliefs", Param.Jsonb beliefs

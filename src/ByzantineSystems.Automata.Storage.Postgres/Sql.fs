@@ -5,6 +5,7 @@ open System.Collections.Concurrent
 open System.Threading
 open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
+open ByzantineSystems.Automata.Storage
 open ByzantineSystems.Automata.Storage.Internal
 open Npgsql
 open NpgsqlTypes
@@ -45,6 +46,21 @@ type internal Param =
     | JsonbOrNull of string option
     | TimestampOrNull of DateTimeOffset option
     | TextArrayOrNull of string list option
+
+/// <summary>Typed identifiers at the PostgreSQL parameter boundary.</summary>
+[<RequireQualifiedAccess>]
+module internal Params =
+
+    let machineId name (value: MachineId) = name, Param.Text(MachineId.value value)
+
+    let entityKey name (value: ByzantineSystems.Automata.Storage.Internal.EntityKey) =
+        name, Param.Text(ByzantineSystems.Automata.Storage.Internal.EntityKey.value value)
+
+    let commandId name (value: CommandId) =
+        name, Param.Bigint(CommandId.value value)
+
+    let commandLease name (value: LeaseToken<CommandWork>) =
+        name, Param.Bigint(LeaseToken.value value)
 
 /// <summary>The statements, reads and runners the PostgreSQL stores are written with.</summary>
 [<RequireQualifiedAccess>]

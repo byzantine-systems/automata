@@ -87,10 +87,10 @@ module internal ReplayMapping =
 
 /// <summary>What finalizing reads about a command before deciding anything.</summary>
 type internal FinalizeTarget =
-    { Machine: string
-      Entity: string
+    { Machine: MachineId
+      Entity: ByzantineSystems.Automata.Storage.Internal.EntityKey
       Status: CommandStatus
-      Holder: int64
+      Holder: LeaseToken<CommandWork>
       Version: int64 }
 
 /// <summary>
@@ -120,7 +120,7 @@ type internal LeaseStanding =
 [<RequireQualifiedAccess>]
 module internal LeaseStanding =
 
-    let classify (held: int64) (target: FinalizeTarget option) : LeaseStanding =
+    let classify (held: LeaseToken<CommandWork>) (target: FinalizeTarget option) : LeaseStanding =
         match target with
         | None -> Unknown
         | Some target ->
@@ -157,6 +157,10 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     (options: CommandProcessorOptions<'EntityId, 'State, 'Event, 'Action, 'Err>) =
 
     let context = options.Context
+
+    let encodeEntityId entityId =
+        options.EntityIdEncode entityId
+        |> ByzantineSystems.Automata.Storage.Internal.EntityKey.ofString
 
     let statement domain operation =
         StatementKey.create domain operation |> Sql.prepareProgram
@@ -382,17 +386,27 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
             | CommandStatus.DeadLettered, _ -> failure () |> Result.map CommandResult.DeadLettered)
 
     let entityOf (target: FinalizeTarget) =
-        [ "@machine_id", Param.Text target.Machine
-          "@entity_id", Param.Text target.Entity ]
+        [ Params.machineId "@machine_id" target.Machine
+          Params.entityKey "@entity_id" target.Entity ]
 
     let finalizeTargetRow reader =
-        EnumCodec.read Row.string EnumCodec.commandStatus "status" reader
-        |> Result.map (fun status ->
-            { Machine = Row.string reader "machine_id"
-              Entity = Row.string reader "entity_id"
-              Status = status
-              Holder = Row.int64 reader "lease_token"
-              Version = Row.int64 reader "chart_version" })
+        result {
+            let! status = EnumCodec.read Row.string EnumCodec.commandStatus "status" reader
+
+            let! machine =
+                Row.string reader "machine_id"
+                |> MachineId.tryCreate
+                |> Result.mapError (Db.decodeFailure "MachineId")
+
+            return
+                { Machine = machine
+                  Entity =
+                    Row.string reader "entity_id"
+                    |> ByzantineSystems.Automata.Storage.Internal.EntityKey.ofString
+                  Status = status
+                  Holder = Row.int64 reader "lease_token" |> LeaseToken.ofInt64
+                  Version = Row.int64 reader "chart_version" }
+        }
 
     /// The entity's current epoch: the initial one when it has never committed.
     let currentEpoch
@@ -409,7 +423,7 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     /// </summary>
     let append
         (now: int64)
-        (commandId: int64)
+        (commandId: CommandId)
         (target: FinalizeTarget)
         (epoch: Epoch)
         (encoded: EncodedDraft<'EntityId, 'State, 'Event, 'Action>)
@@ -420,7 +434,7 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
 
             let written =
                 entity
-                @ [ "@command_id", Param.Integer commandId
+                @ [ Params.commandId "@command_id" commandId
                     "@epoch", Param.Integer(int64 (Epoch.value epoch))
                     "@chart_version", Param.Integer target.Version
                     "@status", Param.Text(EnumCodec.encode EnumCodec.instanceStatus draft.Status)
@@ -445,7 +459,7 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                 StoreProgram.executeDiscard
                     enqueueActions
                     (entity
-                     @ [ "@command_id", Param.Integer commandId
+                     @ [ Params.commandId "@command_id" commandId
                          "@epoch", Param.Integer(int64 (Epoch.value epoch))
                          "@actions", Param.Text encoded.ActionsJson
                          "@now", Param.Integer now ])
@@ -454,12 +468,12 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     /// The encoded failure of a rejected or dead-lettered command.
     let recordError
         (now: int64)
-        (commandId: int64)
+        (commandId: CommandId)
         (error: string)
         : StoreProgram<WriteAccess, (string * Param) list, SqliteDataReader, unit> =
         StoreProgram.executeDiscard
             insertError
-            [ "@command_id", Param.Integer commandId
+            [ Params.commandId "@command_id" commandId
               "@error", Param.Text error
               "@now", Param.Integer now ]
 
@@ -469,7 +483,7 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     /// be re-elected.
     /// </summary>
     let close
-        (commandId: int64)
+        (commandId: CommandId)
         (target: FinalizeTarget)
         (resolution: Resolution<'EntityId, 'State, 'Event, 'Action>)
         : StoreProgram<WriteAccess, (string * Param) list, SqliteDataReader, unit> =
@@ -477,7 +491,7 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
             do!
                 StoreProgram.executeDiscard
                     closeCommand
-                    [ "@command_id", Param.Integer commandId
+                    [ Params.commandId "@command_id" commandId
                       "@status", Param.Text(EnumCodec.encode EnumCodec.commandStatus (Resolution.status resolution)) ]
 
             do! StoreProgram.executeDiscard promoteHead (entityOf target)
@@ -492,7 +506,7 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     /// </summary>
     let resolve
         (now: int64)
-        (commandId: int64)
+        (commandId: CommandId)
         (target: FinalizeTarget)
         (resolution: Resolution<'EntityId, 'State, 'Event, 'Action>)
         : StoreProgram<WriteAccess, (string * Param) list, SqliteDataReader, FinalizeOutcome> =
@@ -526,26 +540,30 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
         (resolution: Resolution<'EntityId, 'State, 'Event, 'Action>)
         (ct: CancellationToken)
         : Task<Result<FinalizeOutcome, StoreError>> =
-        let id = CommandId.value commandId
-
         Sql.writeProgramWith
             context
             (fun now ->
                 store {
                     let! read =
-                        StoreProgram.tryQueryOne finalizeRead [ "@command_id", Param.Integer id ] finalizeTargetRow
+                        StoreProgram.tryQueryOne
+                            finalizeRead
+                            [ Params.commandId "@command_id" commandId ]
+                            finalizeTargetRow
 
-                    match LeaseStanding.classify (LeaseToken.value token) read with
-                    | Unknown -> return! StoreProgram.fail (StoreError.NotFound $"command %d{id}")
+                    match LeaseStanding.classify token read with
+                    | Unknown ->
+                        return! StoreProgram.fail (StoreError.NotFound $"command %d{CommandId.value commandId}")
                     | FinishedByCaller ->
                         let! committed =
-                            StoreProgram.tryQueryOne committedEpoch [ "@command_id", Param.Integer id ] (fun reader ->
-                                Row.int64 reader "epoch" |> Db.epochOf |> Ok)
+                            StoreProgram.tryQueryOne
+                                committedEpoch
+                                [ Params.commandId "@command_id" commandId ]
+                                (fun reader -> Row.int64 reader "epoch" |> Db.epochOf |> Ok)
 
                         return AlreadyFinalized(committed |> Option.defaultValue (Resolution.unmoved resolution))
                     | FinishedByAnother
                     | HeldByAnother -> return FinalizeOutcome.LeaseLost
-                    | HeldByCaller target -> return! resolve now id target resolution
+                    | HeldByCaller target -> return! resolve now commandId target resolution
                 })
             ct
 
@@ -566,8 +584,8 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                 context
                 (StoreProgram.tryQueryOne
                     entitySnapshot
-                    [ "@machine_id", Param.Text(MachineId.value machineId)
-                      "@entity_id", Param.Text(options.EntityIdEncode entityId) ]
+                    [ Params.machineId "@machine_id" machineId
+                      Params.entityKey "@entity_id" (encodeEntityId entityId) ]
                     snapshotRow)
                 ct
 
@@ -583,8 +601,8 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                 context
                 (StoreProgram.queryRows
                     historyPage
-                    [ "@machine_id", Param.Text(MachineId.value machineId)
-                      "@entity_id", Param.Text(options.EntityIdEncode entityId)
+                    [ Params.machineId "@machine_id" machineId
+                      Params.entityKey "@entity_id" (encodeEntityId entityId)
                       "@after", Param.Integer after
                       "@limit", Param.Integer(int64 (Page.limit paging)) ]
                     (transitionRow >> toTransition))
@@ -608,8 +626,5 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
         member _.TryGetResult(commandId, ct) =
             Sql.readProgram
                 context
-                (StoreProgram.tryQueryOne
-                    commandResult
-                    [ "@command_id", Param.Integer(CommandId.value commandId) ]
-                    resultRow)
+                (StoreProgram.tryQueryOne commandResult [ Params.commandId "@command_id" commandId ] resultRow)
                 ct

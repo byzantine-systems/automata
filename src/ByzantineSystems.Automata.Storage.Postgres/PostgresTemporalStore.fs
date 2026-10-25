@@ -37,6 +37,10 @@ type PostgresTemporalStore<'EntityId, 'State>(options: TemporalOptions<'EntityId
 
     let context = options.Context
 
+    let encodeEntityId entityId =
+        options.EntityIdEncode entityId
+        |> ByzantineSystems.Automata.Storage.Internal.EntityKey.ofString
+
     let beliefAsOf = StatementKey.create "belief" "as_of" |> Sql.prepareProgram
     let correctBeliefs = StatementKey.create "belief" "correct" |> Sql.prepareProgram
 
@@ -111,8 +115,8 @@ type PostgresTemporalStore<'EntityId, 'State>(options: TemporalOptions<'EntityId
             context
             (StoreProgram.tryQueryOne
                 beliefAsOf
-                [ "machine_id", Param.Text(MachineId.value machineId)
-                  "entity_id", Param.Text(options.EntityIdEncode entityId)
+                [ Params.machineId "machine_id" machineId
+                  Params.entityKey "entity_id" (encodeEntityId entityId)
                   "valid_at", Param.Timestamp validAt
                   "known_at", Param.Timestamp knownAt ]
                 beliefRow)
@@ -141,8 +145,8 @@ type PostgresTemporalStore<'EntityId, 'State>(options: TemporalOptions<'EntityId
                         context
                         (StoreProgram.queryOne
                             correctBeliefs
-                            [ "machine_id", Param.Text(MachineId.value machineId)
-                              "entity_id", Param.Text(options.EntityIdEncode entityId)
+                            [ Params.machineId "machine_id" machineId
+                              Params.entityKey "entity_id" (encodeEntityId entityId)
                               "valid_from", Param.Timestamp validFrom
                               "beliefs", Param.Jsonb payload ]
                             (fun reader -> Row.int32 reader "superseded" |> Ok))

@@ -87,6 +87,10 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
 
     let context = options.Context
 
+    let encodeEntityId entityId =
+        options.EntityIdEncode entityId
+        |> ByzantineSystems.Automata.Storage.Internal.EntityKey.ofString
+
     let findByKey = StatementKey.create "command" "find_by_key" |> Sql.prepareProgram
     let commandById = StatementKey.create "command" "by_id" |> Sql.prepareProgram
 
@@ -208,38 +212,43 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
               DeliveryCount = int row.read_ct
               ExpiresAt = record.VisibleAt })
 
-    let findExisting (machineId: MachineId) (entityId: string) (idempotencyKey: string) (ct: CancellationToken) =
+    let findExisting
+        (machineId: MachineId)
+        (entityId: ByzantineSystems.Automata.Storage.Internal.EntityKey)
+        (idempotencyKey: string)
+        (ct: CancellationToken)
+        =
         Sql.readProgram
             context
             (StoreProgram.tryQueryOne
                 commandByKey
-                [ "@machine_id", Param.Text(MachineId.value machineId)
-                  "@entity_id", Param.Text entityId
+                [ Params.machineId "@machine_id" machineId
+                  Params.entityKey "@entity_id" entityId
                   "@idempotency_key", Param.Text idempotencyKey ]
                 recordRow)
             ct
 
     let submit
         (submission: CommandSubmission<'EntityId, 'Event>)
-        (entityId: string)
+        (entityId: ByzantineSystems.Automata.Storage.Internal.EntityKey)
         (encodedEvent: string)
         (now: int64)
         : StoreProgram<WriteAccess, (string * Param) list, SqliteDataReader, SubmissionOutcome> =
-        let machineId = MachineId.value submission.MachineId
+        let machineId = submission.MachineId
         let version = ChartVersion.value submission.ChartVersion
 
         let existing =
             StoreProgram.tryQueryOne
                 findByKey
-                [ "@machine_id", Param.Text machineId
-                  "@entity_id", Param.Text entityId
+                [ Params.machineId "@machine_id" machineId
+                  Params.entityKey "@entity_id" entityId
                   "@idempotency_key", Param.Text submission.IdempotencyKey ]
                 (fun reader -> Ok(Row.int64 reader "command_id" |> CommandId.ofInt64))
 
         let registered =
             StoreProgram.tryQueryOne
                 chartByVersion
-                [ "@machine_id", Param.Text machineId
+                [ Params.machineId "@machine_id" machineId
                   "@version", Param.Integer(int64 version) ]
                 (fun reader -> Ok(Row.string reader "fingerprint"))
             |> StoreProgram.map Option.isSome
@@ -252,7 +261,7 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
                 Some(fun commandId ->
                     StoreProgram.executeDiscard
                         submitCorrection
-                        [ "@command_id", Param.Integer(CommandId.value commandId)
+                        [ Params.commandId "@command_id" commandId
                           "@effective_at", Param.Integer(Instant.ofDateTimeOffset at)
                           "@on_divergence", Param.Text(EnumCodec.encode EnumCodec.divergence policy.OnDivergence)
                           "@replay_limit", Param.Integer(int64 policy.ReplayLimit) ])
@@ -272,8 +281,8 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
         let insert =
             StoreProgram.queryOne
                 submitCommand
-                [ "@machine_id", Param.Text machineId
-                  "@entity_id", Param.Text entityId
+                [ Params.machineId "@machine_id" machineId
+                  Params.entityKey "@entity_id" entityId
                   "@idempotency_key", Param.Text submission.IdempotencyKey
                   "@chart_version", Param.Integer(int64 version)
                   "@event", Param.Text encodedEvent
@@ -290,7 +299,7 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
         CheckedSubmission(
             existing,
             registered,
-            StoreError.NotFound $"chart version %d{version} of machine %s{machineId}",
+            StoreError.NotFound $"chart version %d{version} of machine %s{MachineId.value machineId}",
             insert,
             correction
         )
@@ -308,7 +317,7 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
             return!
                 StoreProgram.queryRows
                     claimCommands
-                    [ "@machine_id", Param.Text(MachineId.value machineId)
+                    [ Params.machineId "@machine_id" machineId
                       "@batch", Param.Integer(int64 batch)
                       "@now", Param.Integer now
                       "@deadline", Param.Integer(Instant.add now lease)
@@ -319,7 +328,7 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
     interface ICommandInbox<'EntityId, 'Event> with
 
         member _.Submit(submission, ct) =
-            let entityId = options.EntityIdEncode submission.EntityId
+            let entityId = encodeEntityId submission.EntityId
 
             // Encoded before the write begins, so the transaction only writes.
             backgroundTaskResult {
@@ -347,8 +356,8 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
                     CommandInboxProgram.leaseUpdate (
                         ChangedRows(
                             rescheduleCommand,
-                            [ "@command_id", Param.Integer(CommandId.value commandId)
-                              "@lease_token", Param.Integer(LeaseToken.value leaseToken)
+                            [ Params.commandId "@command_id" commandId
+                              Params.commandLease "@lease_token" leaseToken
                               "@now", Param.Integer now
                               "@base_us", Param.Integer(CommandMapping.micros (Backoff.baseDelay backoff))
                               "@cap_us", Param.Integer(CommandMapping.micros (Backoff.ceiling backoff)) ]
@@ -366,8 +375,8 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
                     CommandInboxProgram.leaseUpdate (
                         ChangedRows(
                             extendLease,
-                            [ "@command_id", Param.Integer(CommandId.value commandId)
-                              "@lease_token", Param.Integer(LeaseToken.value leaseToken)
+                            [ Params.commandId "@command_id" commandId
+                              Params.commandLease "@lease_token" leaseToken
                               "@deadline", Param.Integer(Instant.add now lease) ]
                         )
                     ))
@@ -376,11 +385,8 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
         member _.TryGet(commandId, ct) =
             Sql.readProgram
                 context
-                (StoreProgram.tryQueryOne
-                    commandById
-                    [ "@command_id", Param.Integer(CommandId.value commandId) ]
-                    recordRow)
+                (StoreProgram.tryQueryOne commandById [ Params.commandId "@command_id" commandId ] recordRow)
                 ct
 
         member _.TryFind(machineId, entityId, idempotencyKey, ct) =
-            findExisting machineId (options.EntityIdEncode entityId) idempotencyKey ct
+            findExisting machineId (encodeEntityId entityId) idempotencyKey ct

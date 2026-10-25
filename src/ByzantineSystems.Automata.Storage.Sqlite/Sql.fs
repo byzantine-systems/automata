@@ -5,6 +5,7 @@ open System.Collections.Concurrent
 open System.Threading
 open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
+open ByzantineSystems.Automata.Storage
 open ByzantineSystems.Automata.Storage.Internal
 open Microsoft.Data.Sqlite
 
@@ -35,6 +36,21 @@ type internal Param =
     | Integer of int64
     | Text of string
     | TextOrNull of string option
+
+/// <summary>Typed identifiers at the SQLite parameter boundary.</summary>
+[<RequireQualifiedAccess>]
+module internal Params =
+
+    let machineId name (value: MachineId) = name, Param.Text(MachineId.value value)
+
+    let entityKey name (value: ByzantineSystems.Automata.Storage.Internal.EntityKey) =
+        name, Param.Text(ByzantineSystems.Automata.Storage.Internal.EntityKey.value value)
+
+    let commandId name (value: CommandId) =
+        name, Param.Integer(CommandId.value value)
+
+    let commandLease name (value: LeaseToken<CommandWork>) =
+        name, Param.Integer(LeaseToken.value value)
 
 /// <summary>
 /// The statements, reads and runners the SQLite stores are written with. Parameters are named

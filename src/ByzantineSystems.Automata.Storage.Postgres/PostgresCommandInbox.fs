@@ -46,6 +46,10 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
 
     let context = options.Context
 
+    let encodeEntityId entityId =
+        options.EntityIdEncode entityId
+        |> ByzantineSystems.Automata.Storage.Internal.EntityKey.ofString
+
     let submitCommand = StatementKey.create "command" "submit" |> Sql.prepareProgram
 
     let submitCorrection =
@@ -197,7 +201,7 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
 
     let findExisting
         (machineId: MachineId)
-        (entityId: string)
+        (entityId: ByzantineSystems.Automata.Storage.Internal.EntityKey)
         (idempotencyKey: string)
         (ct: CancellationToken)
         : Task<Result<CommandRecord<'EntityId, 'Event> option, StoreError>> =
@@ -205,8 +209,8 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
             context
             (StoreProgram.tryQueryOne
                 commandByKey
-                [ "machine_id", Param.Text(MachineId.value machineId)
-                  "entity_id", Param.Text entityId
+                [ Params.machineId "machine_id" machineId
+                  Params.entityKey "entity_id" entityId
                   "idempotency_key", Param.Text idempotencyKey ]
                 recordRow)
             ct
@@ -216,10 +220,14 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
     /// corrects in the same transaction. It is claimable at once and arrives now: its effective
     /// time is the instant it corrects, which the routine stores beside it.
     /// </summary>
-    let submit (submission: CommandSubmission<'EntityId, 'Event>) (encodedEvent: string) (entityId: string) =
+    let submit
+        (submission: CommandSubmission<'EntityId, 'Event>)
+        (encodedEvent: string)
+        (entityId: ByzantineSystems.Automata.Storage.Internal.EntityKey)
+        =
         let common =
-            [ "machine_id", Param.Text(MachineId.value submission.MachineId)
-              "entity_id", Param.Text entityId
+            [ Params.machineId "machine_id" submission.MachineId
+              Params.entityKey "entity_id" entityId
               "idempotency_key", Param.Text submission.IdempotencyKey
               "chart_version", Param.Int(ChartVersion.value submission.ChartVersion)
               "event", Param.Jsonb encodedEvent
@@ -261,7 +269,7 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
     interface ICommandInbox<'EntityId, 'Event> with
 
         member _.Submit(submission, ct) =
-            let entityId = options.EntityIdEncode submission.EntityId
+            let entityId = encodeEntityId submission.EntityId
 
             backgroundTaskResult {
                 let! encodedEvent = options.EventCodec.Encode submission.Event |> Result.mapError Db.toStoreError
@@ -309,7 +317,7 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
                 context
                 (StoreProgram.queryRows
                     claimCommands
-                    [ "machine_id", Param.Text(MachineId.value machineId)
+                    [ Params.machineId "machine_id" machineId
                       "batch", Param.Int batch
                       "lease", Param.Interval lease ]
                     leasedRow)
@@ -320,8 +328,8 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
                 context
                 (leaseUpdate
                     rescheduleCommand
-                    [ "command_id", Param.Bigint(CommandId.value commandId)
-                      "lease_token", Param.Bigint(LeaseToken.value leaseToken)
+                    [ Params.commandId "command_id" commandId
+                      Params.commandLease "lease_token" leaseToken
                       "base_ms", Param.Int(int (Backoff.baseDelay backoff).TotalMilliseconds)
                       "cap_ms", Param.Int(int (Backoff.ceiling backoff).TotalMilliseconds) ])
                 ct
@@ -334,19 +342,16 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
                 context
                 (leaseUpdate
                     extendLease
-                    [ "command_id", Param.Bigint(CommandId.value commandId)
-                      "lease_token", Param.Bigint(LeaseToken.value leaseToken)
+                    [ Params.commandId "command_id" commandId
+                      Params.commandLease "lease_token" leaseToken
                       "lease", Param.Interval lease ])
                 ct
 
         member _.TryGet(commandId, ct) =
             Sql.readProgram
                 context
-                (StoreProgram.tryQueryOne
-                    commandById
-                    [ "command_id", Param.Bigint(CommandId.value commandId) ]
-                    recordRow)
+                (StoreProgram.tryQueryOne commandById [ Params.commandId "command_id" commandId ] recordRow)
                 ct
 
         member _.TryFind(machineId, entityId, idempotencyKey, ct) =
-            findExisting machineId (options.EntityIdEncode entityId) idempotencyKey ct
+            findExisting machineId (encodeEntityId entityId) idempotencyKey ct
