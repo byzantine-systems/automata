@@ -155,65 +155,187 @@ let spec (strategy: RestartStrategy) (intensity: int) (period: TimeSpan) (childr
       Period = period
       Children = children }
 
+// A supervisor specification is generated as raw choices over small tables, so every defect
+// class - and the boundaries between them, like a startup timeout of exactly ten milliseconds -
+// is reachable, and the oracle below recomputes the exact error list from the documented
+// contract rather than from validate's own code.
+
+type private ChildChoices =
+    { IdPick: int
+      DelayPick: int
+      ShutdownPick: int
+      HasStartup: bool
+      AttemptsPick: int
+      BasePick: int
+      MaxDeltaPick: int
+      TimeoutPick: int }
+
+type private SpecChoices =
+    { IntensityPick: int
+      PeriodPick: int
+      Children: ChildChoices list }
+
+let private norm (m: int) (raw: int) = ((raw % m) + m) % m
+let private ms (value: float) = TimeSpan.FromMilliseconds value
+let private pickOf (table: 'a[]) (raw: int) = table[norm table.Length raw]
+
+let private intensities = [| 1; 0; -3 |]
+let private periods = [| ms 10000.; TimeSpan.Zero; ms -1000. |]
+let private ids = [| "alpha"; "beta"; ""; " " |]
+let private delays = [| TimeSpan.Zero; ms 1000.; ms -1000. |]
+let private attempts = [| 3; 1; 0; -2 |]
+let private baseDelays = [| TimeSpan.Zero; ms 5.; ms -1. |]
+let private maxDeltas = [| ms 10.; TimeSpan.Zero; ms -10. |]
+
+let private timeouts =
+    [| ms 100.
+       TimeSpan.Zero
+       ms 5.
+       TimeSpan.FromDays 2.
+       ms 10.
+       TimeSpan.FromDays 1. |]
+
+let private childFrom (child: ChildChoices) : ChildSpec =
+    let baseDelay = pickOf baseDelays child.BasePick
+
+    { Id = pickOf ids child.IdPick
+      Start = fun _ -> Task.FromResult(Unchecked.defaultof<ISupervisedChild>)
+      Restart = Permanent
+      RestartDelay = pickOf delays child.DelayPick
+      Shutdown = pickOf delays child.ShutdownPick
+      StartupRetry =
+        if not child.HasStartup then
+            None
+        else
+            Some
+                { MaxAttempts = pickOf attempts child.AttemptsPick
+                  BaseDelay = baseDelay
+                  MaxDelay = baseDelay + (pickOf maxDeltas child.MaxDeltaPick)
+                  UseJitter = false
+                  StartupTimeout = pickOf timeouts child.TimeoutPick } }
+
+let private specFrom (choices: SpecChoices) : SupervisorSpec =
+    { Strategy = OneForOne
+      Intensity = pickOf intensities choices.IntensityPick
+      Period = pickOf periods choices.PeriodPick
+      Children = choices.Children |> List.truncate 3 |> List.map childFrom }
+
+/// Every defect the contract says validation reports, in the order it reports them:
+/// supervisor-level first, then per child, identity before timing before startup policy.
+let private expectedOf (choices: SpecChoices) =
+    let spec = specFrom choices
+
+    let topErrors =
+        [ if spec.Intensity < 1 then
+              IntensityBelowOne spec.Intensity
+
+          if spec.Period <= TimeSpan.Zero then
+              PeriodNotPositive spec.Period ]
+
+    let childErrors, _ =
+        spec.Children
+        |> List.fold
+            (fun (errors, seen) child ->
+                let idErrors, seen =
+                    if String.IsNullOrWhiteSpace child.Id then
+                        [ ChildIdEmpty ], seen
+                    elif Set.contains child.Id seen then
+                        [ DuplicateChildId child.Id ], seen
+                    else
+                        [], Set.add child.Id seen
+
+                let timingErrors =
+                    [ if child.RestartDelay < TimeSpan.Zero then
+                          RestartDelayNegative(child.Id, child.RestartDelay)
+
+                      if child.Shutdown < TimeSpan.Zero then
+                          ShutdownNegative(child.Id, child.Shutdown) ]
+
+                let startupErrors =
+                    match child.StartupRetry with
+                    | None -> []
+                    | Some startup ->
+                        [ if startup.MaxAttempts < 1 then
+                              StartupMaxAttemptsBelowOne(child.Id, startup.MaxAttempts)
+
+                          if startup.BaseDelay < TimeSpan.Zero || startup.MaxDelay < startup.BaseDelay then
+                              StartupDelayInvalid(child.Id, startup.BaseDelay, startup.MaxDelay)
+
+                          if startup.StartupTimeout <= TimeSpan.Zero then
+                              StartupTimeoutNotPositive(child.Id, startup.StartupTimeout)
+                          elif startup.StartupTimeout < ms 10. || startup.StartupTimeout > TimeSpan.FromDays 1. then
+                              StartupTimeoutOutOfRange(child.Id, startup.StartupTimeout) ]
+
+                errors @ idErrors @ timingErrors @ startupErrors, seen)
+            (topErrors, Set.empty)
+
+    if childErrors.IsEmpty then Ok spec else Error childErrors
+
+let private randomSpecChoices (seed: int) : SpecChoices =
+    let rng = Random seed
+
+    let child () : ChildChoices =
+        { IdPick = rng.Next()
+          DelayPick = rng.Next()
+          ShutdownPick = rng.Next()
+          HasStartup = rng.Next 2 = 1
+          AttemptsPick = rng.Next()
+          BasePick = rng.Next()
+          MaxDeltaPick = rng.Next()
+          TimeoutPick = rng.Next() }
+
+    { IntensityPick = rng.Next()
+      PeriodPick = rng.Next()
+      Children = List.init (rng.Next 4) (fun _ -> child ()) }
+
+let private defectKind =
+    function
+    | ChildIdEmpty -> "child-id-empty"
+    | DuplicateChildId _ -> "duplicate-child-id"
+    | IntensityBelowOne _ -> "intensity-below-one"
+    | PeriodNotPositive _ -> "period-not-positive"
+    | RestartDelayNegative _ -> "restart-delay-negative"
+    | ShutdownNegative _ -> "shutdown-negative"
+    | StartupMaxAttemptsBelowOne _ -> "startup-attempts-below-one"
+    | StartupDelayInvalid _ -> "startup-delay-invalid"
+    | StartupTimeoutNotPositive _ -> "startup-timeout-not-positive"
+    | StartupTimeoutOutOfRange _ -> "startup-timeout-out-of-range"
+
 let validationTests =
     testList
         "Supervisor.validate"
-        [ test "a sound spec passes" {
-              let child = mkChildSpec "only" [ Run ] Permanent (ResizeArray()) (ResizeArray())
-              Expect.isOk (Supervisor.validate (spec OneForOne 5 (TimeSpan.FromSeconds 10.) [ child ])) "valid spec"
-          }
+        [ Property.property
+              "validation reports exactly every structural defect, in order"
+              (fun (choices: SpecChoices) ->
+                  match Supervisor.validate (specFrom choices), expectedOf choices with
+                  | Ok _, Ok _ -> true
+                  | Error actual, Error expected -> actual = expected
+                  | _ -> false)
 
-          test "duplicate ids and weak intensity are rejected" {
-              let child = mkChildSpec "dup" [ Run ] Permanent (ResizeArray()) (ResizeArray())
+          test "the generated specs reach every defect class" {
+              let classes =
+                  seq { 0..299 }
+                  |> Seq.collect (fun seed ->
+                      match expectedOf (randomSpecChoices seed) with
+                      | Ok _ -> [ "ok" ]
+                      | Error errors -> errors |> List.map defectKind)
+                  |> Set.ofSeq
 
-              match Supervisor.validate (spec OneForOne 0 TimeSpan.Zero [ child; child ]) with
-              | Error errors ->
-                  Expect.contains errors (DuplicateChildId "dup") "duplicate child ids"
-                  Expect.contains errors (IntensityBelowOne 0) "intensity below one"
-                  Expect.contains errors (PeriodNotPositive TimeSpan.Zero) "period not positive"
-              | Ok _ -> failtest "expected defects"
-          }
-
-          test "negative delays are rejected per child" {
-              let child =
-                  { (mkChildSpec "delayed" [ Run ] Permanent (ResizeArray()) (ResizeArray())) with
-                      RestartDelay = TimeSpan.FromSeconds -1.
-                      Shutdown = TimeSpan.FromSeconds -1. }
-
-              match Supervisor.validate (spec OneForOne 1 (TimeSpan.FromSeconds 1.) [ child ]) with
-              | Error errors ->
-                  Expect.contains
-                      errors
-                      (RestartDelayNegative("delayed", TimeSpan.FromSeconds -1.))
-                      "negative restart delay"
-
-                  Expect.contains
-                      errors
-                      (ShutdownNegative("delayed", TimeSpan.FromSeconds -1.))
-                      "negative shutdown budget"
-              | Ok _ -> failtest "expected defects"
-          }
-
-          test "Polly 8.8 startup timeout bounds are validated" {
-              let timeout = TimeSpan.FromMilliseconds 1.
-
-              let child =
-                  { (mkChildSpec "quick" [ Run ] Permanent (ResizeArray()) (ResizeArray())) with
-                      StartupRetry =
-                          Some
-                              { MaxAttempts = 1
-                                BaseDelay = TimeSpan.Zero
-                                MaxDelay = TimeSpan.Zero
-                                UseJitter = false
-                                StartupTimeout = timeout } }
-
-              match Supervisor.validate (spec OneForOne 1 (TimeSpan.FromSeconds 1.) [ child ]) with
-              | Error errors ->
-                  Expect.contains
-                      errors
-                      (StartupTimeoutOutOfRange("quick", timeout))
-                      "startup timeout matches Polly's lower bound"
-              | Ok _ -> failtest "expected a startup timeout defect"
+              Expect.equal
+                  classes
+                  (set
+                      [ "ok"
+                        "child-id-empty"
+                        "duplicate-child-id"
+                        "intensity-below-one"
+                        "period-not-positive"
+                        "restart-delay-negative"
+                        "shutdown-negative"
+                        "startup-attempts-below-one"
+                        "startup-delay-invalid"
+                        "startup-timeout-not-positive"
+                        "startup-timeout-out-of-range" ])
+                  "every defect class is reachable from three hundred random specs"
           } ]
 
 let restartTests =
