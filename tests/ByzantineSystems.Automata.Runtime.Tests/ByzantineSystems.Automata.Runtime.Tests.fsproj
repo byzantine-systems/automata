@@ -9,6 +9,7 @@
 
     <ItemGroup>
         <Compile Include="TestSupport.fs" />
+        <Compile Include="Property.fs" />
         <Compile Include="DraftTests.fs" />
         <Compile Include="DispositionTests.fs" />
         <Compile Include="ProcessorTests.fs" />
@@ -20,6 +21,7 @@
 
     <ItemGroup>
         <PackageReference Include="Expecto" />
+        <PackageReference Include="FsCheck" />
         <PackageReference Include="Microsoft.NET.Test.Sdk" PrivateAssets="all" />
         <PackageReference Include="YoloDev.Expecto.TestSdk" PrivateAssets="all" />
         <PackageReference Include="coverlet.msbuild" PrivateAssets="all" />
