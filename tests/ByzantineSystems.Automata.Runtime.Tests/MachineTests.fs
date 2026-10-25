@@ -16,6 +16,103 @@ let private started (stub: StubStore<TestError>) =
         return built
     }
 
+// A processor policy is generated as choices over small tables that include both ends of
+// every bounded range, and the oracle below recomputes the exact defect list from the
+// documented contract rather than from validate's own code.
+
+type private PolicyChoices =
+    { BatchPick: int
+      LeasePick: int
+      RenewPick: int
+      PollingPick: int
+      ConcurrencyPick: int
+      AttemptsPick: int }
+
+let private norm (m: int) (raw: int) = ((raw % m) + m) % m
+let private pickOf (table: 'a[]) (raw: int) = table[norm table.Length raw]
+
+/// Every provider can represent a claim batch of 1..1000 and a lease of at most
+/// <see cref="P:System.Int32.MaxValue" /> milliseconds; both ends are choices here.
+let private leaseCeiling = TimeSpan.FromMilliseconds(float Int32.MaxValue)
+
+let private batches = [| 32; 1; 1000; 0; -5; 1001 |]
+
+let private leases =
+    [| TimeSpan.FromSeconds 30.
+       leaseCeiling
+       TimeSpan.Zero
+       TimeSpan.FromSeconds -5.
+       leaseCeiling + TimeSpan.FromTicks 1L |]
+
+let private renews =
+    [| TimeSpan.FromSeconds 20.
+       TimeSpan.Zero
+       TimeSpan.FromSeconds 30.
+       TimeSpan.FromSeconds 40. |]
+
+let private pollings =
+    [| TimeSpan.FromSeconds 5.; TimeSpan.Zero; TimeSpan.FromSeconds -1. |]
+
+let private concurrencies = [| 8; 1; 0; -2 |]
+let private attempts = [| 5; 1; 0; -3 |]
+
+let private policyFrom (choices: PolicyChoices) : ProcessorPolicy<TestError> =
+    { ProcessorPolicy.defaults with
+        Batch = pickOf batches choices.BatchPick
+        Lease = pickOf leases choices.LeasePick
+        RenewAfter = pickOf renews choices.RenewPick
+        PollingInterval = pickOf pollings choices.PollingPick
+        Concurrency = pickOf concurrencies choices.ConcurrencyPick
+        MaxAttempts = pickOf attempts choices.AttemptsPick }
+
+/// Every defect the contract says validation reports, in the order it reports them.
+let private expectedPolicyErrors (policy: ProcessorPolicy<TestError>) =
+    [ if policy.Batch < 1 then
+          BatchBelowOne policy.Batch
+      elif policy.Batch > 1000 then
+          BatchAboveMaximum policy.Batch
+
+      if policy.Lease <= TimeSpan.Zero then
+          LeaseNotPositive policy.Lease
+      elif policy.Lease > leaseCeiling then
+          LeaseAboveMaximum policy.Lease
+
+      if policy.RenewAfter <= TimeSpan.Zero then
+          RenewAfterNotPositive policy.RenewAfter
+      elif policy.RenewAfter >= policy.Lease then
+          RenewAfterNotBelowLease(policy.RenewAfter, policy.Lease)
+
+      if policy.PollingInterval <= TimeSpan.Zero then
+          PollingIntervalNotPositive policy.PollingInterval
+
+      if policy.Concurrency < 1 then
+          ConcurrencyBelowOne policy.Concurrency
+
+      if policy.MaxAttempts < 1 then
+          MaxAttemptsBelowOne policy.MaxAttempts ]
+
+let private randomPolicyChoices (seed: int) : PolicyChoices =
+    let rng = Random seed
+
+    { BatchPick = rng.Next()
+      LeasePick = rng.Next()
+      RenewPick = rng.Next()
+      PollingPick = rng.Next()
+      ConcurrencyPick = rng.Next()
+      AttemptsPick = rng.Next() }
+
+let private policyDefectKind =
+    function
+    | BatchBelowOne _ -> "batch-below-one"
+    | BatchAboveMaximum _ -> "batch-above-maximum"
+    | LeaseNotPositive _ -> "lease-not-positive"
+    | LeaseAboveMaximum _ -> "lease-above-maximum"
+    | RenewAfterNotPositive _ -> "renew-not-positive"
+    | RenewAfterNotBelowLease _ -> "renew-not-below-lease"
+    | PollingIntervalNotPositive _ -> "polling-not-positive"
+    | ConcurrencyBelowOne _ -> "concurrency-below-one"
+    | MaxAttemptsBelowOne _ -> "attempts-below-one"
+
 let configurationTests =
     testList
         "configuration"
@@ -91,30 +188,37 @@ let configurationTests =
               | other -> failtestf "expected one policy defect, got %A" other
           }
 
-          test "processor claim arguments are validated when the machine is built" {
-              let stub = StubStore<TestError>()
+          Property.property
+              "processor policy validation reports exactly every defect, in order"
+              (fun (choices: PolicyChoices) ->
+                  let policy = policyFrom choices
+                  let expected = expectedPolicyErrors policy
 
-              let excessiveLease =
-                  TimeSpan.FromMilliseconds(float Int32.MaxValue) + TimeSpan.FromTicks 1L
+                  match ProcessorPolicy.validate policy with
+                  | Ok _ -> expected.IsEmpty
+                  | Error defects -> defects = expected)
 
-              let result =
-                  machine<EntityId<TestEntity>, TestState, TestEvent, TestAction, TestError> testMachine {
-                      chart testChart
-                      chartVersion 1
-                      initialState Idle
-                      store (stub :> IMachineStore<_, _, _, _, _>)
+          test "the generated policies reach every defect class" {
+              let classes =
+                  seq { 0..299 }
+                  |> Seq.collect (fun seed ->
+                      expectedPolicyErrors (policyFrom (randomPolicyChoices seed))
+                      |> List.map policyDefectKind)
+                  |> Set.ofSeq
 
-                      processor
-                          { ProcessorPolicy.defaults with
-                              Batch = 1001
-                              Lease = excessiveLease }
-                  }
-
-              match result with
-              | Error [ InvalidProcessorPolicy defects ] ->
-                  Expect.contains defects (BatchAboveMaximum 1001) "the claim batch has a provider-safe maximum"
-                  Expect.contains defects (LeaseAboveMaximum excessiveLease) "the lease has a provider-safe maximum"
-              | other -> failtestf "expected claim argument defects, got %A" other
+              Expect.equal
+                  classes
+                  (set
+                      [ "batch-below-one"
+                        "batch-above-maximum"
+                        "lease-not-positive"
+                        "lease-above-maximum"
+                        "renew-not-positive"
+                        "renew-not-below-lease"
+                        "polling-not-positive"
+                        "concurrency-below-one"
+                        "attempts-below-one" ])
+                  "every defect class is reachable from three hundred random policies"
           } ]
 
 let lifecycleTests =
