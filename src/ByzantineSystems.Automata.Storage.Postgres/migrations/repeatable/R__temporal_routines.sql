@@ -86,20 +86,22 @@ CREATE OR REPLACE TRIGGER instance_state_versioning_trigger
     EXECUTE FUNCTION fsm.temporal_versioning ();
 
 -- ---------------------------------------------------------------------------
--- fsm.split_belief: the portion update, and why it is its own routine.
+-- fsm.split_belief: the portion update, hand-rolled.
 --
--- UPDATE ... FOR PORTION OF will not take a plpgsql variable as a bound. On
--- 19beta3 the bound expressions are parsed without plpgsql's variable
--- substitution, so a variable there is read as a column reference and the
--- statement fails with "cannot use column reference in FOR PORTION OF
--- expression". A prepared statement's parameters work, and so do a SQL
--- function's, which is what this is.
+-- PostgreSQL carried SQL:2011's `UPDATE ... FOR PORTION OF` through the 19
+-- betas and dropped it again before rc1, so the split is written out rather
+-- than parsed: one statement whose CTEs re-insert the part of the live belief
+-- that precedes p_at with the old values, then rewrite the live row from p_at
+-- on with the new ones. The temporal key (`WITHOUT OVERLAPS`, PG 18) still
+-- polices the overlap, and one statement is still one belief instant: both
+-- CTEs fire the versioning trigger within it, so statement_timestamp() agrees
+-- with itself and the archived row ends exactly where its replacements begin.
 --
--- Positional $n rather than the parameter names, since names resolve through
--- the same path that fails inside plpgsql.
+-- The bounds and new values ride the statement's parameters directly, which
+-- is why this is a SQL function: there is nothing left to substitute.
 --
--- Returns the number of rows the portion update matched, because no routine
--- here returns void.
+-- Returns the number of rows the update matched, because no routine here
+-- returns void.
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION fsm.split_belief (p_machine_id text, p_entity_id text, p_at timestamptz, p_state jsonb, p_status fsm.instance_status, p_epoch bigint, p_command_id bigint, p_chart_version integer)
     RETURNS bigint
@@ -107,23 +109,51 @@ CREATE OR REPLACE FUNCTION fsm.split_belief (p_machine_id text, p_entity_id text
     VOLATILE PARALLEL UNSAFE
     SET search_path = pg_catalog, pg_temp
     AS $$
-    WITH updated AS (
-        UPDATE
-            fsm.instance_state FOR PORTION OF valid_during
-        FROM
-            $3 TO 'infinity'
-        SET
-            state = $4,
-            status = $5,
-            epoch = $6,
-            command_id = $7,
-            chart_version = $8
-        WHERE
-            machine_id = $1
-            AND entity_id = $2
-            AND UPPER(valid_during) = 'infinity'
-        RETURNING
-            1
+    WITH
+        carried AS (
+            -- The tail of the old belief that the new one does not cover,
+            -- re-inserted unchanged. Empty when p_at is the live belief's own
+            -- start: nothing precedes the new belief, which is the replaced
+            -- case.
+            INSERT INTO fsm.instance_state (machine_id, entity_id, state, status, epoch, command_id, chart_version, valid_during)
+            SELECT
+                machine_id,
+                entity_id,
+                state,
+                status,
+                epoch,
+                command_id,
+                chart_version,
+                TSTZRANGE(LOWER(valid_during), $3, '[)')
+            FROM
+                fsm.instance_state
+            WHERE
+                machine_id = $1
+                AND entity_id = $2
+                AND UPPER(valid_during) = 'infinity'
+                AND LOWER(valid_during) < $3
+            RETURNING
+                1
+),
+        updated AS (
+            -- The covered portion, rewritten in place. GREATEST keeps the
+            -- original start should a caller ever arrive with p_at behind it,
+            -- though fsm.close_and_open raises before that can happen.
+            UPDATE
+                fsm.instance_state
+            SET
+                state = $4,
+                status = $5,
+                epoch = $6,
+                command_id = $7,
+                chart_version = $8,
+                valid_during = TSTZRANGE(GREATEST(LOWER(valid_during), $3), 'infinity', '[)')
+            WHERE
+                machine_id = $1
+                AND entity_id = $2
+                AND UPPER(valid_during) = 'infinity'
+            RETURNING
+                1
 )
     SELECT
         COUNT(*)
@@ -137,11 +167,11 @@ $$;
 -- Every valid-time write routes through here, so the split is written and
 -- tested once instead of being re-derived at each call site.
 --
--- UPDATE ... FOR PORTION OF does the split itself: it rewrites the portion of
--- the matched rows covered by [p_at, infinity) and re-inserts the remainder as
--- its own row, keeping the temporal key satisfied throughout. Both the update
--- and the re-insert fire the versioning trigger, so the superseded belief is
--- archived rather than discarded.
+-- fsm.split_belief does the split: it rewrites the portion of the live row
+-- covered by [p_at, infinity) and re-inserts the remainder as its own row,
+-- keeping the temporal key satisfied throughout. Both the update and the
+-- re-insert fire the versioning trigger, so the superseded belief is archived
+-- rather than discarded.
 --
 -- Three cases remain, which is why this is still plpgsql:
 --
