@@ -21,7 +21,7 @@ updates:
       interval: "monthly"
     # This block groups all updates for this ecosystem together
     groups:
-      github-actions-deps:
+      nuget-deps:
         patterns:
           - "*"
 
@@ -32,6 +32,6 @@ updates:
       interval: "monthly"
     # This block groups all updates for this ecosystem together
     groups:
-      github-actions-deps:
+      dotnet-sdk-deps:
         patterns:
           - "*"

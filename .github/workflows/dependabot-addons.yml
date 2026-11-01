@@ -23,6 +23,8 @@ jobs:
           ref: ${{ github.event.pull_request.head.ref }}
           # Use a custom token if this push needs to trigger other GitHub Actions
           token: ${{ secrets.GITHUB_TOKEN }}
+          # The bump detection below diffs against the parent commit
+          fetch-depth: 2
 
       - name: Install Nix
         uses: cachix/install-nix-action@v31
@@ -52,6 +54,19 @@ jobs:
         with:
           name: devenv
 
+      # The .NET SDK comes from the locked nixpkgs, so a global.json bump (dotnet-sdk ecosystem)
+      # can only build once nixpkgs carries the matching version. Re-pin nixpkgs in the same PR
+      # and stage flake.lock alongside the regenerated deps.json below.
+      - name: "Re-pin nixpkgs when global.json changed"
+        run: |
+          if git diff --name-only HEAD~1 HEAD -- global.json | grep -q .; then
+            echo "global.json bumped; updating the nixpkgs lock to match"
+            nix flake update nixpkgs
+            git add flake.lock
+          else
+            echo "global.json unchanged; keeping the current nixpkgs lock"
+          fi
+
       - name: "Generate new deps.json lockfile + SQLHydra updates"
         run: |
           nix develop --impure --command make nix-lock
@@ -62,8 +77,8 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           
-          # Replace 'generated-file.json' with your actual file path
-          git add deps.json 
+          # deps.json is regenerated above; flake.lock may already be staged by the re-pin step
+          git add deps.json
           
           # Check if there are actual changes to commit to avoid workflow failure
           if ! git diff --cached --exit-code; then
