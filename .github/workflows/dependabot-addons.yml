@@ -48,7 +48,7 @@ jobs:
           purge-primary-key: never
 
       # devenv's own binary cache. Without it the shell is built from source on every cold runner.
-      - uses: cachix/cachix-action@v16
+      - uses: cachix/cachix-action@v17
         with:
           name: devenv
 
