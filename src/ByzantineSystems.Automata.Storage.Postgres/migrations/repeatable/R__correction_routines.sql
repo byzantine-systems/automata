@@ -60,17 +60,16 @@ BEGIN
             -- query can answer; either is refused before anything is written.
             IF v_previous = '-infinity'::timestamptz THEN
                 IF (v_belief ->> 'valid_from')::timestamptz <> p_valid_from THEN
-                    RAISE EXCEPTION 'fsm.correct_beliefs: the first belief at % must start exactly at the corrected instant %', (v_belief ->> 'valid_from')::timestamptz, p_valid_from
-                        USING ERRCODE = 'invalid_parameter_value';
-                END IF;
-            ELSE
-                IF (v_belief ->> 'valid_from')::timestamptz <= v_previous THEN
-                    RAISE EXCEPTION 'fsm.correct_beliefs: the beliefs are not in ascending valid-time order at %', (v_belief ->> 'valid_from')::timestamptz
-                        USING ERRCODE = 'invalid_parameter_value';
-                END IF;
-            END IF;
-            v_previous := (v_belief ->> 'valid_from')::timestamptz;
-    END LOOP;
+                    RAISE EXCEPTION 'fsm.correct_beliefs: the first belief at % must start exactly at the corrected instant %', (v_belief ->> 'valid_from')::timestamptz, p_valid_from USING ERRCODE = 'invalid_parameter_value';
+        END IF;
+ELSE
+    IF (v_belief ->> 'valid_from')::timestamptz <= v_previous THEN
+        RAISE EXCEPTION 'fsm.correct_beliefs: the beliefs are not in ascending valid-time order at %', (v_belief ->> 'valid_from')::timestamptz
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+END IF;
+    v_previous := (v_belief ->> 'valid_from')::timestamptz;
+END LOOP;
     -- A belief that starts before the corrected instant and runs past it is
     -- truncated to end there rather than removed: the part of it before the
     -- correction was never in question. The trigger archives the untruncated
@@ -115,7 +114,6 @@ BEGIN
     RETURN v_truncated + v_deleted;
 END
 $$;
-
 
 -- ---------------------------------------------------------------------------
 -- fsm.submit_correction: a correction enters the inbox like any command.
@@ -308,3 +306,4 @@ BEGIN
         p_expected_epoch + 1;
 END
 $$;
+

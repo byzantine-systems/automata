@@ -70,7 +70,10 @@ let private expectedValidationErrors (policy: TransientPolicy) =
 
       if policy.AttemptTimeout <= TimeSpan.Zero then
           AttemptTimeoutNotPositive policy.AttemptTimeout
-      elif policy.AttemptTimeout < minimumTimeout || policy.AttemptTimeout > maximumDuration then
+      elif
+          policy.AttemptTimeout < minimumTimeout
+          || policy.AttemptTimeout > maximumDuration
+      then
           AttemptTimeoutOutOfRange policy.AttemptTimeout
 
       if policy.TotalTimeout <= TimeSpan.Zero then
@@ -105,7 +108,10 @@ let private expectedValidationErrors (policy: TransientPolicy) =
 
           if breaker.BreakDuration <= TimeSpan.Zero then
               BreakerBreakDurationNotPositive breaker.BreakDuration
-          elif breaker.BreakDuration < minimumBreakerDuration || breaker.BreakDuration > maximumDuration then
+          elif
+              breaker.BreakDuration < minimumBreakerDuration
+              || breaker.BreakDuration > maximumDuration
+          then
               BreakerBreakDurationOutOfRange breaker.BreakDuration ]
 
 let private sameValidationError expected actual =
@@ -115,7 +121,8 @@ let private sameValidationError expected actual =
     | _ -> expected = actual
 
 let private sameValidationErrors expected actual =
-    List.length expected = List.length actual && List.forall2 sameValidationError expected actual
+    List.length expected = List.length actual
+    && List.forall2 sameValidationError expected actual
 
 /// An operation whose responses follow a script, counting executions as it goes.
 let scripted (outcomes: Result<int, exn> list) =
@@ -153,8 +160,19 @@ let validationTests =
 
           Property.property "validation reports exactly every structural defect" (fun input ->
               let attempts = pick [| Int32.MinValue; -1; 0; 1; 2; Int32.MaxValue |] input.Attempts
-              let ratios = [| Double.NaN; Double.NegativeInfinity; -1.; 0.; 0.5; 1.; 1.1; Double.PositiveInfinity |]
-              let throughput = pick [| Int32.MinValue; -1; 0; 1; 2; Int32.MaxValue |] input.MinimumThroughput
+
+              let ratios =
+                  [| Double.NaN
+                     Double.NegativeInfinity
+                     -1.
+                     0.
+                     0.5
+                     1.
+                     1.1
+                     Double.PositiveInfinity |]
+
+              let throughput =
+                  pick [| Int32.MinValue; -1; 0; 1; 2; Int32.MaxValue |] input.MinimumThroughput
 
               let breaker =
                   if input.HasBreaker then

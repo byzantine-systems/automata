@@ -135,13 +135,16 @@ let private readLeaseOutcome row =
 let private readCommandId row =
     readValue row |> Result.map (int64 >> CommandId.ofInt64)
 
-let private keyAt index = StatementKey.create "generated" $"step-%d{index}"
+let private keyAt index =
+    StatementKey.create "generated" $"step-%d{index}"
 
-let private expectedInstruction index = function
+let private expectedInstruction index =
+    function
     | ExecuteStep -> Execute(keyAt index)
     | QueryStep -> QueryOne(keyAt index)
 
-let rec private programFrom outcome = function
+let rec private programFrom outcome =
+    function
     | [] -> StoreProgram.ok outcome
     | (index, step) :: rest ->
         store {
@@ -167,34 +170,44 @@ let private run interpreter program =
 let tests =
     testList
         "store program"
-        [ Property.property "instructions are cold and execute sequentially" (fun (steps: ProgramStep list, outcome: int) ->
-              let indexed = List.indexed steps
-              let interpreter = RecordingInterpreter(rowsFor steps)
-              let program = programFrom outcome indexed
-              let cold = List.isEmpty interpreter.Instructions
-              let result = run interpreter program
+        [ Property.property
+              "instructions are cold and execute sequentially"
+              (fun (steps: ProgramStep list, outcome: int) ->
+                  let indexed = List.indexed steps
+                  let interpreter = RecordingInterpreter(rowsFor steps)
+                  let program = programFrom outcome indexed
+                  let cold = List.isEmpty interpreter.Instructions
+                  let result = run interpreter program
 
-              cold
-              && result = Ok outcome
-              && interpreter.Instructions = (indexed |> List.map (fun (index, step) -> expectedInstruction index step)))
+                  cold
+                  && result = Ok outcome
+                  && interpreter.Instructions = (indexed
+                                                 |> List.map (fun (index, step) -> expectedInstruction index step)))
 
-          Property.property "a typed error stops the remaining program" (fun (generated: ProgramStep list, position: uint32) ->
-              let steps =
-                  match generated with
-                  | [] -> [ ExecuteStep ]
-                  | values -> values
+          Property.property
+              "a typed error stops the remaining program"
+              (fun (generated: ProgramStep list, position: uint32) ->
+                  let steps =
+                      match generated with
+                      | [] -> [ ExecuteStep ]
+                      | values -> values
 
-              let indexed = List.indexed steps
-              let failureIndex = int (position % uint32 steps.Length)
-              let failureKey = keyAt failureIndex
-              let interpreter = RecordingInterpreter(rowsFor steps, failureAt = failureKey)
-              let result = programFrom () indexed |> run interpreter
-              let expected = indexed |> List.take (failureIndex + 1) |> List.map (fun (index, step) -> expectedInstruction index step)
+                  let indexed = List.indexed steps
+                  let failureIndex = int (position % uint32 steps.Length)
+                  let failureKey = keyAt failureIndex
+                  let interpreter = RecordingInterpreter(rowsFor steps, failureAt = failureKey)
+                  let result = programFrom () indexed |> run interpreter
 
-              match result with
-              | Error(StoreError.Unexpected error) ->
-                  error.Message = StatementKey.value failureKey && interpreter.Instructions = expected
-              | _ -> false)
+                  let expected =
+                      indexed
+                      |> List.take (failureIndex + 1)
+                      |> List.map (fun (index, step) -> expectedInstruction index step)
+
+                  match result with
+                  | Error(StoreError.Unexpected error) ->
+                      error.Message = StatementKey.value failureKey
+                      && interpreter.Instructions = expected
+                  | _ -> false)
 
           testTask "row decode errors stop the remaining program" {
               let interpreter = RecordingInterpreter([ Map.empty ])
