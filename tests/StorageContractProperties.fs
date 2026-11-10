@@ -386,8 +386,13 @@ let private runInboxTrace
                             let! outcome = stores.Inbox.Submit(submission, ct)
 
                             match outcome with
-                            | Ok(AlreadySubmitted found) when found = tracked.Id ->
+                            | Ok(AlreadySubmitted found) when found = tracked.Id && event = tracked.Event ->
                                 classes.Add "resubmit"
+                                return! loop rest
+                            | Ok(SubmissionOutcome.Refused(KeyReused found)) when
+                                found = tracked.Id && event <> tracked.Event
+                                ->
+                                classes.Add "key-reused"
                                 return! loop rest
                             | _ -> return false
                         | None ->
@@ -992,7 +997,8 @@ type FakeInbox(env: ContractInboxEnv) =
                 rows
                 |> Seq.tryFind (fun row -> row.EntityId = submission.EntityId && row.Key = submission.IdempotencyKey)
             with
-            | Some row -> Task.FromResult(Ok(AlreadySubmitted row.Id))
+            | Some row when row.Event = submission.Event -> Task.FromResult(Ok(AlreadySubmitted row.Id))
+            | Some row -> Task.FromResult(Ok(SubmissionOutcome.Refused(KeyReused row.Id)))
             | None ->
                 nextId <- nextId + 1L
 
@@ -1245,6 +1251,109 @@ let inboxProperty name maxTests endSize (env: ContractInboxEnv) =
                         eprintfn "inbox trace falsified:\n%s" (renderTrace trace)
 
                     return verdict
+                }
+        ))
+
+/// A key names one immutable request. Retries may change delivery/audit metadata, but cannot
+/// replace any request field, allocate a sequence, or change the stored command on refusal.
+let requestIdentityProperty name maxTests (env: ContractInboxEnv) =
+    testCase name (fun () ->
+        let config = Config.QuickThrowOnFailure.WithMaxTest(maxTests)
+        let ct = CancellationToken.None
+
+        Check.One(
+            config,
+            fun (payload: byte, seconds: byte) ->
+                task {
+                    let! stores = env.Fresh()
+                    let entity: ContractEntityId = entityId "request-identity"
+                    let original = contractSubmission env entity "identity" (Ping(int payload))
+
+                    let at =
+                        DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero).AddSeconds(float seconds)
+
+                    let correction = CommandKind.Correction(at, CorrectionPolicy.defaults)
+
+                    let changed =
+                        [ { original with
+                              Event = Ping(int payload + 1) }
+                          { original with
+                              ChartVersion = ChartVersion.create (ChartVersion.value env.Version + 1) }
+                          { original with Kind = correction } ]
+
+                    let! first = stores.Inbox.Submit(original, ct)
+                    let! before = stores.Inbox.TryFind(env.Machine, entity, original.IdempotencyKey, ct)
+
+                    match first with
+                    | Ok(Accepted commandId) ->
+                        let! retry =
+                            stores.Inbox.Submit(
+                                { original with
+                                    VisibleAt = Some(stores.Now().AddDays 1.)
+                                    ReceivedAt = Some at
+                                    Audit =
+                                        { AuditContext.empty with
+                                            CorrelationId = Some "retry" } },
+                                ct
+                            )
+
+                        Expect.equal retry (Ok(AlreadySubmitted commandId)) "retry metadata does not redefine identity"
+
+                        for request in changed do
+                            let! outcome = stores.Inbox.Submit(request, ct)
+
+                            Expect.equal
+                                outcome
+                                (Ok(SubmissionOutcome.Refused(KeyReused commandId)))
+                                "a changed request is refused"
+
+                        let! after = stores.Inbox.TryFind(env.Machine, entity, original.IdempotencyKey, ct)
+                        Expect.equal after before "refused submissions do not alter the original"
+
+                        let correctionRequest =
+                            { original with
+                                IdempotencyKey = "correction"
+                                Kind = correction }
+
+                        let! acceptedCorrection = stores.Inbox.Submit(correctionRequest, ct)
+
+                        match acceptedCorrection with
+                        | Ok(Accepted correctionId) ->
+                            let! same = stores.Inbox.Submit(correctionRequest, ct)
+
+                            Expect.equal
+                                same
+                                (Ok(AlreadySubmitted correctionId))
+                                "a correction also retries identically"
+
+                            for kind in
+                                [ CommandKind.Event
+                                  CommandKind.Correction(at.AddSeconds 1., CorrectionPolicy.defaults)
+                                  CommandKind.Correction(
+                                      at,
+                                      { CorrectionPolicy.defaults with
+                                          ReplayLimit = CorrectionPolicy.defaults.ReplayLimit + 1 }
+                                  )
+                                  CommandKind.Correction(
+                                      at,
+                                      { CorrectionPolicy.defaults with
+                                          OnDivergence = Divergence.Truncate }
+                                  ) ] do
+                                let! outcome = stores.Inbox.Submit({ correctionRequest with Kind = kind }, ct)
+
+                                Expect.equal
+                                    outcome
+                                    (Ok(SubmissionOutcome.Refused(KeyReused correctionId)))
+                                    "correction fields define identity"
+
+                            let! next = stores.Inbox.TryFind(env.Machine, entity, "correction", ct)
+
+                            Expect.equal
+                                (next |> Result.map (Option.map _.Sequence))
+                                (Ok(Some 2L))
+                                "refusals allocate no sequence"
+                        | other -> failtestf "expected a new correction, got %A" other
+                    | other -> failtestf "expected a new command, got %A" other
                 }
         ))
 

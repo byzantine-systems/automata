@@ -74,6 +74,7 @@ let private contractEnv () : ContractInboxEnv =
 
 let private behaviorClasses =
     [ "resubmit"
+      "key-reused"
       "empty-claim"
       "batch-limited"
       "blocked-sibling"
@@ -111,6 +112,8 @@ let tests =
         [ ContractProperties.inboxProperty "the inbox follows the shared state machine" 12 25 (contractEnv ())
 
           ContractProperties.finalizeProperty "finalization obeys the shared equations" 3 (contractEnv ())
+
+          ContractProperties.requestIdentityProperty "idempotency keys name immutable requests" 12 (contractEnv ())
 
           ContractProperties.readyTokenProperty
               "a ready command's sentinel token never authorizes finalization"

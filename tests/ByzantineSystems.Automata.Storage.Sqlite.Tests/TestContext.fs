@@ -124,6 +124,7 @@ let insertCommand (connectionString: string) (overrides: (string * obj) list) : 
           "idempotency_key", box "key-1"
           "chart_version", box 1L
           "event", box "{}"
+          "request_digest", box (Array.zeroCreate<byte> 32)
           "kind", box "event"
           "status", box "ready"
           "blocked", box 0L
@@ -320,6 +321,7 @@ let commandIdOf (outcome: SubmissionOutcome) : CommandId =
     match outcome with
     | Accepted commandId -> commandId
     | AlreadySubmitted commandId -> commandId
+    | SubmissionOutcome.Refused reason -> failtestf "submission was refused: %A" reason
 
 /// Submits one command and answers its id.
 let submit (inbox: Inbox) (entity: Entity) (key: string) (event: TestEvent) : Task<CommandId> =

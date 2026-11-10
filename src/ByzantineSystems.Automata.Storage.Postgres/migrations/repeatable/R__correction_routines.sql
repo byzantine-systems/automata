@@ -121,14 +121,17 @@ $$;
 -- Through fsm.submit_command, so idempotency, the gapless sequence and the
 -- head invariant are exactly an ordinary command's: a correction waits behind
 -- work already queued for its entity, and nothing queued after it runs first.
--- Only a newly accepted command is marked a correction and given its details;
--- a repeated key returns the original, whatever it was.
+-- The shared insert records the correction kind and digest immediately. Only a
+-- newly accepted command receives details; changed requests under a key are refused.
 -- ---------------------------------------------------------------------------
+DROP FUNCTION IF EXISTS fsm.submit_correction (text, text, text, integer, jsonb, timestamptz, fsm.divergence, integer, text, text, text, text, text);
+
 CREATE OR REPLACE FUNCTION fsm.submit_correction (p_machine_id text, p_entity_id text, p_idempotency_key text, p_chart_version integer, p_event jsonb, p_effective_at timestamptz, p_on_divergence fsm.divergence, p_replay_limit integer, p_tenant text DEFAULT '', p_principal text DEFAULT '', p_source text DEFAULT '', p_correlation_id text DEFAULT '', p_causation_id text DEFAULT '')
     RETURNS TABLE (
         command_id bigint,
         seq bigint,
-        accepted boolean)
+        accepted boolean,
+        key_reused boolean)
     LANGUAGE plpgsql
     VOLATILE PARALLEL UNSAFE
     SET search_path = pg_catalog,
@@ -138,24 +141,21 @@ DECLARE
     v_command_id bigint;
     v_seq bigint;
     v_accepted boolean;
+    v_key_reused boolean;
 BEGIN
     SELECT
         s.command_id,
         s.seq,
-        s.accepted
+        s.accepted,
+        s.key_reused
     INTO
         v_command_id,
         v_seq,
-        v_accepted
+        v_accepted,
+        v_key_reused
     FROM
-        fsm.submit_command (p_machine_id, p_entity_id, p_idempotency_key, p_chart_version, p_event, NULL, NULL, p_tenant, p_principal, p_source, p_correlation_id, p_causation_id) s;
+        fsm.submit_command (p_machine_id, p_entity_id, p_idempotency_key, p_chart_version, p_event, NULL, NULL, p_tenant, p_principal, p_source, p_correlation_id, p_causation_id, 'correction', JSONB_BUILD_ARRAY(EXTRACT(EPOCH FROM p_effective_at), p_on_divergence, p_replay_limit)) s;
     IF v_accepted THEN
-        UPDATE
-            fsm.command c
-        SET
-            kind = 'correction'
-        WHERE
-            c.command_id = v_command_id;
         INSERT INTO fsm.command_correction (command_id, effective_at, on_divergence, replay_limit)
             VALUES (v_command_id, p_effective_at, p_on_divergence, p_replay_limit);
     END IF;
@@ -163,7 +163,8 @@ BEGIN
     SELECT
         v_command_id,
         v_seq,
-        v_accepted;
+        v_accepted,
+        v_key_reused;
 END
 $$;
 

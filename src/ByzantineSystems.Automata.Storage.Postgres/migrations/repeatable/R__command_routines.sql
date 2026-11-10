@@ -90,11 +90,16 @@ $$;
 -- entity and never global, and a hash collision between two unrelated entities
 -- costs serialisation rather than correctness.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fsm.submit_command (p_machine_id text, p_entity_id text, p_idempotency_key text, p_chart_version integer, p_event jsonb, p_visible_at timestamptz DEFAULT NULL, p_received_at timestamptz DEFAULT NULL, p_tenant text DEFAULT '', p_principal text DEFAULT '', p_source text DEFAULT '', p_correlation_id text DEFAULT '', p_causation_id text DEFAULT '')
+DROP FUNCTION IF EXISTS fsm.submit_command (text, text, text, integer, jsonb, timestamptz, timestamptz, text, text, text, text, text);
+
+DROP FUNCTION IF EXISTS fsm.submit_command (text, text, text, integer, jsonb, timestamptz, timestamptz, text, text, text, text, text, fsm.command_kind, jsonb);
+
+CREATE OR REPLACE FUNCTION fsm.submit_command (p_machine_id text, p_entity_id text, p_idempotency_key text, p_chart_version integer, p_event jsonb, p_visible_at timestamptz DEFAULT NULL, p_received_at timestamptz DEFAULT NULL, p_tenant text DEFAULT '', p_principal text DEFAULT '', p_source text DEFAULT '', p_correlation_id text DEFAULT '', p_causation_id text DEFAULT '', p_kind fsm.command_kind DEFAULT 'event', p_correction jsonb DEFAULT '{}')
     RETURNS TABLE (
         command_id bigint,
         seq bigint,
-        accepted boolean)
+        accepted boolean,
+        key_reused boolean)
     LANGUAGE plpgsql
     VOLATILE PARALLEL UNSAFE
     SET search_path = pg_catalog,
@@ -104,9 +109,12 @@ DECLARE
     v_command_id bigint;
     v_seq bigint;
     v_blocked boolean;
+    v_digest bytea;
+    v_existing_digest bytea;
 BEGIN
     PERFORM
         PG_ADVISORY_XACT_LOCK(HASHTEXTEXTENDED(FORMAT('fsm.command/%s/%s', p_machine_id, p_entity_id), 0));
+    v_digest := SHA256 (CONVERT_TO(JSONB_BUILD_ARRAY(p_kind, p_chart_version, p_event, p_correction)::text, 'UTF8'));
     -- The incumbent, if this key was already submitted. Under the lock this read
     -- is race-free, and command_unique_idem remains the backstop.
     --
@@ -116,10 +124,12 @@ BEGIN
     -- than silently picking one.
     SELECT
         c.command_id,
-        c.seq
+        c.seq,
+        c.request_digest
     INTO
         v_command_id,
-        v_seq
+        v_seq,
+        v_existing_digest
     FROM
         fsm.command c
     WHERE
@@ -131,7 +141,8 @@ BEGIN
         SELECT
             v_command_id,
             v_seq,
-            FALSE;
+            FALSE,
+            v_existing_digest <> v_digest;
         RETURN;
     END IF;
     -- One backward index scan on command_unique_seq, not a scan of the entity's
@@ -158,8 +169,8 @@ BEGIN
             c.machine_id = p_machine_id
             AND c.entity_id = p_entity_id
             AND c.status IN ('ready', 'leased'));
-    INSERT INTO fsm.command (machine_id, entity_id, seq, idempotency_key, chart_version, event, blocked, visible_at, received_at, tenant, principal, source, correlation_id, causation_id)
-        VALUES (p_machine_id, p_entity_id, v_seq, p_idempotency_key, p_chart_version, p_event, v_blocked, COALESCE(p_visible_at, NOW()), COALESCE(p_received_at, STATEMENT_TIMESTAMP()), COALESCE(p_tenant, ''), coalesce(p_principal, ''), COALESCE(p_source, ''), coalesce(p_correlation_id, ''), COALESCE(p_causation_id, ''))
+    INSERT INTO fsm.command (machine_id, entity_id, seq, idempotency_key, chart_version, event, kind, request_digest, blocked, visible_at, received_at, tenant, principal, source, correlation_id, causation_id)
+        VALUES (p_machine_id, p_entity_id, v_seq, p_idempotency_key, p_chart_version, p_event, p_kind, v_digest, v_blocked, COALESCE(p_visible_at, NOW()), COALESCE(p_received_at, STATEMENT_TIMESTAMP()), COALESCE(p_tenant, ''), coalesce(p_principal, ''), COALESCE(p_source, ''), coalesce(p_correlation_id, ''), COALESCE(p_causation_id, ''))
     RETURNING
         fsm.command.command_id
     INTO
@@ -168,7 +179,8 @@ BEGIN
     SELECT
         v_command_id,
         v_seq,
-        TRUE;
+        TRUE,
+        FALSE;
 END;
 $$;
 

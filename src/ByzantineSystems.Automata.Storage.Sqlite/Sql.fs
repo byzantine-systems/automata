@@ -35,6 +35,7 @@ module internal Statement =
 type internal Param =
     | Integer of int64
     | Text of string
+    | Blob of byte array
     | TextOrNull of string option
 
 /// <summary>Typed identifiers at the SQLite parameter boundary.</summary>
@@ -67,6 +68,7 @@ module internal Sql =
         let parameter =
             match value with
             | Param.Integer number -> SqliteParameter(name, SqliteType.Integer, Value = box number)
+            | Param.Blob bytes -> SqliteParameter(name, SqliteType.Blob, Value = box bytes)
             | Param.Text text
             | Param.TextOrNull(Some text) ->
                 if isNull text then

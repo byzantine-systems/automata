@@ -275,7 +275,7 @@ let tests =
 
               let program =
                   CheckedSubmission(
-                      StoreProgram.ok (Some commandId),
+                      StoreProgram.ok (Some(AlreadySubmitted commandId)),
                       StoreProgram.fail (StoreError.NotFound "should not check registration"),
                       StoreError.NotFound "unregistered",
                       StoreProgram.fail (StoreError.NotFound "should not insert"),

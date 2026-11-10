@@ -221,12 +221,17 @@ type Leased<'kind, 'Work> =
 type LeasedCommand<'EntityId, 'Event> = Leased<CommandWork, CommandRecord<'EntityId, 'Event>>
 
 /// <summary>
-/// What a submission did. Both cases are success: a repeated idempotency key is how a client
-/// retry after a lost response is recognised, and it carries the original command's id.
+/// An expected refusal that records no command and changes no existing command.
 /// </summary>
+type SubmissionRefusal =
+    /// <summary>The key already names a different request.</summary>
+    | KeyReused of existing: CommandId
+
+/// <summary>A new request, an identical retry, or a refusal without writes.</summary>
 type SubmissionOutcome =
     | Accepted of accepted: CommandId
     | AlreadySubmitted of existing: CommandId
+    | Refused of SubmissionRefusal
 
 /// <summary>
 /// What a fenced write did. <c>LeaseLost</c> is an outcome, not an error: it is the expected
@@ -291,7 +296,11 @@ module Backoff =
 /// </summary>
 type ICommandInbox<'EntityId, 'Event> =
 
-    /// <summary>Records a command durably. Idempotent on the submission's key.</summary>
+    /// <summary>
+    /// Records a command durably. The key identifies kind, chart version, event and correction
+    /// fields; different request content is refused. Visibility, arrival and audit are retry
+    /// metadata and never replace the first submission's values.
+    /// </summary>
     abstract Submit:
         submission: CommandSubmission<'EntityId, 'Event> * ct: CancellationToken ->
             Task<Result<SubmissionOutcome, StoreError>>

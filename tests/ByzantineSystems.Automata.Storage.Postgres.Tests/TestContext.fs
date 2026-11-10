@@ -253,6 +253,7 @@ let commandIdOf (outcome: SubmissionOutcome) : CommandId =
     match outcome with
     | Accepted commandId -> commandId
     | AlreadySubmitted commandId -> commandId
+    | SubmissionOutcome.Refused reason -> failtestf "submission was refused: %A" reason
 
 /// Runs a raw statement, returning the failure so a constraint test can inspect it.
 let exec (sql: string) : Result<unit, exn> =

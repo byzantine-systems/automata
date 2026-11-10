@@ -823,8 +823,8 @@ let planTests =
               do! boot RetentionPolicy.keepEverything
 
               arrange
-                  """INSERT INTO fsm.command (machine_id, entity_id, seq, idempotency_key, chart_version, event, blocked)
-                     SELECT 'pg-tests', 'e' || g, 1, 'k' || g, 1, '{}'::jsonb, false FROM generate_series(1, 20000) g"""
+                  """INSERT INTO fsm.command (machine_id, entity_id, seq, idempotency_key, chart_version, event, request_digest, blocked)
+                     SELECT 'pg-tests', 'e' || g, 1, 'k' || g, 1, '{}'::jsonb, sha256(''::bytea), false FROM generate_series(1, 20000) g"""
 
               arrange "ANALYZE fsm.command"
 

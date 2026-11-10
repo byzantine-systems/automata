@@ -157,6 +157,7 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
           idempotency_key = Row.string reader "idempotency_key"
           chart_version = Row.int32 reader "chart_version"
           event = Row.string reader "event"
+          request_digest = reader.GetFieldValue<byte array>(reader.GetOrdinal "request_digest")
           kind = Row.string reader "kind"
           status = Row.string reader "status"
           blocked = Row.bool reader "blocked"
@@ -254,7 +255,9 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
         StoreProgram.queryOne statement values (fun reader ->
             let commandId = Row.int64 reader "command_id" |> CommandId.ofInt64
 
-            if Row.bool reader "accepted" then
+            if Row.bool reader "key_reused" then
+                Ok(SubmissionOutcome.Refused(KeyReused commandId))
+            elif Row.bool reader "accepted" then
                 Ok(Accepted commandId)
             else
                 Ok(AlreadySubmitted commandId))
@@ -285,20 +288,9 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
                                 $"chart version %d{ChartVersion.value submission.ChartVersion} of machine %s{MachineId.value submission.MachineId}"
                         )
                 | Db.Refused(Db.Unique "command_unique_idem", _) ->
-                    // fsm.submit_command serialises submissions per entity, so this is
-                    // unreachable through the routine. It stays because the constraint, not the
-                    // advisory lock, is the integrity boundary: if anything ever writes the table
-                    // another way, a concurrent duplicate must still read as AlreadySubmitted
-                    // rather than escaping as an error.
-                    match! findExisting submission.MachineId entityId submission.IdempotencyKey ct with
-                    | Some record -> return AlreadySubmitted record.CommandId
-                    | None ->
-                        return!
-                            Error(
-                                Db.decodeFailure
-                                    (nameof SubmissionOutcome)
-                                    "a duplicate idempotency key had no matching command"
-                            )
+                    // A writer outside the routine raced the unique constraint. Recheck identity
+                    // atomically instead of treating every request under the key as equal.
+                    return! Sql.runProgram context (submit submission encodedEvent entityId) ct
                 | Db.Refused(_, cause) -> return! Error(StoreError.Unexpected cause)
             }
 

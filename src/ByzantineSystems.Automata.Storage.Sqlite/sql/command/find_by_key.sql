@@ -1,7 +1,8 @@
 -- The command already submitted under an idempotency key, if any. Served by
 -- command_unique_idem's index.
 SELECT
-    c.command_id
+    c.command_id,
+    c.request_digest
 FROM
     fsm_command c
 WHERE

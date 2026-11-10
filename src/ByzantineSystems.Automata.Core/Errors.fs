@@ -80,6 +80,9 @@ type MachineRejection =
     /// <summary>The persisted entity lifecycle does not permit another transition.</summary>
     | InstanceNotRunning of InstanceStatus
 
+    /// <summary>An idempotency key already identifies a different request.</summary>
+    | KeyReused of existingCommandId: int64
+
 /// <summary>
 /// The only error type that crosses the public machine API. Only
 /// <see cref="F:ByzantineSystems.Automata.Core.MachineError`1.Store" />

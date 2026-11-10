@@ -16,6 +16,7 @@ let private commandColumns =
       "idempotency_key"
       "chart_version"
       "event"
+      "request_digest"
       "kind"
       "status"
       "blocked"
@@ -354,8 +355,8 @@ let tests =
                   """INSERT INTO fsm.machine_chart_version (machine_id, version, fingerprint)
                      VALUES ('plan-probe', 1, repeat('a', 64));
 
-                     INSERT INTO fsm.command (machine_id, entity_id, seq, idempotency_key, chart_version, event, blocked)
-                     SELECT 'plan-probe', 'e' || g, 1, 'k' || g, 1, '{}'::jsonb, false FROM generate_series(1, 20000) g"""
+                     INSERT INTO fsm.command (machine_id, entity_id, seq, idempotency_key, chart_version, event, request_digest, blocked)
+                     SELECT 'plan-probe', 'e' || g, 1, 'k' || g, 1, '{}'::jsonb, sha256(''::bytea), false FROM generate_series(1, 20000) g"""
               |> function
                   | Ok() -> ()
                   | Error error -> failtestf "seeding failed: %s" error.Message

@@ -48,6 +48,7 @@ RETURNING
     idempotency_key,
     chart_version,
     event,
+    request_digest,
     kind,
     status,
     blocked,

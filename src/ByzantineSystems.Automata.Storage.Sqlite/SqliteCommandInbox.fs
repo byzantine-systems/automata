@@ -1,6 +1,9 @@
 namespace ByzantineSystems.Automata.Storage.Sqlite
 
 open System
+open System.IO
+open System.Security.Cryptography
+open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
@@ -31,6 +34,48 @@ type CommandInboxOptions<'EntityId, 'Event> =
 [<RequireQualifiedAccess>]
 module internal CommandMapping =
 
+    /// Provider-local identity, independent of JSON whitespace and object key order.
+    /// PostgreSQL computes its digest from jsonb instead; digest bytes are not portable.
+    let requestDigest version kind (encodedEvent: string) =
+        use document = JsonDocument.Parse encodedEvent
+        use buffer = new MemoryStream()
+        use writer = new Utf8JsonWriter(buffer)
+
+        let rec write (element: JsonElement) =
+            match element.ValueKind with
+            | JsonValueKind.Object ->
+                writer.WriteStartObject()
+
+                element.EnumerateObject()
+                |> Seq.map (fun property -> property.Name, property.Value)
+                |> Map.ofSeq
+                |> Map.iter (fun name value ->
+                    writer.WritePropertyName name
+                    write value)
+
+                writer.WriteEndObject()
+            | JsonValueKind.Array ->
+                writer.WriteStartArray()
+                element.EnumerateArray() |> Seq.iter write
+                writer.WriteEndArray()
+            | _ -> element.WriteTo writer
+
+        writer.WriteStartArray()
+        writer.WriteNumberValue(version: int)
+
+        match kind with
+        | CommandKind.Event -> writer.WriteStringValue "event"
+        | CommandKind.Correction(at, policy) ->
+            writer.WriteStringValue "correction"
+            writer.WriteNumberValue(Instant.ofDateTimeOffset at)
+            writer.WriteStringValue(EnumCodec.encode EnumCodec.divergence policy.OnDivergence)
+            writer.WriteNumberValue policy.ReplayLimit
+
+        write document.RootElement
+        writer.WriteEndArray()
+        writer.Flush()
+        SHA256.HashData(buffer.ToArray())
+
     /// The schema stores the empty string for an unsupplied audit field.
     let audit (value: string option) : string = defaultArg value ""
 
@@ -58,6 +103,7 @@ module internal CommandMapping =
           idempotency_key = Row.string reader "idempotency_key"
           chart_version = Row.int64 reader "chart_version"
           event = Row.string reader "event"
+          request_digest = reader.GetFieldValue<byte array>(reader.GetOrdinal "request_digest")
           kind = Row.string reader "kind"
           status = Row.string reader "status"
           blocked = Row.int64 reader "blocked"
@@ -236,6 +282,7 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
         : StoreProgram<WriteAccess, (string * Param) list, SqliteDataReader, SubmissionOutcome> =
         let machineId = submission.MachineId
         let version = ChartVersion.value submission.ChartVersion
+        let digest = CommandMapping.requestDigest version submission.Kind encodedEvent
 
         let existing =
             StoreProgram.tryQueryOne
@@ -243,7 +290,14 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
                 [ Params.machineId "@machine_id" machineId
                   Params.entityKey "@entity_id" entityId
                   "@idempotency_key", Param.Text submission.IdempotencyKey ]
-                (fun reader -> Ok(Row.int64 reader "command_id" |> CommandId.ofInt64))
+                (fun reader ->
+                    let commandId = Row.int64 reader "command_id" |> CommandId.ofInt64
+                    let stored = reader.GetFieldValue<byte array>(reader.GetOrdinal "request_digest")
+
+                    if stored = digest then
+                        Ok(AlreadySubmitted commandId)
+                    else
+                        Ok(SubmissionOutcome.Refused(KeyReused commandId)))
 
         let registered =
             StoreProgram.tryQueryOne
@@ -286,6 +340,7 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
                   "@idempotency_key", Param.Text submission.IdempotencyKey
                   "@chart_version", Param.Integer(int64 version)
                   "@event", Param.Text encodedEvent
+                  "@request_digest", Param.Blob digest
                   "@kind", Param.Text kind
                   "@visible_at", Param.Integer visibleAt
                   "@received_at", Param.Integer receivedAt

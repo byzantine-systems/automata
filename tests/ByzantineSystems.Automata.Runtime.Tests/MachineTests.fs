@@ -301,6 +301,20 @@ let submissionTests =
               | other -> failtestf "expected an already-submitted outcome, got %A" other
           }
 
+          testTask "send reports key reuse without awaiting the original command" {
+              let stub = StubStore<TestError>()
+              stub.SubmitOutcome <- Ok(SubmissionOutcome.Refused(KeyReused(CommandId.ofInt64 7L)))
+              let! built = started stub
+
+              let! outcome =
+                  Machine.send built (entityId "E-1") (EventEnvelope.create "k1" (Start 2)) CancellationToken.None
+
+              Expect.equal
+                  outcome
+                  (Error(MachineError.Rejected(MachineRejection.KeyReused 7L)))
+                  "a refusal is caller-actionable"
+          }
+
           testTask "commandResult reads what became of a command without waiting" {
               let stub = StubStore<TestError>()
               stub.ResultOutcome <- Ok(Some CommandResult.Pending)

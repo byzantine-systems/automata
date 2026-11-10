@@ -12,7 +12,7 @@ type internal LeaseUpdateInstruction<'Params, 'Reader> =
 type internal SubmitInstruction<'Params, 'Reader> =
     | AtomicSubmission of StoreProgram<WriteAccess, 'Params, 'Reader, SubmissionOutcome>
     | CheckedSubmission of
-        existing: StoreProgram<WriteAccess, 'Params, 'Reader, CommandId option> *
+        existing: StoreProgram<WriteAccess, 'Params, 'Reader, SubmissionOutcome option> *
         registered: StoreProgram<WriteAccess, 'Params, 'Reader, bool> *
         unregistered: StoreError *
         insert: StoreProgram<WriteAccess, 'Params, 'Reader, CommandId> *
@@ -29,7 +29,7 @@ module internal CommandInboxProgram =
             | AtomicSubmission program -> return! program
             | CheckedSubmission(existing, registered, unregistered, insert, correction) ->
                 match! existing with
-                | Some commandId -> return AlreadySubmitted commandId
+                | Some outcome -> return outcome
                 | None ->
                     match! registered with
                     | false -> return! StoreProgram.fail unregistered
