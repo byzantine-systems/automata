@@ -1436,6 +1436,39 @@ let arrivalOrderProperty name maxTests (env: ContractInboxEnv) =
                 }
         ))
 
+/// Provider hooks only arrange corruption and observe its durable quarantine; the batch is
+/// supplied and claimed through public store interfaces.
+type PoisonBatchFixture =
+    { Ids: CommandId list
+      Corrupt: CommandId -> Task<unit>
+      Claim: unit -> Task<Result<CommandId list, StoreError>>
+      IsQuarantined: CommandId -> Task<bool> }
+
+let poisonBatchProperty name maxTests (fresh: int -> int -> Task<PoisonBatchFixture>) =
+    testCase name (fun () ->
+        Check.One(
+            Config.QuickThrowOnFailure.WithMaxTest(maxTests),
+            fun (size: byte, position: byte, payload: byte) ->
+                task {
+                    let count = 1 + int size % 7
+                    let! fixture = fresh count (int payload)
+                    let poison = fixture.Ids[int position % count]
+                    do! fixture.Corrupt poison
+                    let! claimed = fixture.Claim()
+                    let expected = fixture.Ids |> List.filter ((<>) poison) |> Set.ofList
+
+                    Expect.equal
+                        (claimed |> Result.map Set.ofList)
+                        (Ok expected)
+                        "healthy rows survive every poison position"
+
+                    let! quarantined = fixture.IsQuarantined poison
+                    Expect.isTrue quarantined "the poison has a durable dead letter"
+                    let! next = fixture.Claim()
+                    Expect.equal next (Ok []) "the poison no longer wedges claims"
+                }
+        ))
+
 /// The finalize equations through public observations. Every generated case runs every semantic
 /// branch against fresh stores; the generated payload varies codecs and transition data without
 /// leaving critical outcomes to a low-probability command sequence.

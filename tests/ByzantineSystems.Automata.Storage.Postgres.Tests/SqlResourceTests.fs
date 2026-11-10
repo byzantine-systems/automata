@@ -9,6 +9,7 @@ open Expecto
 let private expected =
     [ "command", "submit"
       "command", "claim"
+      "command", "dead_letter_undecodable"
       "command", "by_id"
       "command", "find_by_key"
       "command", "finalize"

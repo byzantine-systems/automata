@@ -57,6 +57,9 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
 
     let claimCommands = StatementKey.create "command" "claim" |> Sql.prepareProgram
 
+    let deadLetterUndecodable =
+        StatementKey.create "command" "dead_letter_undecodable" |> Sql.prepareProgram
+
     let commandById = StatementKey.create "command" "by_id" |> Sql.prepareProgram
 
     let commandByKey = StatementKey.create "command" "find_by_key" |> Sql.prepareProgram
@@ -190,10 +193,8 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
     /// A claimed row carries its own lease: the token that fences it, the delivery count, and the
     /// deadline the database assigned. visible_at means the lease deadline while a command is
     /// leased, which is the one place that dual reading of the column surfaces in F#.
-    let leasedRow (reader: NpgsqlDataReader) : Result<LeasedCommand<'EntityId, 'Event>, StoreError> =
-        let row = commandRow reader
-
-        toRecord (row, correctionOption reader)
+    let leasedRow (row: fsm.command, correction) : Result<LeasedCommand<'EntityId, 'Event>, StoreError> =
+        toRecord (row, correction)
         |> Result.map (fun record ->
             { Work = record
               Token = LeaseToken.ofInt64 row.lease_token
@@ -305,15 +306,34 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
             // idempotent: a claim whose reply was lost has already leased a batch, and a retry
             // leases a second one while the first stays invisible until its lease lapses. The
             // worker polls again in a moment, which recovers sooner than a retry would.
-            Sql.runProgramOnce
-                context
-                (StoreProgram.queryRows
-                    claimCommands
-                    [ Params.machineId "machine_id" machineId
-                      "batch", Param.Int(ClaimBatch.value batch)
-                      "lease", Param.Interval(LeaseDuration.value lease) ]
-                    leasedRow)
-                ct
+            backgroundTaskResult {
+                let! rows =
+                    Sql.runProgramOnce
+                        context
+                        (StoreProgram.queryRows
+                            claimCommands
+                            [ Params.machineId "machine_id" machineId
+                              "batch", Param.Int(ClaimBatch.value batch)
+                              "lease", Param.Interval(LeaseDuration.value lease) ]
+                            (fun reader -> Ok(commandRow reader, correctionOption reader)))
+                        ct
+
+                return!
+                    ClaimRecovery.collect
+                        leasedRow
+                        (fun (row, _) reason ->
+                            Sql.runProgram
+                                context
+                                (StoreProgram.queryOne
+                                    deadLetterUndecodable
+                                    [ "command_id", Param.Bigint row.command_id
+                                      "lease_token", Param.Bigint row.lease_token
+                                      "reason", Param.Text reason ]
+                                    (fun _ -> Ok()))
+                                ct)
+                        rows
+                        ct
+            }
 
         member _.Reschedule(commandId, leaseToken, backoff, ct) =
             Sql.runProgram

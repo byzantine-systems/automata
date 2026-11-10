@@ -62,9 +62,12 @@ type PostgresActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'Entity
             let root = document.RootElement
 
             let field (name: string) : Result<JsonElement, StoreError> =
-                match root.TryGetProperty name with
-                | true, value -> Ok value
-                | _ -> Error(Db.decodeFailure (nameof ActionRecord) $"an action message carried no {name}")
+                if root.ValueKind <> JsonValueKind.Object then
+                    Error(Db.decodeFailure (nameof ActionRecord) "an action message was not an object")
+                else
+                    match root.TryGetProperty name with
+                    | true, value -> Ok value
+                    | _ -> Error(Db.decodeFailure (nameof ActionRecord) $"an action message carried no {name}")
 
             let text (name: string) : Result<string, StoreError> =
                 field name
@@ -77,7 +80,10 @@ type PostgresActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'Entity
                 field name
                 |> Result.bind (fun value ->
                     match value.ValueKind with
-                    | JsonValueKind.Number -> Ok(value.GetInt64())
+                    | JsonValueKind.Number ->
+                        match value.TryGetInt64() with
+                        | true, number -> Ok number
+                        | _ -> Error(Db.decodeFailure (nameof ActionRecord) $"{name} was outside int64 range")
                     | _ -> Error(Db.decodeFailure (nameof ActionRecord) $"{name} was not a number"))
 
             result {
@@ -164,19 +170,28 @@ type PostgresActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'Entity
             backgroundTaskResult {
                 let! claimed = Sql.runProgramOnce context claim ct
 
-                // Decoded once the claim has returned. The first message that does not decode
-                // fails the claim, as before; its lease lapses and it is redelivered.
                 return!
-                    claimed
-                    |> List.traverseResultM (fun (message, messageId, deliveries, visibleUntil) ->
-                        readMessage message
-                        |> Result.map (fun record ->
-                            { Work = record
-                              // The message's id identifies the claim; the delivery count fences
-                              // it. Every write below needs both.
-                              Token = LeaseToken.ofInt64 messageId
-                              DeliveryCount = deliveries
-                              ExpiresAt = visibleUntil }))
+                    ClaimRecovery.collect
+                        (fun (message, messageId, deliveries, visibleUntil) ->
+                            readMessage message
+                            |> Result.map (fun record ->
+                                { Work = record
+                                  // The message's id identifies the claim; the delivery count fences
+                                  // it. Every write below needs both.
+                                  Token = LeaseToken.ofInt64 messageId
+                                  DeliveryCount = deliveries
+                                  ExpiresAt = visibleUntil }))
+                        (fun (_, messageId, deliveries, _) reason ->
+                            fenced
+                                abandonAction
+                                (queue
+                                 @ [ "msg_id", Param.Bigint messageId
+                                     "read_ct", Param.Int deliveries
+                                     "reason", Param.Text reason ])
+                                ct
+                            |> TaskResult.map ignore)
+                        claimed
+                        ct
             }
 
         member _.Complete(action, ct) = fenced completeAction (fence action) ct

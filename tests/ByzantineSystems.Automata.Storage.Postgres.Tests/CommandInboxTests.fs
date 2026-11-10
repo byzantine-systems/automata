@@ -108,6 +108,92 @@ let private behaviorClasses =
       "result-deadlettered"
       "result-missing" ]
 
+let internal poisonFixture actions count payload =
+    task {
+        do! reset ()
+        let inbox = newInbox ()
+        let processor = newProcessor ()
+        let ids = ResizeArray<CommandId>()
+
+        for index in 1..count do
+            let! submitted =
+                inbox.Submit(submission (entity $"poison-{index}") $"k{index}" (Start payload), noCancellation)
+
+            ids.Add(submitted |> expectOk "submit" |> commandIdOf)
+
+        if actions then
+            let! held = inbox.Claim(machine, ClaimBatch.create count, lease, noCancellation)
+
+            for row in held |> expectOk "claim" do
+                let! committed =
+                    processor.Commit(
+                        row.Work.CommandId,
+                        row.Token,
+                        Epoch.initial,
+                        draft row.Work.EntityId Idle (Active payload) startTime,
+                        noCancellation
+                    )
+
+                committed |> expectOk "commit" |> ignore
+
+        return
+            { Ids = List.ofSeq ids
+              Corrupt =
+                fun id ->
+                    task {
+                        let id = CommandId.value id
+
+                        let sql =
+                            if actions then
+                                $"UPDATE pgmq.q_{actionQueue} SET message = jsonb_set(message, '{{action}}', '{{}}'::jsonb) WHERE (message->>'command_id')::bigint = {id}"
+                            else
+                                $"UPDATE fsm.command SET event = '{{}}'::jsonb WHERE command_id = {id}"
+
+                        exec sql |> expectOk "corrupt"
+                    }
+              Claim =
+                fun () ->
+                    task {
+                        if actions then
+                            let! rows =
+                                (newActionQueue ())
+                                    .Claim(
+                                        machine,
+                                        ClaimBatch.create count,
+                                        LeaseDuration.create (TimeSpan.FromMinutes 1.),
+                                        noCancellation
+                                    )
+
+                            return rows |> Result.map (List.map (fun row -> row.Work.CommandId))
+                        else
+                            let! rows =
+                                inbox.Claim(
+                                    machine,
+                                    ClaimBatch.create count,
+                                    LeaseDuration.create (TimeSpan.FromMinutes 1.),
+                                    noCancellation
+                                )
+
+                            return rows |> Result.map (List.map (fun row -> row.Work.CommandId))
+                    }
+              IsQuarantined =
+                fun id ->
+                    task {
+                        if actions then
+                            return
+                                scalar<bool>
+                                    $"SELECT EXISTS (SELECT 1 FROM fsm.action_dead_letter WHERE command_id = {CommandId.value id} AND reason LIKE 'undecodable:%%')"
+                        else
+                            let! result = processor.TryGetResult(id, noCancellation)
+
+                            return
+                                match result with
+                                | Ok(Some(CommandResult.DeadLettered(CommandFailure.Machine reason))) ->
+                                    reason.StartsWith "undecodable:"
+                                | _ -> false
+                    } }
+    }
+
 let tests =
     testList
         "Postgres ICommandInbox"
@@ -118,6 +204,8 @@ let tests =
           ContractProperties.requestIdentityProperty "idempotency keys name immutable requests" 12 (contractEnv ())
 
           ContractProperties.arrivalOrderProperty "arrival time follows sequence order" 12 (contractEnv ())
+
+          ContractProperties.poisonBatchProperty "poison commands do not wedge a batch" 12 (poisonFixture false)
 
           testCaseTask "arrival is sampled after a blocked submit takes the entity lock" (fun () ->
               task {

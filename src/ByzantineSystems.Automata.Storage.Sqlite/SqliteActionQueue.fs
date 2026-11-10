@@ -106,6 +106,24 @@ type SqliteActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'EntityId
                     (actionRow >> Ok)
         }
 
+    let abandon values reason ct =
+        Sql.writeProgramWith
+            context
+            (fun now ->
+                store {
+                    let! recorded =
+                        StoreProgram.executeCount
+                            abandonAction
+                            (values @ [ "@reason", Param.Text reason; "@now", Param.Integer now ])
+
+                    match CommandMapping.leaseOutcome recorded with
+                    | LeaseUpdateOutcome.LeaseLost -> return LeaseUpdateOutcome.LeaseLost
+                    | Updated ->
+                        do! StoreProgram.executeDiscard completeAction values
+                        return Updated
+                })
+            ct
+
     interface IActionQueue<'EntityId, 'Action> with
 
         member _.Claim(machineId, batch, lease, ct) =
@@ -119,7 +137,19 @@ type SqliteActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'EntityId
                         (claim machineId (ClaimBatch.value batch) (LeaseDuration.value lease))
                         ct
 
-                return! rows |> List.traverseResultM toLeased
+                return!
+                    ClaimRecovery.collect
+                        toLeased
+                        (fun row reason ->
+                            abandon
+                                [ "@command_id", Param.Integer row.command_id
+                                  "@ordinal", Param.Integer row.ordinal
+                                  "@lease_token", Param.Integer row.lease_token ]
+                                reason
+                                ct
+                            |> TaskResult.map ignore)
+                        rows
+                        ct
             }
 
         member _.Complete(action, ct) =
@@ -143,20 +173,4 @@ type SqliteActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'EntityId
                 ct
 
         member _.Abandon(action, reason, ct) =
-            Sql.writeProgramWith
-                context
-                (fun now ->
-                    store {
-                        let! recorded =
-                            StoreProgram.executeCount
-                                abandonAction
-                                (fence action
-                                 @ [ "@reason", Param.Text(Reason.value reason); "@now", Param.Integer now ])
-
-                        match CommandMapping.leaseOutcome recorded with
-                        | LeaseUpdateOutcome.LeaseLost -> return LeaseUpdateOutcome.LeaseLost
-                        | Updated ->
-                            do! StoreProgram.executeDiscard completeAction (fence action)
-                            return Updated
-                    })
-                ct
+            abandon (fence action) (Reason.value reason) ct

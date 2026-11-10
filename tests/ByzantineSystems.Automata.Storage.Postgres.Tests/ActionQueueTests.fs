@@ -55,7 +55,12 @@ let private deadLetterCount () =
 let tests =
     testList
         "Postgres action queue"
-        [ testTask "a commit enqueues its actions in the same transaction" {
+        [ ContractProperties.poisonBatchProperty
+              "poison actions do not wedge a batch"
+              12
+              (CommandInboxTests.poisonFixture true)
+
+          testTask "a commit enqueues its actions in the same transaction" {
               do! reset ()
               let inbox = newInbox ()
               let! held = leased inbox "e1" "k1"

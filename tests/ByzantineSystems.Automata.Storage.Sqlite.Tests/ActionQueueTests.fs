@@ -58,7 +58,12 @@ let private stringStore (fixture: Fixture) =
 let tests =
     testList
         "IActionQueue"
-        [ testTask "a claimed action carries the command and ordinal that produced it" {
+        [ ContractProperties.poisonBatchProperty
+              "poison actions do not wedge a batch"
+              25
+              (CommandInboxTests.poisonFixture true)
+
+          testTask "a claimed action carries the command and ordinal that produced it" {
               let db = fixture "actions"
               let! held = committed db "k1"
 

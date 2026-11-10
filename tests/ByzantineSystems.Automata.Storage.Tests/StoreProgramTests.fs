@@ -185,6 +185,42 @@ let tests =
                                                  |> List.map (fun (index, step) -> expectedInstruction index step)))
 
           Property.property
+              "failed poison quarantine preserves healthy work and attempts every poison"
+              (fun (payloads: byte list) ->
+                  task {
+                      let rows = (0uy :: 1uy :: 2uy :: List.truncate 20 payloads) |> List.indexed
+                      let attempted = ResizeArray<int>()
+
+                      let decode (index, value) =
+                          if index % 3 = 0 then
+                              Error(StoreError.Serialization("event", FormatException "obsolete representation"))
+                          else
+                              Ok value
+
+                      let quarantine (index, _) reason =
+                          Expect.stringStarts
+                              reason
+                              "undecodable: event:"
+                              "the dead letter records the decoder failure"
+
+                          attempted.Add index
+                          Task.FromResult(Error(StoreError.Unavailable(InvalidOperationException "write failed")))
+
+                      let! recovered = ClaimRecovery.collect decode quarantine rows CancellationToken.None
+
+                      let healthy =
+                          rows
+                          |> List.choose (fun (index, value) -> if index % 3 = 0 then None else Some value)
+
+                      let poison =
+                          rows
+                          |> List.choose (fun (index, _) -> if index % 3 = 0 then Some index else None)
+
+                      return recovered = Ok healthy && List.ofSeq attempted = poison
+                  }
+                  |> fun running -> running.GetAwaiter().GetResult())
+
+          Property.property
               "a typed error stops the remaining program"
               (fun (generated: ProgramStep list, position: uint32) ->
                   let steps =

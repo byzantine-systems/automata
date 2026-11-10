@@ -82,6 +82,8 @@ Every store method answers failures as `StoreError`, and the case says what a ca
 
 Arrival time is nondecreasing in each entity's sequence order. Database-stamped arrivals are sampled inside the ordering transaction and clamped to their predecessor, including corrections. An explicit earlier arrival returns `Refused(ArrivedBeforePredecessor predecessor)` without inserting a command. Identical retries still return the original command regardless of retry metadata.
 
+Claims isolate undecodable rows. A poison command is dead-lettered with a machine failure beginning `undecodable:`; a poison action is abandoned with a durable action dead letter. These follow-up writes use the raw claim fence, so decoding an entity id is not required to quarantine it. Healthy work from the same claim is returned. If a follow-up write fails, that poison stays leased for reclamation and another quarantine attempt.
+
 ### Optional capabilities
 
 Two capabilities sit outside the required four, discovered by `Store.tryTemporal` and `Store.tryCorrections` rather than declared on `IMachineStore`. A type test is the only shape where adding a capability breaks nobody: members returning `option` would force every provider to write `None` for capabilities it has never heard of, and declaring one separately when a machine is wired would let a caller hand over a reader belonging to a different store than the one it configured. `Machine.temporal` and `Machine.corrections` return the options; `Machine.history` is always available because history is required.

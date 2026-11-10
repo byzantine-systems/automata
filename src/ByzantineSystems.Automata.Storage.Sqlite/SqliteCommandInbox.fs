@@ -153,6 +153,12 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
     let nextToken = StatementKey.create "system" "next_token" |> Sql.prepareProgram
     let claimCommands = StatementKey.create "command" "claim" |> Sql.prepareProgram
 
+    let deadLetterUndecodable =
+        StatementKey.create "command" "dead_letter_undecodable" |> Sql.prepareProgram
+
+    let insertError = StatementKey.create "command" "insert_error" |> Sql.prepareProgram
+    let promoteHead = StatementKey.create "command" "promote_head" |> Sql.prepareProgram
+
     let rescheduleCommand =
         StatementKey.create "command" "reschedule" |> Sql.prepareProgram
 
@@ -249,10 +255,8 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
 
     /// A claimed row carries its own lease: the token that fences it, the delivery count, and the
     /// deadline the claim assigned. visible_at means the lease deadline while a command is leased.
-    let leasedRow (reader: SqliteDataReader) : Result<LeasedCommand<'EntityId, 'Event>, StoreError> =
-        let row = CommandMapping.commandRow reader
-
-        toRecord (row, correctionOption reader)
+    let leasedRow (row: main.fsm_command, correction) : Result<LeasedCommand<'EntityId, 'Event>, StoreError> =
+        toRecord (row, correction)
         |> Result.map (fun record ->
             { Work = record
               Token = LeaseToken.ofInt64 row.lease_token
@@ -391,7 +395,7 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
                       "@now", Param.Integer now
                       "@deadline", Param.Integer(Instant.add now lease)
                       "@lease_token", Param.Integer token ]
-                    leasedRow
+                    (fun reader -> Ok(CommandMapping.commandRow reader, correctionOption reader))
         }
 
     interface ICommandInbox<'EntityId, 'Event> with
@@ -410,7 +414,46 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
             // outcome was lost may have leased a batch, and a retry would lease a second one
             // while the first stays invisible until its lease lapses. The worker polls again in a
             // moment, which recovers sooner than a retry would.
-            Sql.writeProgramOnceWith context (claim machineId (ClaimBatch.value batch) (LeaseDuration.value lease)) ct
+            backgroundTaskResult {
+                let! rows =
+                    Sql.writeProgramOnceWith
+                        context
+                        (claim machineId (ClaimBatch.value batch) (LeaseDuration.value lease))
+                        ct
+
+                return!
+                    ClaimRecovery.collect
+                        leasedRow
+                        (fun (row, _) reason ->
+                            Sql.writeProgramWith
+                                context
+                                (fun now ->
+                                    store {
+                                        let! changed =
+                                            StoreProgram.executeCount
+                                                deadLetterUndecodable
+                                                [ "@command_id", Param.Integer row.command_id
+                                                  "@lease_token", Param.Integer row.lease_token ]
+
+                                        if changed = 1 then
+                                            do!
+                                                StoreProgram.executeDiscard
+                                                    insertError
+                                                    [ "@command_id", Param.Integer row.command_id
+                                                      "@error",
+                                                      Param.Text(JsonSerializer.Serialize {| machine = reason |})
+                                                      "@now", Param.Integer now ]
+
+                                            do!
+                                                StoreProgram.executeDiscard
+                                                    promoteHead
+                                                    [ "@machine_id", Param.Text row.machine_id
+                                                      "@entity_id", Param.Text row.entity_id ]
+                                    })
+                                ct)
+                        rows
+                        ct
+            }
 
         member _.Reschedule(commandId, leaseToken, backoff, ct) =
             Sql.writeProgramWith

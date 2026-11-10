@@ -113,6 +113,93 @@ let private behaviorClasses =
       "result-deadlettered"
       "result-missing" ]
 
+let internal poisonFixture actions count payload =
+    task {
+        let db = fixture "poison-batch"
+        let inbox = inboxOf db
+        let processor = processorOf db
+        let ids = ResizeArray<CommandId>()
+
+        for index in 1..count do
+            let! submitted =
+                inbox.Submit(submission (entity $"poison-{index}") $"k{index}" (Start payload), noCancellation)
+
+            ids.Add(submitted |> expectOk "submit" |> commandIdOf)
+
+        if actions then
+            let! held = claim inbox count
+
+            for row in held do
+                let! committed =
+                    processor.Commit(
+                        row.Work.CommandId,
+                        row.Token,
+                        Epoch.initial,
+                        draft row.Work.EntityId Idle (Active payload) startTime,
+                        noCancellation
+                    )
+
+                committed |> expectOk "commit" |> ignore
+
+        return
+            { Ids = List.ofSeq ids
+              Corrupt =
+                fun id ->
+                    task {
+                        let sql =
+                            if actions then
+                                "UPDATE fsm_action SET action = '{}' WHERE command_id = @id"
+                            else
+                                "DROP TRIGGER fsm_command_submission_is_immutable; UPDATE fsm_command SET event = '{}' WHERE command_id = @id"
+
+                        exec db.Db sql [ "@id", box (CommandId.value id) ]
+                    }
+              Claim =
+                fun () ->
+                    task {
+                        if actions then
+                            let! rows =
+                                (actionsOf db)
+                                    .Claim(
+                                        testMachine,
+                                        ClaimBatch.create count,
+                                        LeaseDuration.create (TimeSpan.FromMinutes 1.),
+                                        noCancellation
+                                    )
+
+                            return rows |> Result.map (List.map (fun row -> row.Work.CommandId))
+                        else
+                            let! rows =
+                                inbox.Claim(
+                                    testMachine,
+                                    ClaimBatch.create count,
+                                    LeaseDuration.create (TimeSpan.FromMinutes 1.),
+                                    noCancellation
+                                )
+
+                            return rows |> Result.map (List.map (fun row -> row.Work.CommandId))
+                    }
+              IsQuarantined =
+                fun id ->
+                    task {
+                        if actions then
+                            return
+                                column
+                                    db.Db
+                                    "SELECT reason FROM fsm_action_dead_letter WHERE command_id = @id"
+                                    [ "@id", box (CommandId.value id) ]
+                                |> List.exists (fun reason -> reason.StartsWith "undecodable:")
+                        else
+                            let! result = processor.TryGetResult(id, noCancellation)
+
+                            return
+                                match result with
+                                | Ok(Some(CommandResult.DeadLettered(CommandFailure.Machine reason))) ->
+                                    reason.StartsWith "undecodable:"
+                                | _ -> false
+                    } }
+    }
+
 let tests =
     testList
         "ICommandInbox"
@@ -123,6 +210,8 @@ let tests =
           ContractProperties.requestIdentityProperty "idempotency keys name immutable requests" 25 (contractEnv ())
 
           ContractProperties.arrivalOrderProperty "arrival time follows sequence order" 25 (contractEnv ())
+
+          ContractProperties.poisonBatchProperty "poison commands do not wedge a batch" 25 (poisonFixture false)
 
           ContractProperties.readyTokenProperty
               "a ready command's sentinel token never authorizes finalization"

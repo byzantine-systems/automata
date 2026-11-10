@@ -26,6 +26,7 @@
         <!-- One codec table per database enumeration, both directions derived from it. -->
         <Compile Include="EnumCodec.fs" />
         <Compile Include="CommandInboxProgram.fs" />
+        <Compile Include="ClaimRecovery.fs" />
         <!-- How a leased command ends, shared by the bundled providers' finalize paths. -->
         <Compile Include="Finalize.fs" />
     </ItemGroup>
