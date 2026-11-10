@@ -266,6 +266,9 @@ CREATE OR REPLACE FUNCTION fsm.purge_action_archive (p_queue text, p_before time
 DECLARE
     v_purged bigint;
 BEGIN
+    IF p_queue = '' THEN
+        RETURN 0;
+    END IF;
     PERFORM
         fsm.assert_queue_name (p_queue);
     IF TO_REGCLASS(FORMAT('pgmq.%I', 'a_' || p_queue)) IS NULL THEN
@@ -294,6 +297,9 @@ CREATE OR REPLACE FUNCTION fsm.has_visible_actions (p_queue text)
 DECLARE
     v_visible boolean := FALSE;
 BEGIN
+    IF p_queue = '' THEN
+        RETURN FALSE;
+    END IF;
     PERFORM
         fsm.assert_queue_name (p_queue);
     IF TO_REGCLASS(FORMAT('pgmq.%I', 'q_' || p_queue)) IS NOT NULL THEN

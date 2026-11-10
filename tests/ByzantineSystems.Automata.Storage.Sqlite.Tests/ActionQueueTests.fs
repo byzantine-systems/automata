@@ -52,7 +52,9 @@ let private deadLetters (fixture: Fixture) =
 /// A whole store whose actions are plain strings, which the default codec writes as bare JSON
 /// strings. That is the shape json_each's value column would have unquoted.
 let private stringStore (fixture: Fixture) =
-    MachineStoreOptions.forEntityId<TestEntity, TestState, TestEvent, string, TestError> fixture.Context
+    MachineStoreOptions.forEntityId<TestEntity, TestState, TestEvent, string, TestError>
+        fixture.Context
+        (ActionDelivery.Deliver(ActionQueueName.create "sqlite_actions"))
     |> SqliteMachineStore
 
 let tests =
@@ -62,6 +64,40 @@ let tests =
               "poison actions do not wedge a batch"
               25
               (CommandInboxTests.poisonFixture true)
+
+          testTask "explicit Discard records actions without queueing them" {
+              let db = fixture "discard"
+
+              let store =
+                  MachineStoreOptions.forEntityId<TestEntity, TestState, TestEvent, TestAction, TestError>
+                      db.Context
+                      ActionDelivery.Discard
+                  |> SqliteMachineStore
+
+              let! held = leased (store :> Inbox) (entity "discard") "key"
+              let processor = store :> Processor
+
+              let! outcome =
+                  processor.Commit(
+                      held.Work.CommandId,
+                      held.Token,
+                      Epoch.initial,
+                      draft held.Work.EntityId Idle (Active 1) effectiveAt,
+                      noCancellation
+                  )
+
+              outcome |> expectOk "commit" |> ignore
+              let! result = processor.TryGetResult(held.Work.CommandId, noCancellation)
+
+              match result |> expectOk "result" with
+              | Some(CommandResult.Committed transition) ->
+                  Expect.equal transition.Draft.Actions [ Notify "done" ] "the transition keeps its actions"
+              | other -> failtestf "expected a committed transition, got %A" other
+
+              Expect.equal (depth db) "0" "discard does not enqueue"
+              let! actions = (store :> Actions).Claim(testMachine, ClaimBatch.create 10, leaseDuration, noCancellation)
+              Expect.equal (actions |> expectOk "claim") [] "discard has no deliverable work"
+          }
 
           testTask "a claimed action carries the command and ordinal that produced it" {
               let db = fixture "actions"

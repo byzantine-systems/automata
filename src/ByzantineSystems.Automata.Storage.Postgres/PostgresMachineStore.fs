@@ -17,8 +17,8 @@ open FsToolkit.ErrorHandling
 type MachineStoreOptions<'EntityId, 'State, 'Event, 'Action, 'Err> =
     {
         Context: PostgresContext
-        /// <summary>The queue this machine's actions are delivered through, one per machine.</summary>
-        ActionQueue: string
+        /// <summary>Delivery registered at boot, or explicit Discard.</summary>
+        ActionDelivery: ActionDelivery
         StateCodec: Codec<'State>
         EventCodec: Codec<'Event>
         ActionCodec: Codec<'Action>
@@ -61,18 +61,18 @@ module MachineStoreOptions =
     /// <code lang="fsharp">
     /// let store =
     ///     MachineStoreOptions.forEntityId&lt;Payment, PaymentState, PaymentEvent, PaymentAction, PaymentError&gt;
-    ///         context "payment_actions"
+    ///         context (ActionDelivery.Deliver(ActionQueueName.create "payment_actions"))
     ///     |> PostgresMachineStore
     /// </code>
     /// </example>
     let forEntityId<'Tag, 'State, 'Event, 'Action, 'Err>
         (context: PostgresContext)
-        (actionQueue: string)
+        (actionDelivery: ActionDelivery)
         : MachineStoreOptions<EntityId<'Tag>, 'State, 'Event, 'Action, 'Err> =
         let encode, decode = EntityKey.forEntityId<'Tag>
 
         { Context = context
-          ActionQueue = actionQueue
+          ActionDelivery = actionDelivery
           StateCodec = Serialization.systemTextJson<'State> ()
           EventCodec = Serialization.systemTextJson<'Event> ()
           ActionCodec = Serialization.systemTextJson<'Action> ()
@@ -111,7 +111,6 @@ type PostgresMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     let processor =
         PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>(
             { Context = options.Context
-              ActionQueue = options.ActionQueue
               StateCodec = options.StateCodec
               EventCodec = options.EventCodec
               // The transition row stores the whole action list as one document, while the
@@ -123,14 +122,28 @@ type PostgresMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
               EntityIdDecode = options.EntityIdDecode }
         )
 
-    let actions =
-        PostgresActionQueue<'EntityId, 'Action>(
-            { Context = options.Context
-              Queue = options.ActionQueue
-              ActionCodec = options.ActionCodec
-              EntityIdEncode = options.EntityIdEncode
-              EntityIdDecode = options.EntityIdDecode }
-        )
+    let queueName, actions =
+        match options.ActionDelivery with
+        | ActionDelivery.Discard -> "", None
+        | ActionDelivery.Deliver name ->
+            let queue = ActionQueueName.value name
+
+            queue,
+            Some(
+                PostgresActionQueue<'EntityId, 'Action>(
+                    { Context = options.Context
+                      Queue = queue
+                      ActionCodec = options.ActionCodec
+                      EntityIdEncode = options.EntityIdEncode
+                      EntityIdDecode = options.EntityIdDecode }
+                )
+            )
+
+    let ensureQueue ct =
+        match actions with
+        | Some actions -> actions.EnsureQueueAsync ct
+        | None when ct.IsCancellationRequested -> Task.FromCanceled<Result<bool, StoreError>> ct
+        | None -> Task.FromResult(Ok false)
 
     let temporalStore =
         PostgresTemporalStore<'EntityId, 'State>(
@@ -141,9 +154,13 @@ type PostgresMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
         )
 
     let notifications =
-        PostgresWorkNotifications(options.Context, options.ActionQueue, options.Listener) :> IWorkNotifications
+        PostgresWorkNotifications(options.Context, queueName, options.Listener) :> IWorkNotifications
 
-    let actionQueue = actions :> IActionQueue<'EntityId, 'Action>
+    let actionQueue =
+        match actions with
+        | Some actions -> actions :> IActionQueue<'EntityId, 'Action>
+        | None -> ActionQueues.discard ()
+
     let reader = processor :> IStateReader<'EntityId, 'State, 'Event, 'Action>
     let temporal = temporalStore :> ITemporalReader<'EntityId, 'State>
     let corrections = temporalStore :> ICorrectionStore<'EntityId, 'State>
@@ -158,8 +175,8 @@ type PostgresMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
         taskResult {
             match! Boot.inspect options.Context ct with
             | [] ->
-                let! _ = actions.EnsureQueueAsync ct
-                do! Boot.register options.Context machineId options.ActionQueue options.Retention options.ReapAfter ct
+                let! _ = ensureQueue ct
+                do! Boot.register options.Context machineId queueName options.Retention options.ReapAfter ct
                 return BootReport.Ready
             | defects -> return BootReport.Refused defects
         }
@@ -169,7 +186,7 @@ type PostgresMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     /// before any command can commit: a commit enqueues into this queue inside its own
     /// transaction, and a missing queue would fail the commit rather than only the delivery.
     /// </summary>
-    member _.EnsureQueueAsync(ct: CancellationToken) : Task<Result<bool, StoreError>> = actions.EnsureQueueAsync ct
+    member _.EnsureQueueAsync(ct: CancellationToken) : Task<Result<bool, StoreError>> = ensureQueue ct
 
     interface ICommandInbox<'EntityId, 'Event> with
 
@@ -239,14 +256,10 @@ type PostgresMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
         member _.Correct(machineId, entityId, validFrom, beliefs, ct) =
             corrections.Correct(machineId, entityId, validFrom, beliefs, ct)
 
-    /// The boot check. A queue name the store could not use is refused before the database is
-    /// asked anything.
+    /// The boot check. Delivery names are validated before the options can be constructed.
     interface IStoreBoot with
 
-        member _.Boot(machineId, ct) =
-            match Boot.queueName options.ActionQueue with
-            | Some defect -> Task.FromResult(Ok(BootReport.Refused [ defect ]))
-            | None -> boot machineId ct
+        member _.Boot(machineId, ct) = boot machineId ct
 
     interface IWorkNotifications with
 

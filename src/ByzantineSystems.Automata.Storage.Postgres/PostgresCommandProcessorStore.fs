@@ -18,12 +18,6 @@ open Npgsql
 type CommandProcessorOptions<'EntityId, 'State, 'Event, 'Action, 'Err> =
     {
         Context: PostgresContext
-        /// <summary>
-        /// The queue a commit enqueues its actions into, inside the commit's own transaction.
-        /// The empty string means this machine delivers no actions, which is how a chart that
-        /// emits none avoids requiring a queue to exist.
-        /// </summary>
-        ActionQueue: string
         StateCodec: Codec<'State>
         EventCodec: Codec<'Event>
         ActionCodec: Codec<'Action list>
@@ -228,8 +222,7 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
             ([ Params.commandId "command_id" commandId
                Params.commandLease "lease_token" token
                "expected_epoch", Param.Bigint(int64 (Epoch.value expected))
-               "status", Param.Text(EnumCodec.encode EnumCodec.commandStatus (Resolution.status resolution))
-               "action_queue", Param.Text options.ActionQueue ]
+               "status", Param.Text(EnumCodec.encode EnumCodec.commandStatus (Resolution.status resolution)) ]
              @ ending)
             (finalizeOutcome expected)
 

@@ -238,7 +238,7 @@ let bootTests =
               let store =
                   MachineStoreOptions.forEntityId<TestEntity, TestState, TestEvent, TestAction, TestError>
                       (context ())
-                      actionQueue
+                      (ActionDelivery.Deliver(ActionQueueName.create actionQueue))
                   |> PostgresMachineStore
 
               let! booted = (store :> IStoreBoot).Boot(machine, noCancellation)
@@ -253,26 +253,6 @@ let bootTests =
                   (found |> expectOk "read" |> Option.map (fun record -> record.Event))
                   (Some(Start 1))
                   "the default codecs read back what they wrote"
-          }
-
-          testTask "a queue name the store could not use is refused before the database is asked" {
-              // Nothing is listening on this host. Asking the database would answer Unavailable;
-              // answering Misconfigured proves nobody asked.
-              use unreachable = DataSource.create "Host=unreachable.invalid;Timeout=1"
-
-              let store =
-                  MachineStoreOptions.forEntityId<TestEntity, TestState, TestEvent, TestAction, TestError>
-                      (PostgresContext.create
-                          unreachable
-                          ByzantineSystems.Automata.Resilience.TransientPolicy.defaults
-                          ignore)
-                      "Bad Queue; DROP TABLE"
-                  |> PostgresMachineStore
-
-              match! (store :> IStoreBoot).Boot(machine, noCancellation) with
-              | Ok(BootReport.Refused [ BootDefect.Misconfigured reason ]) ->
-                  Expect.stringContains reason "Bad Queue" "the reason names the queue"
-              | other -> failtestf "expected a configuration refusal, got %A" other
           }
 
           testTask "boot creates the action queue when it is missing" {

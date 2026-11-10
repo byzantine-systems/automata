@@ -76,3 +76,19 @@ type IActionQueue<'EntityId, 'Action> =
     abstract Abandon:
         action: LeasedAction<'EntityId, 'Action> * reason: Reason * ct: CancellationToken ->
             Task<Result<LeaseUpdateOutcome, StoreError>>
+
+/// The consumer side of explicit Discard: no claim can issue a delivery lease.
+[<RequireQualifiedAccess>]
+module internal ActionQueues =
+    let discard<'EntityId, 'Action> () : IActionQueue<'EntityId, 'Action> =
+        let answer (ct: CancellationToken) value =
+            if ct.IsCancellationRequested then
+                Task.FromCanceled<Result<_, StoreError>> ct
+            else
+                Task.FromResult(Ok value)
+
+        { new IActionQueue<'EntityId, 'Action> with
+            member _.Claim(_, _, _, ct) = answer ct []
+            member _.Complete(_, ct) = answer ct LeaseUpdateOutcome.LeaseLost
+            member _.Reschedule(_, _, ct) = answer ct LeaseUpdateOutcome.LeaseLost
+            member _.Abandon(_, _, ct) = answer ct LeaseUpdateOutcome.LeaseLost }

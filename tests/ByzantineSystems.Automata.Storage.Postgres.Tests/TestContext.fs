@@ -120,7 +120,8 @@ let reset () : Task =
                  -- it is empty too.
                  REFRESH MATERIALIZED VIEW fsm.belief_cold;
                  INSERT INTO fsm.machine_chart_version (machine_id, version, fingerprint)
-                 VALUES (@machine_id, @version, @fingerprint);
+                  VALUES (@machine_id, @version, @fingerprint);
+                  INSERT INTO fsm.machine_maintenance(machine_id, action_queue) VALUES (@machine_id, @queue);
                  -- The queue survives the truncate because it is pgmq's table, not ours.
                  -- Emptying it keeps one test's undelivered actions out of the next one.
                  SELECT pgmq.purge_queue(@queue);
@@ -153,7 +154,6 @@ let private processorStore () =
 
     PostgresCommandProcessorStore<Entity, TestState, TestEvent, TestAction, TestError>(
         { Context = context ()
-          ActionQueue = actionQueue
           StateCodec = Serialization.systemTextJson<TestState> ()
           EventCodec = Serialization.systemTextJson<TestEvent> ()
           ActionCodec = Serialization.systemTextJson<TestAction list> ()
@@ -377,7 +377,7 @@ let newMachineStore (retention: RetentionPolicy) =
 
     PostgresMachineStore<Entity, TestState, TestEvent, TestAction, TestError>(
         { Context = context ()
-          ActionQueue = actionQueue
+          ActionDelivery = ActionDelivery.Deliver(ActionQueueName.create actionQueue)
           StateCodec = Serialization.systemTextJson<TestState> ()
           EventCodec = Serialization.systemTextJson<TestEvent> ()
           ActionCodec = Serialization.systemTextJson<TestAction> ()

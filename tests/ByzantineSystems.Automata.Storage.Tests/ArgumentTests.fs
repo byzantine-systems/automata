@@ -131,6 +131,44 @@ let tests =
                 TimeSpan.FromTicks baseTicks, TimeSpan.FromTicks ceilingTicks ]
               |> List.forall backoffLaw)
 
+          Property.property
+              "ActionQueueName enforces pgmq's alphabet and 47-character limit"
+              (fun (raw: string, suffix: byte list) ->
+                  let alphabet = "abcdefghijklmnopqrstuvwxyz_0123456789"
+
+                  let generated =
+                      "a"
+                      + (suffix
+                         |> List.truncate 46
+                         |> List.map (fun b -> alphabet[int b % alphabet.Length])
+                         |> Array.ofList
+                         |> String)
+
+                  [ null
+                    ""
+                    raw
+                    generated
+                    String('a', 47)
+                    String('a', 48)
+                    "0queue"
+                    "queue\n"
+                    "Upper"
+                    "a-b" ]
+                  |> List.forall (fun value ->
+                      let valid =
+                          not (isNull value)
+                          && value.Length > 0
+                          && value.Length <= 47
+                          && (value[0] = '_' || (value[0] >= 'a' && value[0] <= 'z'))
+                          && (value |> Seq.forall (fun c -> alphabet.Contains c))
+
+                      match ActionQueueName.tryCreate value with
+                      | Ok name ->
+                          valid
+                          && ActionQueueName.value name = value
+                          && ActionQueueName.create value = name
+                      | Error _ -> not valid && throwsArgument (fun () -> ActionQueueName.create value |> ignore)))
+
           Property.property "Page accepts exactly positive limits and observes them" (fun (seed: int) ->
               let epoch = Epoch.ofUInt64 (uint64 (bounded 1000 seed) + 1UL)
 

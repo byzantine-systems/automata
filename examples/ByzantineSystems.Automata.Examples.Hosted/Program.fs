@@ -104,7 +104,9 @@ let documents (log: ILogger) (context: PostgresContext) =
         initialState Drafting
 
         store (
-            MachineStoreOptions.forEntityId<Document, Stage, Review, Notice, string> context "document_notices"
+            MachineStoreOptions.forEntityId<Document, Stage, Review, Notice, string>
+                context
+                (ActionDelivery.Deliver(ActionQueueName.create "document_notices"))
             |> PostgresMachineStore
         )
 

@@ -2,6 +2,38 @@ namespace ByzantineSystems.Automata.Storage
 
 open System
 
+/// <summary>An ASCII pgmq-compatible queue name, at most 47 characters.</summary>
+[<Struct>]
+type ActionQueueName = private ActionQueueName of string
+
+[<RequireQualifiedAccess>]
+module ActionQueueName =
+
+    // pgmq.validate_queue_name reserves 16 identifier characters for its longest prefix.
+    // https://github.com/pgmq/pgmq/blob/main/pgmq-extension/sql/pgmq.sql
+    let tryCreate (value: string) : Result<ActionQueueName, string> =
+        if isNull value || value.Length = 0 then
+            Error "An action queue name cannot be empty. Use ActionDelivery.Discard to omit delivery."
+        elif value.Length > 47 then
+            Error "An action queue name cannot exceed pgmq's 47-character limit."
+        elif not (Text.RegularExpressions.Regex.IsMatch(value, "\\A[a-z_][a-z0-9_]*\\z")) then
+            Error "An action queue name must match [a-z_][a-z0-9_]*."
+        else
+            Ok(ActionQueueName value)
+
+    let create value =
+        match tryCreate value with
+        | Ok name -> name
+        | Error message -> invalidArg (nameof value) message
+
+    let value (ActionQueueName value) = value
+
+/// <summary>Deliver a transition's recorded actions, or explicitly discard their delivery.</summary>
+[<RequireQualifiedAccess>]
+type ActionDelivery =
+    | Deliver of ActionQueueName
+    | Discard
+
 /// <summary>The maximum number of work items claimed or processed in one operation.</summary>
 [<Struct>]
 type ClaimBatch = private ClaimBatch of int

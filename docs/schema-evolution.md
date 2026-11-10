@@ -37,7 +37,7 @@ Reads go through SqlHydra-generated types; routine calls stay in `sql/`. Run `ma
 
 ## Action delivery, and why pgmq is wrapped
 
-A commit enqueues its actions through `pgmq.send`, inside `fsm.finalize_command`, in the same transaction as the transition and the belief. 
+A commit enqueues its actions through `pgmq.send`, inside `fsm.finalize_command`, in the same transaction as the transition and the belief. The routine reads `machine_maintenance.action_queue`; callers cannot override it. A registered empty queue represents explicit `ActionDelivery.Discard`, retaining the actions in the transition without delivery. An absent registration is refused when actions exist. Queue names are ASCII and at most 47 characters, matching `pgmq.validate_queue_name` (verified against pgmq 1.13.1).
 
 ## Temporal tables
 

@@ -44,7 +44,9 @@
 -- ---------------------------------------------------------------------------
 DROP FUNCTION IF EXISTS fsm.finalize_command (bigint, bigint, bigint, fsm.command_status, text, jsonb, jsonb, fsm.instance_status, timestamptz, jsonb, jsonb, jsonb, jsonb, text, text[], text[]);
 
-CREATE OR REPLACE FUNCTION fsm.finalize_command (p_command_id bigint, p_lease_token bigint, p_expected_epoch bigint, p_status fsm.command_status, p_action_queue text DEFAULT '', p_error jsonb DEFAULT NULL, p_state jsonb DEFAULT NULL, p_instance_status fsm.instance_status DEFAULT NULL, p_effective_at timestamptz DEFAULT NULL, p_event jsonb DEFAULT NULL, p_actions jsonb DEFAULT NULL, p_from_state jsonb DEFAULT NULL, p_to_state jsonb DEFAULT NULL, p_handled_by text DEFAULT NULL, p_exited text[] DEFAULT NULL, p_entered text[] DEFAULT NULL)
+DROP FUNCTION IF EXISTS fsm.finalize_command (bigint, bigint, bigint, fsm.command_status, jsonb, jsonb, fsm.instance_status, timestamptz, jsonb, jsonb, jsonb, jsonb, text, text[], text[]);
+
+CREATE OR REPLACE FUNCTION fsm.finalize_command (p_command_id bigint, p_lease_token bigint, p_expected_epoch bigint, p_status fsm.command_status, p_error jsonb DEFAULT NULL, p_state jsonb DEFAULT NULL, p_instance_status fsm.instance_status DEFAULT NULL, p_effective_at timestamptz DEFAULT NULL, p_event jsonb DEFAULT NULL, p_actions jsonb DEFAULT NULL, p_from_state jsonb DEFAULT NULL, p_to_state jsonb DEFAULT NULL, p_handled_by text DEFAULT NULL, p_exited text[] DEFAULT NULL, p_entered text[] DEFAULT NULL)
     RETURNS TABLE (
         outcome fsm.finalize_outcome,
         epoch bigint,
@@ -61,6 +63,7 @@ DECLARE
     v_token bigint;
     v_chart_version integer;
     v_current_epoch bigint;
+    v_action_queue text;
 BEGIN
     IF p_status NOT IN ('succeeded', 'rejected', 'dead_letter') THEN
         RAISE EXCEPTION 'fsm.finalize_command: % is not a terminal status', p_status
@@ -174,18 +177,30 @@ BEGIN
         -- the command id it is the identity a destination deduplicates on: a
         -- redelivery carries a new msg_id and the same pair.
         --
-        -- An empty queue name means the caller has no delivery configured,
-        -- which is how a machine whose chart emits nothing avoids requiring a
-        -- queue to exist. Explicit casts throughout, because pgmq.send is
-        -- overloaded and overload resolution happens at prepare time.
-        IF p_action_queue <> '' AND p_actions IS NOT NULL AND JSONB_ARRAY_LENGTH(p_actions) > 0 THEN
-            PERFORM
-                fsm.assert_queue_name (p_action_queue);
-            PERFORM
-                pgmq.send (p_action_queue::text, JSONB_BUILD_OBJECT('machine_id', v_machine_id, 'entity_id', v_entity_id, 'command_id', p_command_id, 'epoch', p_expected_epoch + 1, 'ordinal', a.ordinal - 1, 'action', a.value), 0::integer)
+        -- Boot's registration is authoritative. An empty registered queue is
+        -- explicit Discard; an absent row is a configuration error, not Discard.
+        IF p_actions IS NOT NULL AND JSONB_ARRAY_LENGTH(p_actions) > 0 THEN
+            SELECT
+                m.action_queue
+            INTO
+                v_action_queue
             FROM
-                JSONB_ARRAY_ELEMENTS(p_actions)
+                fsm.machine_maintenance m
+            WHERE
+                m.machine_id = v_machine_id;
+            IF NOT FOUND THEN
+                RAISE EXCEPTION 'fsm.finalize_command: action delivery is not registered for machine %', v_machine_id
+                    USING ERRCODE = 'invalid_parameter_value';
+            END IF;
+            IF v_action_queue <> '' THEN
+                PERFORM
+                    fsm.assert_queue_name (v_action_queue);
+                PERFORM
+                    pgmq.send (v_action_queue::text, JSONB_BUILD_OBJECT('machine_id', v_machine_id, 'entity_id', v_entity_id, 'command_id', p_command_id, 'epoch', p_expected_epoch + 1, 'ordinal', a.ordinal - 1, 'action', a.value), 0::integer)
+                FROM
+                    JSONB_ARRAY_ELEMENTS(p_actions)
     WITH ORDINALITY AS a (value, ordinal);
+            END IF;
         END IF;
     ELSE
         INSERT INTO fsm.command_error (command_id, error)

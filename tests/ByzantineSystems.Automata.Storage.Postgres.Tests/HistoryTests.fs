@@ -17,7 +17,6 @@ let private contractHistoryEnv () : ContractHistoryEnv =
         let processor =
             PostgresCommandProcessorStore<ContractEntityId, ContractState, ContractEvent, ContractAction, ContractError>(
                 { Context = context ()
-                  ActionQueue = actionQueue
                   StateCodec = Serialization.systemTextJson<ContractState> ()
                   EventCodec = Serialization.systemTextJson<ContractEvent> ()
                   ActionCodec = Serialization.systemTextJson<ContractAction list> ()

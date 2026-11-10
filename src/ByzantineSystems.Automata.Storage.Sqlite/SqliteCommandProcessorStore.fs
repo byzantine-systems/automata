@@ -19,6 +19,7 @@ open Microsoft.Data.Sqlite
 type CommandProcessorOptions<'EntityId, 'State, 'Event, 'Action, 'Err> =
     {
         Context: SqliteContext
+        ActionDelivery: ActionDelivery
         StateCodec: Codec<'State>
         EventCodec: Codec<'Event>
         /// <summary>
@@ -462,14 +463,17 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
 
             do! StoreProgram.executeDiscard upsertSnapshot (written @ [ "@state", Param.Text encoded.ToJson ])
 
-            do!
-                StoreProgram.executeDiscard
-                    enqueueActions
-                    (entity
-                     @ [ Params.commandId "@command_id" commandId
-                         "@epoch", Param.Integer(int64 (Epoch.value epoch))
-                         "@actions", Param.Text encoded.ActionsJson
-                         "@now", Param.Integer now ])
+            match options.ActionDelivery with
+            | ActionDelivery.Discard -> ()
+            | ActionDelivery.Deliver _ ->
+                do!
+                    StoreProgram.executeDiscard
+                        enqueueActions
+                        (entity
+                         @ [ Params.commandId "@command_id" commandId
+                             "@epoch", Param.Integer(int64 (Epoch.value epoch))
+                             "@actions", Param.Text encoded.ActionsJson
+                             "@now", Param.Integer now ])
         }
 
     /// The encoded failure of a rejected or dead-lettered command.

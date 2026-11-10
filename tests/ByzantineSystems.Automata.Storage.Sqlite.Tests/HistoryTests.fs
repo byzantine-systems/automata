@@ -57,6 +57,7 @@ let private contractHistoryEnv () : ContractHistoryEnv =
         let processor =
             SqliteCommandProcessorStore<ContractEntityId, ContractState, ContractEvent, ContractAction, ContractError>(
                 { Context = db.Context
+                  ActionDelivery = ActionDelivery.Deliver(ActionQueueName.create "sqlite_actions")
                   StateCodec = Serialization.systemTextJson<ContractState> ()
                   EventCodec = Serialization.systemTextJson<ContractEvent> ()
                   ActionCodec = Serialization.systemTextJson<ContractAction list> ()

@@ -37,7 +37,7 @@ CREATE OR REPLACE FUNCTION fsm.assert_queue_name (p_queue text)
     SET search_path = pg_catalog, pg_temp
     AS $$
 BEGIN
-    IF p_queue !~ '^[a-z_][a-z0-9_]*$' THEN
+    IF p_queue IS NULL OR LENGTH(p_queue) > 47 OR p_queue !~ '^[a-z_][a-z0-9_]*$' THEN
         RAISE EXCEPTION 'fsm: % is not an acceptable queue name', p_queue
             USING ERRCODE = 'invalid_parameter_value';
     END IF;

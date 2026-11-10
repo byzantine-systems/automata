@@ -256,6 +256,7 @@ let private processorStoreOf (fixture: Fixture) =
 
     SqliteCommandProcessorStore<Entity, TestState, TestEvent, TestAction, TestError>(
         { Context = fixture.Context
+          ActionDelivery = ActionDelivery.Deliver(ActionQueueName.create "sqlite_actions")
           StateCodec = Serialization.systemTextJson<TestState> ()
           EventCodec = Serialization.systemTextJson<TestEvent> ()
           ActionCodec = Serialization.systemTextJson<TestAction list> ()
@@ -283,7 +284,9 @@ let registryOf (fixture: Fixture) : IChartRegistry =
     SqliteChartRegistry({ Context = fixture.Context }) :> IChartRegistry
 
 let storeOf (context: SqliteContext) : Store =
-    MachineStoreOptions.forEntityId<TestEntity, TestState, TestEvent, TestAction, TestError> context
+    MachineStoreOptions.forEntityId<TestEntity, TestState, TestEvent, TestAction, TestError>
+        context
+        (ActionDelivery.Deliver(ActionQueueName.create "sqlite_actions"))
     |> SqliteMachineStore
 
 let submission (entity: Entity) (key: string) (event: TestEvent) : CommandSubmission<Entity, TestEvent> =

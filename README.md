@@ -133,7 +133,7 @@ let switches (context: PostgresContext) =
         store (
             MachineStoreOptions.forEntityId<LightSwitch, SwitchState, SwitchEvent, SwitchAction, string>
                 context
-                "switch_actions"
+                (ActionDelivery.Deliver(ActionQueueName.create "switch_actions"))
             |> PostgresMachineStore
         )
     }
