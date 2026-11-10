@@ -255,7 +255,13 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
         StoreProgram.queryOne statement values (fun reader ->
             let commandId = Row.int64 reader "command_id" |> CommandId.ofInt64
 
-            if Row.bool reader "key_reused" then
+            if not (reader.IsDBNull(reader.GetOrdinal "predecessor_received_at")) then
+                let at =
+                    reader.GetDateTime(reader.GetOrdinal "predecessor_received_at")
+                    |> Db.fromTimestamp
+
+                Ok(SubmissionOutcome.Refused(ArrivedBeforePredecessor at))
+            elif Row.bool reader "key_reused" then
                 Ok(SubmissionOutcome.Refused(KeyReused commandId))
             elif Row.bool reader "accepted" then
                 Ok(Accepted commandId)

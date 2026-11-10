@@ -1,12 +1,14 @@
 module ByzantineSystems.Automata.Storage.Postgres.Tests.CommandInboxTests
 
 open System
+open System.Threading
 open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
 open ByzantineSystems.Automata.Storage.Postgres
 open ByzantineSystems.Automata.Storage.ContractProperties
 open Expecto
+open Npgsql
 open TestContext
 
 let private entity name : Entity = entityId name
@@ -114,6 +116,79 @@ let tests =
           ContractProperties.finalizeProperty "finalization obeys the shared equations" 3 (contractEnv ())
 
           ContractProperties.requestIdentityProperty "idempotency keys name immutable requests" 12 (contractEnv ())
+
+          ContractProperties.arrivalOrderProperty "arrival time follows sequence order" 12 (contractEnv ())
+
+          testCaseTask "arrival is sampled after a blocked submit takes the entity lock" (fun () ->
+              task {
+                  do! reset ()
+                  use deadline = new CancellationTokenSource(TimeSpan.FromSeconds 10.)
+                  let ct = deadline.Token
+                  use! holder = (dataSource ()).OpenConnectionAsync ct
+                  use! blocked = (dataSource ()).OpenConnectionAsync ct
+                  use! transaction = holder.BeginTransactionAsync ct
+
+                  use acquire =
+                      new NpgsqlCommand(
+                          "SELECT pg_advisory_xact_lock(hashtextextended(format('fsm.command/%s/%s', @machine::text, 'arrival-race'), 0))",
+                          holder,
+                          transaction
+                      )
+
+                  acquire.Parameters.AddWithValue("machine", MachineId.value machine) |> ignore
+                  let! _ = acquire.ExecuteNonQueryAsync ct
+
+                  let sql =
+                      "SELECT * FROM fsm.submit_command(@machine, 'arrival-race', @key, 1, '{}'::jsonb)"
+
+                  use waiting = new NpgsqlCommand(sql, blocked)
+                  waiting.Parameters.AddWithValue("machine", MachineId.value machine) |> ignore
+                  waiting.Parameters.AddWithValue("key", "second") |> ignore
+                  let waitingResult = waiting.ExecuteNonQueryAsync ct
+
+                  use probe =
+                      new NpgsqlCommand(
+                          "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = @pid AND locktype = 'advisory' AND NOT granted)",
+                          holder,
+                          transaction
+                      )
+
+                  probe.Parameters.AddWithValue("pid", blocked.ProcessID) |> ignore
+                  let mutable isWaiting = false
+
+                  while not isWaiting do
+                      let! observed = probe.ExecuteScalarAsync ct
+                      isWaiting <- unbox<bool> observed
+
+                      if not isWaiting then
+                          do! Task.Delay(5, ct)
+
+                  // B's statement clock is now older than this first insertion's arrival.
+                  use first = new NpgsqlCommand(sql, holder, transaction)
+                  first.Parameters.AddWithValue("machine", MachineId.value machine) |> ignore
+                  first.Parameters.AddWithValue("key", "first") |> ignore
+                  let! _ = first.ExecuteNonQueryAsync ct
+                  do! transaction.CommitAsync ct
+                  let! _ = waitingResult
+
+                  use result =
+                      new NpgsqlCommand(
+                          "SELECT received_at FROM fsm.command WHERE machine_id = @machine AND entity_id = 'arrival-race' ORDER BY seq",
+                          holder
+                      )
+
+                  result.Parameters.AddWithValue("machine", MachineId.value machine) |> ignore
+                  use! reader = result.ExecuteReaderAsync ct
+                  let! _ = reader.ReadAsync ct
+                  let firstArrival = reader.GetDateTime 0
+                  let! _ = reader.ReadAsync ct
+                  let secondArrival = reader.GetDateTime 0
+
+                  Expect.isGreaterThanOrEqual
+                      secondArrival
+                      firstArrival
+                      "waiting on the lock cannot reverse arrival order"
+              })
 
           ContractProperties.readyTokenProperty
               "a ready command's sentinel token never authorizes finalization"

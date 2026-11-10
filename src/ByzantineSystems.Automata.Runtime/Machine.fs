@@ -451,6 +451,8 @@ module Machine =
                 | AlreadySubmitted id -> Ok id
                 | SubmissionOutcome.Refused(KeyReused id) ->
                     Error(MachineError.Rejected(MachineRejection.KeyReused(CommandId.value id)))
+                | SubmissionOutcome.Refused(ArrivedBeforePredecessor at) ->
+                    Error(MachineError.Rejected(MachineRejection.ArrivedBeforePredecessor at))
 
             let waiter = machine.Completions.Register identifier
 

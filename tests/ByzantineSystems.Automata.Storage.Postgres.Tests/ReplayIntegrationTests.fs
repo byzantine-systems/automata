@@ -199,7 +199,10 @@ let tests =
               // that produced it, the next command would expect an epoch already taken.
               let! built = seeded "after"
               let! _ = correctAndSettle built "after" "fix" 10 11 CorrectionPolicy.defaults
-              let! _ = Machine.enqueue built (entity "after") (at "after" "s3" 1 13) noCancellation
+              // Corrections arrive now, so a subsequent ordinary command must not claim it
+              // arrived in the historical seed timeline.
+              let! next = Machine.enqueue built (entity "after") (EventEnvelope.create "s3" (Start 1)) noCancellation
+              let _ = accepted "the next command" next
               do! drainUntil built (fun () -> (transitions "after").Length = 4)
 
               let! live = liveState "after"

@@ -15,6 +15,7 @@ type internal SubmitInstruction<'Params, 'Reader> =
         existing: StoreProgram<WriteAccess, 'Params, 'Reader, SubmissionOutcome option> *
         registered: StoreProgram<WriteAccess, 'Params, 'Reader, bool> *
         unregistered: StoreError *
+        refusal: StoreProgram<WriteAccess, 'Params, 'Reader, SubmissionRefusal option> *
         insert: StoreProgram<WriteAccess, 'Params, 'Reader, CommandId> *
         correction: (CommandId -> StoreProgram<WriteAccess, 'Params, 'Reader, unit>) option
 
@@ -27,20 +28,23 @@ module internal CommandInboxProgram =
         store {
             match instruction with
             | AtomicSubmission program -> return! program
-            | CheckedSubmission(existing, registered, unregistered, insert, correction) ->
+            | CheckedSubmission(existing, registered, unregistered, refusal, insert, correction) ->
                 match! existing with
                 | Some outcome -> return outcome
                 | None ->
                     match! registered with
                     | false -> return! StoreProgram.fail unregistered
                     | true ->
-                        let! commandId = insert
+                        match! refusal with
+                        | Some reason -> return SubmissionOutcome.Refused reason
+                        | None ->
+                            let! commandId = insert
 
-                        match correction with
-                        | Some write -> do! write commandId
-                        | None -> ()
+                            match correction with
+                            | Some write -> do! write commandId
+                            | None -> ()
 
-                        return Accepted commandId
+                            return Accepted commandId
         }
 
     let leaseUpdate

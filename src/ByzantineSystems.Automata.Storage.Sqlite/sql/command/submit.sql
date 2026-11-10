@@ -25,6 +25,9 @@ INSERT INTO fsm_command (machine_id, entity_id, seq, idempotency_key, chart_vers
             WHERE
                 c.machine_id = @machine_id
                 AND c.entity_id = @entity_id
-                AND c.status IN ('ready', 'leased')), @visible_at, @received_at, @tenant, @principal, @source, @correlation_id, @causation_id)
+                AND c.status IN ('ready', 'leased')), @visible_at, MAX(@received_at, COALESCE((
+                    SELECT c.received_at FROM fsm_command c
+                    WHERE c.machine_id = @machine_id AND c.entity_id = @entity_id
+                    ORDER BY c.seq DESC LIMIT 1), @received_at)), @tenant, @principal, @source, @correlation_id, @causation_id)
 RETURNING
     command_id;

@@ -226,6 +226,8 @@ type LeasedCommand<'EntityId, 'Event> = Leased<CommandWork, CommandRecord<'Entit
 type SubmissionRefusal =
     /// <summary>The key already names a different request.</summary>
     | KeyReused of existing: CommandId
+    /// <summary>The supplied arrival would precede an entity's previous command.</summary>
+    | ArrivedBeforePredecessor of predecessor: DateTimeOffset
 
 /// <summary>A new request, an identical retry, or a refusal without writes.</summary>
 type SubmissionOutcome =
@@ -300,6 +302,8 @@ type ICommandInbox<'EntityId, 'Event> =
     /// Records a command durably. The key identifies kind, chart version, event and correction
     /// fields; different request content is refused. Visibility, arrival and audit are retry
     /// metadata and never replace the first submission's values.
+    /// Arrival time is nondecreasing in per-entity sequence order: database timestamps are
+    /// clamped to the predecessor, while an explicitly earlier arrival is refused.
     /// </summary>
     abstract Submit:
         submission: CommandSubmission<'EntityId, 'Event> * ct: CancellationToken ->

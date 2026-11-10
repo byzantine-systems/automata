@@ -99,7 +99,8 @@ CREATE OR REPLACE FUNCTION fsm.submit_command (p_machine_id text, p_entity_id te
         command_id bigint,
         seq bigint,
         accepted boolean,
-        key_reused boolean)
+        key_reused boolean,
+        predecessor_received_at timestamptz)
     LANGUAGE plpgsql
     VOLATILE PARALLEL UNSAFE
     SET search_path = pg_catalog,
@@ -111,6 +112,8 @@ DECLARE
     v_blocked boolean;
     v_digest bytea;
     v_existing_digest bytea;
+    v_predecessor timestamptz;
+    v_received_at timestamptz;
 BEGIN
     PERFORM
         PG_ADVISORY_XACT_LOCK(HASHTEXTEXTENDED(FORMAT('fsm.command/%s/%s', p_machine_id, p_entity_id), 0));
@@ -142,21 +145,40 @@ BEGIN
             v_command_id,
             v_seq,
             FALSE,
-            v_existing_digest <> v_digest;
+            v_existing_digest <> v_digest,
+            NULL::timestamptz;
         RETURN;
     END IF;
     -- One backward index scan on command_unique_seq, not a scan of the entity's
-    -- history. coalesce supplies the first sequence number, since max() over an
-    -- empty set is NULL rather than 0.
+    -- history. The predecessor supplies both ordering coordinates.
     SELECT
-        COALESCE(MAX(c.seq), 0) + 1
+        c.seq + 1,
+        c.received_at
     INTO
-        v_seq
+        v_seq,
+        v_predecessor
     FROM
         fsm.command c
     WHERE
         c.machine_id = p_machine_id
-        AND c.entity_id = p_entity_id;
+        AND c.entity_id = p_entity_id
+    ORDER BY
+        c.seq DESC
+    LIMIT 1;
+    v_seq := COALESCE(v_seq, 1);
+    IF p_received_at < v_predecessor THEN
+        RETURN QUERY
+        SELECT
+            0::bigint,
+            v_seq,
+            FALSE,
+            FALSE,
+            v_predecessor;
+        RETURN;
+    END IF;
+    -- Sample after the advisory lock. A clock step backwards or a future caller
+    -- timestamp on the predecessor must not reverse effective-time order.
+    v_received_at := COALESCE(p_received_at, GREATEST (CLOCK_TIMESTAMP(), v_predecessor));
     -- An earlier non-terminal sibling means this command waits its turn. EXISTS
     -- states semi-join intent and stops at the first match; served by
     -- command_entity_open_idx, which indexes open commands only.
@@ -170,7 +192,7 @@ BEGIN
             AND c.entity_id = p_entity_id
             AND c.status IN ('ready', 'leased'));
     INSERT INTO fsm.command (machine_id, entity_id, seq, idempotency_key, chart_version, event, kind, request_digest, blocked, visible_at, received_at, tenant, principal, source, correlation_id, causation_id)
-        VALUES (p_machine_id, p_entity_id, v_seq, p_idempotency_key, p_chart_version, p_event, p_kind, v_digest, v_blocked, COALESCE(p_visible_at, NOW()), COALESCE(p_received_at, STATEMENT_TIMESTAMP()), COALESCE(p_tenant, ''), coalesce(p_principal, ''), COALESCE(p_source, ''), coalesce(p_correlation_id, ''), COALESCE(p_causation_id, ''))
+        VALUES (p_machine_id, p_entity_id, v_seq, p_idempotency_key, p_chart_version, p_event, p_kind, v_digest, v_blocked, COALESCE(p_visible_at, NOW()), v_received_at, COALESCE(p_tenant, ''), coalesce(p_principal, ''), COALESCE(p_source, ''), coalesce(p_correlation_id, ''), COALESCE(p_causation_id, ''))
     RETURNING
         fsm.command.command_id
     INTO
@@ -180,7 +202,8 @@ BEGIN
         v_command_id,
         v_seq,
         TRUE,
-        FALSE;
+        FALSE,
+        NULL::timestamptz;
 END;
 $$;
 

@@ -145,6 +145,7 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
 
     let chartByVersion = StatementKey.create "chart" "by_version" |> Sql.prepareProgram
     let submitCommand = StatementKey.create "command" "submit" |> Sql.prepareProgram
+    let predecessor = StatementKey.create "command" "predecessor" |> Sql.prepareProgram
 
     let submitCorrection =
         StatementKey.create "command" "submit_correction" |> Sql.prepareProgram
@@ -351,10 +352,23 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
                   "@causation_id", Param.Text(CommandMapping.audit submission.Audit.CausationId) ]
                 (fun reader -> Ok(Row.int64 reader "command_id" |> CommandId.ofInt64))
 
+        let refusal =
+            StoreProgram.tryQueryOne
+                predecessor
+                [ Params.machineId "@machine_id" machineId
+                  Params.entityKey "@entity_id" entityId ]
+                (fun reader -> Ok(Row.int64 reader "received_at"))
+            |> StoreProgram.map (fun previous ->
+                match submission.Kind, submission.ReceivedAt, previous with
+                | CommandKind.Event, Some supplied, Some at when Instant.ofDateTimeOffset supplied < at ->
+                    Some(ArrivedBeforePredecessor(Instant.toDateTimeOffset at))
+                | _ -> None)
+
         CheckedSubmission(
             existing,
             registered,
             StoreError.NotFound $"chart version %d{version} of machine %s{MachineId.value machineId}",
+            refusal,
             insert,
             correction
         )

@@ -1357,6 +1357,85 @@ let requestIdentityProperty name maxTests (env: ContractInboxEnv) =
                 }
         ))
 
+/// Sequence order implies nondecreasing arrival time, including a predecessor ahead of the
+/// database clock. An explicitly earlier arrival is refused without consuming a sequence.
+let arrivalOrderProperty name maxTests (env: ContractInboxEnv) =
+    testCase name (fun () ->
+        Check.One(
+            Config.QuickThrowOnFailure.WithMaxTest(maxTests),
+            fun (seconds: byte) ->
+                task {
+                    let! stores = env.Fresh()
+                    let entity: ContractEntityId = entityId "arrival-order"
+                    let at = stores.Now().AddDays(1.).AddSeconds(float seconds)
+                    // Persisted instants have microsecond precision on both providers.
+                    let at = DateTimeOffset(at.Ticks / 10L * 10L, at.Offset)
+
+                    let original =
+                        { contractSubmission env entity "first" Pong with
+                            ReceivedAt = Some at }
+
+                    let ct = CancellationToken.None
+                    let! first = stores.Inbox.Submit(original, ct)
+                    Expect.isOk first "the first arrival is unconstrained"
+
+                    let! earlier =
+                        stores.Inbox.Submit(
+                            { original with
+                                IdempotencyKey = "earlier"
+                                ReceivedAt = Some(at.AddSeconds -1.) },
+                            ct
+                        )
+
+                    Expect.equal
+                        earlier
+                        (Ok(SubmissionOutcome.Refused(ArrivedBeforePredecessor at)))
+                        "an earlier caller arrival is refused"
+
+                    let! stamped =
+                        stores.Inbox.Submit(
+                            { original with
+                                IdempotencyKey = "stamped"
+                                ReceivedAt = None },
+                            ct
+                        )
+
+                    Expect.isOk stamped "database time is clamped rather than refused"
+                    let! found = stores.Inbox.TryFind(env.Machine, entity, "stamped", ct)
+
+                    match found with
+                    | Ok(Some row) ->
+                        Expect.equal row.ReceivedAt at "a future predecessor clamps the database clock"
+                        Expect.equal row.Sequence 2L "refusals consume no sequence"
+                    | other -> failtestf "expected the stamped arrival, got %A" other
+
+                    let! equal =
+                        stores.Inbox.Submit(
+                            { original with
+                                IdempotencyKey = "equal" },
+                            ct
+                        )
+
+                    Expect.isOk equal "equal caller arrivals are permitted"
+
+                    let! correction =
+                        stores.Inbox.Submit(
+                            { original with
+                                IdempotencyKey = "correction"
+                                Kind = CommandKind.Correction(at.AddDays -1., CorrectionPolicy.defaults) },
+                            ct
+                        )
+
+                    Expect.isOk correction "correction arrival time is also clamped"
+                    let! foundCorrection = stores.Inbox.TryFind(env.Machine, entity, "correction", ct)
+
+                    Expect.equal
+                        (foundCorrection |> Result.map (Option.map _.ReceivedAt))
+                        (Ok(Some at))
+                        "correction effective time does not reorder arrival"
+                }
+        ))
+
 /// The finalize equations through public observations. Every generated case runs every semantic
 /// branch against fresh stores; the generated payload varies codecs and transition data without
 /// leaving critical outcomes to a low-probability command sequence.

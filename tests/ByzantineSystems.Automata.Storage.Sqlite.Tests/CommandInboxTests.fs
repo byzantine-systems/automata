@@ -122,6 +122,8 @@ let tests =
 
           ContractProperties.requestIdentityProperty "idempotency keys name immutable requests" 25 (contractEnv ())
 
+          ContractProperties.arrivalOrderProperty "arrival time follows sequence order" 25 (contractEnv ())
+
           ContractProperties.readyTokenProperty
               "a ready command's sentinel token never authorizes finalization"
               12

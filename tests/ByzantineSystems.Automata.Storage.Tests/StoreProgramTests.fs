@@ -278,6 +278,7 @@ let tests =
                       StoreProgram.ok (Some(AlreadySubmitted commandId)),
                       StoreProgram.fail (StoreError.NotFound "should not check registration"),
                       StoreError.NotFound "unregistered",
+                      StoreProgram.fail (StoreError.NotFound "should not check arrival"),
                       StoreProgram.fail (StoreError.NotFound "should not insert"),
                       None
                   )
@@ -306,6 +307,7 @@ let tests =
                       StoreProgram.ok None,
                       registered,
                       StoreError.NotFound "unregistered",
+                      StoreProgram.ok None,
                       insert,
                       Some correction
                   )

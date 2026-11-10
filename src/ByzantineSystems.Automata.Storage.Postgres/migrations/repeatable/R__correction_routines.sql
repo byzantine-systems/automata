@@ -131,7 +131,8 @@ CREATE OR REPLACE FUNCTION fsm.submit_correction (p_machine_id text, p_entity_id
         command_id bigint,
         seq bigint,
         accepted boolean,
-        key_reused boolean)
+        key_reused boolean,
+        predecessor_received_at timestamptz)
     LANGUAGE plpgsql
     VOLATILE PARALLEL UNSAFE
     SET search_path = pg_catalog,
@@ -142,17 +143,20 @@ DECLARE
     v_seq bigint;
     v_accepted boolean;
     v_key_reused boolean;
+    v_predecessor timestamptz;
 BEGIN
     SELECT
         s.command_id,
         s.seq,
         s.accepted,
-        s.key_reused
+        s.key_reused,
+        s.predecessor_received_at
     INTO
         v_command_id,
         v_seq,
         v_accepted,
-        v_key_reused
+        v_key_reused,
+        v_predecessor
     FROM
         fsm.submit_command (p_machine_id, p_entity_id, p_idempotency_key, p_chart_version, p_event, NULL, NULL, p_tenant, p_principal, p_source, p_correlation_id, p_causation_id, 'correction', JSONB_BUILD_ARRAY(EXTRACT(EPOCH FROM p_effective_at), p_on_divergence, p_replay_limit)) s;
     IF v_accepted THEN
@@ -164,7 +168,8 @@ BEGIN
         v_command_id,
         v_seq,
         v_accepted,
-        v_key_reused;
+        v_key_reused,
+        v_predecessor;
 END
 $$;
 

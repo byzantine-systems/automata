@@ -83,6 +83,9 @@ type MachineRejection =
     /// <summary>An idempotency key already identifies a different request.</summary>
     | KeyReused of existingCommandId: int64
 
+    /// <summary>The supplied arrival precedes an entity's previous command.</summary>
+    | ArrivedBeforePredecessor of predecessor: DateTimeOffset
+
 /// <summary>
 /// The only error type that crosses the public machine API. Only
 /// <see cref="F:ByzantineSystems.Automata.Core.MachineError`1.Store" />
