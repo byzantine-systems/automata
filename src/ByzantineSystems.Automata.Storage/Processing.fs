@@ -111,8 +111,12 @@ type FinalizeOutcome =
     /// <summary>The command was finished by this call.</summary>
     | Finalized of committed: Epoch
 
-    /// <summary>This lease had already finished it. The epoch is the one it wrote.</summary>
-    | AlreadyFinalized of stored: Epoch
+    /// <summary>
+    /// This lease had already finished it. The epoch is the one it wrote, and the status is the
+    /// resolution that was stored, so a retry that sends a different resolution can tell its
+    /// answer was not the one recorded.
+    /// </summary>
+    | AlreadyFinalized of stored: Epoch * status: CommandStatus
 
     /// <summary>The entity moved on without this caller. Both epochs are reported so a caller knows how far behind it is.</summary>
     | Conflict of expected: Epoch * actual: Epoch

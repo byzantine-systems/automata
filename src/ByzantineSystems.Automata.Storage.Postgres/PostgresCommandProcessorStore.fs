@@ -50,10 +50,10 @@ module private ProcessorMapping =
             | Conflict -> "conflict"
             | LeaseLost -> "lease_lost")
 
-    let outcome (tag: FinalizeTag) (epoch: int64) (expected: Epoch) : FinalizeOutcome =
+    let outcome (tag: FinalizeTag) (epoch: int64) (status: CommandStatus) (expected: Epoch) : FinalizeOutcome =
         match tag with
         | Finalized -> FinalizeOutcome.Finalized(Db.epochOf epoch)
-        | AlreadyFinalized -> FinalizeOutcome.AlreadyFinalized(Db.epochOf epoch)
+        | AlreadyFinalized -> FinalizeOutcome.AlreadyFinalized(Db.epochOf epoch, status)
         | Conflict -> FinalizeOutcome.Conflict(expected, Db.epochOf epoch)
         | LeaseLost -> FinalizeOutcome.LeaseLost
 
@@ -172,8 +172,11 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     let states (ids: StateId list) : string list = ids |> List.map StateId.value
 
     let finalizeOutcome expected reader =
-        EnumCodec.read Row.string ProcessorMapping.finalizeTag "outcome" reader
-        |> Result.map (fun tag -> ProcessorMapping.outcome tag (Row.int64 reader "epoch") expected)
+        result {
+            let! tag = EnumCodec.read Row.string ProcessorMapping.finalizeTag "outcome" reader
+            let! status = EnumCodec.read Row.string EnumCodec.commandStatus "status" reader
+            return ProcessorMapping.outcome tag (Row.int64 reader "epoch") status expected
+        }
 
     /// <summary>
     /// One call to <c>fsm.finalize_command</c>. Which half of its parameters is filled follows

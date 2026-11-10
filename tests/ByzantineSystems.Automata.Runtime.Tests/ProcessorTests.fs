@@ -48,7 +48,7 @@ let tests =
               // asks again and is told what it already did. Treating that as a failure would
               // turn the one safe recovery into a duplicate.
               let store = StubStore<TestError>()
-              store.CommitOutcome <- Ok(AlreadyFinalized(Epoch.ofUInt64 7UL))
+              store.CommitOutcome <- Ok(AlreadyFinalized(Epoch.ofUInt64 7UL, CommandStatus.Succeeded))
               store.Offer(leasedCommand 1L "E-1" (Start 5) 0)
               let! report = poll store
 

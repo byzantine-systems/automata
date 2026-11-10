@@ -101,8 +101,11 @@ type internal LeaseStanding =
     /// <summary>No command has this id.</summary>
     | Unknown
 
-    /// <summary>The caller's own lease already finished it: a retry, answered with what it did.</summary>
-    | FinishedByCaller
+    /// <summary>
+    /// The caller's own lease already finished it: a retry, answered with what it did and the
+    /// resolution that was stored.
+    /// </summary>
+    | FinishedByCaller of status: CommandStatus
 
     /// <summary>Finished under somebody else's lease.</summary>
     | FinishedByAnother
@@ -129,7 +132,11 @@ module internal LeaseStanding =
             match target.Status with
             | CommandStatus.Succeeded
             | CommandStatus.Rejected
-            | CommandStatus.DeadLettered -> if callerHolds then FinishedByCaller else FinishedByAnother
+            | CommandStatus.DeadLettered ->
+                if callerHolds then
+                    FinishedByCaller target.Status
+                else
+                    FinishedByAnother
             | CommandStatus.Ready -> HeldByAnother
             | CommandStatus.Leased -> if callerHolds then HeldByCaller target else HeldByAnother
 
@@ -553,14 +560,15 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                     match LeaseStanding.classify token read with
                     | Unknown ->
                         return! StoreProgram.fail (StoreError.NotFound $"command %d{CommandId.value commandId}")
-                    | FinishedByCaller ->
+                    | FinishedByCaller status ->
                         let! committed =
                             StoreProgram.tryQueryOne
                                 committedEpoch
                                 [ Params.commandId "@command_id" commandId ]
                                 (fun reader -> Row.int64 reader "epoch" |> Db.epochOf |> Ok)
 
-                        return AlreadyFinalized(committed |> Option.defaultValue (Resolution.unmoved resolution))
+                        return
+                            AlreadyFinalized(committed |> Option.defaultValue (Resolution.unmoved resolution), status)
                     | FinishedByAnother
                     | HeldByAnother -> return FinalizeOutcome.LeaseLost
                     | HeldByCaller target -> return! resolve now commandId target resolution

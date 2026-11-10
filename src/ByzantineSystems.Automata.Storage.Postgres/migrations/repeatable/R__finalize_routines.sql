@@ -17,6 +17,11 @@
 -- forces a terminal row to carry a non-zero token, so "who wrote it" is a
 -- column too. The four rows are two comparisons.
 --
+-- The status column of the answer is what the row holds after the call: for
+-- 'finalized' it is the status this call wrote, and for every other outcome it
+-- is the status the row already had, which for 'already_finalized' is the
+-- resolution a retry with a different resolution needs to see.
+--
 -- This is what makes an ambiguous outcome safe to retry, and why a cancelled
 -- Npgsql command or a dropped socket can be treated as "unknown, try again".
 --
@@ -37,10 +42,13 @@
 --
 -- VOLATILE and PARALLEL UNSAFE because it writes.
 -- ---------------------------------------------------------------------------
+DROP FUNCTION IF EXISTS fsm.finalize_command (bigint, bigint, bigint, fsm.command_status, text, jsonb, jsonb, fsm.instance_status, timestamptz, jsonb, jsonb, jsonb, jsonb, text, text[], text[]);
+
 CREATE OR REPLACE FUNCTION fsm.finalize_command (p_command_id bigint, p_lease_token bigint, p_expected_epoch bigint, p_status fsm.command_status, p_action_queue text DEFAULT '', p_error jsonb DEFAULT NULL, p_state jsonb DEFAULT NULL, p_instance_status fsm.instance_status DEFAULT NULL, p_effective_at timestamptz DEFAULT NULL, p_event jsonb DEFAULT NULL, p_actions jsonb DEFAULT NULL, p_from_state jsonb DEFAULT NULL, p_to_state jsonb DEFAULT NULL, p_handled_by text DEFAULT NULL, p_exited text[] DEFAULT NULL, p_entered text[] DEFAULT NULL)
     RETURNS TABLE (
         outcome fsm.finalize_outcome,
-        epoch bigint)
+        epoch bigint,
+        status fsm.command_status)
     LANGUAGE plpgsql
     VOLATILE PARALLEL UNSAFE
     SET search_path = pg_catalog,
@@ -103,12 +111,14 @@ BEGIN
                         t.epoch
                     FROM fsm.transition t
                     WHERE
-                        t.command_id = p_command_id), p_expected_epoch);
+                        t.command_id = p_command_id), p_expected_epoch),
+                v_status;
         ELSE
             RETURN QUERY
             SELECT
                 'lease_lost'::fsm.finalize_outcome,
-                p_expected_epoch;
+                p_expected_epoch,
+                v_status;
         END IF;
         RETURN;
     END IF;
@@ -122,7 +132,8 @@ BEGIN
         RETURN QUERY
         SELECT
             'lease_lost'::fsm.finalize_outcome,
-            p_expected_epoch;
+            p_expected_epoch,
+            v_status;
         RETURN;
     END IF;
     -- The epoch check guards the state write, so it applies only when there is
@@ -150,7 +161,8 @@ BEGIN
             RETURN QUERY
             SELECT
                 'conflict'::fsm.finalize_outcome,
-                v_current_epoch;
+                v_current_epoch,
+                v_status;
             RETURN;
         END IF;
         INSERT INTO fsm.transition (machine_id, entity_id, epoch, command_id, chart_version, event, actions, from_state, to_state, handled_by, exited, entered, status, effective_at)
@@ -213,7 +225,7 @@ BEGIN
             p_expected_epoch + 1
         ELSE
             p_expected_epoch
-        END;
+        END,
+        p_status;
 END
 $$;
-

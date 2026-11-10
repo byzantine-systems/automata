@@ -623,9 +623,28 @@ let private runInboxTrace
                             match tracked.Status with
                             | Finished(RejectedResult _)
                             | Finished(DeadLetterResult _) when token = tracked.RowToken ->
-                                // A cross-resolution retry has underspecified epoch reporting.
-                                // Repeat exercises idempotence without changing the resolution.
-                                return! loop rest
+                                // A cross-resolution retry: the command finished under a
+                                // different resolution, and the answer reports the stored
+                                // status so the caller can tell. The epoch is the caller's
+                                // own expectation echoed back, because a failure wrote no
+                                // transition to name one.
+                                let actual = currentEpoch tracked.Entity
+                                let expected = expectedEpoch expected actual
+
+                                let! outcome =
+                                    stores.Processor.Commit(
+                                        tracked.Id,
+                                        LeaseToken.ofInt64 token,
+                                        expected,
+                                        draftOf tracked state,
+                                        ct
+                                    )
+
+                                if outcome = Ok(AlreadyFinalized(expected, commandStatusOf tracked)) then
+                                    classes.Add "commit-already"
+                                    return! loop rest
+                                else
+                                    return false
                             | status ->
                                 let actual = currentEpoch tracked.Entity
                                 let expected = expectedEpoch expected actual
@@ -639,7 +658,7 @@ let private runInboxTrace
 
                                 match status with
                                 | Finished(CommittedResult(_, committed, _, _, _)) when token = tracked.RowToken ->
-                                    if outcome = Ok(AlreadyFinalized committed) then
+                                    if outcome = Ok(AlreadyFinalized(committed, CommandStatus.Succeeded)) then
                                         classes.Add "commit-already"
                                         return! loop rest
                                     else
@@ -708,7 +727,7 @@ let private runInboxTrace
                                 | Finished(CommittedResult(expected, committed, draft, _, _)) ->
                                     let! outcome = stores.Processor.Commit(tracked.Id, token, expected, draft, ct)
 
-                                    if outcome = Ok(AlreadyFinalized committed) then
+                                    if outcome = Ok(AlreadyFinalized(committed, CommandStatus.Succeeded)) then
                                         classes.Add "commit-already"
                                         return! loop rest
                                     else
@@ -716,7 +735,7 @@ let private runInboxTrace
                                 | Finished(RejectedResult failure) ->
                                     let! outcome = stores.Processor.Reject(tracked.Id, token, failure, ct)
 
-                                    if outcome = Ok(AlreadyFinalized Epoch.initial) then
+                                    if outcome = Ok(AlreadyFinalized(Epoch.initial, CommandStatus.Rejected)) then
                                         classes.Add "reject-already"
                                         return! loop rest
                                     else
@@ -724,7 +743,7 @@ let private runInboxTrace
                                 | Finished(DeadLetterResult failure) ->
                                     let! outcome = stores.Processor.DeadLetter(tracked.Id, token, failure, ct)
 
-                                    if outcome = Ok(AlreadyFinalized Epoch.initial) then
+                                    if outcome = Ok(AlreadyFinalized(Epoch.initial, CommandStatus.DeadLettered)) then
                                         classes.Add "deadletter-already"
                                         return! loop rest
                                     else
@@ -898,6 +917,16 @@ type private FakeRow =
           CommandResult<ContractEntityId, ContractState, ContractEvent, ContractAction, ContractError> option
       ReceivedAt: DateTimeOffset }
 
+/// The fake's own status labels, as the contract spells them. The finalize answers carry the
+/// stored status, so the mapping lives once beside the row it reads from.
+let private commandStatusOf (status: FakeStatus) =
+    match status with
+    | Ready -> CommandStatus.Ready
+    | Leased -> CommandStatus.Leased
+    | Succeeded -> CommandStatus.Succeeded
+    | Rejected -> CommandStatus.Rejected
+    | Dead -> CommandStatus.DeadLettered
+
 /// The contract as the reference sees it: exactly the behavior the runner asserts, nothing more.
 type FakeInbox(env: ContractInboxEnv) =
     let mutable now = DateTimeOffset(2026, 10, 1, 8, 0, 0, TimeSpan.Zero)
@@ -933,13 +962,7 @@ type FakeInbox(env: ContractInboxEnv) =
           ChartVersion = env.Version
           Kind = CommandKind.Event
           Event = row.Event
-          Status =
-            (match row.Status with
-             | Ready -> CommandStatus.Ready
-             | Leased -> CommandStatus.Leased
-             | Succeeded -> CommandStatus.Succeeded
-             | Rejected -> CommandStatus.Rejected
-             | Dead -> CommandStatus.DeadLettered)
+          Status = commandStatusOf row.Status
           Blocked = blocked row
           VisibleAt =
             (match row.Status with
@@ -1072,10 +1095,13 @@ type FakeInbox(env: ContractInboxEnv) =
                 if row.Token <> LeaseToken.value token then
                     Task.FromResult(Ok FinalizeOutcome.LeaseLost)
                 else
+                    // The epoch is the one a commit wrote, or the caller's own expectation
+                    // echoed back when a failure left no transition; the status is always what
+                    // was stored, so a retry with a different resolution can tell.
                     let stored =
                         match row.Result with
-                        | Some(CommandResult.Committed committed) -> committed.Epoch
-                        | _ -> expected
+                        | Some(CommandResult.Committed committed) -> committed.Epoch, CommandStatus.Succeeded
+                        | _ -> expected, commandStatusOf row.Status
 
                     Task.FromResult(Ok(AlreadyFinalized stored))
             | Some row when row.Status = Leased && row.Token = LeaseToken.value token ->
@@ -1105,7 +1131,7 @@ type FakeInbox(env: ContractInboxEnv) =
         member _.Reject(commandId: CommandId, token: LeaseToken<CommandWork>, failure, _ct) =
             match rows |> Seq.tryFind (fun row -> row.Id = commandId) with
             | Some row when row.Status = Rejected && row.Token = LeaseToken.value token ->
-                Task.FromResult(Ok(AlreadyFinalized Epoch.initial))
+                Task.FromResult(Ok(AlreadyFinalized(Epoch.initial, CommandStatus.Rejected)))
             | Some row when row.Status = Leased && row.Token = LeaseToken.value token ->
                 row.Status <- Rejected
                 row.Result <- Some(CommandResult.Rejected failure)
@@ -1115,7 +1141,7 @@ type FakeInbox(env: ContractInboxEnv) =
         member _.DeadLetter(commandId: CommandId, token: LeaseToken<CommandWork>, failure, _ct) =
             match rows |> Seq.tryFind (fun row -> row.Id = commandId) with
             | Some row when row.Status = Dead && row.Token = LeaseToken.value token ->
-                Task.FromResult(Ok(AlreadyFinalized Epoch.initial))
+                Task.FromResult(Ok(AlreadyFinalized(Epoch.initial, CommandStatus.DeadLettered)))
             | Some row when row.Status = Leased && row.Token = LeaseToken.value token ->
                 row.Status <- Dead
                 row.Result <- Some(CommandResult.DeadLettered failure)
@@ -1315,7 +1341,7 @@ let finalizeProperty name maxTests (env: ContractInboxEnv) =
                             firstOutcome = Ok(Finalized firstEpoch)
                             && committedResultMatches first firstDraft firstEpoch before after firstResult
                             && secondOutcome = Ok(Finalized(Epoch.next firstEpoch))
-                            && repeated = Ok(AlreadyFinalized firstEpoch)
+                            && repeated = Ok(AlreadyFinalized(firstEpoch, CommandStatus.Succeeded))
             }
 
         let conflictLaw payload =
@@ -1357,9 +1383,15 @@ let finalizeProperty name maxTests (env: ContractInboxEnv) =
                         else
                             Some(CommandResult.DeadLettered failure)
 
+                    let expectedStatus =
+                        if reject then
+                            CommandStatus.Rejected
+                        else
+                            CommandStatus.DeadLettered
+
                     return
                         first = Ok(Finalized Epoch.initial)
-                        && repeated = Ok(AlreadyFinalized Epoch.initial)
+                        && repeated = Ok(AlreadyFinalized(Epoch.initial, expectedStatus))
                         && result = Ok expectedResult
                         && sibling.IsSome
             }
@@ -1448,6 +1480,52 @@ let finalizeProperty name maxTests (env: ContractInboxEnv) =
                             && committedResultMatches holder draft epoch before after result
             }
 
+        /// A retry that sends a different resolution than the one that landed is answered with
+        /// the stored status, so the caller can tell its resolution was not the one recorded.
+        let crossResolutionLaw payload =
+            task {
+                match! setup payload true with
+                | None -> return false
+                | Some(stores, held) ->
+                    let failure = failureOf payload
+                    let draft = contractDraft env held.Work.EntityId held.Work.Event payload Idle
+                    let epoch = Epoch.next Epoch.initial
+
+                    let! committed = stores.Processor.Commit(held.Work.CommandId, held.Token, Epoch.initial, draft, ct)
+
+                    // The command committed; a late rejection and a late dead letter are both
+                    // told the stored status rather than what they asked for.
+                    let! lateRejection = stores.Processor.Reject(held.Work.CommandId, held.Token, failure, ct)
+
+                    let! lateDeadLetter = stores.Processor.DeadLetter(held.Work.CommandId, held.Token, failure, ct)
+
+                    match! claimKey stores "sibling" with
+                    | None -> return false
+                    | Some sibling ->
+                        // A fresh command rejected; a late commit is told it never committed.
+                        // Its epoch echo is the caller's expectation, which is the entity's
+                        // epoch after the first command committed.
+                        let siblingPayload = byte ((int payload + 1) % 256)
+
+                        let! rejected = stores.Processor.Reject(sibling.Work.CommandId, sibling.Token, failure, ct)
+
+                        let! lateCommit =
+                            stores.Processor.Commit(
+                                sibling.Work.CommandId,
+                                sibling.Token,
+                                epoch,
+                                contractDraft env sibling.Work.EntityId sibling.Work.Event siblingPayload draft.ToState,
+                                ct
+                            )
+
+                        return
+                            committed = Ok(Finalized epoch)
+                            && lateRejection = Ok(AlreadyFinalized(epoch, CommandStatus.Succeeded))
+                            && lateDeadLetter = Ok(AlreadyFinalized(epoch, CommandStatus.Succeeded))
+                            && rejected = Ok(Finalized Epoch.initial)
+                            && lateCommit = Ok(AlreadyFinalized(epoch, CommandStatus.Rejected))
+            }
+
         Check.One(
             config,
             fun (payload: byte) ->
@@ -1458,7 +1536,8 @@ let finalizeProperty name maxTests (env: ContractInboxEnv) =
                     let! stale = staleLaw payload
                     let! expired = expiredLaw payload
                     let! reclaimed = reclaimedLaw payload
-                    return committed && conflicted && failed && stale && expired && reclaimed
+                    let! crossed = crossResolutionLaw payload
+                    return committed && conflicted && failed && stale && expired && reclaimed && crossed
                 }
         ))
 

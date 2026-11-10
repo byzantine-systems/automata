@@ -184,10 +184,13 @@ $$;
 -- belief's epoch as the entity's, so any other attribution would leave the next
 -- ordinary command expecting an epoch that is already taken.
 -- ---------------------------------------------------------------------------
+DROP FUNCTION IF EXISTS fsm.finalize_correction (bigint, bigint, bigint, timestamptz, jsonb, fsm.instance_status, jsonb, jsonb, jsonb, text, text[], text[]);
+
 CREATE OR REPLACE FUNCTION fsm.finalize_correction (p_command_id bigint, p_lease_token bigint, p_expected_epoch bigint, p_valid_from timestamptz, p_beliefs jsonb, p_instance_status fsm.instance_status, p_event jsonb, p_from_state jsonb, p_to_state jsonb, p_handled_by text, p_exited text[], p_entered text[])
     RETURNS TABLE (
         outcome fsm.finalize_outcome,
-        epoch bigint)
+        epoch bigint,
+        status fsm.command_status)
     LANGUAGE plpgsql
     VOLATILE PARALLEL UNSAFE
     SET search_path = pg_catalog,
@@ -239,12 +242,14 @@ BEGIN
                         t.epoch
                     FROM fsm.transition t
                     WHERE
-                        t.command_id = p_command_id), p_expected_epoch);
+                        t.command_id = p_command_id), p_expected_epoch),
+                v_status;
         ELSE
             RETURN QUERY
             SELECT
                 'lease_lost'::fsm.finalize_outcome,
-                p_expected_epoch;
+                p_expected_epoch,
+                v_status;
         END IF;
         RETURN;
     END IF;
@@ -252,7 +257,8 @@ BEGIN
         RETURN QUERY
         SELECT
             'lease_lost'::fsm.finalize_outcome,
-            p_expected_epoch;
+            p_expected_epoch,
+            v_status;
         RETURN;
     END IF;
     SELECT
@@ -270,7 +276,8 @@ BEGIN
         RETURN QUERY
         SELECT
             'conflict'::fsm.finalize_outcome,
-            v_current_epoch;
+            v_current_epoch,
+            v_status;
         RETURN;
     END IF;
     INSERT INTO fsm.transition (machine_id, entity_id, epoch, command_id, chart_version, event, actions, from_state, to_state, handled_by, exited, entered, status, effective_at)
@@ -303,7 +310,7 @@ BEGIN
     RETURN QUERY
     SELECT
         'finalized'::fsm.finalize_outcome,
-        p_expected_epoch + 1;
+        p_expected_epoch + 1,
+        'succeeded'::fsm.command_status;
 END
 $$;
-

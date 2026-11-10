@@ -232,7 +232,7 @@ type CommandProcessor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: e
             // connection mid-commit and do not know whether it landed", and treating it as
             // anything else would turn the one safe recovery into a duplicate.
             | Finalized epoch
-            | AlreadyFinalized epoch ->
+            | AlreadyFinalized(epoch, _) ->
                 publish
                     record
                     (CommandResult.Committed
