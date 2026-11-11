@@ -8,24 +8,24 @@
         <!-- F# runtime: pinned so transitive >=4.7.0 constraints (FSharp.SystemTextJson) cannot downgrade it -->
         <PackageVersion Include="FSharp.Core" Version="10.1.401" />
         <!-- Test -->
-        <PackageVersion Include="Expecto" Version="11.1.0" />
+        <PackageVersion Include="Expecto" Version="11.1.1" />
         <PackageVersion Include="FsCheck" Version="3.6.0" />
-        <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.10.1" />
+        <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.11.1" />
         <PackageVersion Include="YoloDev.Expecto.TestSdk" Version="0.16.1" />
         <PackageVersion Include="coverlet.msbuild" Version="10.1.0" />
 
         <!-- Resilience (Polly v8) -->
-        <PackageVersion Include="Polly.Core" Version="8.8.0" />
-        <PackageVersion Include="Polly.Extensions" Version="8.8.0" />
+        <PackageVersion Include="Polly.Core" Version="8.9.1" />
+        <PackageVersion Include="Polly.Extensions" Version="8.9.1" />
 
         <!-- Host integration -->
-        <PackageVersion Include="Microsoft.Extensions.Hosting" Version="10.0.12" />
-        <PackageVersion Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.12" />
-        <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.12" />
+        <PackageVersion Include="Microsoft.Extensions.Hosting" Version="11.0.0" />
+        <PackageVersion Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="11.0.0" />
+        <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="11.0.0" />
 
         <!-- Persistence shared by every storage provider. Each provider's own driver and
              migration runner are versioned in its .fsproj, with VersionOverride. -->
-        <PackageVersion Include="SqlHydra.Query" Version="5.1.0" />
+        <PackageVersion Include="SqlHydra.Query" Version="5.1.1" />
         <PackageVersion Include="FSharp.SystemTextJson" Version="1.4.36" />
 
         <!-- Optional, package-edge ergonomics only; never referenced by Core -->
