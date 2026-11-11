@@ -8,9 +8,8 @@ open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
 open ByzantineSystems.Automata.Storage.Internal
-open ByzantineSystems.Automata.Storage.Postgres.Schema
 open FsToolkit.ErrorHandling
-open SqlHydra.Query
+open Npgsql
 
 /// <summary>What the catalog says about a database, before anything in it is trusted.</summary>
 type internal CatalogCheck =
@@ -72,20 +71,6 @@ module internal Boot =
                   BootDefect.MissingPrerequisite "fsm routines (the repeatable migrations)" ]
 
     /// <summary>
-    /// The queue name, checked before anything is sent. It reaches the database as an identifier
-    /// rather than a parameter, so only names that never need quoting are accepted: the same
-    /// allowlist <c>fsm.assert_queue_name</c> applies on the other side.
-    /// </summary>
-    let queueName (queue: string) : BootDefect option =
-        if
-            not (isNull queue)
-            && Text.RegularExpressions.Regex.IsMatch(queue, "^[a-z_][a-z0-9_]*$")
-        then
-            None
-        else
-            Some(BootDefect.Misconfigured $"the action queue name {queue} is not in [a-z_][a-z0-9_]*")
-
-    /// <summary>
     /// How long to keep something, as PostgreSQL reads an interval. Text rather than a
     /// <see cref="T:System.TimeSpan" />, because keeping forever is <c>'infinity'</c> and a
     /// <c>TimeSpan</c> cannot say it.
@@ -97,33 +82,39 @@ module internal Boot =
             String.Format(CultureInfo.InvariantCulture, "{0} microseconds", span.Ticks / 10L)
         | Retain.For span -> invalidArg (nameof retain) $"A retention period must be positive, not {span}."
 
-    let private bootCheck = Statement.load "system" "boot_check"
+    let private bootCheck =
+        StatementKey.create "system" "boot_check" |> Sql.prepareProgram
 
-    let private journalOf = Statement.load "system" "journal"
+    let private journalOf = StatementKey.create "system" "journal" |> Sql.prepareProgram
 
-    let private registerMaintenance = Statement.load "system" "register_maintenance"
+    let private registerMaintenance =
+        StatementKey.create "system" "register_maintenance" |> Sql.prepareProgram
 
     /// <summary>Reads the catalog check. Never fails for a missing object; see boot_check.sql.</summary>
-    let check: Op<PgSession, CatalogCheck> =
-        Sql.one (nameof CatalogCheck) bootCheck [] (fun reader ->
-            { HasSchema = Row.bool reader "has_schema"
-              HasJournal = Row.bool reader "has_journal"
-              HasRoutines = Row.bool reader "has_routines"
-              HasBtreeGist = Row.bool reader "has_btree_gist"
-              HasPgmq = Row.bool reader "has_pgmq" })
+    let check: StoreProgram<ReadAccess, (string * Param) list, NpgsqlDataReader, CatalogCheck> =
+        StoreProgram.queryOne bootCheck [] (fun reader ->
+            Ok
+                { HasSchema = Row.bool reader "has_schema"
+                  HasJournal = Row.bool reader "has_journal"
+                  HasRoutines = Row.bool reader "has_routines"
+                  HasBtreeGist = Row.bool reader "has_btree_gist"
+                  HasPgmq = Row.bool reader "has_pgmq" })
 
     /// <summary>The applied migrations, read only once the check has said the journal exists.</summary>
-    let journal (check: CatalogCheck) : Op<PgSession, string list option> =
+    let journal
+        (check: CatalogCheck)
+        : StoreProgram<ReadAccess, (string * Param) list, NpgsqlDataReader, string list option> =
         if check.HasJournal then
-            Sql.rows journalOf [] (fun row -> Row.string row "scriptname") |> Op.map Some
+            StoreProgram.queryRows journalOf [] (fun row -> Row.string row "scriptname" |> Ok)
+            |> StoreProgram.map Some
         else
-            Op.ok None
+            StoreProgram.ok None
 
     /// <summary>Everything the database is missing, empty when it can serve.</summary>
     let inspect (context: PostgresContext) (ct: CancellationToken) : Task<Result<BootDefect list, StoreError>> =
-        Sql.run
+        Sql.readProgram
             context
-            (postgres {
+            (store {
                 let! check = check
                 let! applied = journal check
                 return defects check applied expectedMigrations
@@ -136,23 +127,19 @@ module internal Boot =
         (machineId: MachineId)
         (queue: string)
         (retention: RetentionPolicy)
-        (reapAfter: TimeSpan)
+        (reapAfter: LeaseDuration)
         (ct: CancellationToken)
         : Task<Result<unit, StoreError>> =
-        if reapAfter <= TimeSpan.Zero then
-            invalidArg (nameof reapAfter) "The reaping grace period must be a positive duration."
-
-        Sql.run
+        Sql.runProgram
             context
-            (Sql.execute
+            (StoreProgram.executeDiscard
                 registerMaintenance
                 [ "machine_id", Param.Text(MachineId.value machineId)
                   "action_queue", Param.Text queue
                   "keep_commands", Param.Text(interval retention.Commands)
                   "keep_belief_history", Param.Text(interval retention.BeliefHistory)
                   "keep_action_archive", Param.Text(interval retention.ActionArchive)
-                  "reap_after", Param.Interval reapAfter ]
-             |> Op.discard)
+                  "reap_after", Param.Interval(LeaseDuration.value reapAfter) ])
             ct
 
 /// <summary>
@@ -164,14 +151,18 @@ module internal Boot =
 /// </summary>
 type PostgresMaintenance(context: PostgresContext) =
 
-    let notifyPending = Statement.load "system" "notify_pending"
-    let runMaintenance = Statement.load "system" "run_maintenance"
-    let repairBlocked = Statement.load "command" "repair_blocked"
-    let scheduleMaintenance = Statement.load "system" "schedule"
-    let unscheduleMaintenance = Statement.load "system" "unschedule"
-    let beliefColdStale = Statement.load "system" "belief_cold_stale"
-    let refreshBeliefCold = Statement.load "system" "refresh_belief_cold"
-    let markBeliefCold = Statement.load "system" "mark_belief_cold"
+    let statement domain operation =
+        StatementKey.create domain operation |> Sql.prepareProgram
+
+    let notifyPending = statement "system" "notify_pending"
+    let runMaintenance = statement "system" "run_maintenance"
+    let blockedDrift = statement "command" "blocked_drift"
+    let repairBlocked = statement "command" "repair_blocked"
+    let scheduleMaintenance = statement "system" "schedule"
+    let unscheduleMaintenance = statement "system" "unschedule"
+    let beliefColdStale = statement "system" "belief_cold_stale"
+    let refreshBeliefCold = statement "system" "refresh_belief_cold"
+    let markBeliefCold = statement "system" "mark_belief_cold"
 
     let schedulingOf (value: string) : Result<Scheduling, StoreError> =
         match value with
@@ -189,45 +180,81 @@ type PostgresMaintenance(context: PostgresContext) =
     /// repeat and safe to race: a second host's refresh waits for the first and finds nothing new.
     /// </summary>
     let refreshColdBeliefs ct : Task<Result<unit, StoreError>> =
-        Sql.run
+        Sql.runProgram
             context
-            (postgres {
-                let! stale = Sql.one "BeliefCold" beliefColdStale [] (fun reader -> Row.bool reader "stale")
+            (store {
+                let! stale = StoreProgram.queryOne beliefColdStale [] (fun reader -> Row.bool reader "stale" |> Ok)
 
                 if stale then
-                    do! Sql.execute refreshBeliefCold [] |> Op.discard
-                    do! Sql.execute markBeliefCold [] |> Op.discard
+                    do! StoreProgram.executeDiscard refreshBeliefCold []
+                    do! StoreProgram.executeDiscard markBeliefCold []
             })
             ct
 
-    let positiveBatch (batch: int) =
-        if batch < 1 then
-            invalidArg (nameof batch) "A maintenance batch size must be positive."
+    let driftRow (reader: NpgsqlDataReader) : Result<BlockedDrift, StoreError> =
+        let required (read: int -> 'T) (column: string) =
+            let ordinal = reader.GetOrdinal column
+
+            if reader.IsDBNull ordinal then
+                Error(Db.decodeFailure (nameof BlockedDrift) $"the view returned no {column}")
+            else
+                Ok(read ordinal)
+
+        result {
+            let! commandId = required reader.GetInt64 "command_id"
+
+            let! machineId =
+                required reader.GetString "machine_id"
+                |> Result.bind (MachineId.tryCreate >> Result.mapError (Db.decodeFailure "MachineId"))
+
+            let! entityId = required reader.GetString "entity_id"
+            let! sequence = required reader.GetInt64 "seq"
+            let! blocked = required reader.GetBoolean "blocked"
+            let! expected = required reader.GetBoolean "expected_blocked"
+
+            return
+                { BlockedDrift.CommandId = CommandId.ofInt64 commandId
+                  MachineId = machineId
+                  EntityId = entityId
+                  Sequence = sequence
+                  Blocked = blocked
+                  Expected = expected }
+        }
 
     interface IDatabaseMaintenance with
 
         member _.NotifyPending(ct) =
-            Sql.run
+            Sql.runProgram
                 context
-                (Sql.one "NotifyReport" notifyPending [] (fun row ->
-                    { Sent = Row.int32 row "sent"
-                      QueueUsage = row.GetDouble(row.GetOrdinal "queue_usage") }))
+                (StoreProgram.queryOne notifyPending [] (fun row ->
+                    Ok
+                        { Sent = Row.int32 row "sent"
+                          QueueUsage = row.GetDouble(row.GetOrdinal "queue_usage") }))
                 ct
 
         member _.Run(batch, ct) =
-            positiveBatch batch
-
             backgroundTaskResult {
                 let! reports =
-                    Sql.run
+                    Sql.runProgram
                         context
-                        (Sql.rows runMaintenance [ "batch", Param.Int batch ] (fun row ->
-                            { MachineId = MachineId.create (Row.string row "machine_id")
-                              Reaped = Row.int64 row "reaped"
-                              PurgedCommands = Row.int64 row "purged_commands"
-                              PurgedBeliefs = Row.int64 row "purged_beliefs"
-                              PurgedActions = Row.int64 row "purged_actions"
-                              Drifted = Row.int64 row "drifted" }))
+                        (StoreProgram.queryRows
+                            runMaintenance
+                            [ "batch", Param.Int(ClaimBatch.value batch) ]
+                            (fun row ->
+                                result {
+                                    let! machineId =
+                                        Row.string row "machine_id"
+                                        |> MachineId.tryCreate
+                                        |> Result.mapError (Db.decodeFailure "MachineId")
+
+                                    return
+                                        { MachineId = machineId
+                                          Reaped = Row.int64 row "reaped"
+                                          PurgedCommands = Row.int64 row "purged_commands"
+                                          PurgedBeliefs = Row.int64 row "purged_beliefs"
+                                          PurgedActions = Row.int64 row "purged_actions"
+                                          Drifted = Row.int64 row "drifted" }
+                                }))
                         ct
 
                 do! refreshColdBeliefs ct
@@ -235,72 +262,30 @@ type PostgresMaintenance(context: PostgresContext) =
             }
 
         member _.DetectDrift(ct) =
-            let toDrift (row: fsm.blocked_drift) : Result<BlockedDrift, StoreError> =
-                let column name value =
-                    Db.required (nameof BlockedDrift) name value
-
-                result {
-                    let! commandId = column "command_id" row.command_id
-                    let! machineId = column "machine_id" row.machine_id
-                    let! entityId = column "entity_id" row.entity_id
-                    let! seq = column "seq" row.seq
-                    let! blocked = column "blocked" row.blocked
-                    let! expected = column "expected_blocked" row.expected_blocked
-
-                    return
-                        { BlockedDrift.CommandId = CommandId.ofInt64 commandId
-                          MachineId = MachineId.create machineId
-                          EntityId = entityId
-                          Sequence = seq
-                          Blocked = blocked
-                          Expected = expected }
-                }
-
-            Sql.run
-                context
-                (postgres {
-                    let! rows =
-                        Sql.select (fun query token ->
-                            selectTask query {
-                                for d in fsm.blocked_drift do
-                                    orderBy d.machine_id
-                                    thenBy d.entity_id
-                                    thenBy d.seq
-                                    select d
-                                    toList
-                                    cancel token
-                            })
-
-                    return! rows |> List.traverseResultM toDrift
-                })
-                ct
+            Sql.readProgram context (StoreProgram.queryRows blockedDrift [] driftRow) ct
 
         member _.RepairDrift(ct) =
-            Sql.run
+            Sql.runProgram
                 context
-                (Sql.rows repairBlocked [] (fun row ->
-                    { RepairedBlock.CommandId = CommandId.ofInt64 (Row.int64 row "command_id")
-                      Blocked = Row.bool row "blocked" }))
+                (StoreProgram.queryRows repairBlocked [] (fun row ->
+                    Ok
+                        { RepairedBlock.CommandId = CommandId.ofInt64 (Row.int64 row "command_id")
+                          Blocked = Row.bool row "blocked" }))
                 ct
 
         member _.Schedule(notifyEvery, runEvery, batch, ct) =
-            positiveBatch batch
-
-            Sql.run
+            Sql.runProgram
                 context
-                (postgres {
-                    let! scheduling =
-                        Sql.one
-                            (nameof Scheduling)
-                            scheduleMaintenance
-                            [ "notify_every", Param.Interval notifyEvery
-                              "run_every", Param.Interval runEvery
-                              "batch", Param.Int batch ]
-                            (fun row -> Row.string row "scheduling")
-
-                    return! schedulingOf scheduling
-                })
+                (StoreProgram.queryOne
+                    scheduleMaintenance
+                    [ "notify_every", Param.Interval notifyEvery
+                      "run_every", Param.Interval runEvery
+                      "batch", Param.Int(ClaimBatch.value batch) ]
+                    (fun row -> Row.string row "scheduling" |> schedulingOf))
                 ct
 
         member _.Unschedule(ct) =
-            Sql.run context (Sql.one "Unscheduled" unscheduleMaintenance [] (fun row -> Row.int32 row "removed")) ct
+            Sql.runProgram
+                context
+                (StoreProgram.queryOne unscheduleMaintenance [] (fun row -> Row.int32 row "removed" |> Ok))
+                ct

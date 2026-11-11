@@ -131,9 +131,10 @@ type ICorrectionStore<'EntityId, 'State> =
     /// answerable through <c>AsOf</c>. That is the whole point: a correction that erased what it
     /// replaced would leave an audit record claiming the new answer had always been the answer.
     ///
-    /// The beliefs must be ordered by <c>ValidFrom</c>, all at or after
-    /// <paramref name="validFrom" />. Each one runs until the next begins and the last is left
-    /// open, so a gap or an overlap in the corrected timeline is not expressible.
+    /// The beliefs must be ordered by <c>ValidFrom</c>: when non-empty, the first starts exactly
+    /// at <paramref name="validFrom" /> and each later one strictly after the previous. Each one
+    /// runs until the next begins and the last is left open, so a gap or an overlap in the
+    /// corrected timeline is not expressible.
     ///
     /// An empty list asserts that the entity had no belief from <paramref name="validFrom" />
     /// onward, which is how a correction undoes one rather than replacing it.
@@ -172,10 +173,12 @@ type CorrectionCommit<'EntityId, 'State, 'Event, 'Action> =
         /// <summary>The instant the belief timeline is rewritten from.</summary>
         ValidFrom: DateTimeOffset
         /// <summary>
-        /// The rewritten timeline. The last belief is attributed to the correction's own epoch,
+        /// The rewritten timeline, never empty: at least the correction's own belief is written,
+        /// or the next ordinary command would read a missing live belief and an epoch of zero.
+        /// The first belief is the earliest; the last is attributed to the correction's own epoch,
         /// which is what the next ordinary command expects.
         /// </summary>
-        Beliefs: CorrectedBelief<'State> list
+        Beliefs: CorrectedBelief<'State> * CorrectedBelief<'State> list
     }
 
 /// <summary>

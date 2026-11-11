@@ -18,3 +18,22 @@ CREATE TABLE fsm.command_correction (
     CONSTRAINT command_correction_command_fkey FOREIGN KEY (command_id) REFERENCES fsm.command (command_id)
 );
 
+-- ---------------------------------------------------------------------------
+-- fsm.entity_purge: the furthest back a replay can still see.
+--
+-- Retention removes an entity's oldest commands together with their transitions,
+-- and a transition is the only thing replay reads. The greatest effective instant
+-- any purged transition carried is therefore the exact boundary of a complete
+-- suffix: a suffix that starts at or before it may have lost events, one that
+-- starts strictly after it has not. The value is monotonic (a purge never makes
+-- replay see further back) and must outlive the history it describes, so it has
+-- no foreign key. The '-infinity' default keeps absence a value rather than a
+-- null, but a row only exists once something was actually purged.
+-- ---------------------------------------------------------------------------
+CREATE TABLE fsm.entity_purge (
+    machine_id text NOT NULL,
+    entity_id text NOT NULL,
+    max_purged_effective_at timestamptz NOT NULL DEFAULT '-infinity',
+    PRIMARY KEY (machine_id, entity_id)
+);
+

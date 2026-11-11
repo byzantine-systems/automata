@@ -109,56 +109,55 @@ CREATE OR REPLACE FUNCTION fsm.split_belief (p_machine_id text, p_entity_id text
     VOLATILE PARALLEL UNSAFE
     SET search_path = pg_catalog, pg_temp
     AS $$
-    WITH
-        carried AS (
-            -- The tail of the old belief that the new one does not cover,
-            -- re-inserted unchanged. Empty when p_at is the live belief's own
-            -- start: nothing precedes the new belief, which is the replaced
-            -- case.
-            INSERT INTO fsm.instance_state (machine_id, entity_id, state, status, epoch, command_id, chart_version, valid_during)
-            SELECT
-                machine_id,
-                entity_id,
-                state,
-                status,
-                epoch,
-                command_id,
-                chart_version,
-                TSTZRANGE(LOWER(valid_during), $3, '[)')
-            FROM
-                fsm.instance_state
-            WHERE
-                machine_id = $1
-                AND entity_id = $2
-                AND UPPER(valid_during) = 'infinity'
-                AND LOWER(valid_during) < $3
-            RETURNING
-                1
+    WITH carried AS (
+        -- The tail of the old belief that the new one does not cover,
+        -- re-inserted unchanged. Empty when p_at is the live belief's own
+        -- start: nothing precedes the new belief, which is the replaced
+        -- case.
+        INSERT INTO fsm.instance_state (machine_id, entity_id, state, status, epoch, command_id, chart_version, valid_during)
+        SELECT
+            machine_id,
+            entity_id,
+            state,
+            status,
+            epoch,
+            command_id,
+            chart_version,
+            TSTZRANGE(LOWER(valid_during), $3, '[)')
+        FROM
+            fsm.instance_state
+        WHERE
+            machine_id = $1
+            AND entity_id = $2
+            AND UPPER(valid_during) = 'infinity'
+            AND LOWER(valid_during) < $3
+        RETURNING
+            1
 ),
-        updated AS (
-            -- The covered portion, rewritten in place. GREATEST keeps the
-            -- original start should a caller ever arrive with p_at behind it,
-            -- though fsm.close_and_open raises before that can happen.
-            UPDATE
-                fsm.instance_state
-            SET
-                state = $4,
-                status = $5,
-                epoch = $6,
-                command_id = $7,
-                chart_version = $8,
-                valid_during = TSTZRANGE(GREATEST(LOWER(valid_during), $3), 'infinity', '[)')
-            WHERE
-                machine_id = $1
-                AND entity_id = $2
-                AND UPPER(valid_during) = 'infinity'
-            RETURNING
-                1
+updated AS (
+    -- The covered portion, rewritten in place. GREATEST keeps the
+    -- original start should a caller ever arrive with p_at behind it,
+    -- though fsm.close_and_open raises before that can happen.
+    UPDATE
+        fsm.instance_state
+    SET
+        state = $4,
+        status = $5,
+        epoch = $6,
+        command_id = $7,
+        chart_version = $8,
+        valid_during = TSTZRANGE(GREATEST (LOWER(valid_during), $3), 'infinity', '[)')
+    WHERE
+        machine_id = $1
+        AND entity_id = $2
+        AND UPPER(valid_during) = 'infinity'
+    RETURNING
+        1
 )
-    SELECT
-        COUNT(*)
-    FROM
-        updated;
+SELECT
+    COUNT(*)
+FROM
+    updated;
 $$;
 
 -- ---------------------------------------------------------------------------

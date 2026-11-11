@@ -30,10 +30,99 @@ let fastPolicy: TransientPolicy =
 let pipelineOf policy =
     TransientPolicy.toPipeline policy "test" isTransient ignore
 
-let expectSingleValidationError expected (policy: TransientPolicy) =
-    match TransientPolicy.validate policy with
-    | Error errors -> Expect.equal [ expected ] errors "the expected validation error is returned"
-    | Ok _ -> failtestf "expected %A" expected
+type private ValidationInput =
+    { Attempts: byte
+      BaseDelay: byte
+      MaxDelay: byte
+      AttemptTimeout: byte
+      TotalTimeout: byte
+      HasBreaker: bool
+      FailureRatio: byte
+      MinimumThroughput: byte
+      SamplingDuration: byte
+      BreakDuration: byte }
+
+let private durations =
+    [| TimeSpan.FromSeconds -1.
+       TimeSpan.Zero
+       TimeSpan.FromTicks 1L
+       TimeSpan.FromMilliseconds 9.999
+       TimeSpan.FromMilliseconds 10.
+       TimeSpan.FromMilliseconds 500.
+       TimeSpan.FromDays 1.
+       TimeSpan.FromDays(1.).Add(TimeSpan.FromTicks 1L) |]
+
+let private pick (values: 'T array) seed = values[int seed % values.Length]
+
+let private expectedValidationErrors (policy: TransientPolicy) =
+    let minimumTimeout = TimeSpan.FromMilliseconds 10.
+    let minimumBreakerDuration = TimeSpan.FromMilliseconds 500.
+    let maximumDuration = TimeSpan.FromDays 1.
+
+    [ if policy.MaxAttempts < 1 then
+          MaxAttemptsBelowOne policy.MaxAttempts
+
+      if policy.BaseDelay < TimeSpan.Zero then
+          NegativeBaseDelay policy.BaseDelay
+
+      if policy.MaxDelay < policy.BaseDelay then
+          MaxDelayBelowBaseDelay(policy.BaseDelay, policy.MaxDelay)
+
+      if policy.AttemptTimeout <= TimeSpan.Zero then
+          AttemptTimeoutNotPositive policy.AttemptTimeout
+      elif
+          policy.AttemptTimeout < minimumTimeout
+          || policy.AttemptTimeout > maximumDuration
+      then
+          AttemptTimeoutOutOfRange policy.AttemptTimeout
+
+      if policy.TotalTimeout <= TimeSpan.Zero then
+          TotalTimeoutNotPositive policy.TotalTimeout
+      else
+          if policy.TotalTimeout < minimumTimeout || policy.TotalTimeout > maximumDuration then
+              TotalTimeoutOutOfRange policy.TotalTimeout
+
+          if policy.TotalTimeout < policy.AttemptTimeout then
+              TotalTimeoutBelowAttemptTimeout(policy.TotalTimeout, policy.AttemptTimeout)
+
+      match policy.Breaker with
+      | None -> ()
+      | Some breaker ->
+          if
+              Double.IsNaN breaker.FailureRatio
+              || breaker.FailureRatio <= 0.0
+              || breaker.FailureRatio > 1.0
+          then
+              BreakerFailureRatioOutOfRange breaker.FailureRatio
+
+          if breaker.MinimumThroughput < 2 then
+              BreakerMinimumThroughputBelowTwo breaker.MinimumThroughput
+
+          if breaker.SamplingDuration <= TimeSpan.Zero then
+              BreakerSamplingDurationNotPositive breaker.SamplingDuration
+          elif
+              breaker.SamplingDuration < minimumBreakerDuration
+              || breaker.SamplingDuration > maximumDuration
+          then
+              BreakerSamplingDurationOutOfRange breaker.SamplingDuration
+
+          if breaker.BreakDuration <= TimeSpan.Zero then
+              BreakerBreakDurationNotPositive breaker.BreakDuration
+          elif
+              breaker.BreakDuration < minimumBreakerDuration
+              || breaker.BreakDuration > maximumDuration
+          then
+              BreakerBreakDurationOutOfRange breaker.BreakDuration ]
+
+let private sameValidationError expected actual =
+    match expected, actual with
+    | BreakerFailureRatioOutOfRange left, BreakerFailureRatioOutOfRange right ->
+        (Double.IsNaN left && Double.IsNaN right) || left = right
+    | _ -> expected = actual
+
+let private sameValidationErrors expected actual =
+    List.length expected = List.length actual
+    && List.forall2 sameValidationError expected actual
 
 /// An operation whose responses follow a script, counting executions as it goes.
 let scripted (outcomes: Result<int, exn> list) =
@@ -68,41 +157,46 @@ let validationTests =
               | Ok _ -> ()
               | Error errors -> failtestf "the defaults should validate, but reported %A" errors
           }
-          test "attempts below one are rejected" {
-              { TransientPolicy.defaults with
-                  MaxAttempts = 0 }
-              |> expectSingleValidationError (MaxAttemptsBelowOne 0)
-          }
-          test "a delay cap below the seed is rejected" {
+
+          Property.property "validation reports exactly every structural defect" (fun input ->
+              let attempts = pick [| Int32.MinValue; -1; 0; 1; 2; Int32.MaxValue |] input.Attempts
+
+              let ratios =
+                  [| Double.NaN
+                     Double.NegativeInfinity
+                     -1.
+                     0.
+                     0.5
+                     1.
+                     1.1
+                     Double.PositiveInfinity |]
+
+              let throughput =
+                  pick [| Int32.MinValue; -1; 0; 1; 2; Int32.MaxValue |] input.MinimumThroughput
+
+              let breaker =
+                  if input.HasBreaker then
+                      Some
+                          { FailureRatio = pick ratios input.FailureRatio
+                            MinimumThroughput = throughput
+                            SamplingDuration = pick durations input.SamplingDuration
+                            BreakDuration = pick durations input.BreakDuration }
+                  else
+                      None
+
               let policy =
                   { TransientPolicy.defaults with
-                      BaseDelay = TimeSpan.FromSeconds 5.
-                      MaxDelay = TimeSpan.FromSeconds 1. }
+                      MaxAttempts = attempts
+                      BaseDelay = pick durations input.BaseDelay
+                      MaxDelay = pick durations input.MaxDelay
+                      AttemptTimeout = pick durations input.AttemptTimeout
+                      TotalTimeout = pick durations input.TotalTimeout
+                      Breaker = breaker }
 
-              policy
-              |> expectSingleValidationError (MaxDelayBelowBaseDelay(TimeSpan.FromSeconds 5., TimeSpan.FromSeconds 1.))
-          }
-          test "a total budget below one attempt is rejected" {
-              let policy =
-                  { TransientPolicy.defaults with
-                      AttemptTimeout = TimeSpan.FromSeconds 30.
-                      TotalTimeout = TimeSpan.FromSeconds 5. }
-
-              policy
-              |> expectSingleValidationError (
-                  TotalTimeoutBelowAttemptTimeout(TimeSpan.FromSeconds 5., TimeSpan.FromSeconds 30.)
-              )
-          }
-          test "every defect is reported, not just the first" {
-              let policy =
-                  { TransientPolicy.defaults with
-                      MaxAttempts = 0
-                      BaseDelay = TimeSpan.FromSeconds -1. }
-
-              match TransientPolicy.validate policy with
-              | Error errors -> Expect.isGreaterThan errors.Length 1 "accumulates rather than short-circuits"
-              | Ok _ -> failtest "an invalid policy validated"
-          } ]
+              match expectedValidationErrors policy, TransientPolicy.validate policy with
+              | [], Ok validated -> validated = policy
+              | expected, Error actual -> sameValidationErrors expected actual
+              | _ -> false) ]
 
 let retryTests =
     testList

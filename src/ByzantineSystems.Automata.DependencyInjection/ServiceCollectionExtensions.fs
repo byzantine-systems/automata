@@ -3,6 +3,7 @@ namespace ByzantineSystems.Automata.DependencyInjection
 open System
 open System.Runtime.CompilerServices
 open ByzantineSystems.Automata.Runtime
+open ByzantineSystems.Automata.Storage
 open Microsoft.Extensions.DependencyInjection
 open Microsoft.Extensions.Hosting
 open Microsoft.Extensions.Logging
@@ -96,8 +97,7 @@ type ServiceCollectionExtensions =
         if options.RunEvery <= TimeSpan.Zero then
             invalidArg (nameof options) "RunEvery must be a positive duration."
 
-        if options.Batch < 1 then
-            invalidArg (nameof options) "Batch must be positive."
+        let batch = ClaimBatch.create options.Batch
 
         services.AddLogging() |> ignore
 
@@ -105,6 +105,7 @@ type ServiceCollectionExtensions =
             Func<IServiceProvider, IHostedService>(fun provider ->
                 new MaintenanceService(
                     options,
+                    batch,
                     options.Maintenance provider,
                     provider.GetRequiredService<ILogger<MaintenanceService>>()
                 )

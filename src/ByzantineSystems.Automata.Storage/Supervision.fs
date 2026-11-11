@@ -13,13 +13,23 @@ type SupervisorName = private SupervisorName of string
 [<RequireQualifiedAccess>]
 module SupervisorName =
 
+    /// <summary>
+    /// Parses a supervisor name, returning the reason rather than raising. A corrupt row read
+    /// back out of storage becomes a typed failure at the store boundary instead of an exception
+    /// escaping it.
+    /// </summary>
+    let tryCreate (value: string) : Result<SupervisorName, string> =
+        if String.IsNullOrWhiteSpace value then
+            Error "A supervisor name must be a non-empty string."
+        else
+            Ok(SupervisorName(value.Trim()))
+
     /// <summary>Constructs a name from a non-empty string, trimming surrounding whitespace.</summary>
     /// <exception cref="T:System.ArgumentException">The input is null, empty, or whitespace.</exception>
     let create (value: string) : SupervisorName =
-        if String.IsNullOrWhiteSpace value then
-            invalidArg (nameof value) "A supervisor name must be a non-empty string."
-
-        SupervisorName(value.Trim())
+        match tryCreate value with
+        | Ok name -> name
+        | Error message -> invalidArg (nameof value) message
 
     /// <summary>Returns the underlying string.</summary>
     let value (SupervisorName value) : string = value
@@ -32,13 +42,23 @@ type SupervisedChildId = private SupervisedChildId of string
 [<RequireQualifiedAccess>]
 module SupervisedChildId =
 
+    /// <summary>
+    /// Parses a supervised child id, returning the reason rather than raising. A corrupt row read
+    /// back out of storage becomes a typed failure at the store boundary instead of an exception
+    /// escaping it.
+    /// </summary>
+    let tryCreate (value: string) : Result<SupervisedChildId, string> =
+        if String.IsNullOrWhiteSpace value then
+            Error "A supervised child id must be a non-empty string."
+        else
+            Ok(SupervisedChildId(value.Trim()))
+
     /// <summary>Constructs an id from a non-empty string, trimming surrounding whitespace.</summary>
     /// <exception cref="T:System.ArgumentException">The input is null, empty, or whitespace.</exception>
     let create (value: string) : SupervisedChildId =
-        if String.IsNullOrWhiteSpace value then
-            invalidArg (nameof value) "A supervised child id must be a non-empty string."
-
-        SupervisedChildId(value.Trim())
+        match tryCreate value with
+        | Ok id -> id
+        | Error message -> invalidArg (nameof value) message
 
     /// <summary>Returns the underlying string.</summary>
     let value (SupervisedChildId value) : string = value

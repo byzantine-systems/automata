@@ -8,8 +8,7 @@ open FsToolkit.ErrorHandling
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
 open ByzantineSystems.Automata.Storage.Internal
-open ByzantineSystems.Automata.Storage.Postgres.Schema
-open SqlHydra.Query
+open Npgsql
 
 /// <summary>
 /// What a temporal store needs to bridge one machine's state to the belief tables.
@@ -38,37 +37,57 @@ type PostgresTemporalStore<'EntityId, 'State>(options: TemporalOptions<'EntityId
 
     let context = options.Context
 
-    let correctBeliefs = Statement.load "belief" "correct"
+    let encodeEntityId entityId =
+        options.EntityIdEncode entityId
+        |> ByzantineSystems.Automata.Storage.Internal.EntityKey.ofString
+
+    let beliefAsOf = StatementKey.create "belief" "as_of" |> Sql.prepareProgram
+    let correctBeliefs = StatementKey.create "belief" "correct" |> Sql.prepareProgram
 
     /// Rebuilds one belief from a row of fsm.belief. The view cannot carry NOT NULL, so every
     /// column is required here rather than assumed; a row that will not decode fails on its first
     /// reason, because the reasons are not independent complaints, they are one corrupt row.
-    let toBelief (row: fsm.belief) : Result<Belief<'EntityId, 'State>, StoreError> =
-        let column name value = Db.required (nameof Belief) name value
+    let beliefRow (reader: NpgsqlDataReader) : Result<Belief<'EntityId, 'State>, StoreError> =
+        let required (read: int -> 'T) (column: string) =
+            let ordinal = reader.GetOrdinal column
+
+            if reader.IsDBNull ordinal then
+                Error(Db.decodeFailure (nameof Belief) $"the view returned no {column}")
+            else
+                Ok(read ordinal)
 
         result {
-            let! machineId = column "machine_id" row.machine_id
-            let! entity = column "entity_id" row.entity_id
-            let! state = column "state" row.state
-            let! status = column "status" row.status
-            let! epoch = column "epoch" row.epoch
-            let! commandId = column "command_id" row.command_id
-            let! chartVersion = column "chart_version" row.chart_version
-            let! validFrom = column "valid_from" row.valid_from
-            let! validTo = column "valid_to" row.valid_to
-            let! knownFrom = column "known_from" row.known_from
-            let! knownTo = column "known_to" row.known_to
+            let! machineId =
+                required reader.GetString "machine_id"
+                |> Result.bind (MachineId.tryCreate >> Result.mapError (Db.decodeFailure "MachineId"))
 
-            let! entityId = options.EntityIdDecode entity |> Result.mapError (Db.decodeFailure "EntityId")
-            let! state = options.StateCodec.Decode state |> Result.mapError Db.toStoreError
-            let! status = Db.instanceStatusFromString status
+            let! entity = required reader.GetString "entity_id"
+            let! state = required reader.GetString "state"
+            let! status = required reader.GetString "status"
+            let! epoch = required reader.GetInt64 "epoch"
+            let! commandId = required reader.GetInt64 "command_id"
+            let! chartVersion = required reader.GetInt32 "chart_version"
+            let! validFrom = required reader.GetDateTime "valid_from"
+            let! validTo = required reader.GetDateTime "valid_to"
+            let! knownFrom = required reader.GetDateTime "known_from"
+            let! knownTo = required reader.GetDateTime "known_to"
+
+            let! entityId =
+                entity
+                |> options.EntityIdDecode
+                |> Result.mapError (Db.decodeFailure "EntityId")
+
+            let! state = state |> options.StateCodec.Decode |> Result.mapError Db.toStoreError
+
+            let! status = EnumCodec.decode EnumCodec.instanceStatus status
 
             let! chartVersion =
-                ChartVersion.tryCreate chartVersion
+                chartVersion
+                |> ChartVersion.tryCreate
                 |> Result.mapError (Db.decodeFailure "ChartVersion")
 
             return
-                { MachineId = MachineId.create machineId
+                { MachineId = machineId
                   EntityId = entityId
                   Snapshot =
                     { State = state
@@ -92,34 +111,15 @@ type PostgresTemporalStore<'EntityId, 'State>(options: TemporalOptions<'EntityId
     /// machine's retention.
     /// </summary>
     let asOf machineId entityId (validAt: DateTimeOffset) (knownAt: DateTimeOffset) ct =
-        let machine = Some(MachineId.value machineId)
-        let entity = Some(options.EntityIdEncode entityId)
-        let valid = Some(Db.timestamp validAt)
-        let known = Some(Db.timestamp knownAt)
-
-        Sql.run
+        Sql.readProgram
             context
-            (postgres {
-                let! row =
-                    Sql.select (fun query token ->
-                        selectTask query {
-                            for b in fsm.belief do
-                                where (
-                                    b.machine_id = machine
-                                    && b.entity_id = entity
-                                    && b.valid_from <= valid
-                                    && b.valid_to > valid
-                                    && b.known_from <= known
-                                    && b.known_to > known
-                                )
-
-                                select b
-                                tryHead
-                                cancel token
-                        })
-
-                return! row |> Option.traverseResult toBelief
-            })
+            (StoreProgram.tryQueryOne
+                beliefAsOf
+                [ Params.machineId "machine_id" machineId
+                  Params.entityKey "entity_id" (encodeEntityId entityId)
+                  "valid_at", Param.Timestamp validAt
+                  "known_at", Param.Timestamp knownAt ]
+                beliefRow)
             ct
 
     interface ITemporalReader<'EntityId, 'State> with
@@ -141,16 +141,15 @@ type PostgresTemporalStore<'EntityId, 'State>(options: TemporalOptions<'EntityId
                 let! payload = BeliefPayload.encode options.StateCodec beliefs
 
                 let! superseded =
-                    Sql.run
+                    Sql.runProgram
                         context
-                        (Sql.one
-                            (nameof CorrectionOutcome)
+                        (StoreProgram.queryOne
                             correctBeliefs
-                            [ "machine_id", Param.Text(MachineId.value machineId)
-                              "entity_id", Param.Text(options.EntityIdEncode entityId)
+                            [ Params.machineId "machine_id" machineId
+                              Params.entityKey "entity_id" (encodeEntityId entityId)
                               "valid_from", Param.Timestamp validFrom
                               "beliefs", Param.Jsonb payload ]
-                            (fun reader -> Row.int32 reader "superseded"))
+                            (fun reader -> Row.int32 reader "superseded" |> Ok))
                         ct
 
                 return

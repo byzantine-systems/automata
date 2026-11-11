@@ -30,11 +30,7 @@ and RuleOutcome<'State> =
     /// <summary>Internal transition: no exit or entry actions, state unchanged.</summary>
     | Internal
 
-/// <summary>
-/// What a rule is, stripped of the closures that decide when it fires. A rule's behaviour lives
-/// in predicates and transforms, which are opaque functions; this is the part of it that can be
-/// compared, printed, or hashed into a chart fingerprint.
-/// </summary>
+/// <summary>Compatibility projection of a rule's combinator.</summary>
 type RuleKind =
     /// <summary>An ordinary transition, built by <c>Rule.transition</c>.</summary>
     | Transition
@@ -51,137 +47,154 @@ type RuleKind =
     /// <summary>The kind a <c>Rule.guarded</c> wrapper reports, keeping the wrapped rule visible.</summary>
     | Guarded of reason: string * inner: RuleKind
 
-/// <summary>
-/// One transition rule: a total function from (state, event) to a
-/// <see cref="T:ByzantineSystems.Automata.Core.RuleVerdict`3" />, paired with the
-/// <see cref="T:ByzantineSystems.Automata.Core.RuleKind" /> that says which combinator built it.
-/// Private constructor keeps rules built through
-/// <see cref="T:ByzantineSystems.Automata.Core.Rule" /> combinators.
-/// </summary>
+/// <summary>Rule structure with normalized conditions. Transforms remain opaque.</summary>
+[<RequireQualifiedAccess>]
+type RuleSyntax =
+    | Transition of condition: ConditionSyntax
+    | Attempt of condition: ConditionSyntax
+    | Goto of condition: ConditionSyntax * target: StateId
+    | Internal of condition: ConditionSyntax
+    | Guarded of reason: string * condition: ConditionSyntax * inner: RuleSyntax
+
+/// <summary>An executable transition paired with inspectable syntax.</summary>
 type Rule<'State, 'Event, 'Action, 'Err> =
     private
-        { Kind: RuleKind
+        { Syntax: RuleSyntax
           Invoke: 'State * 'Event -> RuleVerdict<'Action, 'State, 'Err> }
 
 /// <summary>Rule combinators and invocation.</summary>
 [<RequireQualifiedAccess>]
 module Rule =
 
-    /// <summary>Ordinary transition: when the predicate matches, transform to (actions, next state).</summary>
-    let transition
-        (predicate: 'State -> 'Event -> bool)
+    /// <summary>Ordinary transition controlled by inspectable condition syntax.</summary>
+    let transitionWhen
+        (condition: Condition<'State, 'Event>)
         (transform: 'State -> 'Event -> 'Action list * 'State)
         : Rule<'State, 'Event, 'Action, 'Err> =
-        { Kind = RuleKind.Transition
+        { Syntax = RuleSyntax.Transition(Condition.syntax condition)
           Invoke =
             fun (state, event) ->
-                if predicate state event then
+                if Condition.matches condition state event then
                     let actions, nextState = transform state event
                     RuleVerdict.Handled(actions, RuleOutcome.Next nextState)
                 else
                     RuleVerdict.NoMatch }
 
-    /// <summary>Result-returning transition: a matched rule may reject the event with a domain error.</summary>
-    let attempt
-        (predicate: 'State -> 'Event -> bool)
+    /// <summary>Ordinary transition with an opaque predicate.</summary>
+    let transition predicate transform =
+        transitionWhen (Condition.custom "legacy.transition" predicate) transform
+
+    /// <summary>Result-returning transition controlled by inspectable condition syntax.</summary>
+    let attemptWhen
+        (condition: Condition<'State, 'Event>)
         (transform: 'State -> 'Event -> Result<'Action list * 'State, 'Err>)
         : Rule<'State, 'Event, 'Action, 'Err> =
-        { Kind = RuleKind.Attempt
+        { Syntax = RuleSyntax.Attempt(Condition.syntax condition)
           Invoke =
             fun (state, event) ->
-                if predicate state event then
+                if Condition.matches condition state event then
                     match transform state event with
                     | Ok(actions, nextState) -> RuleVerdict.Handled(actions, RuleOutcome.Next nextState)
                     | Result.Error err -> RuleVerdict.Rejected err
                 else
                     RuleVerdict.NoMatch }
 
-    /// <summary>Compound-target transition: follows the target node's initial-child path.</summary>
-    let goto
-        (predicate: 'State -> 'Event -> bool)
+    /// <summary>Result-returning transition controlled by an opaque legacy predicate.</summary>
+    let attempt predicate transform =
+        attemptWhen (Condition.custom "legacy.attempt" predicate) transform
+
+    /// <summary>Compound-target transition controlled by inspectable condition syntax.</summary>
+    let gotoWhen
+        (condition: Condition<'State, 'Event>)
         (target: StateId)
         (transform: 'State -> 'Event -> 'Action list * 'State)
         : Rule<'State, 'Event, 'Action, 'Err> =
-        { Kind = RuleKind.Goto target
+        { Syntax = RuleSyntax.Goto(Condition.syntax condition, target)
           Invoke =
             fun (state, event) ->
-                if predicate state event then
+                if Condition.matches condition state event then
                     let actions, nextState = transform state event
                     RuleVerdict.Handled(actions, RuleOutcome.Goto(target, nextState))
                 else
                     RuleVerdict.NoMatch }
 
-    /// <summary>Internal transition: runs actions but performs no exit/entry and keeps the state.</summary>
-    let internalOn
-        (predicate: 'State -> 'Event -> bool)
+    /// <summary>Compound-target transition controlled by an opaque legacy predicate.</summary>
+    let goto predicate target transform =
+        gotoWhen (Condition.custom "legacy.goto" predicate) target transform
+
+    /// <summary>Internal transition controlled by inspectable condition syntax.</summary>
+    let internalWhen
+        (condition: Condition<'State, 'Event>)
         (transform: 'State -> 'Event -> 'Action list)
         : Rule<'State, 'Event, 'Action, 'Err> =
-        { Kind = RuleKind.Internal
+        { Syntax = RuleSyntax.Internal(Condition.syntax condition)
           Invoke =
             fun (state, event) ->
-                if predicate state event then
+                if Condition.matches condition state event then
                     RuleVerdict.Handled(transform state event, RuleOutcome.Internal)
                 else
                     RuleVerdict.NoMatch }
 
-    /// <summary>
-    /// Guard combinator: when the predicate refuses, the rule reports
-    /// <see cref="F:ByzantineSystems.Automata.Core.RuleVerdict`3.GuardFailed" /> instead of
-    /// silently not matching; the search stops with a reportable reason rather than bubbling.
-    /// </summary>
-    let guarded
-        (predicate: 'State -> 'Event -> bool)
+    /// <summary>Internal transition controlled by an opaque legacy predicate.</summary>
+    let internalOn predicate transform =
+        internalWhen (Condition.custom "legacy.internal" predicate) transform
+
+    /// <summary>Guard controlled by inspectable condition syntax.</summary>
+    let guardedWhen
+        (condition: Condition<'State, 'Event>)
         (reason: string)
         (rule: Rule<'State, 'Event, 'Action, 'Err>)
         : Rule<'State, 'Event, 'Action, 'Err> =
-        { Kind = RuleKind.Guarded(reason, rule.Kind)
+        { Syntax = RuleSyntax.Guarded(reason, Condition.syntax condition, rule.Syntax)
           Invoke =
             fun (state, event) ->
-                if predicate state event then
+                if Condition.matches condition state event then
                     rule.Invoke(state, event)
                 else
                     RuleVerdict.GuardFailed reason }
 
-    /// <summary>
-    /// Which combinator built this rule. Everything deciding whether the rule fires is a closure
-    /// and stays invisible; this is the structure a chart fingerprint can see.
-    /// </summary>
-    let kind (rule: Rule<'State, 'Event, 'Action, 'Err>) : RuleKind = rule.Kind
+    /// <summary>Guard combinator controlled by an opaque legacy predicate.</summary>
+    let guarded predicate reason rule =
+        guardedWhen (Condition.custom "legacy.guard" predicate) reason rule
 
-    /// <summary>
-    /// The compound node a rule sends the entity to, looking through any guards, or <c>None</c>
-    /// for a rule that does not goto anywhere. Read from the kind, so a chart can check every
-    /// target it names without firing a single rule.
-    /// </summary>
+    let rec private kindOf syntax =
+        match syntax with
+        | RuleSyntax.Transition _ -> RuleKind.Transition
+        | RuleSyntax.Attempt _ -> RuleKind.Attempt
+        | RuleSyntax.Goto(_, target) -> RuleKind.Goto target
+        | RuleSyntax.Internal _ -> RuleKind.Internal
+        | RuleSyntax.Guarded(reason, _, inner) -> RuleKind.Guarded(reason, kindOf inner)
+
+    /// <summary>Returns the compatibility combinator projection.</summary>
+    let kind (rule: Rule<'State, 'Event, 'Action, 'Err>) : RuleKind = kindOf rule.Syntax
+
+    /// <summary>The rule's normalized, function-free structural syntax.</summary>
+    let syntax (rule: Rule<'State, 'Event, 'Action, 'Err>) : RuleSyntax = rule.Syntax
+
+    /// <summary>Returns a goto target through guard wrappers.</summary>
     let target (rule: Rule<'State, 'Event, 'Action, 'Err>) : StateId option =
-        let rec targetOf kind =
-            match kind with
-            | RuleKind.Goto target -> Some target
-            | RuleKind.Guarded(_, inner) -> targetOf inner
-            | RuleKind.Transition
-            | RuleKind.Attempt
-            | RuleKind.Internal -> None
+        let rec targetOf syntax =
+            match syntax with
+            | RuleSyntax.Goto(_, target) -> Some target
+            | RuleSyntax.Guarded(_, _, inner) -> targetOf inner
+            | RuleSyntax.Transition _
+            | RuleSyntax.Attempt _
+            | RuleSyntax.Internal _ -> None
 
-        targetOf rule.Kind
+        targetOf rule.Syntax
 
-    /// <summary>
-    /// Renames the goto target a rule can produce, both where the chart reads it (the kind,
-    /// through any guards) and where resolution does (the outcome its closure returns). The
-    /// second is only reachable by wrapping the closure, which is why this lives beside the
-    /// private fields rather than in the fragment code that calls it. Every other verdict and
-    /// outcome passes through untouched.
-    /// </summary>
+    /// <summary>Renames goto targets in syntax and execution.</summary>
     let retarget
         (rename: StateId -> StateId)
         (rule: Rule<'State, 'Event, 'Action, 'Err>)
         : Rule<'State, 'Event, 'Action, 'Err> =
-        let rec renameKind kind =
-            match kind with
-            | RuleKind.Goto target -> RuleKind.Goto(rename target)
-            | RuleKind.Guarded(reason, inner) -> RuleKind.Guarded(reason, renameKind inner)
-            | RuleKind.Transition
-            | RuleKind.Attempt
-            | RuleKind.Internal -> kind
+        let rec renameSyntax syntax =
+            match syntax with
+            | RuleSyntax.Goto(condition, target) -> RuleSyntax.Goto(condition, rename target)
+            | RuleSyntax.Guarded(reason, condition, inner) -> RuleSyntax.Guarded(reason, condition, renameSyntax inner)
+            | RuleSyntax.Transition _
+            | RuleSyntax.Attempt _
+            | RuleSyntax.Internal _ -> syntax
 
         let renameVerdict verdict =
             match verdict with
@@ -189,7 +202,7 @@ module Rule =
                 RuleVerdict.Handled(actions, RuleOutcome.Goto(rename target, state))
             | other -> other
 
-        { Kind = renameKind rule.Kind
+        { Syntax = renameSyntax rule.Syntax
           Invoke = rule.Invoke >> renameVerdict }
 
     /// <summary>Applies a rule to one (state, event) pair.</summary>

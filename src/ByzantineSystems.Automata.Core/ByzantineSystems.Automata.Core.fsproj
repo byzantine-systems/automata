@@ -13,9 +13,11 @@
         <Compile Include="Errors.fs" />
         <Compile Include="Boundary.fs" />
         <Compile Include="Codec.fs" />
+        <Compile Include="Condition.fs" />
         <Compile Include="Rules.fs" />
         <Compile Include="Resolution.fs" />
         <Compile Include="Chart.fs" />
+        <Compile Include="ChartEquivalence.fs" />
         <Compile Include="ChartBuilder.fs" />
     </ItemGroup>
 

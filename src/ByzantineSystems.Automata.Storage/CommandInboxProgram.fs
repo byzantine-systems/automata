@@ -1,0 +1,64 @@
+namespace ByzantineSystems.Automata.Storage.Internal
+
+open ByzantineSystems.Automata.Core
+open ByzantineSystems.Automata.Storage
+
+/// <summary>Provider-specific evidence for one fenced lease update.</summary>
+type internal LeaseUpdateInstruction<'Params, 'Reader> =
+    | ChangedRows of key: StatementKey * parameters: 'Params
+    | ReturnedOutcome of key: StatementKey * parameters: 'Params * read: Read<'Reader, LeaseUpdateOutcome>
+
+/// <summary>Provider-specific evidence and writes for one idempotent submission.</summary>
+type internal SubmitInstruction<'Params, 'Reader> =
+    | AtomicSubmission of StoreProgram<WriteAccess, 'Params, 'Reader, SubmissionOutcome>
+    | CheckedSubmission of
+        existing: StoreProgram<WriteAccess, 'Params, 'Reader, SubmissionOutcome option> *
+        registered: StoreProgram<WriteAccess, 'Params, 'Reader, bool> *
+        unregistered: StoreError *
+        refusal: StoreProgram<WriteAccess, 'Params, 'Reader, SubmissionRefusal option> *
+        insert: StoreProgram<WriteAccess, 'Params, 'Reader, CommandId> *
+        correction: (CommandId -> StoreProgram<WriteAccess, 'Params, 'Reader, unit>) option
+
+[<RequireQualifiedAccess>]
+module internal CommandInboxProgram =
+
+    let submit
+        (instruction: SubmitInstruction<'Params, 'Reader>)
+        : StoreProgram<WriteAccess, 'Params, 'Reader, SubmissionOutcome> =
+        store {
+            match instruction with
+            | AtomicSubmission program -> return! program
+            | CheckedSubmission(existing, registered, unregistered, refusal, insert, correction) ->
+                match! existing with
+                | Some outcome -> return outcome
+                | None ->
+                    match! registered with
+                    | false -> return! StoreProgram.fail unregistered
+                    | true ->
+                        match! refusal with
+                        | Some reason -> return SubmissionOutcome.Refused reason
+                        | None ->
+                            let! commandId = insert
+
+                            match correction with
+                            | Some write -> do! write commandId
+                            | None -> ()
+
+                            return Accepted commandId
+        }
+
+    let leaseUpdate
+        (instruction: LeaseUpdateInstruction<'Params, 'Reader>)
+        : StoreProgram<WriteAccess, 'Params, 'Reader, LeaseUpdateOutcome> =
+        store {
+            match instruction with
+            | ChangedRows(key, parameters) ->
+                let! changed = StoreProgram.executeCount key parameters
+
+                return
+                    if changed = 1 then
+                        LeaseUpdateOutcome.Updated
+                    else
+                        LeaseUpdateOutcome.LeaseLost
+            | ReturnedOutcome(key, parameters, read) -> return! StoreProgram.queryOne key parameters read
+        }

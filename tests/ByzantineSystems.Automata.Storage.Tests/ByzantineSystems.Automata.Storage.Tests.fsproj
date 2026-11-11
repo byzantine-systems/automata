@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <IsPackable>false</IsPackable>
+        <IsTestProject>true</IsTestProject>
+        <GenerateProgramFile>false</GenerateProgramFile>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <Compile Include="Property.fs" />
+        <Compile Include="ArgumentTests.fs" />
+        <Compile Include="StoreProgramTests.fs" />
+        <Compile Include="EnumCodecTests.fs" />
+        <Compile Include="Program.fs" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <PackageReference Include="Expecto" />
+        <PackageReference Include="FsCheck" />
+        <PackageReference Include="FsToolkit.ErrorHandling" />
+        <PackageReference Include="Microsoft.NET.Test.Sdk" PrivateAssets="all" />
+        <PackageReference Include="YoloDev.Expecto.TestSdk" PrivateAssets="all" />
+        <PackageReference Include="coverlet.msbuild" PrivateAssets="all" />
+        <ProjectReference Include="..\..\src\ByzantineSystems.Automata.Storage\ByzantineSystems.Automata.Storage.fsproj" />
+    </ItemGroup>
+
+</Project>

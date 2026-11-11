@@ -8,8 +8,7 @@ open Expecto
 let tests =
     testList
         "ByzantineSystems.Automata.Storage.Sqlite.Tests"
-        [ OpTests.tests
-          SqlResourceTests.tests
+        [ SqlResourceTests.tests
           DbTests.tests
           MigrationTests.tests
           SchemaContractTests.tests

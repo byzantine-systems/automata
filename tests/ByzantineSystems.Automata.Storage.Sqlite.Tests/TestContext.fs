@@ -124,6 +124,7 @@ let insertCommand (connectionString: string) (overrides: (string * obj) list) : 
           "idempotency_key", box "key-1"
           "chart_version", box 1L
           "event", box "{}"
+          "request_digest", box (Array.zeroCreate<byte> 32)
           "kind", box "event"
           "status", box "ready"
           "blocked", box 0L
@@ -255,6 +256,7 @@ let private processorStoreOf (fixture: Fixture) =
 
     SqliteCommandProcessorStore<Entity, TestState, TestEvent, TestAction, TestError>(
         { Context = fixture.Context
+          ActionDelivery = ActionDelivery.Deliver(ActionQueueName.create "sqlite_actions")
           StateCodec = Serialization.systemTextJson<TestState> ()
           EventCodec = Serialization.systemTextJson<TestEvent> ()
           ActionCodec = Serialization.systemTextJson<TestAction list> ()
@@ -282,7 +284,9 @@ let registryOf (fixture: Fixture) : IChartRegistry =
     SqliteChartRegistry({ Context = fixture.Context }) :> IChartRegistry
 
 let storeOf (context: SqliteContext) : Store =
-    MachineStoreOptions.forEntityId<TestEntity, TestState, TestEvent, TestAction, TestError> context
+    MachineStoreOptions.forEntityId<TestEntity, TestState, TestEvent, TestAction, TestError>
+        context
+        (ActionDelivery.Deliver(ActionQueueName.create "sqlite_actions"))
     |> SqliteMachineStore
 
 let submission (entity: Entity) (key: string) (event: TestEvent) : CommandSubmission<Entity, TestEvent> =
@@ -320,6 +324,7 @@ let commandIdOf (outcome: SubmissionOutcome) : CommandId =
     match outcome with
     | Accepted commandId -> commandId
     | AlreadySubmitted commandId -> commandId
+    | SubmissionOutcome.Refused reason -> failtestf "submission was refused: %A" reason
 
 /// Submits one command and answers its id.
 let submit (inbox: Inbox) (entity: Entity) (key: string) (event: TestEvent) : Task<CommandId> =
@@ -331,7 +336,14 @@ let submit (inbox: Inbox) (entity: Entity) (key: string) (event: TestEvent) : Ta
 /// Claims up to a batch of commands with a lease the test does not expect to lapse.
 let claim (inbox: Inbox) (batch: int) : Task<Claimed list> =
     task {
-        let! claimed = inbox.Claim(testMachine, batch, TimeSpan.FromSeconds 30.0, noCancellation)
+        let! claimed =
+            inbox.Claim(
+                testMachine,
+                ClaimBatch.create batch,
+                LeaseDuration.create (TimeSpan.FromSeconds 30.0),
+                noCancellation
+            )
+
         return claimed |> expectOk "claim"
     }
 

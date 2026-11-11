@@ -1,6 +1,7 @@
 module ByzantineSystems.Automata.Storage.Postgres.Tests.SqlTests
 
 open ByzantineSystems.Automata.Core
+open ByzantineSystems.Automata.Storage.Internal
 open ByzantineSystems.Automata.Storage.Postgres
 open ByzantineSystems.Automata.Storage.Postgres.Tests.TestContext
 open Expecto
@@ -8,10 +9,9 @@ open Expecto
 /// A submission under a chart version nobody registered, which the server refuses under the
 /// command's foreign key to the version table.
 let private unregisteredSubmission =
-    let submit = Statement.load "command" "submit"
+    let submit = StatementKey.create "command" "submit" |> Sql.prepareProgram
 
-    Sql.one
-        "SubmissionOutcome"
+    StoreProgram.queryOne
         submit
         [ "machine_id", Param.Text "pg-sql-tests"
           "entity_id", Param.Text "e1"
@@ -25,14 +25,14 @@ let private unregisteredSubmission =
           "source", Param.Text ""
           "correlation_id", Param.Text ""
           "causation_id", Param.Text "" ]
-        (fun reader -> Row.int64 reader "command_id")
+        (fun reader -> Row.int64 reader "command_id" |> Ok)
 
 let tests =
     testList
         "Sql"
         [ testTask "a named violation is a refusal the caller can match on" {
               do! reset ()
-              let! attempt = Sql.attempt (context ()) unregisteredSubmission noCancellation
+              let! attempt = Sql.attemptProgram (context ()) unregisteredSubmission noCancellation
 
               match attempt with
               | Db.Refused(Db.ForeignKey "command_chart_version_fkey", _) -> ()
@@ -41,7 +41,7 @@ let tests =
 
           testTask "a violation nobody asked to handle is Unexpected" {
               do! reset ()
-              let! outcome = Sql.run (context ()) unregisteredSubmission noCancellation
+              let! outcome = Sql.runProgram (context ()) unregisteredSubmission noCancellation
 
               match outcome with
               | Error(StoreError.Unexpected _) -> ()
@@ -52,13 +52,12 @@ let tests =
               do! reset ()
 
               let byVersion =
-                  Sql.one
-                      "ChartFingerprint"
-                      (Statement.load "chart" "by_version")
+                  StoreProgram.queryOne
+                      (StatementKey.create "chart" "by_version" |> Sql.prepareProgram)
                       [ "machine_id", Param.Text "nobody"; "version", Param.Int 1 ]
-                      (fun reader -> Row.string reader "fingerprint")
+                      (fun reader -> Row.string reader "fingerprint" |> Ok)
 
-              let! outcome = Sql.run (context ()) byVersion noCancellation
+              let! outcome = Sql.readProgram (context ()) byVersion noCancellation
 
               match outcome with
               | Error(StoreError.Serialization(_, error)) ->
@@ -68,9 +67,10 @@ let tests =
 
           testTask "one refuses a statement that returns more than one row" {
               let journal =
-                  Sql.one "Script" (Statement.load "system" "journal") [] (fun reader -> Row.string reader "scriptname")
+                  StoreProgram.queryOne (StatementKey.create "system" "journal" |> Sql.prepareProgram) [] (fun reader ->
+                      Row.string reader "scriptname" |> Ok)
 
-              let! outcome = Sql.run (context ()) journal noCancellation
+              let! outcome = Sql.readProgram (context ()) journal noCancellation
 
               match outcome with
               | Error(StoreError.Serialization(_, error)) ->

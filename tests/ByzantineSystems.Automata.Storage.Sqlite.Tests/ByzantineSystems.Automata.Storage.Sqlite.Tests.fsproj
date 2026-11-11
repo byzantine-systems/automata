@@ -9,7 +9,7 @@
 
     <ItemGroup>
         <Compile Include="TestContext.fs" />
-        <Compile Include="OpTests.fs" />
+        <Compile Include="..\StorageContractProperties.fs" Link="StorageContractProperties.fs" />
         <Compile Include="SqlResourceTests.fs" />
         <Compile Include="DbTests.fs" />
         <Compile Include="MigrationTests.fs" />
@@ -27,6 +27,7 @@
 
     <ItemGroup>
         <PackageReference Include="Expecto" />
+        <PackageReference Include="FsCheck" />
         <PackageReference Include="Microsoft.NET.Test.Sdk" PrivateAssets="all" />
         <PackageReference Include="YoloDev.Expecto.TestSdk" PrivateAssets="all" />
         <PackageReference Include="coverlet.msbuild" PrivateAssets="all" />

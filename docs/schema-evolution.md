@@ -37,7 +37,7 @@ Reads go through SqlHydra-generated types; routine calls stay in `sql/`. Run `ma
 
 ## Action delivery, and why pgmq is wrapped
 
-A commit enqueues its actions through `pgmq.send`, inside `fsm.finalize_command`, in the same transaction as the transition and the belief. 
+A commit enqueues its actions through `pgmq.send`, inside `fsm.finalize_command`, in the same transaction as the transition and the belief. The routine reads `machine_maintenance.action_queue`; callers cannot override it. A registered empty queue represents explicit `ActionDelivery.Discard`, retaining the actions in the transition without delivery. An absent registration is refused when actions exist. Queue names are ASCII and at most 47 characters, matching `pgmq.validate_queue_name` (verified against pgmq 1.13.1).
 
 ## Temporal tables
 
@@ -59,3 +59,9 @@ CREATE OR REPLACE TRIGGER <t>_versioning_trigger
 
 - **`fsm.command.kind`**: `'event'` or `'correction'`.
 - **`fsm.command_correction`**: a correction's instant, divergence policy and replay limit, one row per correction command.
+
+## Command retention and the replay watermark
+
+`fsm.purge_commands` removes a terminal command and, in one statement, its `command_correction`, transition, error and undelivered actions. Deleting a transition advances `fsm.entity_purge.max_purged_effective_at` to the greatest effective instant of the transitions removed, so the value is a monotonic watermark: a purge never makes replay see further back. It has no foreign key, because it must survive the history it describes.
+
+`IReplayStore.Suffix` reads the transition suffix and then the watermark. A suffix whose requested start is at or before the watermark may have lost events, so it reports `Incomplete`; one that starts strictly after is complete. This is exact under corrections, which back-date transitions: what matters is the effective instant a purged transition carried, not the epoch it held.

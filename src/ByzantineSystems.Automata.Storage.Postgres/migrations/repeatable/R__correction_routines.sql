@@ -55,13 +55,19 @@ BEGIN
     FROM
         JSONB_ARRAY_ELEMENTS(p_beliefs)
         LOOP
-            IF (v_belief ->> 'valid_from')::timestamptz < p_valid_from THEN
-                RAISE EXCEPTION 'fsm.correct_beliefs: a belief at % precedes the corrected instant %', (v_belief ->> 'valid_from')::timestamptz, p_valid_from USING ERRCODE = 'invalid_parameter_value';
-END IF;
+            -- The first belief must start exactly at the corrected instant. Starting earlier is a
+            -- belief behind the correction, and starting later opens a leading gap that no as-of
+            -- query can answer; either is refused before anything is written.
+            IF v_previous = '-infinity'::timestamptz THEN
+                IF (v_belief ->> 'valid_from')::timestamptz <> p_valid_from THEN
+                    RAISE EXCEPTION 'fsm.correct_beliefs: the first belief at % must start exactly at the corrected instant %', (v_belief ->> 'valid_from')::timestamptz, p_valid_from USING ERRCODE = 'invalid_parameter_value';
+        END IF;
+ELSE
     IF (v_belief ->> 'valid_from')::timestamptz <= v_previous THEN
         RAISE EXCEPTION 'fsm.correct_beliefs: the beliefs are not in ascending valid-time order at %', (v_belief ->> 'valid_from')::timestamptz
             USING ERRCODE = 'invalid_parameter_value';
     END IF;
+END IF;
     v_previous := (v_belief ->> 'valid_from')::timestamptz;
 END LOOP;
     -- A belief that starts before the corrected instant and runs past it is
@@ -115,14 +121,18 @@ $$;
 -- Through fsm.submit_command, so idempotency, the gapless sequence and the
 -- head invariant are exactly an ordinary command's: a correction waits behind
 -- work already queued for its entity, and nothing queued after it runs first.
--- Only a newly accepted command is marked a correction and given its details;
--- a repeated key returns the original, whatever it was.
+-- The shared insert records the correction kind and digest immediately. Only a
+-- newly accepted command receives details; changed requests under a key are refused.
 -- ---------------------------------------------------------------------------
+DROP FUNCTION IF EXISTS fsm.submit_correction (text, text, text, integer, jsonb, timestamptz, fsm.divergence, integer, text, text, text, text, text);
+
 CREATE OR REPLACE FUNCTION fsm.submit_correction (p_machine_id text, p_entity_id text, p_idempotency_key text, p_chart_version integer, p_event jsonb, p_effective_at timestamptz, p_on_divergence fsm.divergence, p_replay_limit integer, p_tenant text DEFAULT '', p_principal text DEFAULT '', p_source text DEFAULT '', p_correlation_id text DEFAULT '', p_causation_id text DEFAULT '')
     RETURNS TABLE (
         command_id bigint,
         seq bigint,
-        accepted boolean)
+        accepted boolean,
+        key_reused boolean,
+        predecessor_received_at timestamptz)
     LANGUAGE plpgsql
     VOLATILE PARALLEL UNSAFE
     SET search_path = pg_catalog,
@@ -132,24 +142,24 @@ DECLARE
     v_command_id bigint;
     v_seq bigint;
     v_accepted boolean;
+    v_key_reused boolean;
+    v_predecessor timestamptz;
 BEGIN
     SELECT
         s.command_id,
         s.seq,
-        s.accepted
+        s.accepted,
+        s.key_reused,
+        s.predecessor_received_at
     INTO
         v_command_id,
         v_seq,
-        v_accepted
+        v_accepted,
+        v_key_reused,
+        v_predecessor
     FROM
-        fsm.submit_command (p_machine_id, p_entity_id, p_idempotency_key, p_chart_version, p_event, NULL, NULL, p_tenant, p_principal, p_source, p_correlation_id, p_causation_id) s;
+        fsm.submit_command (p_machine_id, p_entity_id, p_idempotency_key, p_chart_version, p_event, NULL, NULL, p_tenant, p_principal, p_source, p_correlation_id, p_causation_id, 'correction', JSONB_BUILD_ARRAY(EXTRACT(EPOCH FROM p_effective_at), p_on_divergence, p_replay_limit)) s;
     IF v_accepted THEN
-        UPDATE
-            fsm.command c
-        SET
-            kind = 'correction'
-        WHERE
-            c.command_id = v_command_id;
         INSERT INTO fsm.command_correction (command_id, effective_at, on_divergence, replay_limit)
             VALUES (v_command_id, p_effective_at, p_on_divergence, p_replay_limit);
     END IF;
@@ -157,7 +167,9 @@ BEGIN
     SELECT
         v_command_id,
         v_seq,
-        v_accepted;
+        v_accepted,
+        v_key_reused,
+        v_predecessor;
 END
 $$;
 
@@ -178,10 +190,13 @@ $$;
 -- belief's epoch as the entity's, so any other attribution would leave the next
 -- ordinary command expecting an epoch that is already taken.
 -- ---------------------------------------------------------------------------
+DROP FUNCTION IF EXISTS fsm.finalize_correction (bigint, bigint, bigint, timestamptz, jsonb, fsm.instance_status, jsonb, jsonb, jsonb, text, text[], text[]);
+
 CREATE OR REPLACE FUNCTION fsm.finalize_correction (p_command_id bigint, p_lease_token bigint, p_expected_epoch bigint, p_valid_from timestamptz, p_beliefs jsonb, p_instance_status fsm.instance_status, p_event jsonb, p_from_state jsonb, p_to_state jsonb, p_handled_by text, p_exited text[], p_entered text[])
     RETURNS TABLE (
         outcome fsm.finalize_outcome,
-        epoch bigint)
+        epoch bigint,
+        status fsm.command_status)
     LANGUAGE plpgsql
     VOLATILE PARALLEL UNSAFE
     SET search_path = pg_catalog,
@@ -233,20 +248,23 @@ BEGIN
                         t.epoch
                     FROM fsm.transition t
                     WHERE
-                        t.command_id = p_command_id), p_expected_epoch);
+                        t.command_id = p_command_id), p_expected_epoch),
+                v_status;
         ELSE
             RETURN QUERY
             SELECT
                 'lease_lost'::fsm.finalize_outcome,
-                p_expected_epoch;
+                p_expected_epoch,
+                v_status;
         END IF;
         RETURN;
     END IF;
-    IF v_token <> p_lease_token THEN
+    IF v_status <> 'leased' OR v_token <> p_lease_token THEN
         RETURN QUERY
         SELECT
             'lease_lost'::fsm.finalize_outcome,
-            p_expected_epoch;
+            p_expected_epoch,
+            v_status;
         RETURN;
     END IF;
     SELECT
@@ -264,7 +282,8 @@ BEGIN
         RETURN QUERY
         SELECT
             'conflict'::fsm.finalize_outcome,
-            v_current_epoch;
+            v_current_epoch,
+            v_status;
         RETURN;
     END IF;
     INSERT INTO fsm.transition (machine_id, entity_id, epoch, command_id, chart_version, event, actions, from_state, to_state, handled_by, exited, entered, status, effective_at)
@@ -297,7 +316,7 @@ BEGIN
     RETURN QUERY
     SELECT
         'finalized'::fsm.finalize_outcome,
-        p_expected_epoch + 1;
+        p_expected_epoch + 1,
+        'succeeded'::fsm.command_status;
 END
 $$;
-

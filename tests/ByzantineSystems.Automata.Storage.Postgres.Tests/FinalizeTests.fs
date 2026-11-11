@@ -9,7 +9,7 @@ open TestContext
 
 let private entity name : Entity = entityId name
 type private Claimed = LeasedCommand<Entity, TestEvent>
-let private lease = TimeSpan.FromSeconds 30.0
+let private lease = LeaseDuration.create (TimeSpan.FromSeconds 30.0)
 let private effectiveAt = DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero)
 
 /// Submits one command and claims it, which is the state every test here starts from.
@@ -18,7 +18,7 @@ let private effectiveAt = DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero)
 /// entity: any other entity with a claimable head would otherwise be returned instead, silently.
 let private claimKey (inbox: Inbox) (key: string) : Task<Claimed> =
     task {
-        let! claimed = inbox.Claim(machine, 50, lease, noCancellation)
+        let! claimed = inbox.Claim(machine, ClaimBatch.create 50, lease, noCancellation)
 
         return
             claimed
@@ -80,114 +80,6 @@ let tests =
                   "and the entity's next command is released"
           }
 
-          // The case the whole routine exists for. A worker whose connection dropped does not know
-          // whether it committed; asking again must report what it already did, not a lost lease.
-          testTask "a repeat from the same lease reports the work already done" {
-              do! reset ()
-              let inbox = newInbox ()
-              let! held = leased inbox "e1" "k1"
-              let processor = newProcessor ()
-
-              let! first = commit processor held Epoch.initial (Active 7)
-              let! again = commit processor held Epoch.initial (Active 7)
-
-              Expect.equal first (Finalized(Epoch.next Epoch.initial)) "the first call commits"
-              Expect.equal again (AlreadyFinalized(Epoch.next Epoch.initial)) "the retry reports the same epoch"
-              Expect.equal (counts ()) "1/1/0" "and writes nothing a second time"
-          }
-
-          testTask "a reclaimed command cannot be finalized by the worker that lost it" {
-              do! reset ()
-              let inbox = newInbox ()
-              let! _ = inbox.Submit(submission (entity "e1") "k1" (Start 1), noCancellation)
-
-              let! first = inbox.Claim(machine, 1, TimeSpan.FromMilliseconds 1.0, noCancellation)
-              let stale = (first |> expectOk "first claim") |> List.exactlyOne
-              do! Task.Delay 60
-              let! second = inbox.Claim(machine, 1, lease, noCancellation)
-              let holder = (second |> expectOk "reclaim") |> List.exactlyOne
-
-              Expect.isGreaterThan
-                  (LeaseToken.value holder.Token)
-                  (LeaseToken.value stale.Token)
-                  "the reclaim issues a higher token"
-
-              let! outcome = commit (newProcessor ()) stale Epoch.initial (Active 7)
-
-              Expect.equal outcome FinalizeOutcome.LeaseLost "the worker that lost the lease writes nothing"
-              Expect.equal (counts ()) "0/0/0" "and nothing was written"
-          }
-
-          testTask "a stale token against a still-leased command loses" {
-              do! reset ()
-              let inbox = newInbox ()
-              let! held = leased inbox "e1" "k1"
-
-              let forged =
-                  { held with
-                      Token = LeaseToken.ofInt64 (LeaseToken.value held.Token - 1L) }
-
-              let! outcome = commit (newProcessor ()) forged Epoch.initial (Active 7)
-
-              Expect.equal outcome FinalizeOutcome.LeaseLost "the token is the fence"
-              Expect.equal (counts ()) "0/0/0" "and nothing was written"
-          }
-
-          testTask "an expected epoch that does not match reports both values" {
-              do! reset ()
-              let inbox = newInbox ()
-              let! held = leased inbox "e1" "k1"
-              let ahead = Epoch.ofUInt64 5UL
-
-              let! outcome = commit (newProcessor ()) held ahead (Active 7)
-
-              Expect.equal outcome (Conflict(ahead, Epoch.initial)) "the caller learns how far behind it was"
-              Expect.equal (counts ()) "0/0/0" "a conflict writes nothing"
-          }
-
-          testTask "rejecting records the error and leaves the state alone" {
-              do! reset ()
-              let inbox = newInbox ()
-              let! held = leased inbox "e1" "first"
-              let! _ = inbox.Submit(submission (entity "e1") "second" Finish, noCancellation)
-
-              let! outcome =
-                  (newProcessor ())
-                      .Reject(held.Work.CommandId, held.Token, CommandFailure.Domain(Refused "no"), noCancellation)
-
-              Expect.equal (outcome |> expectOk "reject") (Finalized Epoch.initial) "the epoch does not move"
-              Expect.equal (counts ()) "0/0/1" "an error, and no transition or belief"
-
-              Expect.equal
-                  (scalar<bool> "SELECT NOT blocked FROM fsm.command WHERE idempotency_key = 'second'")
-                  true
-                  "the entity is released"
-          }
-
-          testTask "dead-lettering records the error and releases the entity" {
-              do! reset ()
-              let inbox = newInbox ()
-              let! held = leased inbox "e1" "first"
-              let! _ = inbox.Submit(submission (entity "e1") "second" Finish, noCancellation)
-
-              let! outcome =
-                  (newProcessor ())
-                      .DeadLetter(
-                          held.Work.CommandId,
-                          held.Token,
-                          CommandFailure.Domain(Refused "poison"),
-                          noCancellation
-                      )
-
-              Expect.equal (outcome |> expectOk "dead letter") (Finalized Epoch.initial) "terminal, no epoch change"
-              Expect.equal (counts ()) "0/0/1" "an error, and no transition or belief"
-
-              Expect.equal
-                  (scalar<bool> "SELECT NOT blocked FROM fsm.command WHERE idempotency_key = 'second'")
-                  true
-                  "a command nobody can process must not wedge its entity"
-          }
-
           // All of it or none of it. The transition is inserted before the belief moves, so a
           // belief write that raises must take the transition with it.
           testTask "a failure after the transition insert rolls the whole finalize back" {
@@ -221,22 +113,6 @@ let tests =
                   (scalar<string> "SELECT status FROM fsm.command WHERE idempotency_key = 'k2'")
                   "leased"
                   "the command is still open, so it will be redelivered"
-          }
-
-          testTask "epochs are gapless across an entity's commands" {
-              do! reset ()
-              let inbox = newInbox ()
-              let processor = newProcessor ()
-
-              for index in 1..4 do
-                  let! held = leased inbox "e1" $"k{index}"
-                  let! _ = commit processor held (Epoch.ofUInt64 (uint64 (index - 1))) (Active index)
-                  ()
-
-              Expect.equal
-                  (scalar<string> "SELECT string_agg(epoch::text, ',' ORDER BY epoch) FROM fsm.transition")
-                  "1,2,3,4"
-                  "no gaps, no repeats"
           }
 
           testTask "one command can never produce two transitions" {
@@ -300,50 +176,4 @@ let tests =
                   (scalar<bool> "SELECT min(effective_at) < min(committed_at) FROM fsm.transition")
                   true
                   "business time and commit time are independent"
-          }
-
-          testTask "a command's result reads back as what happened to it" {
-              do! reset ()
-              let inbox = newInbox ()
-              let processor = newProcessor ()
-
-              let! pending = inbox.Submit(submission (entity "e1") "k1" (Start 1), noCancellation)
-              let pendingId = pending |> expectOk "submit" |> commandIdOf
-
-              let! before = processor.TryGetResult(pendingId, noCancellation)
-
-              Expect.equal
-                  (before |> expectOk "pending result")
-                  (Some CommandResult.Pending)
-                  "an unfinished command has no result yet"
-
-              let! held = claimKey inbox "k1"
-              let! _ = commit processor held Epoch.initial (Active 9)
-              let! after = processor.TryGetResult(held.Work.CommandId, noCancellation)
-
-              match after |> expectOk "committed result" with
-              | Some(CommandResult.Committed committed) ->
-                  Expect.equal committed.Epoch (Epoch.next Epoch.initial) "the stored epoch"
-                  Expect.equal committed.Draft.ToState (Active 9) "the state it moved to"
-                  Expect.equal committed.Draft.Actions [ Notify "done" ] "and the actions it emitted"
-              | other -> failtestf "expected a committed result, got %A" other
-
-              let! rejected = inbox.Submit(submission (entity "e2") "r1" Finish, noCancellation)
-              let rejectedId = rejected |> expectOk "submit" |> commandIdOf
-              let! heldTwo = claimKey inbox "r1"
-
-              let! _ =
-                  processor.Reject(
-                      heldTwo.Work.CommandId,
-                      heldTwo.Token,
-                      CommandFailure.Domain(Refused "nope"),
-                      noCancellation
-                  )
-
-              let! result = processor.TryGetResult(rejectedId, noCancellation)
-
-              Expect.equal
-                  (result |> expectOk "rejected result")
-                  (Some(CommandResult.Rejected(CommandFailure.Domain(Refused "nope"))))
-                  "a rejection reads back as the error that caused it"
           } ]

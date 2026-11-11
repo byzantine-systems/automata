@@ -129,14 +129,9 @@ let private planTests =
                   (steps |> List.exists (fun step -> step.StartsWith "SCAN fsm_command"))
                   "no scan of the inbox"
 
-          fixture "a history page seeks the log"
+          fixture "the shipped history page seeks the log"
           <| fun db ->
-              let steps =
-                  plan
-                      db
-                      "SELECT * FROM fsm_transition
-                       WHERE machine_id = @machine AND entity_id = @entity AND epoch > @after
-                       ORDER BY epoch LIMIT @limit"
+              let steps = plan db (SqlResources.get "command" "history_page")
 
               Expect.exists steps (fun step -> step.StartsWith "SEARCH fsm_transition") "a seek, not a scan"
               noSort steps

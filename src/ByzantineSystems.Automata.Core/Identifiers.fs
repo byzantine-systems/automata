@@ -21,13 +21,11 @@ type MachineId = private MachineId of string
 type EntityId<'entity> = private EntityId of string
 
 /// <summary>
-/// A hash of a chart's structure: the node graph, the terminal and initial-child markers, and
-/// the kind of every rule, in the order the rules were declared. Rendered as 64 lowercase hex
-/// digits.
+/// A hash of a chart's canonical declaration: the node graph, terminal and initial-child markers,
+/// and normalized rule and condition syntax. Rendered as 64 lowercase hex digits.
 ///
-/// This is a tripwire, not a proof of equivalence: guards, transforms, entry and exit actions and
-/// the classifier are closures, and nothing can see inside them. It catches a chart edited
-/// without a version bump; it cannot catch a behaviour change that leaves the structure alone.
+/// This is a tripwire, not a proof of equivalence: transforms, predicate delegates, entry and exit
+/// actions, and the classifier remain opaque. It cannot catch behavior changes outside the syntax.
 /// </summary>
 [<Struct>]
 type ChartFingerprint = private ChartFingerprint of string
@@ -36,13 +34,22 @@ type ChartFingerprint = private ChartFingerprint of string
 [<RequireQualifiedAccess>]
 module StateId =
 
+    /// <summary>
+    /// Parses a state id, returning the reason rather than raising. A corrupt row read back out
+    /// of storage becomes a typed failure at the store boundary instead of an exception escaping it.
+    /// </summary>
+    let tryCreate (value: string) : Result<StateId, string> =
+        if String.IsNullOrWhiteSpace value then
+            Error "A state id must be a non-empty string."
+        else
+            Ok(StateId(value.Trim()))
+
     /// <summary>Constructs a state id from a non-empty string, trimming surrounding whitespace.</summary>
     /// <exception cref="T:System.ArgumentException">The input is null, empty, or whitespace.</exception>
     let create (value: string) : StateId =
-        if String.IsNullOrWhiteSpace value then
-            invalidArg (nameof value) "A state id must be a non-empty string."
-
-        StateId(value.Trim())
+        match tryCreate value with
+        | Ok stateId -> stateId
+        | Error message -> invalidArg (nameof value) message
 
     /// <summary>Returns the underlying string.</summary>
     let value (StateId value) : string = value
@@ -51,13 +58,23 @@ module StateId =
 [<RequireQualifiedAccess>]
 module MachineId =
 
+    /// <summary>
+    /// Parses a machine id, returning the reason rather than raising. A corrupt row read back
+    /// out of storage becomes a typed failure at the store boundary instead of an exception
+    /// escaping it.
+    /// </summary>
+    let tryCreate (value: string) : Result<MachineId, string> =
+        if String.IsNullOrWhiteSpace value then
+            Error "A machine id must be a non-empty string."
+        else
+            Ok(MachineId(value.Trim()))
+
     /// <summary>Constructs a machine id from a non-empty string, trimming surrounding whitespace.</summary>
     /// <exception cref="T:System.ArgumentException">The input is null, empty, or whitespace.</exception>
     let create (value: string) : MachineId =
-        if String.IsNullOrWhiteSpace value then
-            invalidArg (nameof value) "A machine id must be a non-empty string."
-
-        MachineId(value.Trim())
+        match tryCreate value with
+        | Ok machineId -> machineId
+        | Error message -> invalidArg (nameof value) message
 
     /// <summary>Returns the underlying string.</summary>
     let value (MachineId value) : string = value

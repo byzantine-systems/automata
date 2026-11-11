@@ -32,7 +32,7 @@ CREATE TABLE fsm.machine_maintenance (
     -- CHECK cannot call a routine the repeatable scripts have not created yet.
     -- The queue reaches dynamic SQL as an identifier, so it is checked on the
     -- way in as well as on the way out.
-    CONSTRAINT machine_maintenance_queue_name CHECK (action_queue ~ '^[a-z_][a-z0-9_]*$'),
+    CONSTRAINT machine_maintenance_queue_name CHECK (action_queue = '' OR (LENGTH(action_queue) <= 47 AND action_queue ~ '^[a-z_][a-z0-9_]*$')),
     CONSTRAINT machine_maintenance_keep_positive CHECK (keep_commands > interval '0' AND keep_belief_history > interval '0' AND keep_action_archive > interval '0'),
     CONSTRAINT machine_maintenance_reap_after_positive CHECK (reap_after > interval '0')
 );

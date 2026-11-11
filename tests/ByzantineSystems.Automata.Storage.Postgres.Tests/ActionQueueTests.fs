@@ -4,19 +4,20 @@ open System
 open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
+open ByzantineSystems.Automata.Storage.Postgres
 open Expecto
 open TestContext
 
 let private entity name : Entity = entityId name
 type private Claimed = LeasedCommand<Entity, TestEvent>
-let private lease = TimeSpan.FromSeconds 30.0
-let private actionLease = TimeSpan.FromSeconds 30.0
+let private lease = LeaseDuration.create (TimeSpan.FromSeconds 30.0)
+let private actionLease = LeaseDuration.create (TimeSpan.FromSeconds 30.0)
 let private effectiveAt = DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero)
 
 let private leased (inbox: Inbox) (name: string) (key: string) : Task<Claimed> =
     task {
         let! _ = inbox.Submit(submission (entity name) key (Start 1), noCancellation)
-        let! claimed = inbox.Claim(machine, 50, lease, noCancellation)
+        let! claimed = inbox.Claim(machine, ClaimBatch.create 50, lease, noCancellation)
 
         return
             claimed
@@ -42,7 +43,7 @@ let private commit (processor: Processor) (held: Claimed) =
 
 let private claimActions (queue: Actions) =
     task {
-        let! claimed = queue.Claim(machine, 50, actionLease, noCancellation)
+        let! claimed = queue.Claim(machine, ClaimBatch.create 50, actionLease, noCancellation)
         return claimed |> expectOk "claim actions"
     }
 
@@ -55,7 +56,89 @@ let private deadLetterCount () =
 let tests =
     testList
         "Postgres action queue"
-        [ testTask "a commit enqueues its actions in the same transaction" {
+        [ ContractProperties.poisonBatchProperty
+              "poison actions do not wedge a batch"
+              12
+              (CommandInboxTests.poisonFixture true)
+
+          testTask "a commit routes actions to the boot registration" {
+              do! reset ()
+
+              exec
+                  "SELECT fsm.ensure_action_queue('registered_action_target'); SELECT pgmq.purge_queue('registered_action_target'); INSERT INTO fsm.machine_maintenance(machine_id, action_queue) VALUES ('pg-tests', 'registered_action_target') ON CONFLICT(machine_id) DO UPDATE SET action_queue = EXCLUDED.action_queue"
+              |> expectOk "register A"
+
+              let! held = leased (newInbox ()) "routing" "key"
+              // This store's delivery configuration is the fixture's normal queue B.
+              let processor = newMachineStore RetentionPolicy.keepEverything :> Processor
+              let! _ = commit processor held
+
+              Expect.equal
+                  (scalar<int64> "SELECT count(*) FROM pgmq.q_registered_action_target")
+                  1L
+                  "registration A is authoritative"
+
+              Expect.equal (queueDepth ()) 0L "client configuration B cannot redirect the commit"
+          }
+
+          testTask "a commit with actions requires a delivery registration" {
+              do! reset ()
+              exec "DELETE FROM fsm.machine_maintenance" |> expectOk "unregister"
+              let! held = leased (newInbox ()) "unregistered" "key"
+
+              let! outcome =
+                  (newProcessor ())
+                      .Commit(
+                          held.Work.CommandId,
+                          held.Token,
+                          Epoch.initial,
+                          draft held.Work.EntityId Idle (Active 1) effectiveAt,
+                          noCancellation
+                      )
+
+              match outcome with
+              | Error(StoreError.Unexpected(:? Npgsql.PostgresException as error)) ->
+                  Expect.equal error.SqlState "22023" "a configuration refusal"
+                  Expect.stringContains error.MessageText "action delivery is not registered" "a named reason"
+              | other -> failtestf "expected an unregistered delivery refusal, got %A" other
+
+              Expect.equal
+                  (scalar<int64> "SELECT count(*) FROM fsm.transition")
+                  0L
+                  "the transition rolls back with routing"
+
+              Expect.equal (queueDepth ()) 0L "nothing was delivered"
+          }
+
+          testTask "explicit Discard records actions without queueing or maintaining a delivery queue" {
+              do! reset ()
+
+              let store =
+                  MachineStoreOptions.forEntityId<TestEntity, TestState, TestEvent, TestAction, TestError>
+                      (context ())
+                      ActionDelivery.Discard
+                  |> PostgresMachineStore
+
+              let! booted = (store :> IStoreBoot).Boot(machine, noCancellation)
+              Expect.equal (booted |> expectOk "boot") BootReport.Ready "discard is a valid boot policy"
+              let! held = leased (store :> Inbox) "discard" "key"
+              let! _ = commit (store :> Processor) held
+              let! result = (store :> Processor).TryGetResult(held.Work.CommandId, noCancellation)
+
+              match result |> expectOk "result" with
+              | Some(CommandResult.Committed transition) ->
+                  Expect.equal transition.Draft.Actions [ Notify "done" ] "actions remain in the transition"
+              | other -> failtestf "expected a committed transition, got %A" other
+
+              Expect.equal (queueDepth ()) 0L "there is no delivery"
+              let! actions = (store :> Actions).Claim(machine, ClaimBatch.create 10, actionLease, noCancellation)
+              Expect.equal (actions |> expectOk "claim") [] "the discard consumer needs no physical queue"
+
+              exec "SELECT * FROM fsm.run_maintenance(100); SELECT * FROM fsm.notify_pending();"
+              |> expectOk "discard maintenance"
+          }
+
+          testTask "a commit enqueues its actions in the same transaction" {
               do! reset ()
               let inbox = newInbox ()
               let! held = leased inbox "e1" "k1"
@@ -191,7 +274,7 @@ let tests =
                   { action with
                       DeliveryCount = action.DeliveryCount - 1 }
 
-              let! outcome = queue.Abandon(stale, "gave up", noCancellation)
+              let! outcome = queue.Abandon(stale, Reason.create "gave up", noCancellation)
               Expect.equal LeaseUpdateOutcome.LeaseLost (outcome |> expectOk "abandon") "fenced out"
               Expect.equal 0L (deadLetterCount ()) "and nothing was recorded"
           }
@@ -206,7 +289,7 @@ let tests =
               let! claimed = claimActions queue
               let action: LeasedAction<Entity, TestAction> = List.exactlyOne claimed
 
-              let! outcome = queue.Abandon(action, "the destination refused it", noCancellation)
+              let! outcome = queue.Abandon(action, Reason.create "the destination refused it", noCancellation)
               Expect.equal Updated (outcome |> expectOk "abandon") "given up on"
               Expect.equal 0L (queueDepth ()) "the message left the queue"
               Expect.equal 1L (deadLetterCount ()) "and the fact was recorded"

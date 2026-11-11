@@ -48,6 +48,7 @@ RETURNING
     idempotency_key,
     chart_version,
     event,
+    request_digest,
     kind,
     status,
     blocked,
@@ -60,4 +61,32 @@ RETURNING
     principal,
     source,
     correlation_id,
-    causation_id;
+    causation_id,
+    (
+        SELECT
+            d.command_id
+        FROM
+            fsm_command_correction d
+        WHERE
+            d.command_id = fsm_command.command_id) AS correction_command_id,
+    (
+        SELECT
+            d.effective_at
+        FROM
+            fsm_command_correction d
+        WHERE
+            d.command_id = fsm_command.command_id) AS correction_effective_at,
+    (
+        SELECT
+            d.on_divergence
+        FROM
+            fsm_command_correction d
+        WHERE
+            d.command_id = fsm_command.command_id) AS correction_on_divergence,
+    (
+        SELECT
+            d.replay_limit
+        FROM
+            fsm_command_correction d
+        WHERE
+            d.command_id = fsm_command.command_id) AS correction_replay_limit;

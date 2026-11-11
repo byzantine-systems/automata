@@ -66,7 +66,7 @@ let private ownStore () =
 
     PostgresMachineStore<Entity, TestState, TestEvent, TestAction, TestError>(
         { Context = PostgresContext.create source TransientPolicy.defaults ignore
-          ActionQueue = actionQueue
+          ActionDelivery = ActionDelivery.Deliver(ActionQueueName.create actionQueue)
           StateCodec = Serialization.systemTextJson<TestState> ()
           EventCodec = Serialization.systemTextJson<TestEvent> ()
           ActionCodec = Serialization.systemTextJson<TestAction> ()
@@ -74,7 +74,7 @@ let private ownStore () =
           EntityIdEncode = encode
           EntityIdDecode = decode
           Retention = RetentionPolicy.keepEverything
-          ReapAfter = TimeSpan.FromMinutes 5.
+          ReapAfter = LeaseDuration.create (TimeSpan.FromMinutes 5.)
           Listener = ListenerConnection.SameDataSource }
     )
 

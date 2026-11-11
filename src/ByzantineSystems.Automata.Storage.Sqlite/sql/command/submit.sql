@@ -11,13 +11,13 @@
 --     turn, which is what keeps fsm_command_entity_head_idx satisfied.
 --
 -- The constraints, not the serialisation, remain the integrity boundary.
-INSERT INTO fsm_command (machine_id, entity_id, seq, idempotency_key, chart_version, event, kind, blocked, visible_at, received_at, tenant, principal, source, correlation_id, causation_id)
+INSERT INTO fsm_command (machine_id, entity_id, seq, idempotency_key, chart_version, event, request_digest, kind, blocked, visible_at, received_at, tenant, principal, source, correlation_id, causation_id)
     VALUES (@machine_id, @entity_id, COALESCE((
             SELECT
                 MAX(c.seq)
             FROM fsm_command c
             WHERE
-                c.machine_id = @machine_id AND c.entity_id = @entity_id), 0) + 1, @idempotency_key, @chart_version, @event, @kind, EXISTS (
+                c.machine_id = @machine_id AND c.entity_id = @entity_id), 0) + 1, @idempotency_key, @chart_version, @event, @request_digest, @kind, EXISTS (
             SELECT
                 1
             FROM
@@ -25,6 +25,9 @@ INSERT INTO fsm_command (machine_id, entity_id, seq, idempotency_key, chart_vers
             WHERE
                 c.machine_id = @machine_id
                 AND c.entity_id = @entity_id
-                AND c.status IN ('ready', 'leased')), @visible_at, @received_at, @tenant, @principal, @source, @correlation_id, @causation_id)
+                AND c.status IN ('ready', 'leased')), @visible_at, MAX(@received_at, COALESCE((
+                    SELECT c.received_at FROM fsm_command c
+                    WHERE c.machine_id = @machine_id AND c.entity_id = @entity_id
+                    ORDER BY c.seq DESC LIMIT 1), @received_at)), @tenant, @principal, @source, @correlation_id, @causation_id)
 RETURNING
     command_id;

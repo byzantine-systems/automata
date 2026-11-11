@@ -7,9 +7,7 @@ open Expecto
 open Npgsql
 open TestContext
 
-/// The columns a claim returns. Every other read of fsm.command is typed by the generated schema,
-/// but the claim is a routine SqlHydra cannot call, so its rows are read by name into the
-/// generated record. This list is the contract for that one read.
+/// The columns read into the generated command record.
 let private commandColumns =
     [ "command_id"
       "machine_id"
@@ -18,6 +16,7 @@ let private commandColumns =
       "idempotency_key"
       "chart_version"
       "event"
+      "request_digest"
       "kind"
       "status"
       "blocked"
@@ -31,6 +30,32 @@ let private commandColumns =
       "source"
       "correlation_id"
       "causation_id" ]
+
+let private recordColumns =
+    commandColumns
+    @ [ "correction_command_id"
+        "correction_effective_at"
+        "correction_on_divergence"
+        "correction_replay_limit" ]
+
+let private transitionColumns =
+    [ "machine_id"
+      "entity_id"
+      "epoch"
+      "command_id"
+      "chart_version"
+      "event"
+      "actions"
+      "from_state"
+      "to_state"
+      "handled_by"
+      "exited"
+      "entered"
+      "status"
+      "effective_at"
+      "committed_at" ]
+
+let private resultColumns = [ "command_status" ] @ transitionColumns @ [ "error" ]
 
 /// Builds the plan probe from the routine's own body, read back out of the catalog. Copying the
 /// statement into the test instead would let the two drift, which is exactly the failure this
@@ -81,7 +106,23 @@ let tests =
                         "batch", box 1
                         "lease", box (TimeSpan.FromSeconds 30.0) ]
 
-              Expect.equal columns commandColumns "the claim result is the inbox reader's contract"
+              Expect.equal columns recordColumns "the claim result is the inbox reader's contract"
+          }
+
+          testTask "command lookups return the shared record shape" {
+              do! reset ()
+
+              let byId = columnsOf (SqlResources.get "command" "by_id") [ "command_id", box 0L ]
+
+              let byKey =
+                  columnsOf
+                      (SqlResources.get "command" "find_by_key")
+                      [ "machine_id", box "none"
+                        "entity_id", box "none"
+                        "idempotency_key", box "none" ]
+
+              Expect.equal byId recordColumns "id lookup matches the record reader"
+              Expect.equal byKey recordColumns "key lookup matches the record reader"
           }
 
           testTask "the chart version read returns exactly the column the reader expects" {
@@ -91,6 +132,58 @@ let tests =
                   columnsOf (SqlResources.get "chart" "by_version") [ "machine_id", box "none"; "version", box 1 ]
 
               Expect.equal columns [ "fingerprint" ] "the registry reads this column by name"
+          }
+
+          testTask "processor lookups return the shared row shapes" {
+              do! reset ()
+
+              let belief =
+                  columnsOf (SqlResources.get "belief" "current") [ "machine_id", box "none"; "entity_id", box "none" ]
+
+              let beliefColumns =
+                  [ "machine_id"
+                    "entity_id"
+                    "state"
+                    "status"
+                    "epoch"
+                    "command_id"
+                    "chart_version"
+                    "valid_from"
+                    "known_from" ]
+
+              Expect.equal belief beliefColumns "the snapshot reader requires these columns"
+
+              let page =
+                  columnsOf
+                      (SqlResources.get "transition" "history_page")
+                      [ "machine_id", box "none"
+                        "entity_id", box "none"
+                        "after", box 0L
+                        "limit", box 1 ]
+
+              Expect.equal page transitionColumns "the history reader maps these columns by name"
+
+              let result =
+                  columnsOf (SqlResources.get "transition" "result") [ "command_id", box 0L ]
+
+              Expect.equal result resultColumns "the result reader maps these columns by name"
+
+              let suffix =
+                  columnsOf
+                      (SqlResources.get "transition" "suffix")
+                      [ "machine_id", box "none"
+                        "entity_id", box "none"
+                        "from", box (DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero))
+                        "limit", box 1 ]
+
+              Expect.equal suffix transitionColumns "the replay suffix shares the transition shape"
+
+              let watermark =
+                  columnsOf
+                      (SqlResources.get "transition" "purge_watermark")
+                      [ "machine_id", box "none"; "entity_id", box "none" ]
+
+              Expect.equal watermark [ "max_purged_effective_at" ] "the watermark probe reads one column"
           }
 
           testTask "the current belief view uses its partial index" {
@@ -125,11 +218,12 @@ let tests =
 
                   use cmd =
                       new NpgsqlCommand(
-                          "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "
-                          + "SELECT * FROM fsm.current_belief WHERE machine_id = 'plan-probe' AND entity_id = 'e1234'",
+                          "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + SqlResources.get "belief" "current",
                           conn
                       )
 
+                  cmd.Parameters.AddWithValue("machine_id", "plan-probe") |> ignore
+                  cmd.Parameters.AddWithValue("entity_id", "e1234") |> ignore
                   cmd.ExecuteScalar() |> string
 
               Expect.stringContains plan "instance_state_live_idx" "the current-state read must use the partial index"
@@ -261,8 +355,8 @@ let tests =
                   """INSERT INTO fsm.machine_chart_version (machine_id, version, fingerprint)
                      VALUES ('plan-probe', 1, repeat('a', 64));
 
-                     INSERT INTO fsm.command (machine_id, entity_id, seq, idempotency_key, chart_version, event, blocked)
-                     SELECT 'plan-probe', 'e' || g, 1, 'k' || g, 1, '{}'::jsonb, false FROM generate_series(1, 20000) g"""
+                     INSERT INTO fsm.command (machine_id, entity_id, seq, idempotency_key, chart_version, event, request_digest, blocked)
+                     SELECT 'plan-probe', 'e' || g, 1, 'k' || g, 1, '{}'::jsonb, sha256(''::bytea), false FROM generate_series(1, 20000) g"""
               |> function
                   | Ok() -> ()
                   | Error error -> failtestf "seeding failed: %s" error.Message

@@ -298,7 +298,7 @@ module Machine =
     /// <see cref="M:ByzantineSystems.Automata.Runtime.Machine.commandResult" /> when the outcome
     /// matters but not immediately.
     ///
-    /// Repeating an idempotency key returns <c>AlreadySubmitted</c> with the original command's
+    /// Repeating an identical request returns <c>AlreadySubmitted</c> with the original command's
     /// id. That is success, and it is how a client retry after a lost response is recognised.
     /// </summary>
     /// <example>
@@ -441,24 +441,18 @@ module Machine =
         taskResult {
             do! machine.TryAcceptWork()
 
-            let key = EventEnvelope.idempotencyKey envelope
+            // Every retry passes through Submit's request-identity check. A lookup by key alone
+            // cannot distinguish an identical retry from a different request using that key.
+            let! submitted = enqueue machine entityId envelope ct
 
-            // Registered before submission, so the window where a result is published with
-            // nobody listening does not exist.
-            let! commandId =
-                (inboxOf machine).TryFind(machine.MachineId, entityId, key, ct)
-                |> TaskResult.mapError MachineError.Store
-                |> TaskResult.map (Option.map _.CommandId)
-
-            let! submitted =
-                match commandId with
-                | Some existing -> TaskResult.ok (AlreadySubmitted existing)
-                | None -> enqueue machine entityId envelope ct
-
-            let identifier =
+            let! identifier =
                 match submitted with
                 | Accepted id
-                | AlreadySubmitted id -> id
+                | AlreadySubmitted id -> Ok id
+                | SubmissionOutcome.Refused(KeyReused id) ->
+                    Error(MachineError.Rejected(MachineRejection.KeyReused(CommandId.value id)))
+                | SubmissionOutcome.Refused(ArrivedBeforePredecessor at) ->
+                    Error(MachineError.Rejected(MachineRejection.ArrivedBeforePredecessor at))
 
             let waiter = machine.Completions.Register identifier
 

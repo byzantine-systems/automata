@@ -111,7 +111,7 @@ type TestStore() =
             let drained = ResizeArray()
             let mutable taking = true
 
-            while taking && drained.Count < batch do
+            while taking && drained.Count < ClaimBatch.value batch do
                 match actions.TryDequeue() with
                 | true, leased -> drained.Add leased
                 | _ -> taking <- false

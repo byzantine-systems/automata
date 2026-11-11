@@ -114,13 +114,14 @@ let reset () : Task =
                 "TRUNCATE fsm.command, fsm.command_error, fsm.transition, fsm.machine_chart_version,
                           fsm.supervision_event, fsm.instance_state, fsm.instance_state_history,
                           fsm.action_dead_letter, fsm.machine_maintenance, fsm.belief_cold_state,
-                          fsm.command_correction
+                          fsm.command_correction, fsm.entity_purge
                           RESTART IDENTITY;
                  -- A materialized view cannot be truncated; refreshed over the emptied history,
                  -- it is empty too.
                  REFRESH MATERIALIZED VIEW fsm.belief_cold;
                  INSERT INTO fsm.machine_chart_version (machine_id, version, fingerprint)
-                 VALUES (@machine_id, @version, @fingerprint);
+                  VALUES (@machine_id, @version, @fingerprint);
+                  INSERT INTO fsm.machine_maintenance(machine_id, action_queue) VALUES (@machine_id, @queue);
                  -- The queue survives the truncate because it is pgmq's table, not ours.
                  -- Emptying it keeps one test's undelivered actions out of the next one.
                  SELECT pgmq.purge_queue(@queue);
@@ -153,7 +154,6 @@ let private processorStore () =
 
     PostgresCommandProcessorStore<Entity, TestState, TestEvent, TestAction, TestError>(
         { Context = context ()
-          ActionQueue = actionQueue
           StateCodec = Serialization.systemTextJson<TestState> ()
           EventCodec = Serialization.systemTextJson<TestEvent> ()
           ActionCodec = Serialization.systemTextJson<TestAction list> ()
@@ -165,6 +165,10 @@ let private processorStore () =
 let newProcessor () : Processor = processorStore () :> Processor
 
 let newReader () : Reader = processorStore () :> Reader
+
+type Replay = IReplayStore<Entity, TestState, TestEvent, TestAction>
+
+let newReplayStore () : Replay = processorStore () :> Replay
 
 /// A minimal committed transition, for tests that care about what finalize does to the inbox and
 /// the log rather than about the chart that produced it.
@@ -249,6 +253,7 @@ let commandIdOf (outcome: SubmissionOutcome) : CommandId =
     match outcome with
     | Accepted commandId -> commandId
     | AlreadySubmitted commandId -> commandId
+    | SubmissionOutcome.Refused reason -> failtestf "submission was refused: %A" reason
 
 /// Runs a raw statement, returning the failure so a constraint test can inspect it.
 let exec (sql: string) : Result<unit, exn> =
@@ -372,7 +377,7 @@ let newMachineStore (retention: RetentionPolicy) =
 
     PostgresMachineStore<Entity, TestState, TestEvent, TestAction, TestError>(
         { Context = context ()
-          ActionQueue = actionQueue
+          ActionDelivery = ActionDelivery.Deliver(ActionQueueName.create actionQueue)
           StateCodec = Serialization.systemTextJson<TestState> ()
           EventCodec = Serialization.systemTextJson<TestEvent> ()
           ActionCodec = Serialization.systemTextJson<TestAction> ()
@@ -380,7 +385,7 @@ let newMachineStore (retention: RetentionPolicy) =
           EntityIdEncode = encode
           EntityIdDecode = decode
           Retention = retention
-          ReapAfter = TimeSpan.FromMinutes 5.
+          ReapAfter = LeaseDuration.create (TimeSpan.FromMinutes 5.)
           Listener = ListenerConnection.SameDataSource }
     )
 

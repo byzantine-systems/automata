@@ -27,6 +27,7 @@ UNIT_TEST_PROJECTS := \
 	tests/ByzantineSystems.Automata.Resilience.Tests/ByzantineSystems.Automata.Resilience.Tests.fsproj \
 	tests/ByzantineSystems.Automata.Runtime.Tests/ByzantineSystems.Automata.Runtime.Tests.fsproj \
 	tests/ByzantineSystems.Automata.DependencyInjection.Tests/ByzantineSystems.Automata.DependencyInjection.Tests.fsproj \
+	tests/ByzantineSystems.Automata.Storage.Tests/ByzantineSystems.Automata.Storage.Tests.fsproj \
 	tests/ByzantineSystems.Automata.Storage.Sqlite.Tests/ByzantineSystems.Automata.Storage.Sqlite.Tests.fsproj
 INTEGRATION_TEST_PROJECTS := \
 	tests/ByzantineSystems.Automata.Storage.Postgres.Tests/ByzantineSystems.Automata.Storage.Postgres.Tests.fsproj

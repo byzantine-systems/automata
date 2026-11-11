@@ -221,12 +221,19 @@ type Leased<'kind, 'Work> =
 type LeasedCommand<'EntityId, 'Event> = Leased<CommandWork, CommandRecord<'EntityId, 'Event>>
 
 /// <summary>
-/// What a submission did. Both cases are success: a repeated idempotency key is how a client
-/// retry after a lost response is recognised, and it carries the original command's id.
+/// An expected refusal that records no command and changes no existing command.
 /// </summary>
+type SubmissionRefusal =
+    /// <summary>The key already names a different request.</summary>
+    | KeyReused of existing: CommandId
+    /// <summary>The supplied arrival would precede an entity's previous command.</summary>
+    | ArrivedBeforePredecessor of predecessor: DateTimeOffset
+
+/// <summary>A new request, an identical retry, or a refusal without writes.</summary>
 type SubmissionOutcome =
     | Accepted of accepted: CommandId
     | AlreadySubmitted of existing: CommandId
+    | Refused of SubmissionRefusal
 
 /// <summary>
 /// What a fenced write did. <c>LeaseLost</c> is an outcome, not an error: it is the expected
@@ -250,12 +257,17 @@ type Backoff =
 [<RequireQualifiedAccess>]
 module Backoff =
 
-    /// <summary>Builds an envelope, rejecting a non-positive base or a ceiling below it.</summary>
+    /// <summary>
+    /// Builds an envelope, rejecting a non-positive base, a ceiling below it, or a ceiling above
+    /// <see cref="P:System.Int32.MaxValue" /> milliseconds.
+    /// </summary>
     let tryCreate (baseDelay: TimeSpan) (ceiling: TimeSpan) : Result<Backoff, string> =
         if baseDelay <= TimeSpan.Zero then
             Error "A backoff base delay must be positive."
         elif ceiling < baseDelay then
             Error "A backoff ceiling must be at least the base delay."
+        elif ceiling > LeaseDuration.maximum then
+            Error $"A backoff ceiling cannot exceed {Int32.MaxValue} milliseconds."
         else
             Ok { Base = baseDelay; Ceiling = ceiling }
 
@@ -286,7 +298,13 @@ module Backoff =
 /// </summary>
 type ICommandInbox<'EntityId, 'Event> =
 
-    /// <summary>Records a command durably. Idempotent on the submission's key.</summary>
+    /// <summary>
+    /// Records a command durably. The key identifies kind, chart version, event and correction
+    /// fields; different request content is refused. Visibility, arrival and audit are retry
+    /// metadata and never replace the first submission's values.
+    /// Arrival time is nondecreasing in per-entity sequence order: database timestamps are
+    /// clamped to the predecessor, while an explicitly earlier arrival is refused.
+    /// </summary>
     abstract Submit:
         submission: CommandSubmission<'EntityId, 'Event> * ct: CancellationToken ->
             Task<Result<SubmissionOutcome, StoreError>>
@@ -297,7 +315,7 @@ type ICommandInbox<'EntityId, 'Event> =
     /// transaction, and the token is what protects the work meanwhile.
     /// </summary>
     abstract Claim:
-        machineId: MachineId * batch: int * lease: TimeSpan * ct: CancellationToken ->
+        machineId: MachineId * batch: ClaimBatch * lease: LeaseDuration * ct: CancellationToken ->
             Task<Result<LeasedCommand<'EntityId, 'Event> list, StoreError>>
 
     /// <summary>
@@ -310,7 +328,7 @@ type ICommandInbox<'EntityId, 'Event> =
 
     /// <summary>Pushes out the deadline of a lease still held, for work that runs long.</summary>
     abstract ExtendLease:
-        commandId: CommandId * token: LeaseToken<CommandWork> * lease: TimeSpan * ct: CancellationToken ->
+        commandId: CommandId * token: LeaseToken<CommandWork> * lease: LeaseDuration * ct: CancellationToken ->
             Task<Result<LeaseUpdateOutcome, StoreError>>
 
     /// <summary>Reads a command's current state without waiting for it.</summary>

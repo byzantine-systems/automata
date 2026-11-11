@@ -132,8 +132,10 @@ module private MachineBuild =
 
         let policy = processor |> Option.defaultValue ProcessorPolicy.defaults
 
+        let validatedPolicy = ProcessorPolicy.validate policy
+
         let policyErrors =
-            match ProcessorPolicy.validate policy with
+            match validatedPolicy with
             | Ok _ -> []
             | Error errors -> [ InvalidProcessorPolicy errors ]
 
@@ -154,7 +156,7 @@ module private MachineBuild =
 
         match duplicates @ missing @ policyErrors @ initialStateErrors @ catalogErrors with
         | [] ->
-            match chart, version, initial, store, ProcessorPolicy.validate policy with
+            match chart, version, initial, store, validatedPolicy with
             | Some chart, Some version, Some initial, Some store, Ok validatedPolicy ->
                 let config: RuntimeConfig<'EntityId, 'State, 'Event, 'Action, 'Err> =
                     { MachineId = machineId

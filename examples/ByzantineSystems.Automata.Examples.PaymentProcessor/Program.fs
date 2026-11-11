@@ -182,7 +182,7 @@ let private runPayment (logger: ILogger) (connectionString: string) : Task =
         let store =
             MachineStoreOptions.forEntityId<Payment, PaymentState, PaymentEvent, PaymentAction, string>
                 context
-                ActionQueue
+                (ActionDelivery.Deliver(ActionQueueName.create ActionQueue))
             |> PostgresMachineStore
 
         let machine =

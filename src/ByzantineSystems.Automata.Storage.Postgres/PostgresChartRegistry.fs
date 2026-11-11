@@ -9,6 +9,17 @@ open FsToolkit.ErrorHandling
 type ChartRegistryOptions = { Context: PostgresContext }
 
 /// <summary>
+/// The registration outcome <c>fsm.register_chart</c> reports, before the stored fingerprint
+/// joins it. A tag union rather than <see cref="T:ByzantineSystems.Automata.Storage.ChartRegistration" />
+/// itself, because the payload of <c>Mismatched</c> is a column's value, not something this side
+/// encodes.
+/// </summary>
+type private RegistrationTag =
+    | Registered
+    | Matched
+    | Mismatched
+
+/// <summary>
 /// The PostgreSQL record of which chart structure each declared version belongs to.
 ///
 /// Registration is the first thing a process should do for a machine and the last chance to
@@ -19,9 +30,20 @@ type PostgresChartRegistry(options: ChartRegistryOptions) =
 
     let context = options.Context
 
-    let register = Statement.load "chart" "register"
+    let register = StatementKey.create "chart" "register" |> Sql.prepareProgram
 
-    let byVersion = Statement.load "chart" "by_version"
+    let byVersion = StatementKey.create "chart" "by_version" |> Sql.prepareProgram
+
+    let registrationTag: EnumCodec<RegistrationTag> =
+        EnumCodec.create
+            "chart registration outcome"
+            [ RegistrationTag.Registered
+              RegistrationTag.Matched
+              RegistrationTag.Mismatched ]
+            (function
+             | RegistrationTag.Registered -> "registered"
+             | RegistrationTag.Matched -> "matched"
+             | RegistrationTag.Mismatched -> "mismatched")
 
     /// A stored fingerprint that no longer parses is a corrupt row, reported as the contract's
     /// serialization failure rather than as an exception out of the store. The shape constraint
@@ -40,41 +62,30 @@ type PostgresChartRegistry(options: ChartRegistryOptions) =
     interface IChartRegistry with
 
         member _.Register(identity, ct) =
-            Sql.run
-                context
-                (postgres {
-                    let! registration, stored =
-                        Sql.one
-                            (nameof ChartRegistration)
-                            register
-                            (key identity.MachineId identity.Version
-                             @ [ "fingerprint", Param.Text(ChartFingerprint.value identity.Fingerprint) ])
-                            (fun reader -> Row.string reader "registration", Row.string reader "stored_fingerprint")
+            let registrationRow reader =
+                result {
+                    let! tag = EnumCodec.read Row.string registrationTag "registration" reader
 
-                    match registration with
-                    | "registered" -> return ChartRegistration.Registered
-                    | "matched" -> return ChartRegistration.Matched
-                    | "mismatched" ->
-                        let! fingerprint = parse stored
-                        return ChartRegistration.Mismatched fingerprint
-                    | other ->
-                        return!
-                            Op.fail (
-                                Db.decodeFailure
-                                    (nameof ChartRegistration)
-                                    $"unknown chart registration outcome {other}"
-                            )
-                })
+                    match tag with
+                    | RegistrationTag.Registered -> return ChartRegistration.Registered
+                    | RegistrationTag.Matched -> return ChartRegistration.Matched
+                    | RegistrationTag.Mismatched ->
+                        let! stored = parse (Row.string reader "stored_fingerprint")
+                        return ChartRegistration.Mismatched stored
+                }
+
+            Sql.runProgram
+                context
+                (StoreProgram.queryOne
+                    register
+                    (key identity.MachineId identity.Version
+                     @ [ "fingerprint", Param.Text(ChartFingerprint.value identity.Fingerprint) ])
+                    registrationRow)
                 ct
 
         member _.TryGet(machineId, version, ct) =
-            Sql.run
+            Sql.readProgram
                 context
-                (postgres {
-                    let! stored =
-                        Sql.tryOne "ChartFingerprint" byVersion (key machineId version) (fun reader ->
-                            Row.string reader "fingerprint")
-
-                    return! stored |> Option.traverseResult parse
-                })
+                (StoreProgram.tryQueryOne byVersion (key machineId version) (fun reader ->
+                    parse (Row.string reader "fingerprint")))
                 ct

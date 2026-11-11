@@ -25,72 +25,8 @@ let private register (registry: IChartRegistry) version fingerprint : Task<Chart
 let tests =
     testList
         "IChartRegistry"
-        [ testTask "a version is claimed once and then only confirmed" {
-              let db = fixture "registry"
-              let registry = registryOf db
-
-              let! first = register registry 2 fingerprintA
-              let! second = register registry 2 fingerprintA
-
-              Expect.equal first ChartRegistration.Registered "the first registration claims the version"
-              Expect.equal second ChartRegistration.Matched "the second confirms it"
-
-              Expect.equal
-                  (scalar db.Db "SELECT count(*) FROM fsm_machine_chart_version WHERE version = 2;")
-                  "1"
-                  "confirming writes no second row"
-          }
-
-          testTask "a different chart under a claimed version is reported, not accepted" {
-              let db = fixture "registry"
-              let registry = registryOf db
-
-              let! _ = register registry 2 fingerprintA
-              let! outcome = register registry 2 fingerprintB
-
-              Expect.equal outcome (ChartRegistration.Mismatched fingerprintA) "the mismatch carries what is stored"
-
-              Expect.equal
-                  (scalar db.Db "SELECT fingerprint FROM fsm_machine_chart_version WHERE version = 2;")
-                  (ChartFingerprint.value fingerprintA)
-                  "a registration never overwrites the stored fingerprint"
-          }
-
-          testTask "versions and machines are independent" {
-              let db = fixture "registry"
-              let registry = registryOf db
-
-              let! two = register registry 2 fingerprintA
-              let! three = register registry 3 fingerprintB
-
-              let! elsewhere =
-                  registry.Register(
-                      { MachineId = machineId "other-machine"
-                        Version = ChartVersion.create 2
-                        Fingerprint = fingerprintB },
-                      noCancellation
-                  )
-
-              Expect.equal two ChartRegistration.Registered "version 2"
-              Expect.equal three ChartRegistration.Registered "a different version of the same machine"
-
-              Expect.equal
-                  (elsewhere |> expectOk "another machine")
-                  ChartRegistration.Registered
-                  "another machine's version 2 is a different fact"
-          }
-
-          testTask "a version nothing registered is absent" {
-              let db = fixture "registry"
-              let registry = registryOf db
-
-              let! missing = registry.TryGet(testMachine, ChartVersion.create 9, noCancellation)
-              Expect.equal (missing |> expectOk "unregistered") None "nothing is registered"
-
-              let! _ = register registry 9 fingerprintA
-              let! found = registry.TryGet(testMachine, ChartVersion.create 9, noCancellation)
-              Expect.equal (found |> expectOk "registered") (Some fingerprintA) "the stored fingerprint"
-          }
+        [ ContractProperties.registryProperty "registrations follow an immutable finite map" 40 (fun () ->
+              fixture "registry-property" |> registryOf |> Task.FromResult)
 
           // Every process starts at once after a deploy. With one writer per file, the racers
           // queue rather than interleave, and all but one are told their chart matched.

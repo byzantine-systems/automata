@@ -125,6 +125,8 @@ module fsm =
           chart_version: int
           [<ProviderDbType("Jsonb")>]
           event: string
+          [<ProviderDbType("Bytea")>]
+          request_digest: byte[]
           [<ProviderDbType("Text")>]
           kind: string
           [<ProviderDbType("Text")>]
@@ -161,6 +163,7 @@ module fsm =
                   idempotency_key = this.idempotency_key
                   chart_version = this.chart_version
                   event = this.event
+                  request_digest = this.request_digest
                   kind = this.kind
                   status = this.status
                   blocked = this.blocked
@@ -195,6 +198,9 @@ module fsm =
                   { WriteColumn.Name = "event"
                     Value = box this.event
                     ProviderDbType = Some "Jsonb" }
+                  { WriteColumn.Name = "request_digest"
+                    Value = box this.request_digest
+                    ProviderDbType = Some "Bytea" }
                   { WriteColumn.Name = "kind"
                     Value = box this.kind
                     ProviderDbType = Some "Text" }
@@ -249,6 +255,8 @@ module fsm =
           chart_version: int
           [<ProviderDbType("Jsonb")>]
           event: string
+          [<ProviderDbType("Bytea")>]
+          request_digest: byte[]
           [<ProviderDbType("Text")>]
           kind: string
           [<ProviderDbType("Text")>]
@@ -296,6 +304,9 @@ module fsm =
                   { WriteColumn.Name = "event"
                     Value = box this.event
                     ProviderDbType = Some "Jsonb" }
+                  { WriteColumn.Name = "request_digest"
+                    Value = box this.request_digest
+                    ProviderDbType = Some "Bytea" }
                   { WriteColumn.Name = "kind"
                     Value = box this.kind
                     ProviderDbType = Some "Text" }

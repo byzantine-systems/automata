@@ -8,9 +8,11 @@
     </PropertyGroup>
 
     <ItemGroup>
+        <Compile Include="Arguments.fs" />
         <!-- Command.fs precedes Envelope.fs: an envelope carries an AuditContext, which is
              part of what the inbox records, so the inbox's vocabulary is declared first. -->
         <Compile Include="Command.fs" />
+        <Compile Include="InternalIdentifiers.fs" />
         <Compile Include="Envelope.fs" />
         <Compile Include="ChartRegistry.fs" />
         <Compile Include="Processing.fs" />
@@ -19,9 +21,12 @@
         <Compile Include="Maintenance.fs" />
         <Compile Include="MachineStore.fs" />
         <Compile Include="Supervision.fs" />
-        <!-- The unit-of-work effect the bundled providers are written in. Internal: it is how this
-             repository's stores are built, not part of the contract a provider implements. -->
-        <Compile Include="Op.fs" />
+        <!-- Provider-generic store programs interpreted over each provider's row and parameter types. -->
+        <Compile Include="StoreProgram.fs" />
+        <!-- One codec table per database enumeration, both directions derived from it. -->
+        <Compile Include="EnumCodec.fs" />
+        <Compile Include="CommandInboxProgram.fs" />
+        <Compile Include="ClaimRecovery.fs" />
         <!-- How a leased command ends, shared by the bundled providers' finalize paths. -->
         <Compile Include="Finalize.fs" />
     </ItemGroup>
@@ -29,6 +34,7 @@
     <ItemGroup>
         <InternalsVisibleTo Include="ByzantineSystems.Automata.Storage.Postgres" />
         <InternalsVisibleTo Include="ByzantineSystems.Automata.Storage.Sqlite" />
+        <InternalsVisibleTo Include="ByzantineSystems.Automata.Storage.Tests" />
         <InternalsVisibleTo Include="ByzantineSystems.Automata.Storage.Postgres.Tests" />
         <InternalsVisibleTo Include="ByzantineSystems.Automata.Storage.Sqlite.Tests" />
     </ItemGroup>

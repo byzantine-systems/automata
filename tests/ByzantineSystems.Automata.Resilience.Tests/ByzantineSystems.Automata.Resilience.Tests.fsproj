@@ -8,6 +8,7 @@
     </PropertyGroup>
 
     <ItemGroup>
+        <Compile Include="Property.fs" />
         <Compile Include="ResiliencePipelineTests.fs" />
         <Compile Include="SupervisorTests.fs" />
         <Compile Include="Program.fs" />
@@ -15,6 +16,7 @@
 
     <ItemGroup>
         <PackageReference Include="Expecto" />
+        <PackageReference Include="FsCheck" />
         <PackageReference Include="Microsoft.NET.Test.Sdk" PrivateAssets="all" />
         <PackageReference Include="YoloDev.Expecto.TestSdk" PrivateAssets="all" />
         <PackageReference Include="coverlet.msbuild" PrivateAssets="all" />

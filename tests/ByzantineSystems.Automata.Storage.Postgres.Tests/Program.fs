@@ -23,11 +23,14 @@ let tests =
                     TemporalTests.tests
                     TemporalReaderTests.tests
                     CorrectionTests.tests
+                    TemporalProperties.tests
                     HistoryTests.tests
                     FinalizeTests.tests
                     ActionQueueTests.tests
                     ProcessorIntegrationTests.tests
                     ReplayIntegrationTests.tests
+                    ReplayRetentionProperties.tests
+                    ReplayFinalizeProperties.tests
                     SchemaContractTests.tests
                     MaintenanceTests.integration
                     PostgresSupervisionStoreTests.tests ]

@@ -42,6 +42,7 @@ CREATE TABLE fsm_command (
     idempotency_key TEXT NOT NULL,
     chart_version INTEGER NOT NULL,
     event TEXT NOT NULL,
+    request_digest BLOB NOT NULL,
     kind TEXT NOT NULL DEFAULT 'event',
     status TEXT NOT NULL DEFAULT 'ready',
     blocked INTEGER NOT NULL DEFAULT 0,

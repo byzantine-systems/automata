@@ -10,7 +10,6 @@ open ByzantineSystems.Automata.Storage.Internal
 open ByzantineSystems.Automata.Storage.Sqlite.Schema
 open FsToolkit.ErrorHandling
 open Microsoft.Data.Sqlite
-open SqlHydra.Query
 
 /// <summary>
 /// Everything the processor needs to bridge the generic domain types to the columns of
@@ -20,6 +19,7 @@ open SqlHydra.Query
 type CommandProcessorOptions<'EntityId, 'State, 'Event, 'Action, 'Err> =
     {
         Context: SqliteContext
+        ActionDelivery: ActionDelivery
         StateCodec: Codec<'State>
         EventCodec: Codec<'Event>
         /// <summary>
@@ -72,7 +72,10 @@ module internal ReplayMapping =
             match kind.GetString() with
             | "unknown_chart_version" ->
                 field "version" _.GetInt32()
-                |> Result.map (ChartVersion.create >> ReplayError.UnknownChartVersion)
+                |> Result.bind (fun version ->
+                    ChartVersion.tryCreate version
+                    |> Result.mapError (Db.decodeFailure "ChartVersion"))
+                |> Result.map ReplayError.UnknownChartVersion
             | "diverged" ->
                 Result.map2
                     (fun epoch reason -> ReplayError.Diverged(Db.epochOf epoch, reason))
@@ -85,10 +88,10 @@ module internal ReplayMapping =
 
 /// <summary>What finalizing reads about a command before deciding anything.</summary>
 type internal FinalizeTarget =
-    { Machine: string
-      Entity: string
+    { Machine: MachineId
+      Entity: ByzantineSystems.Automata.Storage.Internal.EntityKey
       Status: CommandStatus
-      Holder: int64
+      Holder: LeaseToken<CommandWork>
       Version: int64 }
 
 /// <summary>
@@ -99,8 +102,11 @@ type internal LeaseStanding =
     /// <summary>No command has this id.</summary>
     | Unknown
 
-    /// <summary>The caller's own lease already finished it: a retry, answered with what it did.</summary>
-    | FinishedByCaller
+    /// <summary>
+    /// The caller's own lease already finished it: a retry, answered with what it did and the
+    /// resolution that was stored.
+    /// </summary>
+    | FinishedByCaller of status: CommandStatus
 
     /// <summary>Finished under somebody else's lease.</summary>
     | FinishedByAnother
@@ -118,7 +124,7 @@ type internal LeaseStanding =
 [<RequireQualifiedAccess>]
 module internal LeaseStanding =
 
-    let classify (held: int64) (target: FinalizeTarget option) : LeaseStanding =
+    let classify (held: LeaseToken<CommandWork>) (target: FinalizeTarget option) : LeaseStanding =
         match target with
         | None -> Unknown
         | Some target ->
@@ -127,8 +133,12 @@ module internal LeaseStanding =
             match target.Status with
             | CommandStatus.Succeeded
             | CommandStatus.Rejected
-            | CommandStatus.DeadLettered -> if callerHolds then FinishedByCaller else FinishedByAnother
-            | CommandStatus.Ready
+            | CommandStatus.DeadLettered ->
+                if callerHolds then
+                    FinishedByCaller target.Status
+                else
+                    FinishedByAnother
+            | CommandStatus.Ready -> HeldByAnother
             | CommandStatus.Leased -> if callerHolds then HeldByCaller target else HeldByAnother
 
 /// <summary>
@@ -156,15 +166,28 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
 
     let context = options.Context
 
-    let finalizeRead = Statement.load "command" "finalize_read"
-    let committedEpoch = Statement.load "command" "committed_epoch"
-    let currentEpochOf = Statement.load "command" "current_epoch"
-    let insertTransition = Statement.load "command" "insert_transition"
-    let upsertSnapshot = Statement.load "command" "upsert_snapshot"
-    let enqueueActions = Statement.load "action" "enqueue"
-    let insertError = Statement.load "command" "insert_error"
-    let closeCommand = Statement.load "command" "close"
-    let promoteHead = Statement.load "command" "promote_head"
+    let encodeEntityId entityId =
+        options.EntityIdEncode entityId
+        |> ByzantineSystems.Automata.Storage.Internal.EntityKey.ofString
+
+    let statement domain operation =
+        StatementKey.create domain operation |> Sql.prepareProgram
+
+    let finalizeRead = statement "command" "finalize_read"
+    let committedEpoch = statement "command" "committed_epoch"
+    let currentEpochOf = statement "command" "current_epoch"
+    let insertTransition = statement "command" "insert_transition"
+    let upsertSnapshot = statement "command" "upsert_snapshot"
+    let enqueueActions = statement "action" "enqueue"
+    let insertError = statement "command" "insert_error"
+    let closeCommand = statement "command" "close"
+    let promoteHead = statement "command" "promote_head"
+
+    let entitySnapshot = StatementKey.create "command" "snapshot" |> Sql.prepareProgram
+
+    let historyPage = StatementKey.create "command" "history_page" |> Sql.prepareProgram
+
+    let commandResult = StatementKey.create "command" "result" |> Sql.prepareProgram
 
     let encodeDraft
         (draft: TransitionDraft<'EntityId, 'State, 'Event, 'Action>)
@@ -202,26 +225,29 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
         | CommandFailure.Replay error -> Ok $"""{{"replay":%s{ReplayMapping.toJson error}}}"""
 
     let readFailure (json: string) : Result<CommandFailure<'Err>, StoreError> =
-        // The column's CHECK has already proved this parses. What it has not proved is that the
-        // shape is one this version writes.
-        use document = JsonDocument.Parse json
-        let root = document.RootElement
+        match Db.parseJson (nameof CommandFailure) json with
+        | Error error -> Error error
+        | Ok parsed ->
+            use document = parsed
+            let root = document.RootElement
 
-        match root.TryGetProperty "domain" with
-        | true, domain ->
-            domain.GetRawText()
-            |> options.ErrorCodec.Decode
-            |> Result.mapError Db.toStoreError
-            |> Result.map CommandFailure.Domain
-        | _ ->
-            match root.TryGetProperty "machine", root.TryGetProperty "replay" with
-            | (true, machine), _ when machine.ValueKind = JsonValueKind.String ->
-                Ok(CommandFailure.Machine(machine.GetString()))
-            | _, (true, replay) -> ReplayMapping.ofJson replay |> Result.map CommandFailure.Replay
+            match root.TryGetProperty "domain" with
+            | true, domain ->
+                domain.GetRawText()
+                |> options.ErrorCodec.Decode
+                |> Result.mapError Db.toStoreError
+                |> Result.map CommandFailure.Domain
             | _ ->
-                Error(
-                    Db.decodeFailure (nameof CommandFailure) "a command error carried no domain, machine or replay tag"
-                )
+                match root.TryGetProperty "machine", root.TryGetProperty "replay" with
+                | (true, machine), _ when machine.ValueKind = JsonValueKind.String ->
+                    Ok(CommandFailure.Machine(machine.GetString()))
+                | _, (true, replay) -> ReplayMapping.ofJson replay |> Result.map CommandFailure.Replay
+                | _ ->
+                    Error(
+                        Db.decodeFailure
+                            (nameof CommandFailure)
+                            "a command error carried no domain, machine or replay tag"
+                    )
 
     /// The exited and entered paths, stored as JSON arrays of state ids.
     let encodePath (states: StateId list) : string =
@@ -231,9 +257,36 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
         try
             match JsonSerializer.Deserialize<string array> json with
             | null -> Error(Db.decodeFailure "StateId list" $"{column} was null")
-            | ids -> Ok(ids |> Array.map StateId.create |> List.ofArray)
+            | ids ->
+                ids
+                |> Array.toList
+                |> List.traverseResultM (fun value ->
+                    StateId.tryCreate value |> Result.mapError (Db.decodeFailure "StateId"))
         with :? JsonException as error ->
             Error(StoreError.Serialization("StateId list", error))
+
+    /// <summary>
+    /// A committed transition's columns, read into the generated record by name. Building the
+    /// record here, where every field is required, is what turns a column added to the table
+    /// into a compile error in this reader rather than a value it silently leaves out. Shared
+    /// by the history page and the result read, so one row shape has one reader.
+    /// </summary>
+    let transitionRow (reader: SqliteDataReader) : main.fsm_transition =
+        { machine_id = Row.string reader "machine_id"
+          entity_id = Row.string reader "entity_id"
+          epoch = Row.int64 reader "epoch"
+          command_id = Row.int64 reader "command_id"
+          chart_version = Row.int64 reader "chart_version"
+          event = Row.string reader "event"
+          actions = Row.string reader "actions"
+          from_state = Row.string reader "from_state"
+          to_state = Row.string reader "to_state"
+          handled_by = Row.string reader "handled_by"
+          exited = Row.string reader "exited"
+          entered = Row.string reader "entered"
+          status = Row.string reader "status"
+          effective_at = Row.int64 reader "effective_at"
+          committed_at = Row.int64 reader "committed_at" }
 
     let toTransition
         (row: main.fsm_transition)
@@ -251,7 +304,7 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
             let! actions = decode options.ActionCodec row.actions
             let! fromState = decode options.StateCodec row.from_state
             let! toState = decode options.StateCodec row.to_state
-            let! status = Db.instanceStatusFromString row.status
+            let! status = EnumCodec.decode EnumCodec.instanceStatus row.status
             let! exited = decodePath "exited" row.exited
             let! entered = decodePath "entered" row.entered
 
@@ -260,15 +313,25 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                 |> ChartVersion.tryCreate
                 |> Result.mapError (Db.decodeFailure "ChartVersion")
 
+            let! machineId =
+                row.machine_id
+                |> MachineId.tryCreate
+                |> Result.mapError (Db.decodeFailure "MachineId")
+
+            let! handledBy =
+                row.handled_by
+                |> StateId.tryCreate
+                |> Result.mapError (Db.decodeFailure "StateId")
+
             return
                 { Draft =
-                    { MachineId = MachineId.create row.machine_id
+                    { MachineId = machineId
                       EntityId = entityId
                       Event = event
                       Actions = actions
                       FromState = fromState
                       ToState = toState
-                      HandledBy = StateId.create row.handled_by
+                      HandledBy = handledBy
                       Exited = exited
                       Entered = entered
                       Status = status
@@ -279,26 +342,47 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                   CommittedAt = Instant.toDateTimeOffset row.committed_at }
         }
 
-    let toSnapshot (row: main.fsm_entity_snapshot) : Result<Snapshot<'State>, StoreError> =
+    let snapshotRow (reader: SqliteDataReader) : Result<Snapshot<'State>, StoreError> =
         result {
-            let! state = options.StateCodec.Decode row.state |> Result.mapError Db.toStoreError
-            let! status = Db.instanceStatusFromString row.status
+            let! state =
+                options.StateCodec.Decode(Row.string reader "state")
+                |> Result.mapError Db.toStoreError
+
+            let! status = EnumCodec.read Row.string EnumCodec.instanceStatus "status" reader
 
             return
                 { State = state
-                  Epoch = Db.epochOf row.epoch
+                  Epoch = Db.epochOf (Row.int64 reader "epoch")
                   Status = status }
         }
 
-    let toResult
-        (command: main.fsm_command, transition: main.fsm_transition option, error: main.fsm_command_error option)
+    /// What became of one command, from its status, its transition if it committed, and its
+    /// error if it failed.
+    let resultRow
+        (reader: SqliteDataReader)
         : Result<CommandResult<'EntityId, 'State, 'Event, 'Action, 'Err>, StoreError> =
+        let transition =
+            let marker = reader.GetOrdinal "command_id"
+
+            if reader.IsDBNull marker then
+                None
+            else
+                Some(transitionRow reader)
+
+        let error =
+            let marker = reader.GetOrdinal "error"
+
+            if reader.IsDBNull marker then
+                None
+            else
+                Some(Row.string reader "error")
+
         let failure () =
             match error with
-            | Some error -> readFailure error.error
+            | Some error -> readFailure error
             | None -> Error(Db.decodeFailure (nameof CommandResult) "a failed command has no recorded error")
 
-        CommandMapping.statusFromString command.status
+        EnumCodec.read Row.string EnumCodec.commandStatus "command_status" reader
         |> Result.bind (fun status ->
             match status, transition with
             | CommandStatus.Ready, _
@@ -310,13 +394,35 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
             | CommandStatus.DeadLettered, _ -> failure () |> Result.map CommandResult.DeadLettered)
 
     let entityOf (target: FinalizeTarget) =
-        [ "@machine_id", Param.Text target.Machine
-          "@entity_id", Param.Text target.Entity ]
+        [ Params.machineId "@machine_id" target.Machine
+          Params.entityKey "@entity_id" target.Entity ]
+
+    let finalizeTargetRow reader =
+        result {
+            let! status = EnumCodec.read Row.string EnumCodec.commandStatus "status" reader
+
+            let! machine =
+                Row.string reader "machine_id"
+                |> MachineId.tryCreate
+                |> Result.mapError (Db.decodeFailure "MachineId")
+
+            return
+                { Machine = machine
+                  Entity =
+                    Row.string reader "entity_id"
+                    |> ByzantineSystems.Automata.Storage.Internal.EntityKey.ofString
+                  Status = status
+                  Holder = Row.int64 reader "lease_token" |> LeaseToken.ofInt64
+                  Version = Row.int64 reader "chart_version" }
+        }
 
     /// The entity's current epoch: the initial one when it has never committed.
-    let currentEpoch (target: FinalizeTarget) : Op<WriteSession, Epoch> =
-        Sql.tryOne "Epoch" currentEpochOf (entityOf target) (fun reader -> Row.int64 reader "epoch" |> Db.epochOf)
-        |> Op.map (Option.defaultValue Epoch.initial)
+    let currentEpoch
+        (target: FinalizeTarget)
+        : StoreProgram<WriteAccess, (string * Param) list, SqliteDataReader, Epoch> =
+        StoreProgram.tryQueryOne currentEpochOf (entityOf target) (fun reader ->
+            Row.int64 reader "epoch" |> Db.epochOf |> Ok)
+        |> StoreProgram.map (Option.defaultValue Epoch.initial)
 
     /// <summary>
     /// A commit's writes, in order: the transition, then the snapshot, then the queued actions.
@@ -324,27 +430,27 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     /// claiming it did, and the actions share the transaction, which is the whole outbox.
     /// </summary>
     let append
-        (commandId: int64)
+        (now: int64)
+        (commandId: CommandId)
         (target: FinalizeTarget)
         (epoch: Epoch)
         (encoded: EncodedDraft<'EntityId, 'State, 'Event, 'Action>)
-        : Op<WriteSession, unit> =
-        sqliteWrite {
-            let! now = Sql.now
+        : StoreProgram<WriteAccess, (string * Param) list, SqliteDataReader, unit> =
+        store {
             let draft = encoded.Source
             let entity = entityOf target
 
             let written =
                 entity
-                @ [ "@command_id", Param.Integer commandId
+                @ [ Params.commandId "@command_id" commandId
                     "@epoch", Param.Integer(int64 (Epoch.value epoch))
                     "@chart_version", Param.Integer target.Version
-                    "@status", Param.Text(Db.instanceStatusToString draft.Status)
+                    "@status", Param.Text(EnumCodec.encode EnumCodec.instanceStatus draft.Status)
                     "@effective_at", Param.Integer(Instant.ofDateTimeOffset draft.EffectiveAt)
                     "@now", Param.Integer now ]
 
             do!
-                Sql.execute
+                StoreProgram.executeDiscard
                     insertTransition
                     (written
                      @ [ "@event", Param.Text encoded.EventJson
@@ -354,36 +460,33 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                          "@handled_by", Param.Text(StateId.value draft.HandledBy)
                          "@exited", Param.Text(encodePath draft.Exited)
                          "@entered", Param.Text(encodePath draft.Entered) ])
-                |> Op.discard
 
-            do!
-                Sql.execute upsertSnapshot (written @ [ "@state", Param.Text encoded.ToJson ])
-                |> Op.discard
+            do! StoreProgram.executeDiscard upsertSnapshot (written @ [ "@state", Param.Text encoded.ToJson ])
 
-            do!
-                Sql.execute
-                    enqueueActions
-                    (entity
-                     @ [ "@command_id", Param.Integer commandId
-                         "@epoch", Param.Integer(int64 (Epoch.value epoch))
-                         "@actions", Param.Text encoded.ActionsJson
-                         "@now", Param.Integer now ])
-                |> Op.discard
+            match options.ActionDelivery with
+            | ActionDelivery.Discard -> ()
+            | ActionDelivery.Deliver _ ->
+                do!
+                    StoreProgram.executeDiscard
+                        enqueueActions
+                        (entity
+                         @ [ Params.commandId "@command_id" commandId
+                             "@epoch", Param.Integer(int64 (Epoch.value epoch))
+                             "@actions", Param.Text encoded.ActionsJson
+                             "@now", Param.Integer now ])
         }
 
     /// The encoded failure of a rejected or dead-lettered command.
-    let recordError (commandId: int64) (error: string) : Op<WriteSession, unit> =
-        sqliteWrite {
-            let! now = Sql.now
-
-            do!
-                Sql.execute
-                    insertError
-                    [ "@command_id", Param.Integer commandId
-                      "@error", Param.Text error
-                      "@now", Param.Integer now ]
-                |> Op.discard
-        }
+    let recordError
+        (now: int64)
+        (commandId: CommandId)
+        (error: string)
+        : StoreProgram<WriteAccess, (string * Param) list, SqliteDataReader, unit> =
+        StoreProgram.executeDiscard
+            insertError
+            [ Params.commandId "@command_id" commandId
+              "@error", Param.Text error
+              "@now", Param.Integer now ]
 
     /// <summary>
     /// Closes the command at its terminal status and promotes the entity's next command to head.
@@ -391,19 +494,18 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     /// be re-elected.
     /// </summary>
     let close
-        (commandId: int64)
+        (commandId: CommandId)
         (target: FinalizeTarget)
         (resolution: Resolution<'EntityId, 'State, 'Event, 'Action>)
-        : Op<WriteSession, unit> =
-        sqliteWrite {
+        : StoreProgram<WriteAccess, (string * Param) list, SqliteDataReader, unit> =
+        store {
             do!
-                Sql.execute
+                StoreProgram.executeDiscard
                     closeCommand
-                    [ "@command_id", Param.Integer commandId
-                      "@status", Param.Text(Resolution.status resolution) ]
-                |> Op.discard
+                    [ Params.commandId "@command_id" commandId
+                      "@status", Param.Text(EnumCodec.encode EnumCodec.commandStatus (Resolution.status resolution)) ]
 
-            do! Sql.execute promoteHead (entityOf target) |> Op.discard
+            do! StoreProgram.executeDiscard promoteHead (entityOf target)
         }
 
     /// <summary>
@@ -414,11 +516,12 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     /// being processed while this one is leased. What it catches is a writer outside that path.
     /// </summary>
     let resolve
-        (commandId: int64)
+        (now: int64)
+        (commandId: CommandId)
         (target: FinalizeTarget)
         (resolution: Resolution<'EntityId, 'State, 'Event, 'Action>)
-        : Op<WriteSession, FinalizeOutcome> =
-        sqliteWrite {
+        : StoreProgram<WriteAccess, (string * Param) list, SqliteDataReader, FinalizeOutcome> =
+        store {
             match resolution with
             | Commit(expected, encoded) ->
                 let! current = currentEpoch target
@@ -427,12 +530,12 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                     return Conflict(expected, current)
                 else
                     let committed = Epoch.next expected
-                    do! append commandId target committed encoded
+                    do! append now commandId target committed encoded
                     do! close commandId target resolution
                     return Finalized committed
             | Reject error
             | DeadLetter error ->
-                do! recordError commandId error
+                do! recordError now commandId error
                 do! close commandId target resolution
                 return Finalized(Resolution.unmoved resolution)
         }
@@ -448,36 +551,32 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
         (resolution: Resolution<'EntityId, 'State, 'Event, 'Action>)
         (ct: CancellationToken)
         : Task<Result<FinalizeOutcome, StoreError>> =
-        let id = CommandId.value commandId
-
-        Sql.write
+        Sql.writeProgramWith
             context
-            (sqliteWrite {
-                let! read =
-                    Sql.tryOne (nameof FinalizeTarget) finalizeRead [ "@command_id", Param.Integer id ] (fun reader ->
-                        Row.string reader "status"
-                        |> CommandMapping.statusFromString
-                        |> Result.map (fun status ->
-                            { Machine = Row.string reader "machine_id"
-                              Entity = Row.string reader "entity_id"
-                              Status = status
-                              Holder = Row.int64 reader "lease_token"
-                              Version = Row.int64 reader "chart_version" }))
+            (fun now ->
+                store {
+                    let! read =
+                        StoreProgram.tryQueryOne
+                            finalizeRead
+                            [ Params.commandId "@command_id" commandId ]
+                            finalizeTargetRow
 
-                let! target = Option.sequenceResult read
+                    match LeaseStanding.classify token read with
+                    | Unknown ->
+                        return! StoreProgram.fail (StoreError.NotFound $"command %d{CommandId.value commandId}")
+                    | FinishedByCaller status ->
+                        let! committed =
+                            StoreProgram.tryQueryOne
+                                committedEpoch
+                                [ Params.commandId "@command_id" commandId ]
+                                (fun reader -> Row.int64 reader "epoch" |> Db.epochOf |> Ok)
 
-                match LeaseStanding.classify (LeaseToken.value token) target with
-                | Unknown -> return! Op.fail (StoreError.NotFound $"command %d{id}")
-                | FinishedByCaller ->
-                    let! committed =
-                        Sql.tryOne "Epoch" committedEpoch [ "@command_id", Param.Integer id ] (fun reader ->
-                            Row.int64 reader "epoch" |> Db.epochOf)
-
-                    return AlreadyFinalized(committed |> Option.defaultValue (Resolution.unmoved resolution))
-                | FinishedByAnother
-                | HeldByAnother -> return FinalizeOutcome.LeaseLost
-                | HeldByCaller target -> return! resolve id target resolution
-            })
+                        return
+                            AlreadyFinalized(committed |> Option.defaultValue (Resolution.unmoved resolution), status)
+                    | FinishedByAnother
+                    | HeldByAnother -> return FinalizeOutcome.LeaseLost
+                    | HeldByCaller target -> return! resolve now commandId target resolution
+                })
             ct
 
     /// <summary>
@@ -493,30 +592,16 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     interface IStateReader<'EntityId, 'State, 'Event, 'Action> with
 
         member _.TryGetSnapshot(machineId, entityId, ct) =
-            let machine = MachineId.value machineId
-            let entity = options.EntityIdEncode entityId
-
-            Sql.read
+            Sql.readProgram
                 context
-                (sqliteRead {
-                    let! row =
-                        Sql.select (fun query token ->
-                            selectTask query {
-                                for s in main.fsm_entity_snapshot do
-                                    where (s.machine_id = machine && s.entity_id = entity)
-                                    select s
-                                    tryHead
-                                    cancel token
-                            })
-
-                    return! row |> Option.traverseResult toSnapshot
-                })
+                (StoreProgram.tryQueryOne
+                    entitySnapshot
+                    [ Params.machineId "@machine_id" machineId
+                      Params.entityKey "@entity_id" (encodeEntityId entityId) ]
+                    snapshotRow)
                 ct
 
         member _.History(machineId, entityId, paging, ct) =
-            let machine = MachineId.value machineId
-            let entity = options.EntityIdEncode entityId
-
             // An absent cursor is zero, which transition_epoch_positive makes smaller than any
             // stored epoch, so one query shape serves every page.
             let after =
@@ -524,25 +609,15 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                 |> Option.map (Epoch.value >> int64)
                 |> Option.defaultValue 0L
 
-            let limit = Page.limit paging
-
-            Sql.read
+            Sql.readProgram
                 context
-                (sqliteRead {
-                    let! rows =
-                        Sql.select (fun query token ->
-                            selectTask query {
-                                for t in main.fsm_transition do
-                                    where (t.machine_id = machine && t.entity_id = entity && t.epoch > after)
-                                    orderBy t.epoch
-                                    take limit
-                                    select t
-                                    toList
-                                    cancel token
-                            })
-
-                    return! rows |> List.traverseResultM toTransition
-                })
+                (StoreProgram.queryRows
+                    historyPage
+                    [ Params.machineId "@machine_id" machineId
+                      Params.entityKey "@entity_id" (encodeEntityId entityId)
+                      "@after", Param.Integer after
+                      "@limit", Param.Integer(int64 (Page.limit paging)) ]
+                    (transitionRow >> toTransition))
                 ct
 
     interface ICommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err> with
@@ -561,23 +636,7 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
             fail DeadLetter commandId token error ct
 
         member _.TryGetResult(commandId, ct) =
-            let id = CommandId.value commandId
-
-            Sql.read
+            Sql.readProgram
                 context
-                (sqliteRead {
-                    let! row =
-                        Sql.select (fun query token ->
-                            selectTask query {
-                                for c in main.fsm_command do
-                                    leftJoin t in main.fsm_transition on (c.command_id = t.Value.command_id)
-                                    leftJoin e in main.fsm_command_error on (c.command_id = e.Value.command_id)
-                                    where (c.command_id = id)
-                                    select (c, t, e)
-                                    tryHead
-                                    cancel token
-                            })
-
-                    return! row |> Option.traverseResult toResult
-                })
+                (StoreProgram.tryQueryOne commandResult [ Params.commandId "@command_id" commandId ] resultRow)
                 ct

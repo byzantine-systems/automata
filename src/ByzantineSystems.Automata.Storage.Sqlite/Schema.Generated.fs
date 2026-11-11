@@ -109,6 +109,7 @@ module main =
           idempotency_key: string
           chart_version: int64
           event: string
+          request_digest: byte[]
           kind: string
           status: string
           blocked: int64
@@ -145,6 +146,9 @@ module main =
                     ProviderDbType = None }
                   { WriteColumn.Name = "event"
                     Value = box this.event
+                    ProviderDbType = None }
+                  { WriteColumn.Name = "request_digest"
+                    Value = box this.request_digest
                     ProviderDbType = None }
                   { WriteColumn.Name = "kind"
                     Value = box this.kind

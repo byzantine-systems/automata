@@ -90,6 +90,8 @@ type CommandProcessor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: e
     ) =
 
     let policy = ValidatedProcessorPolicy.value config.Processor
+    let claimBatch = ValidatedProcessorPolicy.batch config.Processor
+    let leaseDuration = ValidatedProcessorPolicy.lease config.Processor
     let machineId = config.MachineId
     let logger = config.Logger
     let machineName = MachineId.value machineId
@@ -128,7 +130,7 @@ type CommandProcessor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: e
                     if Object.ReferenceEquals(finished, work :> Task) then
                         return ()
                     else
-                        match! inbox.ExtendLease(leased.Work.CommandId, leased.Token, policy.Lease, ct) with
+                        match! inbox.ExtendLease(leased.Work.CommandId, leased.Token, leaseDuration, ct) with
                         | Ok Updated -> return! renew ()
                         | Ok(LeaseUpdateOutcome.LeaseLost)
                         | Error _ -> return ()
@@ -230,7 +232,7 @@ type CommandProcessor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: e
             // connection mid-commit and do not know whether it landed", and treating it as
             // anything else would turn the one safe recovery into a duplicate.
             | Finalized epoch
-            | AlreadyFinalized epoch ->
+            | AlreadyFinalized(epoch, _) ->
                 publish
                     record
                     (CommandResult.Committed
@@ -450,7 +452,7 @@ type CommandProcessor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: e
     member _.PollAsync(ct: CancellationToken) : Task<Result<PollReport, MachineError<'Err>>> =
         taskResult {
             let! batch =
-                inbox.Claim(machineId, policy.Batch, policy.Lease, ct)
+                inbox.Claim(machineId, claimBatch, leaseDuration, ct)
                 |> TaskResult.mapError MachineError.Store
 
             match batch with
@@ -514,7 +516,7 @@ type CommandProcessor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: e
                         | Some(commandId, reason) -> return ProcessorStop.Escalated(commandId, reason, totals)
                         // A full batch means there is probably more waiting, so going straight
                         // round again drains a backlog at claim speed rather than poll speed.
-                        | None when report.Summary.Claimed = policy.Batch -> return! loop totals
+                        | None when report.Summary.Claimed = ClaimBatch.value claimBatch -> return! loop totals
                         | None ->
                             match! waitForWork () with
                             | true -> return! loop totals

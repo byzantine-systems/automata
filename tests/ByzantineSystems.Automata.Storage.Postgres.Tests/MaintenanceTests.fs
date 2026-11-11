@@ -31,9 +31,19 @@ let private submit (name: string) (key: string) =
         return outcome |> expectOk "submit" |> commandIdOf
     }
 
+let private submitCorrection (name: string) (key: string) =
+    task {
+        let correction =
+            { submission (entity name) key (Start 1) with
+                Kind = CommandKind.Correction(effectiveAt, CorrectionPolicy.defaults) }
+
+        let! outcome = (newInbox ()).Submit(correction, noCancellation)
+        return outcome |> expectOk "submit correction" |> commandIdOf
+    }
+
 let private claimed (key: string) =
     task {
-        let! batch = (newInbox ()).Claim(machine, 50, lease, noCancellation)
+        let! batch = (newInbox ()).Claim(machine, ClaimBatch.create 50, LeaseDuration.create lease, noCancellation)
 
         return
             batch
@@ -68,7 +78,7 @@ let private reject (leased: LeasedCommand<Entity, TestEvent>) =
 
 let private run (batch: int) =
     task {
-        let! reports = (newMaintenance ()).Run(batch, noCancellation)
+        let! reports = (newMaintenance ()).Run(ClaimBatch.create batch, noCancellation)
         return reports |> expectOk "run"
     }
 
@@ -228,7 +238,7 @@ let bootTests =
               let store =
                   MachineStoreOptions.forEntityId<TestEntity, TestState, TestEvent, TestAction, TestError>
                       (context ())
-                      actionQueue
+                      (ActionDelivery.Deliver(ActionQueueName.create actionQueue))
                   |> PostgresMachineStore
 
               let! booted = (store :> IStoreBoot).Boot(machine, noCancellation)
@@ -243,26 +253,6 @@ let bootTests =
                   (found |> expectOk "read" |> Option.map (fun record -> record.Event))
                   (Some(Start 1))
                   "the default codecs read back what they wrote"
-          }
-
-          testTask "a queue name the store could not use is refused before the database is asked" {
-              // Nothing is listening on this host. Asking the database would answer Unavailable;
-              // answering Misconfigured proves nobody asked.
-              use unreachable = DataSource.create "Host=unreachable.invalid;Timeout=1"
-
-              let store =
-                  MachineStoreOptions.forEntityId<TestEntity, TestState, TestEvent, TestAction, TestError>
-                      (PostgresContext.create
-                          unreachable
-                          ByzantineSystems.Automata.Resilience.TransientPolicy.defaults
-                          ignore)
-                      "Bad Queue; DROP TABLE"
-                  |> PostgresMachineStore
-
-              match! (store :> IStoreBoot).Boot(machine, noCancellation) with
-              | Ok(BootReport.Refused [ BootDefect.Misconfigured reason ]) ->
-                  Expect.stringContains reason "Bad Queue" "the reason names the queue"
-              | other -> failtestf "expected a configuration refusal, got %A" other
           }
 
           testTask "boot creates the action queue when it is missing" {
@@ -317,6 +307,26 @@ let retentionTests =
                   (count "SELECT count(*) FROM fsm.command WHERE idempotency_key = 'k3'")
                   1L
                   "an open command is work, not history, and is never purged"
+          }
+
+          testTask "a terminal correction is purged with its correction metadata" {
+              do! reset ()
+              do! boot (keepCommandsFor hour)
+              let! _ = submitCorrection "corrected" "c1"
+              let! _ = submit "corrected" "later"
+              let! correction = claimed "c1"
+              do! reject correction
+              ageCommands ()
+
+              let! reports = run 100
+
+              Expect.equal (reportFor reports).PurgedCommands 1L "the correction command"
+              Expect.equal (count "SELECT count(*) FROM fsm.command_correction") 0L "its metadata went with it"
+
+              Expect.equal
+                  (count "SELECT count(*) FROM fsm.command WHERE idempotency_key = 'later'")
+                  1L
+                  "the entity's newest command remains"
           }
 
           testTask "an entity's newest command is kept, so its sequence never restarts" {
@@ -414,7 +424,9 @@ let retentionTests =
               let! _ = submit "e1" "k1"
               let! first = claimed "k1"
               let! _ = commit first Epoch.initial
-              let! actions = (newActionQueue ()).Claim(machine, 10, lease, noCancellation)
+
+              let! actions =
+                  (newActionQueue ()).Claim(machine, ClaimBatch.create 10, LeaseDuration.create lease, noCancellation)
 
               for action in actions |> expectOk "claim actions" do
                   let! _ = (newActionQueue ()).Complete(action, noCancellation)
@@ -464,7 +476,9 @@ let reaperTests =
               let! reports = run 100
               Expect.equal (reportFor reports).Reaped 0L "inside the grace period"
 
-              let! extended = (newInbox ()).ExtendLease(held.Work.CommandId, held.Token, lease, noCancellation)
+              let! extended =
+                  (newInbox ()).ExtendLease(held.Work.CommandId, held.Token, LeaseDuration.create lease, noCancellation)
+
               Expect.equal (extended |> expectOk "extend") Updated "its holder can still keep it"
           } ]
 
@@ -711,7 +725,12 @@ let cronTests =
               let maintenance = newMaintenance ()
 
               let! scheduling =
-                  maintenance.Schedule(TimeSpan.FromSeconds 1., TimeSpan.FromMinutes 1., 100, noCancellation)
+                  maintenance.Schedule(
+                      TimeSpan.FromSeconds 1.,
+                      TimeSpan.FromMinutes 1.,
+                      ClaimBatch.create 100,
+                      noCancellation
+                  )
 
               let expected =
                   if cronInstalled () then
@@ -758,7 +777,12 @@ let cronTests =
 
               for _ in 1..2 do
                   let! scheduled =
-                      maintenance.Schedule(TimeSpan.FromSeconds 1., TimeSpan.FromMinutes 1., 100, noCancellation)
+                      maintenance.Schedule(
+                          TimeSpan.FromSeconds 1.,
+                          TimeSpan.FromMinutes 1.,
+                          ClaimBatch.create 100,
+                          noCancellation
+                      )
 
                   Expect.equal (scheduled |> expectOk "schedule") Scheduling.Scheduled "scheduled"
 
@@ -779,8 +803,8 @@ let planTests =
               do! boot RetentionPolicy.keepEverything
 
               arrange
-                  """INSERT INTO fsm.command (machine_id, entity_id, seq, idempotency_key, chart_version, event, blocked)
-                     SELECT 'pg-tests', 'e' || g, 1, 'k' || g, 1, '{}'::jsonb, false FROM generate_series(1, 20000) g"""
+                  """INSERT INTO fsm.command (machine_id, entity_id, seq, idempotency_key, chart_version, event, request_digest, blocked)
+                     SELECT 'pg-tests', 'e' || g, 1, 'k' || g, 1, '{}'::jsonb, sha256(''::bytea), false FROM generate_series(1, 20000) g"""
 
               arrange "ANALYZE fsm.command"
 

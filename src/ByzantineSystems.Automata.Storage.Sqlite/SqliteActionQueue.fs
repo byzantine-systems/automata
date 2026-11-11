@@ -35,11 +35,14 @@ type SqliteActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'EntityId
 
     let context = options.Context
 
-    let nextToken = Statement.load "system" "next_token"
-    let claimActions = Statement.load "action" "claim"
-    let completeAction = Statement.load "action" "complete"
-    let rescheduleAction = Statement.load "action" "reschedule"
-    let abandonAction = Statement.load "action" "abandon"
+    let nextToken = StatementKey.create "system" "next_token" |> Sql.prepareProgram
+    let claimActions = StatementKey.create "action" "claim" |> Sql.prepareProgram
+    let completeAction = StatementKey.create "action" "complete" |> Sql.prepareProgram
+
+    let rescheduleAction =
+        StatementKey.create "action" "reschedule" |> Sql.prepareProgram
+
+    let abandonAction = StatementKey.create "action" "abandon" |> Sql.prepareProgram
 
     let actionRow (reader: SqliteDataReader) : main.fsm_action =
         { command_id = Row.int64 reader "command_id"
@@ -62,9 +65,14 @@ type SqliteActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'EntityId
 
             let! action = options.ActionCodec.Decode row.action |> Result.mapError Db.toStoreError
 
+            let! machineId =
+                row.machine_id
+                |> MachineId.tryCreate
+                |> Result.mapError (Db.decodeFailure "MachineId")
+
             return
                 { Work =
-                    { MachineId = MachineId.create row.machine_id
+                    { MachineId = machineId
                       EntityId = entityId
                       CommandId = CommandId.ofInt64 row.command_id
                       Epoch = Db.epochOf row.epoch
@@ -82,79 +90,87 @@ type SqliteActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'EntityId
           "@lease_token", Param.Integer(LeaseToken.value action.Token) ]
 
     /// The token and the claimed rows, in the claim's own transaction. Decoding waits until it
-    /// has committed.
-    let claim (machineId: MachineId) (batch: int) (lease: TimeSpan) =
-        sqliteWrite {
-            let! now = Sql.now
-            let! leaseToken = Sql.one "LeaseToken" nextToken [] (fun reader -> Row.int64 reader "value")
+    /// has committed, so the write transaction holds no codec work.
+    let claim (machineId: MachineId) (batch: int) (lease: TimeSpan) (now: int64) =
+        store {
+            let! token = StoreProgram.queryOne nextToken [] (fun reader -> Ok(Row.int64 reader "value"))
 
             return!
-                Sql.rows
+                StoreProgram.queryRows
                     claimActions
                     [ "@machine_id", Param.Text(MachineId.value machineId)
                       "@batch", Param.Integer(int64 batch)
                       "@now", Param.Integer now
                       "@deadline", Param.Integer(Instant.add now lease)
-                      "@lease_token", Param.Integer leaseToken ]
-                    actionRow
+                      "@lease_token", Param.Integer token ]
+                    (actionRow >> Ok)
         }
+
+    let abandon values reason ct =
+        Sql.writeProgramWith
+            context
+            (fun now ->
+                store {
+                    let! recorded =
+                        StoreProgram.executeCount
+                            abandonAction
+                            (values @ [ "@reason", Param.Text reason; "@now", Param.Integer now ])
+
+                    match CommandMapping.leaseOutcome recorded with
+                    | LeaseUpdateOutcome.LeaseLost -> return LeaseUpdateOutcome.LeaseLost
+                    | Updated ->
+                        do! StoreProgram.executeDiscard completeAction values
+                        return Updated
+                })
+            ct
 
     interface IActionQueue<'EntityId, 'Action> with
 
         member _.Claim(machineId, batch, lease, ct) =
-            if batch < 1 then
-                invalidArg (nameof batch) "A claim batch size must be positive."
-
-            if lease <= TimeSpan.Zero then
-                invalidArg (nameof lease) "A lease must be a positive duration."
-
             // Not idempotent, like the command claim: a claim whose outcome was lost may have
             // leased the rows, and repeating it leases more while the first batch stays invisible.
             // The dispatcher polls again shortly, which recovers faster.
             backgroundTaskResult {
-                let! rows = Sql.writeOnce context (claim machineId batch lease) ct
-                return! rows |> List.traverseResultM toLeased
+                let! rows =
+                    Sql.writeProgramOnceWith
+                        context
+                        (claim machineId (ClaimBatch.value batch) (LeaseDuration.value lease))
+                        ct
+
+                return!
+                    ClaimRecovery.collect
+                        toLeased
+                        (fun row reason ->
+                            abandon
+                                [ "@command_id", Param.Integer row.command_id
+                                  "@ordinal", Param.Integer row.ordinal
+                                  "@lease_token", Param.Integer row.lease_token ]
+                                reason
+                                ct
+                            |> TaskResult.map ignore)
+                        rows
+                        ct
             }
 
         member _.Complete(action, ct) =
-            Sql.write context (Sql.execute completeAction (fence action) |> Op.map CommandMapping.leaseOutcome) ct
+            Sql.writeProgram
+                context
+                (StoreProgram.executeCount completeAction (fence action)
+                 |> StoreProgram.map CommandMapping.leaseOutcome)
+                ct
 
         member _.Reschedule(action, backoff, ct) =
-            Sql.write
+            Sql.writeProgramWith
                 context
-                (sqliteWrite {
-                    let! now = Sql.now
-
-                    let! changed =
-                        Sql.execute
-                            rescheduleAction
-                            (fence action
-                             @ [ "@now", Param.Integer now
-                                 "@base_us", Param.Integer(CommandMapping.micros (Backoff.baseDelay backoff))
-                                 "@cap_us", Param.Integer(CommandMapping.micros (Backoff.ceiling backoff)) ])
-
-                    return CommandMapping.leaseOutcome changed
-                })
+                (fun now ->
+                    StoreProgram.executeCount
+                        rescheduleAction
+                        (fence action
+                         @ [ "@now", Param.Integer now
+                             "@base_us", Param.Integer(CommandMapping.micros (Backoff.baseDelay backoff))
+                             "@cap_us", Param.Integer(CommandMapping.micros (Backoff.ceiling backoff)) ])
+                    |> StoreProgram.map CommandMapping.leaseOutcome)
                 ct
 
         member _.Abandon(action, reason, ct) =
-            if String.IsNullOrWhiteSpace reason then
-                invalidArg (nameof reason) "An abandoned delivery must say why."
-
-            Sql.write
-                context
-                (sqliteWrite {
-                    let! now = Sql.now
-
-                    let! recorded =
-                        Sql.execute
-                            abandonAction
-                            (fence action @ [ "@reason", Param.Text reason; "@now", Param.Integer now ])
-
-                    match CommandMapping.leaseOutcome recorded with
-                    | LeaseLost -> return LeaseLost
-                    | Updated ->
-                        do! Sql.execute completeAction (fence action) |> Op.discard
-                        return Updated
-                })
-                ct
+            abandon (fence action) (Reason.value reason) ct

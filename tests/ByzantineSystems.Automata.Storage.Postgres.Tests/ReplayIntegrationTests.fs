@@ -55,16 +55,17 @@ let private cappedChart =
         | Ok c -> c
         | Error errors -> failwithf "the capped chart is invalid: %A" errors
 
-let private build (catalog: ChartCatalog<TestState, TestEvent, TestAction, TestError> option) (current: int) =
+let private buildWith
+    (retention: RetentionPolicy)
+    (catalog: ChartCatalog<TestState, TestEvent, TestAction, TestError> option)
+    (current: int)
+    =
     MachineCE.machine<Entity, TestState, TestEvent, TestAction, TestError> machine {
         chart cappedChart
         chartVersion current
         initialState Idle
 
-        store (
-            newMachineStore RetentionPolicy.keepEverything
-            :> IMachineStore<Entity, TestState, TestEvent, TestAction, TestError>
-        )
+        store (newMachineStore retention :> IMachineStore<Entity, TestState, TestEvent, TestAction, TestError>)
 
         chartCatalog (catalog |> Option.defaultValue ChartCatalog.empty)
 
@@ -75,6 +76,9 @@ let private build (catalog: ChartCatalog<TestState, TestEvent, TestAction, TestE
     |> function
         | Ok built -> built
         | Error errors -> failtestf "the correction machine did not build: %A" errors
+
+let private build catalog current =
+    buildWith RetentionPolicy.keepEverything catalog current
 
 let private transitions name =
     rows
@@ -108,6 +112,18 @@ let private seeded name =
     task {
         do! reset ()
         let built = build None 1
+        let! _ = Machine.startAsync built (newRegistry ()) noCancellation
+        let! _ = Machine.enqueue built (entity name) (at name "s1" 1 10) noCancellation
+        let! _ = Machine.enqueue built (entity name) (at name "s2" 2 12) noCancellation
+        do! drainUntil built (fun () -> (transitions name).Length = 2)
+        return built
+    }
+
+/// The same shared history, on a machine registered for a finite command retention.
+let private seededRetained name retention =
+    task {
+        do! reset ()
+        let built = buildWith retention None 1
         let! _ = Machine.startAsync built (newRegistry ()) noCancellation
         let! _ = Machine.enqueue built (entity name) (at name "s1" 1 10) noCancellation
         let! _ = Machine.enqueue built (entity name) (at name "s2" 2 12) noCancellation
@@ -183,7 +199,10 @@ let tests =
               // that produced it, the next command would expect an epoch already taken.
               let! built = seeded "after"
               let! _ = correctAndSettle built "after" "fix" 10 11 CorrectionPolicy.defaults
-              let! _ = Machine.enqueue built (entity "after") (at "after" "s3" 1 13) noCancellation
+              // Corrections arrive now, so a subsequent ordinary command must not claim it
+              // arrived in the historical seed timeline.
+              let! next = Machine.enqueue built (entity "after") (EventEnvelope.create "s3" (Start 1)) noCancellation
+              let _ = accepted "the next command" next
               do! drainUntil built (fun () -> (transitions "after").Length = 4)
 
               let! live = liveState "after"
@@ -195,7 +214,15 @@ let tests =
               let! built = seeded "queued"
               let inbox = newInbox ()
               let! _ = Machine.enqueue built (entity "queued") (at "queued" "s3" 5 13) noCancellation
-              let! claimed = inbox.Claim(machine, 1, TimeSpan.FromMinutes 1., noCancellation)
+
+              let! claimed =
+                  inbox.Claim(
+                      machine,
+                      ClaimBatch.create 1,
+                      LeaseDuration.create (TimeSpan.FromMinutes 1.),
+                      noCancellation
+                  )
+
               let head = claimed |> expectOk "claim" |> List.exactlyOne
 
               let! submitted =
@@ -264,13 +291,24 @@ let tests =
           }
 
           testTask "history the correction needs but retention removed is reported" {
-              let! built = seeded "purged"
-              arrange "DELETE FROM fsm.transition WHERE entity_id = 'purged' AND epoch = 1"
+              let retention =
+                  { RetentionPolicy.keepEverything with
+                      Commands = Retain.For(TimeSpan.FromHours 1.) }
+
+              let! built = seededRetained "retained" retention
+
+              // Age the first command so retention removes it and its transition, while the
+              // newest command is kept.
+              arrange
+                  "UPDATE fsm.command SET received_at = now() - interval '2 hours' WHERE entity_id = 'retained' AND seq = 1"
+
+              let! reports = (newMaintenance ()).Run(ClaimBatch.create 100, noCancellation)
+              reports |> expectOk "maintenance" |> ignore
 
               match!
                   Machine.previewCorrection
                       built
-                      (entity "purged")
+                      (entity "retained")
                       (Start 10)
                       (hour 9)
                       CorrectionPolicy.defaults
@@ -278,6 +316,19 @@ let tests =
               with
               | Error(CorrectionError.Replay ReplayError.HistoryPurged) -> ()
               | other -> failtestf "expected the purge to be reported, got %A" other
+
+              // A correction starting after the purged instant still has everything it needs.
+              match!
+                  Machine.previewCorrection
+                      built
+                      (entity "retained")
+                      (Start 10)
+                      (hour 11)
+                      CorrectionPolicy.defaults
+                      noCancellation
+              with
+              | Ok _ -> ()
+              | other -> failtestf "expected a correction after the watermark to plan, got %A" other
 
               do! Machine.stopAsync built noCancellation
           }
@@ -295,9 +346,10 @@ let tests =
                       noCancellation
 
               let plan = preview |> expectOk "preview"
+              let head, tail = plan.Commit.Beliefs
 
               Expect.equal
-                  (plan.Commit.Beliefs |> List.map _.Asserted.State)
+                  ((head :: tail) |> List.map _.Asserted.State)
                   [ Active 11; Active 13 ]
                   "the timeline it would write"
 
@@ -340,4 +392,74 @@ let tests =
               match! Machine.startAsync built (newRegistry ()) noCancellation with
               | Ok(Startup.Refused [ BootDefect.Misconfigured _ ]) -> ()
               | other -> failtestf "expected the start to be refused, got %A" other
+          }
+
+          testTask "a rescheduled correction's sentinel token never authorizes finalization" {
+              // Rescheduling releases the lease and puts token zero back on the row. A caller
+              // presenting that sentinel must be fenced out, exactly as an ordinary command is:
+              // zero means nobody holds the work, not that anyone may finish it.
+              do! reset ()
+              let inbox = newInbox ()
+              let at = hour 11
+
+              let correction =
+                  { submission (entity "e1") "c1" (Start 10) with
+                      Kind = CommandKind.Correction(at, CorrectionPolicy.defaults) }
+
+              let! _ = inbox.Submit(correction, noCancellation)
+
+              let! claimed =
+                  inbox.Claim(
+                      machine,
+                      ClaimBatch.create 1,
+                      LeaseDuration.create (TimeSpan.FromMinutes 1.),
+                      noCancellation
+                  )
+
+              let held = claimed |> expectOk "claim" |> List.exactlyOne
+
+              let! rescheduled =
+                  inbox.Reschedule(
+                      held.Work.CommandId,
+                      held.Token,
+                      Backoff.create (TimeSpan.FromMilliseconds 1.) (TimeSpan.FromMilliseconds 1.),
+                      noCancellation
+                  )
+
+              Expect.equal (rescheduled |> expectOk "reschedule") LeaseUpdateOutcome.Updated "back to ready"
+
+              let commit: CorrectionCommit<Entity, TestState, TestEvent, TestAction> =
+                  { Transition = draft (entity "e1") Idle (Active 1) at
+                    ValidFrom = at
+                    Beliefs =
+                      ({ Asserted =
+                          { State = Active 1
+                            Status = Running
+                            Epoch = Epoch.initial }
+                         ValidFrom = at
+                         CommandId = CommandId.ofInt64 1L
+                         ChartVersion = version },
+                       []) }
+
+              let! outcome =
+                  (newReplayStore ())
+                      .CommitCorrection(
+                          held.Work.CommandId,
+                          LeaseToken.ofInt64 0L,
+                          Epoch.initial,
+                          commit,
+                          noCancellation
+                      )
+
+              Expect.equal
+                  (outcome |> expectOk "finalize")
+                  FinalizeOutcome.LeaseLost
+                  "token zero is nobody, not authority"
+
+              Expect.equal (transitions "e1").Length 0 "no transition was written"
+
+              Expect.equal
+                  (scalar<int64> "SELECT count(*) FROM fsm.command WHERE status = 'ready'")
+                  1L
+                  "the command is still ready"
           } ]

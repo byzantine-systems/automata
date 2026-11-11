@@ -9,6 +9,7 @@
 
     <ItemGroup>
         <Compile Include="TestContext.fs" />
+        <Compile Include="..\StorageContractProperties.fs" Link="StorageContractProperties.fs" />
         <Compile Include="SqlResourceTests.fs" />
         <Compile Include="SqlTests.fs" />
         <Compile Include="CommandInboxTests.fs" />
@@ -16,6 +17,9 @@
         <Compile Include="TemporalTests.fs" />
         <Compile Include="TemporalReaderTests.fs" />
         <Compile Include="CorrectionTests.fs" />
+        <Compile Include="TemporalProperties.fs" />
+        <Compile Include="ReplayRetentionProperties.fs" />
+        <Compile Include="ReplayFinalizeProperties.fs" />
         <Compile Include="HistoryTests.fs" />
         <Compile Include="FinalizeTests.fs" />
         <Compile Include="ActionQueueTests.fs" />
@@ -29,6 +33,7 @@
 
     <ItemGroup>
         <PackageReference Include="Expecto" />
+        <PackageReference Include="FsCheck" />
         <PackageReference Include="Microsoft.NET.Test.Sdk" PrivateAssets="all" />
         <PackageReference Include="YoloDev.Expecto.TestSdk" PrivateAssets="all" />
         <PackageReference Include="coverlet.msbuild" PrivateAssets="all" />

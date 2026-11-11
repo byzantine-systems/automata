@@ -60,6 +60,7 @@ CREATE TABLE fsm.command (
     idempotency_key text NOT NULL,
     chart_version integer NOT NULL,
     event jsonb NOT NULL,
+    request_digest bytea NOT NULL,
     kind fsm.command_kind NOT NULL DEFAULT 'event',
     status fsm.command_status NOT NULL DEFAULT 'ready',
     blocked boolean NOT NULL DEFAULT FALSE,

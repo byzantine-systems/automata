@@ -55,79 +55,11 @@ let tests =
         "Postgres IChartRegistry"
         [
 
-          testTask "a version is claimed once and then only confirmed" {
-              do! reset ()
-              let registry = newRegistry ()
-
-              let! first = register registry 2 fingerprintA
-              let! second = register registry 2 fingerprintA
-
-              Expect.equal first ChartRegistration.Registered "the first registration claims the version"
-              Expect.equal second ChartRegistration.Matched "the second confirms it"
-
-              Expect.equal
-                  (scalar<int64> "SELECT count(*) FROM fsm.machine_chart_version WHERE version = 2")
-                  1L
-                  "confirming must not write a second row"
-          }
-
-          testTask "a different chart under a claimed version is reported, not accepted" {
-              do! reset ()
-              let registry = newRegistry ()
-
-              let! _ = register registry 2 fingerprintA
-              let! outcome = register registry 2 fingerprintB
-
-              Expect.equal
-                  outcome
-                  (ChartRegistration.Mismatched fingerprintA)
-                  "the mismatch carries what is stored, which is what an operator needs"
-
-              Expect.equal
-                  (scalar<string> "SELECT fingerprint FROM fsm.machine_chart_version WHERE version = 2")
-                  (ChartFingerprint.value fingerprintA)
-                  "a registration never overwrites the stored fingerprint"
-          }
-
-          testTask "versions and machines are independent" {
-              do! reset ()
-              let registry = newRegistry ()
-
-              let! two = register registry 2 fingerprintA
-              let! three = register registry 3 fingerprintB
-
-              Expect.equal two ChartRegistration.Registered "version 2"
-              Expect.equal three ChartRegistration.Registered "a different version of the same machine"
-
-              let! elsewhere =
-                  registry.Register(
-                      { MachineId = machineId "other-machine"
-                        Version = ChartVersion.create 2
-                        Fingerprint = fingerprintB },
-                      noCancellation
-                  )
-
-              Expect.equal
-                  (elsewhere |> expectOk "register for another machine")
-                  ChartRegistration.Registered
-                  "another machine's version 2 is a different fact"
-          }
-
-          testTask "a version nothing registered is absent rather than empty" {
-              do! reset ()
-              let registry = newRegistry ()
-
-              let! missing = registry.TryGet(machine, ChartVersion.create 9, noCancellation)
-              Expect.equal (missing |> expectOk "read an unregistered version") None "nothing is registered"
-
-              let! _ = register registry 9 fingerprintA
-              let! found = registry.TryGet(machine, ChartVersion.create 9, noCancellation)
-
-              Expect.equal
-                  (found |> expectOk "read a registered version")
-                  (Some fingerprintA)
-                  "reading must not claim anything of its own"
-          }
+          ContractProperties.registryProperty "registrations follow an immutable finite map" 20 (fun () ->
+              task {
+                  do! reset ()
+                  return newRegistry ()
+              })
 
           // The reason fsm.register_chart_version re-reads in a second statement instead of
           // deciding from one clever CTE. Every process starts at once after a deployment, so

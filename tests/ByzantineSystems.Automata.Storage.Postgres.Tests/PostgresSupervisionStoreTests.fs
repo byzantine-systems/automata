@@ -44,7 +44,7 @@ let tests =
                   store.Record(restarted, noCancellation)
                   |> mapTask (expectOkUnit "record restarted")
 
-              let! result = PostgresSupervisionQueries.listRecent (context ()) 1 noCancellation
+              let! result = PostgresSupervisionQueries.listRecent (context ()) (ClaimBatch.create 1) noCancellation
               let actual = result |> expectOk "list recent"
 
               Expect.equal actual [ restarted ] "the query should preserve the typed record and apply its limit"

@@ -11,13 +11,14 @@ open FsToolkit.ErrorHandling
 /// declaring them once is not only convenience: two capabilities encoding an entity id
 /// differently would write rows that cannot find each other.
 ///
-/// There is no queue name, retention or listener here. Actions are rows keyed by machine, so
-/// there is nothing to name or create; retention and notifications are capabilities this store
-/// does not offer yet.
+/// Delivery is explicit. Queue names are portable configuration; SQLite routes rows by machine
+/// within the file. Retention and notifications are capabilities this store does not offer yet.
 /// </summary>
 type MachineStoreOptions<'EntityId, 'State, 'Event, 'Action, 'Err> =
     {
         Context: SqliteContext
+        /// <summary>Deliver through this machine's table-backed queue, or explicitly discard delivery.</summary>
+        ActionDelivery: ActionDelivery
         StateCodec: Codec<'State>
         EventCodec: Codec<'Event>
         ActionCodec: Codec<'Action>
@@ -40,15 +41,18 @@ module MachineStoreOptions =
     /// let store =
     ///     MachineStoreOptions.forEntityId&lt;Payment, PaymentState, PaymentEvent, PaymentAction, PaymentError&gt;
     ///         (SqliteContext.ofPath "payments.db")
+    ///         (ActionDelivery.Deliver(ActionQueueName.create "payment_actions"))
     ///     |> SqliteMachineStore
     /// </code>
     /// </example>
     let forEntityId<'Tag, 'State, 'Event, 'Action, 'Err>
         (context: SqliteContext)
+        (actionDelivery: ActionDelivery)
         : MachineStoreOptions<EntityId<'Tag>, 'State, 'Event, 'Action, 'Err> =
         let encode, decode = EntityKey.forEntityId<'Tag>
 
         { Context = context
+          ActionDelivery = actionDelivery
           StateCodec = Serialization.systemTextJson<'State> ()
           EventCodec = Serialization.systemTextJson<'Event> ()
           ActionCodec = Serialization.systemTextJson<'Action> ()
@@ -87,6 +91,7 @@ type SqliteMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     let processor =
         SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>(
             { Context = options.Context
+              ActionDelivery = options.ActionDelivery
               StateCodec = options.StateCodec
               EventCodec = options.EventCodec
               // The transition row stores the whole action list as one document, while the
@@ -98,7 +103,7 @@ type SqliteMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
               EntityIdDecode = options.EntityIdDecode }
         )
 
-    let actionQueue =
+    let deliveryQueue =
         SqliteActionQueue<'EntityId, 'Action>(
             { Context = options.Context
               ActionCodec = options.ActionCodec
@@ -106,6 +111,11 @@ type SqliteMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
               EntityIdDecode = options.EntityIdDecode }
         )
         :> IActionQueue<'EntityId, 'Action>
+
+    let actionQueue =
+        match options.ActionDelivery with
+        | ActionDelivery.Deliver _ -> deliveryQueue
+        | ActionDelivery.Discard -> ActionQueues.discard ()
 
     let reader = processor :> IStateReader<'EntityId, 'State, 'Event, 'Action>
 

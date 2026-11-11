@@ -1,6 +1,7 @@
 namespace ByzantineSystems.Automata.Storage.Sqlite
 
 open System
+open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
@@ -260,13 +261,6 @@ module internal Db =
     /// <summary>A boolean as the schema stores it. STRICT tables have no boolean type.</summary>
     let flag (value: bool) : int64 = if value then 1L else 0L
 
-    /// <summary>The instance lifecycle, as the status CHECK spells it.</summary>
-    let instanceStatusToString (status: InstanceStatus) : string =
-        match status with
-        | Running -> "running"
-        | Suspended -> "suspended"
-        | Terminated -> "terminated"
-
     let epochOf (value: int64) : Epoch = Epoch.ofUInt64 (uint64 value)
 
     let toStoreError (error: CodecError) : StoreError =
@@ -278,13 +272,29 @@ module internal Db =
     let decodeFailure (typeName: string) (message: string) : StoreError =
         StoreError.Serialization(typeName, FormatException message)
 
-    /// <summary>The instance lifecycle, read back from the status CHECK's spelling.</summary>
-    let instanceStatusFromString (value: string) : Result<InstanceStatus, StoreError> =
-        match value with
-        | "running" -> Ok Running
-        | "suspended" -> Ok Suspended
-        | "terminated" -> Ok Terminated
-        | other -> Error(decodeFailure (nameof InstanceStatus) $"unknown instance status {other}")
+    /// <summary>
+    /// Whether an exception signals the process cannot continue, rather than a failure this
+    /// boundary can classify. These propagate past a decoder's catch: turning
+    /// <see cref="T:System.OutOfMemoryException" /> into <c>StoreError.Serialization</c> would
+    /// report a dying process as bad data.
+    /// </summary>
+    let isFatal (error: exn) : bool =
+        match error with
+        | :? OutOfMemoryException
+        | :? InsufficientExecutionStackException
+        | :? StackOverflowException
+        | :? AccessViolationException -> true
+        | _ -> false
+
+    /// <summary>
+    /// Parses a JSON document, mapping malformed input to a serialization failure rather than
+    /// letting the exception escape a decoder.
+    /// </summary>
+    let parseJson (typeName: string) (json: string) : Result<JsonDocument, StoreError> =
+        try
+            Ok(JsonDocument.Parse json)
+        with :? JsonException as error ->
+            Error(StoreError.Serialization(typeName, error))
 
 /// <summary>
 /// Column access by name.

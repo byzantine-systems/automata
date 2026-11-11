@@ -17,6 +17,11 @@
 -- forces a terminal row to carry a non-zero token, so "who wrote it" is a
 -- column too. The four rows are two comparisons.
 --
+-- The status column of the answer is what the row holds after the call: for
+-- 'finalized' it is the status this call wrote, and for every other outcome it
+-- is the status the row already had, which for 'already_finalized' is the
+-- resolution a retry with a different resolution needs to see.
+--
 -- This is what makes an ambiguous outcome safe to retry, and why a cancelled
 -- Npgsql command or a dropped socket can be treated as "unknown, try again".
 --
@@ -37,10 +42,15 @@
 --
 -- VOLATILE and PARALLEL UNSAFE because it writes.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fsm.finalize_command (p_command_id bigint, p_lease_token bigint, p_expected_epoch bigint, p_status fsm.command_status, p_action_queue text DEFAULT '', p_error jsonb DEFAULT NULL, p_state jsonb DEFAULT NULL, p_instance_status fsm.instance_status DEFAULT NULL, p_effective_at timestamptz DEFAULT NULL, p_event jsonb DEFAULT NULL, p_actions jsonb DEFAULT NULL, p_from_state jsonb DEFAULT NULL, p_to_state jsonb DEFAULT NULL, p_handled_by text DEFAULT NULL, p_exited text[] DEFAULT NULL, p_entered text[] DEFAULT NULL)
+DROP FUNCTION IF EXISTS fsm.finalize_command (bigint, bigint, bigint, fsm.command_status, text, jsonb, jsonb, fsm.instance_status, timestamptz, jsonb, jsonb, jsonb, jsonb, text, text[], text[]);
+
+DROP FUNCTION IF EXISTS fsm.finalize_command (bigint, bigint, bigint, fsm.command_status, jsonb, jsonb, fsm.instance_status, timestamptz, jsonb, jsonb, jsonb, jsonb, text, text[], text[]);
+
+CREATE OR REPLACE FUNCTION fsm.finalize_command (p_command_id bigint, p_lease_token bigint, p_expected_epoch bigint, p_status fsm.command_status, p_error jsonb DEFAULT NULL, p_state jsonb DEFAULT NULL, p_instance_status fsm.instance_status DEFAULT NULL, p_effective_at timestamptz DEFAULT NULL, p_event jsonb DEFAULT NULL, p_actions jsonb DEFAULT NULL, p_from_state jsonb DEFAULT NULL, p_to_state jsonb DEFAULT NULL, p_handled_by text DEFAULT NULL, p_exited text[] DEFAULT NULL, p_entered text[] DEFAULT NULL)
     RETURNS TABLE (
         outcome fsm.finalize_outcome,
-        epoch bigint)
+        epoch bigint,
+        status fsm.command_status)
     LANGUAGE plpgsql
     VOLATILE PARALLEL UNSAFE
     SET search_path = pg_catalog,
@@ -53,6 +63,7 @@ DECLARE
     v_token bigint;
     v_chart_version integer;
     v_current_epoch bigint;
+    v_action_queue text;
 BEGIN
     IF p_status NOT IN ('succeeded', 'rejected', 'dead_letter') THEN
         RAISE EXCEPTION 'fsm.finalize_command: % is not a terminal status', p_status
@@ -103,25 +114,29 @@ BEGIN
                         t.epoch
                     FROM fsm.transition t
                     WHERE
-                        t.command_id = p_command_id), p_expected_epoch);
+                        t.command_id = p_command_id), p_expected_epoch),
+                v_status;
         ELSE
             RETURN QUERY
             SELECT
                 'lease_lost'::fsm.finalize_outcome,
-                p_expected_epoch;
+                p_expected_epoch,
+                v_status;
         END IF;
         RETURN;
     END IF;
-    -- Still open, but held by somebody else. Note that an expired lease is not
-    -- checked here: the token is the fence. A worker past its deadline whose
-    -- command nobody has reclaimed still holds the only token, and rejecting it
-    -- would discard work that is safe to commit. Once another worker claims the
-    -- command, the token differs and this test catches it.
-    IF v_token <> p_lease_token THEN
+    -- Still open, but either not leased at all or held by somebody else. Note
+    -- that an expired lease is not checked here: the token is the fence. A
+    -- worker past its deadline whose command nobody has reclaimed still holds
+    -- the only token, and rejecting it would discard work that is safe to
+    -- commit. A ready command's zero token is the nobody-holds sentinel, never
+    -- an active lease a caller may use to finalize it.
+    IF v_status <> 'leased' OR v_token <> p_lease_token THEN
         RETURN QUERY
         SELECT
             'lease_lost'::fsm.finalize_outcome,
-            p_expected_epoch;
+            p_expected_epoch,
+            v_status;
         RETURN;
     END IF;
     -- The epoch check guards the state write, so it applies only when there is
@@ -149,7 +164,8 @@ BEGIN
             RETURN QUERY
             SELECT
                 'conflict'::fsm.finalize_outcome,
-                v_current_epoch;
+                v_current_epoch,
+                v_status;
             RETURN;
         END IF;
         INSERT INTO fsm.transition (machine_id, entity_id, epoch, command_id, chart_version, event, actions, from_state, to_state, handled_by, exited, entered, status, effective_at)
@@ -161,18 +177,30 @@ BEGIN
         -- the command id it is the identity a destination deduplicates on: a
         -- redelivery carries a new msg_id and the same pair.
         --
-        -- An empty queue name means the caller has no delivery configured,
-        -- which is how a machine whose chart emits nothing avoids requiring a
-        -- queue to exist. Explicit casts throughout, because pgmq.send is
-        -- overloaded and overload resolution happens at prepare time.
-        IF p_action_queue <> '' AND p_actions IS NOT NULL AND JSONB_ARRAY_LENGTH(p_actions) > 0 THEN
-            PERFORM
-                fsm.assert_queue_name (p_action_queue);
-            PERFORM
-                pgmq.send (p_action_queue::text, JSONB_BUILD_OBJECT('machine_id', v_machine_id, 'entity_id', v_entity_id, 'command_id', p_command_id, 'epoch', p_expected_epoch + 1, 'ordinal', a.ordinal - 1, 'action', a.value), 0::integer)
+        -- Boot's registration is authoritative. An empty registered queue is
+        -- explicit Discard; an absent row is a configuration error, not Discard.
+        IF p_actions IS NOT NULL AND JSONB_ARRAY_LENGTH(p_actions) > 0 THEN
+            SELECT
+                m.action_queue
+            INTO
+                v_action_queue
             FROM
-                JSONB_ARRAY_ELEMENTS(p_actions)
+                fsm.machine_maintenance m
+            WHERE
+                m.machine_id = v_machine_id;
+            IF NOT FOUND THEN
+                RAISE EXCEPTION 'fsm.finalize_command: action delivery is not registered for machine %', v_machine_id
+                    USING ERRCODE = 'invalid_parameter_value';
+            END IF;
+            IF v_action_queue <> '' THEN
+                PERFORM
+                    fsm.assert_queue_name (v_action_queue);
+                PERFORM
+                    pgmq.send (v_action_queue::text, JSONB_BUILD_OBJECT('machine_id', v_machine_id, 'entity_id', v_entity_id, 'command_id', p_command_id, 'epoch', p_expected_epoch + 1, 'ordinal', a.ordinal - 1, 'action', a.value), 0::integer)
+                FROM
+                    JSONB_ARRAY_ELEMENTS(p_actions)
     WITH ORDINALITY AS a (value, ordinal);
+            END IF;
         END IF;
     ELSE
         INSERT INTO fsm.command_error (command_id, error)
@@ -212,7 +240,7 @@ BEGIN
             p_expected_epoch + 1
         ELSE
             p_expected_epoch
-        END;
+        END,
+        p_status;
 END
 $$;
-

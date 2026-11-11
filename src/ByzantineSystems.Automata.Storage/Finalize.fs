@@ -26,12 +26,12 @@ type internal Resolution<'EntityId, 'State, 'Event, 'Action> =
 [<RequireQualifiedAccess>]
 module internal Resolution =
 
-    /// <summary>The terminal status an ending writes, as both schemas spell it.</summary>
-    let status (resolution: Resolution<'EntityId, 'State, 'Event, 'Action>) : string =
+    /// <summary>The terminal status an ending writes.</summary>
+    let status (resolution: Resolution<'EntityId, 'State, 'Event, 'Action>) : CommandStatus =
         match resolution with
-        | Commit _ -> "succeeded"
-        | Reject _ -> "rejected"
-        | DeadLetter _ -> "dead_letter"
+        | Commit _ -> CommandStatus.Succeeded
+        | Reject _ -> CommandStatus.Rejected
+        | DeadLetter _ -> CommandStatus.DeadLettered
 
     /// <summary>
     /// The epoch an ending reports when no transition answers for it. A failure moves no state, so
