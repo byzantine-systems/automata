@@ -148,6 +148,7 @@ type PostgresMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     let temporalStore =
         PostgresTemporalStore<'EntityId, 'State>(
             { Context = options.Context
+              TimeProvider = TimeProvider.System
               StateCodec = options.StateCodec
               EntityIdEncode = options.EntityIdEncode
               EntityIdDecode = options.EntityIdDecode }

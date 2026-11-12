@@ -174,8 +174,10 @@ let private readConnectionString () : string option =
 /// </summary>
 let private runPayment (logger: ILogger) (connectionString: string) : Task =
     task {
-        let context =
-            PostgresContext.create (DataSource.create connectionString) TransientPolicy.defaults ignore
+        // One pooled data source for the run, disposed with this scope: nothing else here owns
+        // a pool.
+        use source = DataSource.create connectionString
+        let context = PostgresContext.create source TransientPolicy.defaults ignore
 
         // Every default spelled out in one function: JSON codecs, EntityId keys, nothing deleted,
         // leases reaped five minutes after they expire. Override any of them with { ... with }.

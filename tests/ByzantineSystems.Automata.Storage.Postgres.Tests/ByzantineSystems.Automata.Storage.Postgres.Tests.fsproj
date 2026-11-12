@@ -28,6 +28,7 @@
         <Compile Include="SchemaContractTests.fs" />
         <Compile Include="MaintenanceTests.fs" />
         <Compile Include="PostgresSupervisionStoreTests.fs" />
+        <Compile Include="ListenerTests.fs" />
         <Compile Include="Program.fs" />
     </ItemGroup>
 

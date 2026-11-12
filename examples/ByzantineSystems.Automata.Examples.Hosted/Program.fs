@@ -232,7 +232,11 @@ let main argv =
         1
     | Some connectionString ->
         let builder = Host.CreateApplicationBuilder(argv)
-        configure builder.Services (PostgresContext.ofConnectionString connectionString)
+
+        // One pooled data source for the process, built here and disposed after the host has
+        // stopped: every store below shares this one pool and this one circuit.
+        use source = DataSource.create connectionString
+        configure builder.Services (PostgresContext.create source TransientPolicy.defaults ignore)
         use host = builder.Build()
 
         let logger =

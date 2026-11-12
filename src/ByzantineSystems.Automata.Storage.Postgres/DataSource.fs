@@ -55,10 +55,3 @@ module PostgresContext =
     let create (dataSource: NpgsqlDataSource) (policy: TransientPolicy) (onEvent: PipelineEventSink) : PostgresContext =
         { DataSource = dataSource
           Resilience = DataSource.resilience policy onEvent }
-
-    /// <summary>
-    /// A context from a connection string alone, on the default policy and with no event sink.
-    /// The data source it builds is owned by the caller, who disposes it.
-    /// </summary>
-    let ofConnectionString (connectionString: string) : PostgresContext =
-        create (DataSource.create connectionString) TransientPolicy.defaults ignore

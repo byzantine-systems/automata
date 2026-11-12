@@ -43,6 +43,16 @@ let tests =
               Expect.isNone (belief |> expectOk "valid at") "the entity had no belief then"
           }
 
+          testTask "ValidAt asks the clock the store was given, not the machine's" {
+              do! reset ()
+              believe "e1" (jan 10) (Active 1) 1L
+
+              let frozen = FrozenTime(DateTimeOffset(2020, 1, 1, 0, 0, 0, TimeSpan.Zero))
+              let! belief = (newTemporalReaderAt frozen).ValidAt(machine, entity "e1", jan 12, noCancellation)
+
+              Expect.isNone (belief |> expectOk "valid at") "a now before anything was known reads nothing"
+          }
+
           testTask "a live belief reads back with both upper bounds open" {
               do! reset ()
               believe "e1" (jan 10) (Active 1) 1L

@@ -203,19 +203,30 @@ let newActionQueue () : Actions = actionQueueStore () :> Actions
 type Temporal = ITemporalReader<Entity, TestState>
 type Corrections = ICorrectionStore<Entity, TestState>
 
-let private temporalStore () =
+/// A clock held still, so a test can ask a store what it believed at a frozen now.
+type FrozenTime(at: DateTimeOffset) =
+    inherit TimeProvider()
+    override _.GetUtcNow() = at
+
+let private temporalStore (time: TimeProvider) =
     let encode, decode = EntityKey.forEntityId<TestEntity>
 
     PostgresTemporalStore<Entity, TestState>(
         { Context = context ()
+          TimeProvider = time
           StateCodec = Serialization.systemTextJson<TestState> ()
           EntityIdEncode = encode
           EntityIdDecode = decode }
     )
 
-let newTemporalReader () : Temporal = temporalStore () :> Temporal
+let newTemporalReader () : Temporal =
+    temporalStore TimeProvider.System :> Temporal
 
-let newCorrections () : Corrections = temporalStore () :> Corrections
+/// The reader as one chosen clock sees it, for tests of which "now" gets asked.
+let newTemporalReaderAt (time: TimeProvider) : Temporal = temporalStore time :> Temporal
+
+let newCorrections () : Corrections =
+    temporalStore TimeProvider.System :> Corrections
 
 let newRegistry () : IChartRegistry =
     PostgresChartRegistry({ Context = context () }) :> IChartRegistry

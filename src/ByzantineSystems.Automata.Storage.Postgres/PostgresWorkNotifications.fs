@@ -40,15 +40,38 @@ module internal Listener =
     let keepAlive = TimeSpan.FromSeconds 30.
 
     /// A dedicated connection that neither pools nor enlists, for going around a pooler.
-    let openDirect (connectionString: string) (ct: CancellationToken) : Task<NpgsqlConnection> =
+    ///
+    /// Building, opening and abandoning are separate steps so a failed open can be shown to
+    /// clean up the connection it built: a listener that loses the race to connect must not
+    /// leak it.
+    let internal openDirectWith
+        (build: unit -> NpgsqlConnection)
+        (openAsync: NpgsqlConnection -> CancellationToken -> Task)
+        (abandon: NpgsqlConnection -> unit)
+        (ct: CancellationToken)
+        : Task<NpgsqlConnection> =
         backgroundTask {
-            let builder =
-                NpgsqlConnectionStringBuilder(connectionString, Pooling = false, Enlist = false)
+            let conn = build ()
 
-            let conn = new NpgsqlConnection(builder.ConnectionString)
-            do! conn.OpenAsync ct
-            return conn
+            try
+                do! openAsync conn ct
+                return conn
+            with error ->
+                abandon conn
+                return raise error
         }
+
+    /// A dedicated connection that neither pools nor enlists, for going around a pooler.
+    let openDirect (connectionString: string) (ct: CancellationToken) : Task<NpgsqlConnection> =
+        openDirectWith
+            (fun () ->
+                let builder =
+                    NpgsqlConnectionStringBuilder(connectionString, Pooling = false, Enlist = false)
+
+                new NpgsqlConnection(builder.ConnectionString))
+            (fun conn ct -> conn.OpenAsync ct)
+            (fun conn -> conn.Dispose())
+            ct
 
     /// A connection from the data source, opened with any ambient transaction suppressed. A
     /// listening session inside a long transaction stops the server clearing its notification

@@ -1,7 +1,86 @@
 namespace ByzantineSystems.Automata.DependencyInjection
 
+open System
 open ByzantineSystems.Automata.Resilience
 open Microsoft.Extensions.Logging
+
+/// <summary>
+/// Cached log delegates, one per message: the template is parsed once, so a log call neither
+/// parses a format string nor boxes an argument array. Each carries its delegate type
+/// explicitly, because F# resolves <c>LoggerMessage.Define</c>'s overloads by return type.
+/// </summary>
+[<RequireQualifiedAccess>]
+module internal Log =
+
+    let retryScheduled: Action<ILogger, string, int, TimeSpan, exn> =
+        LoggerMessage.Define<string, int, TimeSpan>(
+            LogLevel.Warning,
+            EventId(1001, "RetryScheduled"),
+            "Automata machine {MachineKey} scheduled retry attempt {AttemptNumber} after {RetryDelay}"
+        )
+
+    let attemptTimedOut: Action<ILogger, string, TimeSpan, exn> =
+        LoggerMessage.Define<string, TimeSpan>(
+            LogLevel.Warning,
+            EventId(1002, "AttemptTimedOut"),
+            "Automata machine {MachineKey} operation attempt exceeded its {TimeoutBudget} timeout"
+        )
+
+    let totalTimedOut: Action<ILogger, string, TimeSpan, exn> =
+        LoggerMessage.Define<string, TimeSpan>(
+            LogLevel.Error,
+            EventId(1003, "TotalTimedOut"),
+            "Automata machine {MachineKey} operation exceeded its total {TimeoutBudget} timeout"
+        )
+
+    let circuitOpened: Action<ILogger, string, TimeSpan, exn> =
+        LoggerMessage.Define<string, TimeSpan>(
+            LogLevel.Error,
+            EventId(1004, "CircuitOpened"),
+            "Automata machine {MachineKey} dependency circuit opened for {BreakDuration}"
+        )
+
+    let circuitClosed: Action<ILogger, string, exn> =
+        LoggerMessage.Define<string>(
+            LogLevel.Information,
+            EventId(1005, "CircuitClosed"),
+            "Automata machine {MachineKey} dependency circuit closed"
+        )
+
+    let childStarted: Action<ILogger, string, string, string, DateTimeOffset, exn> =
+        LoggerMessage.Define<string, string, string, DateTimeOffset>(
+            LogLevel.Information,
+            EventId(1101, "ChildStarted"),
+            "Automata machine {MachineKey} child {ChildId}: {SupervisionReason} at {OccurredAt}"
+        )
+
+    let childRestarted: Action<ILogger, string, string, string, DateTimeOffset, exn> =
+        LoggerMessage.Define<string, string, string, DateTimeOffset>(
+            LogLevel.Warning,
+            EventId(1102, "ChildRestarted"),
+            "Automata machine {MachineKey} child {ChildId}: {SupervisionReason} at {OccurredAt}"
+        )
+
+    let childEscalated: Action<ILogger, string, string, string, DateTimeOffset, exn> =
+        LoggerMessage.Define<string, string, string, DateTimeOffset>(
+            LogLevel.Error,
+            EventId(1103, "ChildEscalated"),
+            "Automata machine {MachineKey} child {ChildId}: {SupervisionReason} at {OccurredAt}"
+        )
+
+    let childStopped: Action<ILogger, string, string, string, DateTimeOffset, exn> =
+        LoggerMessage.Define<string, string, string, DateTimeOffset>(
+            LogLevel.Information,
+            EventId(1104, "ChildStopped"),
+            "Automata machine {MachineKey} child {ChildId}: {SupervisionReason} at {OccurredAt}"
+        )
+
+    let hostedServiceFailed: Action<ILogger, string, exn> =
+        LoggerMessage.Define<string>(
+            LogLevel.Error,
+            EventId(1201, "HostedServiceFailed"),
+            "Automata hosted service for machine {MachineKey} failed"
+        )
 
 /// <summary>
 /// Structured logging owned by the host-integration layer. Core state transitions and storage
@@ -24,52 +103,22 @@ module AutomataLog =
     let pipelineEvent (logger: ILogger) machineKey =
         function
         | RetryScheduled(attemptNumber, delay) ->
-            logger.LogWarning(
-                EventId(1001, "RetryScheduled"),
-                "Automata machine {MachineKey} scheduled retry attempt {AttemptNumber} after {RetryDelay}",
-                [| box machineKey; box attemptNumber; box delay |]
-            )
-        | AttemptTimedOut budget ->
-            logger.LogWarning(
-                EventId(1002, "AttemptTimedOut"),
-                "Automata machine {MachineKey} operation attempt exceeded its {TimeoutBudget} timeout",
-                [| box machineKey; box budget |]
-            )
-        | TotalTimedOut budget ->
-            logger.LogError(
-                EventId(1003, "TotalTimedOut"),
-                "Automata machine {MachineKey} operation exceeded its total {TimeoutBudget} timeout",
-                [| box machineKey; box budget |]
-            )
-        | CircuitOpened breakDuration ->
-            logger.LogError(
-                EventId(1004, "CircuitOpened"),
-                "Automata machine {MachineKey} dependency circuit opened for {BreakDuration}",
-                [| box machineKey; box breakDuration |]
-            )
-        | CircuitClosed ->
-            logger.LogInformation(
-                EventId(1005, "CircuitClosed"),
-                "Automata machine {MachineKey} dependency circuit closed",
-                [| box machineKey |]
-            )
+            Log.retryScheduled.Invoke(logger, machineKey, attemptNumber, delay, null)
+        | AttemptTimedOut budget -> Log.attemptTimedOut.Invoke(logger, machineKey, budget, null)
+        | TotalTimedOut budget -> Log.totalTimedOut.Invoke(logger, machineKey, budget, null)
+        | CircuitOpened breakDuration -> Log.circuitOpened.Invoke(logger, machineKey, breakDuration, null)
+        | CircuitClosed -> Log.circuitClosed.Invoke(logger, machineKey, null)
 
     let internal supervisionEvent (logger: ILogger) machineKey (event: SupervisionEvent) =
-        let values = [| box machineKey; box event.ChildId; box event.Reason; box event.At |]
-
-        let template =
-            "Automata machine {MachineKey} child {ChildId}: {SupervisionReason} at {OccurredAt}"
-
         match event.Kind with
-        | SupervisionEventKind.Started -> logger.LogInformation(EventId(1101, "ChildStarted"), template, values)
-        | SupervisionEventKind.Restarted -> logger.LogWarning(EventId(1102, "ChildRestarted"), template, values)
-        | SupervisionEventKind.Escalated -> logger.LogError(EventId(1103, "ChildEscalated"), template, values)
-        | SupervisionEventKind.Stopped -> logger.LogInformation(EventId(1104, "ChildStopped"), template, values)
+        | SupervisionEventKind.Started ->
+            Log.childStarted.Invoke(logger, machineKey, event.ChildId, event.Reason, event.At, null)
+        | SupervisionEventKind.Restarted ->
+            Log.childRestarted.Invoke(logger, machineKey, event.ChildId, event.Reason, event.At, null)
+        | SupervisionEventKind.Escalated ->
+            Log.childEscalated.Invoke(logger, machineKey, event.ChildId, event.Reason, event.At, null)
+        | SupervisionEventKind.Stopped ->
+            Log.childStopped.Invoke(logger, machineKey, event.ChildId, event.Reason, event.At, null)
 
     let internal hostedServiceFailed (logger: ILogger) machineKey (error: exn) =
-        logger.LogError(
-            EventId(1201, "HostedServiceFailed"),
-            error,
-            "Automata hosted service for machine {MachineKey} failed",
-            [| box machineKey |]
-        )
+        Log.hostedServiceFailed.Invoke(logger, machineKey, error)

@@ -19,6 +19,9 @@ open Npgsql
 type TemporalOptions<'EntityId, 'State> =
     {
         Context: PostgresContext
+        /// <summary>The clock "what do we believe now" is asked from, so a host owns it and a test
+        /// can hold it still.</summary>
+        TimeProvider: TimeProvider
         StateCodec: Codec<'State>
         EntityIdEncode: 'EntityId -> string
         /// <summary>Decoding returns a result, so a corrupt row is a typed failure rather than an exception.</summary>
@@ -128,7 +131,7 @@ type PostgresTemporalStore<'EntityId, 'State>(options: TemporalOptions<'EntityId
             // The clock is read here and nowhere else in this type. "What do we think now" is the
             // one temporal question whose second coordinate is the present; a caller wanting any
             // other one calls AsOf and says so.
-            asOf machineId entityId validAt DateTimeOffset.UtcNow ct
+            asOf machineId entityId validAt (options.TimeProvider.GetUtcNow()) ct
 
         member _.AsOf(machineId, entityId, validAt, knownAt, ct) =
             asOf machineId entityId validAt knownAt ct

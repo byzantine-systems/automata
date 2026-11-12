@@ -146,7 +146,10 @@ type Lamp() =
             Task.FromResult(Ok())
 
 let host (connectionString: string) =
-    let context = PostgresContext.ofConnectionString connectionString
+    // One pooled data source per process: its owner builds it, hands every store the context
+    // made from it, and disposes it when the process ends.
+    let source = DataSource.create connectionString
+    let context = PostgresContext.create source TransientPolicy.defaults ignore
     let builder = Host.CreateApplicationBuilder()
 
     builder.Services
