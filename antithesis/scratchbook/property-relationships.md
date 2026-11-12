@@ -1,6 +1,6 @@
 ---
 sut_path: /home/mbenevides/Code/Personal/byzantine-systems/automata
-commit: 9bdc555187e735cdf31431de3515832d3d0fc9d3
+commit: 4ddd56f070aeb0a1d03b4c01bf620f4da3fb1933
 updated: 2026-11-12
 external_references: []
 ---
@@ -47,12 +47,16 @@ durability observations vacuous (actions "delivered" to the wrong place).
 ## Cluster: runtime loops
 
 `poll-loop-bounded-stack-and-memory`, `cancellation-stops-promptly`,
-`notification-loss-latency-not-correctness`, `send-settles-when-outcome-known`.
+`notification-loss-latency-not-correctness`, `send-settles-when-outcome-known`,
+`pre-canceled-call-does-no-work`, `task-completion-context-independent`.
 
-All four live in the same four loops (processor, dispatcher, observer drain,
+All six live in the same runtime boundary (processor, dispatcher, observer drain,
 `Recurring.repeat`/`awaitSettled`). The B10 rewrite (E41) is the shared
 mechanism for the first two; the E44 fix is the mechanism for the fourth.
 Notification-loss is only coupled by sharing the wake-up machinery.
+`pre-canceled-call-does-no-work` is cancellation's API-entry complement to
+loop shutdown, while `task-completion-context-independent` protects every
+continuation in the same call paths from caller-context deadlock.
 
 ## Cluster: history integrity (PostgreSQL)
 

@@ -1,6 +1,6 @@
 ---
 sut_path: /home/mbenevides/Code/Personal/byzantine-systems/automata
-commit: 9bdc555187e735cdf31431de3515832d3d0fc9d3
+commit: 4ddd56f070aeb0a1d03b4c01bf620f4da3fb1933
 updated: 2026-11-12
 external_references: []
 ---
@@ -96,3 +96,19 @@ an integration check across the lenses:
   breaker (default is `None`) with timeline-scaled durations.
 
 Conclusion: the new category integrates; no further evaluation pass needed.
+
+## Re-evaluation: TAP boundary expansion (2026-11-12)
+
+- **Fit:** `pre-canceled-call-does-no-work` and
+  `task-completion-context-independent` are deterministic-primary. Antithesis
+  contributes scheduling and throttling variation but does not replace the
+  exact task-status and blocked-context regressions, so both are low priority.
+- **Coverage balance:** both extend the existing runtime cluster rather than
+  creating a new category. The catalog now has 27 properties: 18 `Always`,
+  6 `Sometimes`, and 3 `AlwaysOrUnreachable`.
+- **Implementability:** neither needs a new topology. The workload can observe
+  operation traces and completion markers; no SUT-side SDK assertion is
+  required for B11.
+
+Conclusion: the expansion is proportionate and introduces no new evaluation
+bias or topology requirement.

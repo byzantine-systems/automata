@@ -1,13 +1,13 @@
 ---
 sut_path: /home/mbenevides/Code/Personal/byzantine-systems/automata
-commit: 9bdc555187e735cdf31431de3515832d3d0fc9d3
+commit: 4ddd56f070aeb0a1d03b4c01bf620f4da3fb1933
 updated: 2026-11-12
 external_references: []
 ---
 
 # Property Catalog
 
-21 properties. Categories follow the system's architecture. Every property
+27 properties. Categories follow the system's architecture. Every property
 names a deterministic counterpart where one already exists (FsCheck law or
 integration regression) — Antithesis adds the timing, concurrency and partial-
 failure dimension those cannot reach. No property below is instrumented yet
@@ -200,7 +200,7 @@ Covers the loops, cancellation and notification paths shared by both providers.
 |---|---|
 | **Type** | Safety |
 | **Property** | Sustained polling with a synchronously-completing store neither overflows the stack nor retains per-iteration state indefinitely. |
-| **Invariant** | `AlwaysOrUnreachable`: whenever a loop drains >= N iterations, stack depth and retained memory stay bounded (tolerance-based check). Known **defect today** (E41 recursive `task` loops); property validates the B10 rewrite. |
+| **Invariant** | `AlwaysOrUnreachable`: whenever a loop drains >= N iterations, stack depth and retained memory stay bounded (tolerance-based check). Deterministic counterpart: B10's 100k-iteration child-process stress test (commit 4ddd56f). |
 | **Antithesis Angle** | CPU modulation and throttling stretch iterations so growth accumulates across fault windows; a pure deterministic test would need the rewritten loop anyway. |
 | **Why It Matters** | Every long-running host leaks until it dies; stack overflow cannot be caught. |
 
@@ -249,6 +249,34 @@ Covers the loops, cancellation and notification paths shared by both providers.
 **Open Questions:**
 
 - Should a purged-while-awaited command answer with a typed "purged" outcome rather than erroring through the poll loop? `(needs human input)`
+
+### pre-canceled-call-does-no-work — Cancellation is an entry boundary
+
+| | |
+|---|---|
+| **Type** | Safety |
+| **Property** | A public store call entered with an already-canceled token returns a canceled task carrying that token and performs no encoding, callback, connection, or durable operation. |
+| **Invariant** | `Always`: whenever the token is canceled at invocation, the operation trace is empty and the returned task has `Canceled` status. Deterministic counterpart: B11 TAP contract tests over every provider capability. |
+| **Antithesis Angle** | Cancellation races workload dispatch and process throttling at the API boundary; no fault schedule may make a pre-canceled operation observable by the store. |
+| **Why It Matters** | Doing work after cancellation can persist commands a caller was told never started, and makes shutdown latency depend on avoidable I/O. |
+
+**Open Questions:**
+
+- None; B11 rejects null generic entity IDs and defines pre-cancellation before all validation-independent work.
+
+### task-completion-context-independent — Library tasks do not capture callers
+
+| | |
+|---|---|
+| **Type** | Liveness |
+| **Property** | Public library tasks complete without requiring the caller's `SynchronizationContext` or non-default scheduler to run their continuations. |
+| **Invariant** | `Sometimes(cond)`: every operation whose dependency completes eventually reaches its own completion marker even while the invoking context is blocked. Deterministic counterpart: B11's non-pumping-context `Machine.send(...).Result` regression. |
+| **Antithesis Angle** | CPU throttling and asynchronous dependency completion vary which continuation is ready while the caller remains blocked; completion must stay on context-free workers. |
+| **Why It Matters** | A library that captures a UI or legacy ASP.NET context can deadlock a caller even though the database and workers are healthy. |
+
+**Open Questions:**
+
+- None; generated SqlHydra factories are outside the supported API and remain explicit source-guard exceptions.
 
 ## Category: Temporal and corrections (PostgreSQL)
 
@@ -414,6 +442,8 @@ primary oracle, asserted opportunistically.
 | cancellation-stops-promptly | medium |
 | notification-loss-latency-not-correctness | high |
 | send-settles-when-outcome-known | medium |
+| pre-canceled-call-does-no-work | low |
+| task-completion-context-independent | low |
 | correction-atomic-belief-rewrite | medium |
 | correction-fenced-replay-bounded | medium |
 | purge-removes-all-command-dependents | medium |

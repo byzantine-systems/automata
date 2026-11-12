@@ -11,11 +11,11 @@
 - Failure scenario: a warm SQLite file or fast store makes every poll
   complete synchronously; 100k iterations leak state machines and eventually
   raise uncatchable `StackOverflowException`.
-- Key observations: diagnosis is from F# semantics, not yet from a failing
-  test. NEW_PLAN B10 mandates writing the failing test first (100k
-  iterations, flat `GC.GetTotalMemory` between checkpoints), then rewriting
-  as `while` loops with `Task.Yield()` on the synchronous full-batch path.
-  Property validates the *rewritten* loop; it is a known defect today.
+- Key observations: the deterministic oracle failed against the recursive
+  implementation with 3,570 additional stack frames over 256 synchronous
+  steps. B10 rewrote the loops as `while` state machines, added `Task.Yield()`
+  on synchronous full batches, and now runs 100k steps in a child process with
+  bounded retained memory (commit 4ddd56f).
 
 ## Instrumentation
 
@@ -26,8 +26,9 @@
 
 ## Open Questions
 
-- Robust N and memory tolerance inside a 15-minute timeline: partial — plan
-  targets 100k iterations vs baseline; final tolerance TBD when instrumented.
+- Robust N and memory tolerance inside a 15-minute timeline: partial — the
+  deterministic oracle uses N=100k and a 4 MB tolerance between 10k and 100k;
+  the fault-context tolerance remains TBD when instrumented.
 
 ### Investigation Log
 
