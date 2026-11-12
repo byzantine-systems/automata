@@ -28,6 +28,6 @@ type InMemorySupervisionStore() =
 
     interface ISupervisionEventStore with
 
-        member _.Record(record, _) =
+        member _.RecordAsync(record, cancellationToken) =
             records.Enqueue record
             Task.FromResult(Ok())

@@ -329,7 +329,7 @@ let commandIdOf (outcome: SubmissionOutcome) : CommandId =
 /// Submits one command and answers its id.
 let submit (inbox: Inbox) (entity: Entity) (key: string) (event: TestEvent) : Task<CommandId> =
     task {
-        let! outcome = inbox.Submit(submission entity key event, noCancellation)
+        let! outcome = inbox.SubmitAsync(submission entity key event, noCancellation)
         return outcome |> expectOk $"submit {key}" |> commandIdOf
     }
 
@@ -337,7 +337,7 @@ let submit (inbox: Inbox) (entity: Entity) (key: string) (event: TestEvent) : Ta
 let claim (inbox: Inbox) (batch: int) : Task<Claimed list> =
     task {
         let! claimed =
-            inbox.Claim(
+            inbox.ClaimAsync(
                 testMachine,
                 ClaimBatch.create batch,
                 LeaseDuration.create (TimeSpan.FromSeconds 30.0),

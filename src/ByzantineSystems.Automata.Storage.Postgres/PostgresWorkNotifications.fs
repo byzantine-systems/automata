@@ -169,9 +169,9 @@ type PostgresWorkNotifications(context: PostgresContext, queue: string, connecti
 
     interface IWorkNotifications with
 
-        member _.Listen(machineId, onCommands, onActions, ct) =
+        member _.ListenAsync(machineId, onCommands, onActions, cancellationToken) =
             match connection with
             | ListenerConnection.Off -> Task.FromResult(Ok())
             | ListenerConnection.SameDataSource
             | ListenerConnection.Direct _ ->
-                Db.protectOnce (session (MachineId.value machineId) onCommands onActions) ct
+                Db.protectOnce (session (MachineId.value machineId) onCommands onActions) cancellationToken

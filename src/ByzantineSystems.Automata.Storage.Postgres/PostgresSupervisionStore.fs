@@ -25,7 +25,7 @@ type PostgresSupervisionStore(context: PostgresContext) =
 
     interface ISupervisionEventStore with
 
-        member _.Record(entry, ct) =
+        member _.RecordAsync(entry, cancellationToken) =
             Sql.runProgram
                 context
                 (StoreProgram.executeDiscard
@@ -36,7 +36,7 @@ type PostgresSupervisionStore(context: PostgresContext) =
                       "strategy", Param.Text(EnumCodec.encode EnumCodec.supervisionStrategy entry.Strategy)
                       "reason", Param.Jsonb(JsonSerializer.Serialize entry.Reason)
                       "at", Param.Timestamp entry.At ])
-                ct
+                cancellationToken
 
 /// <summary>Read-side query adapters for the supervision audit log.</summary>
 [<RequireQualifiedAccess>]

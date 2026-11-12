@@ -249,10 +249,10 @@ type internal MaintenanceService
 
         Task.CompletedTask
 
-    let notify = attempt "notify" maintenance.NotifyPending notified
+    let notify = attempt "notify" maintenance.NotifyPendingAsync notified
 
     let repair =
-        attempt "repair" maintenance.RepairDrift (logAll MaintenanceLog.repaired)
+        attempt "repair" maintenance.RepairDriftAsync (logAll MaintenanceLog.repaired)
 
     let drifted ct (drift: BlockedDrift list) : Task =
         backgroundTask {
@@ -263,11 +263,11 @@ type internal MaintenanceService
         }
 
     let checkDrift ct =
-        attempt "drift" maintenance.DetectDrift (drifted ct) ct
+        attempt "drift" maintenance.DetectDriftAsync (drifted ct) ct
 
     let pass ct : Task =
         backgroundTask {
-            do! attempt "run" (fun ct -> maintenance.Run(batch, ct)) (logAll MaintenanceLog.pass) ct
+            do! attempt "run" (fun ct -> maintenance.RunAsync(batch, ct)) (logAll MaintenanceLog.pass) ct
             do! checkDrift ct
         }
 
@@ -289,7 +289,7 @@ type internal MaintenanceService
         match options.Scheduler with
         | MaintenanceScheduler.InProcess -> Task.FromResult MaintenanceScheduler.InProcess
         | MaintenanceScheduler.InDatabase ->
-            maintenance.Schedule(options.NotifyEvery, options.RunEvery, batch, ct)
+            maintenance.ScheduleAsync(options.NotifyEvery, options.RunEvery, batch, ct)
             |> Task.map scheduling
 
     let run (scheduler: MaintenanceScheduler) (ct: CancellationToken) : Task<unit> =

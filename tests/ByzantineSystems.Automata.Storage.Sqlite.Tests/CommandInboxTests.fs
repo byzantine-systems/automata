@@ -25,14 +25,14 @@ let private reject (fixture: Fixture) (held: Claimed) =
     task {
         let! outcome =
             (processorOf fixture)
-                .Reject(held.Work.CommandId, held.Token, CommandFailure.Domain(Refused "done"), noCancellation)
+                .RejectAsync(held.Work.CommandId, held.Token, CommandFailure.Domain(Refused "done"), noCancellation)
 
         return outcome |> expectOk "reject"
     }
 
 let private readBack (inbox: Inbox) (commandId: CommandId) =
     task {
-        match! inbox.TryGet(commandId, noCancellation) with
+        match! inbox.TryGetAsync(commandId, noCancellation) with
         | Ok(Some record) -> return record
         | other -> return failtestf "the command should exist, got %A" other
     }
@@ -123,7 +123,7 @@ let internal poisonFixture actions count payload =
 
         for index in 1..count do
             let! submitted =
-                inbox.Submit(submission (entity $"poison-{index}") $"k{index}" (Start payload), noCancellation)
+                inbox.SubmitAsync(submission (entity $"poison-{index}") $"k{index}" (Start payload), noCancellation)
 
             ids.Add(submitted |> expectOk "submit" |> commandIdOf)
 
@@ -132,7 +132,7 @@ let internal poisonFixture actions count payload =
 
             for row in held do
                 let! committed =
-                    processor.Commit(
+                    processor.CommitAsync(
                         row.Work.CommandId,
                         row.Token,
                         Epoch.initial,
@@ -161,7 +161,7 @@ let internal poisonFixture actions count payload =
                         if actions then
                             let! rows =
                                 (actionsOf db)
-                                    .Claim(
+                                    .ClaimAsync(
                                         testMachine,
                                         ClaimBatch.create count,
                                         LeaseDuration.create (TimeSpan.FromMinutes 1.),
@@ -171,7 +171,7 @@ let internal poisonFixture actions count payload =
                             return rows |> Result.map (List.map (fun row -> row.Work.CommandId))
                         else
                             let! rows =
-                                inbox.Claim(
+                                inbox.ClaimAsync(
                                     testMachine,
                                     ClaimBatch.create count,
                                     LeaseDuration.create (TimeSpan.FromMinutes 1.),
@@ -191,7 +191,7 @@ let internal poisonFixture actions count payload =
                                     [ "@id", box (CommandId.value id) ]
                                 |> List.exists (fun reason -> reason.StartsWith "undecodable:")
                         else
-                            let! result = processor.TryGetResult(id, noCancellation)
+                            let! result = processor.TryGetResultAsync(id, noCancellation)
 
                             return
                                 match result with
@@ -254,7 +254,7 @@ let tests =
                   { submission (entity "e1") "k1" (Start 1) with
                       ChartVersion = ChartVersion.create 7 }
 
-              match! inbox.Submit(unregistered, noCancellation) with
+              match! inbox.SubmitAsync(unregistered, noCancellation) with
               | Error(StoreError.NotFound what) -> Expect.stringContains what "7" "the error names the missing version"
               | other -> failtestf "expected NotFound, got %A" other
 
@@ -272,7 +272,7 @@ let tests =
                               Tenant = Some "acme"
                               Principal = Some "operator@example.test" } }
 
-              let! outcome = inbox.Submit(request, noCancellation)
+              let! outcome = inbox.SubmitAsync(request, noCancellation)
               let! record = readBack inbox (outcome |> expectOk "submit" |> commandIdOf)
 
               Expect.equal record.Audit.Tenant (Some "acme") "a supplied field comes back"
@@ -293,7 +293,7 @@ let tests =
                                   ReplayLimit = 42 }
                           ) }
 
-              let! _ = inbox.Submit(correction, noCancellation)
+              let! _ = inbox.SubmitAsync(correction, noCancellation)
               let! head = claimOne inbox
 
               match head.Work.Kind with
@@ -314,7 +314,7 @@ let tests =
               let! results =
                   [ for name in entities do
                         for index in 1..perEntity ->
-                            inbox.Submit(submission (entity name) $"{name}-{index}" (Start index), noCancellation) ]
+                            inbox.SubmitAsync(submission (entity name) $"{name}-{index}" (Start index), noCancellation) ]
                   |> Task.WhenAll
 
               for result in results do

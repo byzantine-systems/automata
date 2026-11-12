@@ -305,8 +305,8 @@ let tests =
           testTask "a blocked command can never be leased" {
               do! reset ()
               let inbox = newInbox ()
-              let! _ = inbox.Submit(submission (entityId "e1") "k1" Finish, noCancellation)
-              let! _ = inbox.Submit(submission (entityId "e1") "k2" Finish, noCancellation)
+              let! _ = inbox.SubmitAsync(submission (entityId "e1") "k1" Finish, noCancellation)
+              let! _ = inbox.SubmitAsync(submission (entityId "e1") "k2" Finish, noCancellation)
 
               // The non-clamped check: derived state that drifts must fail loudly at the write.
               match exec "UPDATE fsm.command SET status = 'leased', lease_token = 1 WHERE seq = 2" with
@@ -321,8 +321,8 @@ let tests =
           testTask "an entity cannot have two claimable commands" {
               do! reset ()
               let inbox = newInbox ()
-              let! _ = inbox.Submit(submission (entityId "e1") "k1" Finish, noCancellation)
-              let! _ = inbox.Submit(submission (entityId "e1") "k2" Finish, noCancellation)
+              let! _ = inbox.SubmitAsync(submission (entityId "e1") "k1" Finish, noCancellation)
+              let! _ = inbox.SubmitAsync(submission (entityId "e1") "k2" Finish, noCancellation)
 
               match exec "UPDATE fsm.command SET blocked = false WHERE seq = 2" with
               | Ok() -> failtest "two unblocked commands for one entity should be impossible"
@@ -336,7 +336,7 @@ let tests =
           testTask "a ready command cannot carry a lease token" {
               do! reset ()
               let inbox = newInbox ()
-              let! _ = inbox.Submit(submission (entityId "e1") "k1" Finish, noCancellation)
+              let! _ = inbox.SubmitAsync(submission (entityId "e1") "k1" Finish, noCancellation)
 
               match exec "UPDATE fsm.command SET lease_token = 5 WHERE seq = 1" with
               | Ok() -> failtest "a ready command holding a token should be impossible"

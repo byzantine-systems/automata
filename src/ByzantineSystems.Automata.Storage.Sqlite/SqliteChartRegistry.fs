@@ -30,7 +30,7 @@ type SqliteChartRegistry(options: ChartRegistryOptions) =
 
     interface IChartRegistry with
 
-        member _.Register(identity, ct) =
+        member _.RegisterAsync(identity, cancellationToken) =
             let key =
                 [ "@machine_id", Param.Text(MachineId.value identity.MachineId)
                   "@version", Param.Integer(int64 (ChartVersion.value identity.Version)) ]
@@ -58,9 +58,9 @@ type SqliteChartRegistry(options: ChartRegistryOptions) =
                                 let! parsed = parse stored
                                 return ChartRegistration.Mismatched parsed
                     })
-                ct
+                cancellationToken
 
-        member _.TryGet(machineId, version, ct) =
+        member _.TryGetAsync(machineId, version, cancellationToken) =
             Sql.readProgram
                 context
                 (StoreProgram.tryQueryOne
@@ -68,4 +68,4 @@ type SqliteChartRegistry(options: ChartRegistryOptions) =
                     [ "@machine_id", Param.Text(MachineId.value machineId)
                       "@version", Param.Integer(int64 (ChartVersion.value version)) ]
                     (fun reader -> parse (Row.string reader "fingerprint")))
-                ct
+                cancellationToken

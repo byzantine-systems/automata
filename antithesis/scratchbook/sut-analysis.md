@@ -22,10 +22,10 @@ A modular F#/.NET 10 statechart toolkit for durable entity workflows
 Storage (contracts, store algebra), Storage.Postgres, Storage.Sqlite, Runtime
 (processor, dispatchers, Machine facade), Resilience (Polly pipelines,
 supervisor), DependencyInjection (hosted services). Data flow: caller
-submits an `EventEnvelope` through `ICommandInbox.Submit` -> per-entity
+submits an `EventEnvelope` through `ICommandInbox.SubmitAsync` -> per-entity
 durable ordering -> worker `CommandProcessor.PollAsync` claims a batch ->
 pure `Chart.resolve` (`src/ByzantineSystems.Automata.Core/Chart.fs:338-397`) ->
-`ICommandProcessorStore.Commit` atomically finalizes -> `ActionDispatcher`
+`ICommandProcessorStore.CommitAsync` atomically finalizes -> `ActionDispatcher`
 claims queued actions from an `IActionQueue` and delivers them at least once.
 Callers and workers meet only through the database
 (`examples/ByzantineSystems.Automata.Examples.Hosted/Program.fs:139-178`).

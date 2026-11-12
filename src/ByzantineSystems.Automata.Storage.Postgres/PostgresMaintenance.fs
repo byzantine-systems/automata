@@ -223,16 +223,16 @@ type PostgresMaintenance(context: PostgresContext) =
 
     interface IDatabaseMaintenance with
 
-        member _.NotifyPending(ct) =
+        member _.NotifyPendingAsync(cancellationToken) =
             Sql.runProgram
                 context
                 (StoreProgram.queryOne notifyPending [] (fun row ->
                     Ok
                         { Sent = Row.int32 row "sent"
                           QueueUsage = row.GetDouble(row.GetOrdinal "queue_usage") }))
-                ct
+                cancellationToken
 
-        member _.Run(batch, ct) =
+        member _.RunAsync(batch, cancellationToken) =
             backgroundTaskResult {
                 let! reports =
                     Sql.runProgram
@@ -255,25 +255,25 @@ type PostgresMaintenance(context: PostgresContext) =
                                           PurgedActions = Row.int64 row "purged_actions"
                                           Drifted = Row.int64 row "drifted" }
                                 }))
-                        ct
+                        cancellationToken
 
-                do! refreshColdBeliefs ct
+                do! refreshColdBeliefs cancellationToken
                 return reports
             }
 
-        member _.DetectDrift(ct) =
-            Sql.readProgram context (StoreProgram.queryRows blockedDrift [] driftRow) ct
+        member _.DetectDriftAsync(cancellationToken) =
+            Sql.readProgram context (StoreProgram.queryRows blockedDrift [] driftRow) cancellationToken
 
-        member _.RepairDrift(ct) =
+        member _.RepairDriftAsync(cancellationToken) =
             Sql.runProgram
                 context
                 (StoreProgram.queryRows repairBlocked [] (fun row ->
                     Ok
                         { RepairedBlock.CommandId = CommandId.ofInt64 (Row.int64 row "command_id")
                           Blocked = Row.bool row "blocked" }))
-                ct
+                cancellationToken
 
-        member _.Schedule(notifyEvery, runEvery, batch, ct) =
+        member _.ScheduleAsync(notifyEvery, runEvery, batch, cancellationToken) =
             Sql.runProgram
                 context
                 (StoreProgram.queryOne
@@ -282,10 +282,10 @@ type PostgresMaintenance(context: PostgresContext) =
                       "run_every", Param.Interval runEvery
                       "batch", Param.Int(ClaimBatch.value batch) ]
                     (fun row -> Row.string row "scheduling" |> schedulingOf))
-                ct
+                cancellationToken
 
-        member _.Unschedule(ct) =
+        member _.UnscheduleAsync(cancellationToken) =
             Sql.runProgram
                 context
                 (StoreProgram.queryOne unscheduleMaintenance [] (fun row -> Row.int32 row "removed" |> Ok))
-                ct
+                cancellationToken

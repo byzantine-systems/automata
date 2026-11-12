@@ -76,37 +76,37 @@ type TestStore() =
     member _.OfferAction(action) = actions.Enqueue action
 
     interface ICommandInbox<Entity, TestEvent> with
-        member _.Submit(_, _) =
+        member _.SubmitAsync(_, cancellationToken) =
             Task.FromResult(Ok(Accepted(CommandId.ofInt64 1L)))
 
-        member this.Claim(_, _, _, _) =
+        member this.ClaimAsync(_, _, _, cancellationToken) =
             this.Claims <- this.Claims + 1
             Task.FromResult(Ok [])
 
-        member _.Reschedule(_, _, _, _) = Task.FromResult(Ok Updated)
-        member _.ExtendLease(_, _, _, _) = Task.FromResult(Ok Updated)
-        member _.TryGet(_, _) = Task.FromResult(Ok None)
-        member _.TryFind(_, _, _, _) = Task.FromResult(Ok None)
+        member _.RescheduleAsync(_, _, _, cancellationToken) = Task.FromResult(Ok Updated)
+        member _.ExtendLeaseAsync(_, _, _, cancellationToken) = Task.FromResult(Ok Updated)
+        member _.TryGetAsync(_, cancellationToken) = Task.FromResult(Ok None)
+        member _.TryFindAsync(_, _, _, cancellationToken) = Task.FromResult(Ok None)
 
     interface IStateReader<Entity, TestState, TestEvent, TestAction> with
-        member _.TryGetSnapshot(_, _, _) = Task.FromResult(Ok None)
-        member _.History(_, _, _, _) = Task.FromResult(Ok [])
+        member _.TryGetSnapshotAsync(_, _, cancellationToken) = Task.FromResult(Ok None)
+        member _.HistoryAsync(_, _, _, cancellationToken) = Task.FromResult(Ok [])
 
     interface ICommandProcessorStore<Entity, TestState, TestEvent, TestAction, string> with
-        member _.Commit(_, _, _, _, _) =
+        member _.CommitAsync(_, _, _, _, cancellationToken) =
             Task.FromResult(Ok(Finalized(Epoch.ofUInt64 1UL)))
 
-        member _.Reject(_, _, _, _) =
+        member _.RejectAsync(_, _, _, cancellationToken) =
             Task.FromResult(Ok(Finalized Epoch.initial))
 
-        member _.DeadLetter(_, _, _, _) =
+        member _.DeadLetterAsync(_, _, _, cancellationToken) =
             Task.FromResult(Ok(Finalized Epoch.initial))
 
-        member _.TryGetResult(_, _) = Task.FromResult(Ok None)
+        member _.TryGetResultAsync(_, cancellationToken) = Task.FromResult(Ok None)
 
     interface IActionQueue<Entity, TestAction> with
 
-        member this.Claim(_, batch, _, _) =
+        member this.ClaimAsync(_, batch, _, cancellationToken) =
             this.Claims <- this.Claims + 1
             let drained = ResizeArray()
             let mutable taking = true
@@ -118,12 +118,12 @@ type TestStore() =
 
             Task.FromResult(Ok(List.ofSeq drained))
 
-        member this.Complete(action, _) =
+        member this.CompleteAsync(action, cancellationToken) =
             lock this.Delivered (fun () -> this.Delivered.Add action.Work.Ordinal)
             Task.FromResult(Ok Updated)
 
-        member _.Reschedule(_, _, _) = Task.FromResult(Ok Updated)
-        member _.Abandon(_, _, _) = Task.FromResult(Ok Updated)
+        member _.RescheduleAsync(_, _, cancellationToken) = Task.FromResult(Ok Updated)
+        member _.AbandonAsync(_, _, cancellationToken) = Task.FromResult(Ok Updated)
 
     interface MachineStore
 
@@ -132,16 +132,16 @@ type RefusingStore() =
     inherit TestStore()
 
     interface IStoreBoot with
-        member _.Boot(_, _) =
+        member _.BootAsync(_, cancellationToken) =
             Task.FromResult(Ok(BootReport.Refused [ BootDefect.SchemaMissing ]))
 
 /// <summary>A registry that agrees with whatever a chart claims.</summary>
 type TestRegistry() =
     interface IChartRegistry with
-        member _.Register(_, _) =
+        member _.RegisterAsync(_, cancellationToken) =
             Task.FromResult(Ok ChartRegistration.Registered)
 
-        member _.TryGet(_, _, _) = Task.FromResult(Ok None)
+        member _.TryGetAsync(_, _, cancellationToken) = Task.FromResult(Ok None)
 
 /// <summary>Builds one leased action for the dispatcher to deliver.</summary>
 let leasedAction (ordinal: int) : LeasedAction<Entity, TestAction> =
@@ -229,5 +229,5 @@ let pollUntil (description: string) (predicate: unit -> bool) : Task =
 type FailingAuditStore(error: StoreError) =
     interface ISupervisionEventStore with
 
-        member _.Record(_record, _ct) =
+        member _.RecordAsync(_record, cancellationToken) =
             Task.FromResult(Result<unit, StoreError>.Error error)

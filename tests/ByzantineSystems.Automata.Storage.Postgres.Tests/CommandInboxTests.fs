@@ -21,13 +21,13 @@ let private lease = LeaseDuration.create (TimeSpan.FromSeconds 30.0)
 
 let private submit (inbox: Inbox) entityName key event =
     task {
-        let! outcome = inbox.Submit(submission (entity entityName) key event, noCancellation)
+        let! outcome = inbox.SubmitAsync(submission (entity entityName) key event, noCancellation)
         return outcome |> expectOk $"submit {key}"
     }
 
 let private claim (inbox: Inbox) batch : Task<Claimed list> =
     task {
-        let! claimed = inbox.Claim(machine, ClaimBatch.create batch, lease, noCancellation)
+        let! claimed = inbox.ClaimAsync(machine, ClaimBatch.create batch, lease, noCancellation)
         return claimed |> expectOk "claim"
     }
 
@@ -116,16 +116,16 @@ let internal poisonFixture actions count payload =
 
         for index in 1..count do
             let! submitted =
-                inbox.Submit(submission (entity $"poison-{index}") $"k{index}" (Start payload), noCancellation)
+                inbox.SubmitAsync(submission (entity $"poison-{index}") $"k{index}" (Start payload), noCancellation)
 
             ids.Add(submitted |> expectOk "submit" |> commandIdOf)
 
         if actions then
-            let! held = inbox.Claim(machine, ClaimBatch.create count, lease, noCancellation)
+            let! held = inbox.ClaimAsync(machine, ClaimBatch.create count, lease, noCancellation)
 
             for row in held |> expectOk "claim" do
                 let! committed =
-                    processor.Commit(
+                    processor.CommitAsync(
                         row.Work.CommandId,
                         row.Token,
                         Epoch.initial,
@@ -156,7 +156,7 @@ let internal poisonFixture actions count payload =
                         if actions then
                             let! rows =
                                 (newActionQueue ())
-                                    .Claim(
+                                    .ClaimAsync(
                                         machine,
                                         ClaimBatch.create count,
                                         LeaseDuration.create (TimeSpan.FromMinutes 1.),
@@ -166,7 +166,7 @@ let internal poisonFixture actions count payload =
                             return rows |> Result.map (List.map (fun row -> row.Work.CommandId))
                         else
                             let! rows =
-                                inbox.Claim(
+                                inbox.ClaimAsync(
                                     machine,
                                     ClaimBatch.create count,
                                     LeaseDuration.create (TimeSpan.FromMinutes 1.),
@@ -183,7 +183,7 @@ let internal poisonFixture actions count payload =
                                 scalar<bool>
                                     $"SELECT EXISTS (SELECT 1 FROM fsm.action_dead_letter WHERE command_id = {CommandId.value id} AND reason LIKE 'undecodable:%%')"
                         else
-                            let! result = processor.TryGetResult(id, noCancellation)
+                            let! result = processor.TryGetResultAsync(id, noCancellation)
 
                             return
                                 match result with
@@ -341,9 +341,9 @@ let tests =
                   { submission (entity "e1") "k1" (Start 1) with
                       Audit = audit }
 
-              let! outcome = inbox.Submit(request, noCancellation)
+              let! outcome = inbox.SubmitAsync(request, noCancellation)
               let commandId = commandIdOf (outcome |> expectOk "submit")
-              let! found = inbox.TryGet(commandId, noCancellation)
+              let! found = inbox.TryGetAsync(commandId, noCancellation)
 
               match found |> expectOk "read back" with
               | Some record ->
@@ -363,7 +363,7 @@ let tests =
               let submissions =
                   [ for name in entities do
                         for index in 1..perEntity ->
-                            inbox.Submit(submission (entity name) $"{name}-{index}" (Start index), noCancellation) ]
+                            inbox.SubmitAsync(submission (entity name) $"{name}-{index}" (Start index), noCancellation) ]
 
               let! results = Task.WhenAll submissions
 
@@ -385,7 +385,7 @@ let tests =
                       let mutable working = true
 
                       while working do
-                          let! claimed = inbox.Claim(machine, ClaimBatch.create 4, lease, noCancellation)
+                          let! claimed = inbox.ClaimAsync(machine, ClaimBatch.create 4, lease, noCancellation)
 
                           match claimed |> expectOk "worker claim" with
                           | [] -> working <- false
@@ -393,7 +393,7 @@ let tests =
                               for leased in batch do
                                   let! outcome =
                                       (newProcessor ())
-                                          .Reject(
+                                          .RejectAsync(
                                               leased.Work.CommandId,
                                               leased.Token,
                                               CommandFailure.Domain(Refused "done"),

@@ -128,7 +128,7 @@ let private stateOf (store: PostgresMachineStore<Entity, TestState, TestEvent, T
     task {
         let! snapshot =
             (store :> IStateReader<Entity, TestState, TestEvent, TestAction>)
-                .TryGetSnapshot(machine, entity name, noCancellation)
+                .TryGetSnapshotAsync(machine, entity name, noCancellation)
 
         return snapshot |> expectOk "snapshot"
     }

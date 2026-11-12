@@ -133,7 +133,7 @@ type ActionDispatcher<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectError whe
                 let reason =
                     Reason.create $"delivered %d{action.DeliveryCount} times without an outcome"
 
-                let! outcome = queue.Abandon(action, reason, ct)
+                let! outcome = queue.AbandonAsync(action, reason, ct)
 
                 return fenced outcome GaveUp
             else
@@ -152,14 +152,14 @@ type ActionDispatcher<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectError whe
                     handlerFailed action attempt
 
                 if succeeded then
-                    let! outcome = queue.Complete(action, ct)
+                    let! outcome = queue.CompleteAsync(action, ct)
                     return fenced outcome Delivered
                 elif action.DeliveryCount >= policy.MaxAttempts then
                     let reason = Reason.create $"undelivered after %d{action.DeliveryCount} attempts"
-                    let! outcome = queue.Abandon(action, reason, ct)
+                    let! outcome = queue.AbandonAsync(action, reason, ct)
                     return fenced outcome GaveUp
                 else
-                    let! outcome = queue.Reschedule(action, policy.Backoff, ct)
+                    let! outcome = queue.RescheduleAsync(action, policy.Backoff, ct)
                     return fenced outcome Retrying
         }
 
@@ -226,7 +226,7 @@ type ActionDispatcher<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectError whe
     member _.PollAsync(ct: CancellationToken) : Task<Result<DeliveryReport, MachineError<'Err>>> =
         taskResult {
             let! batch =
-                queue.Claim(machineId, claimBatch, leaseDuration, ct)
+                queue.ClaimAsync(machineId, claimBatch, leaseDuration, ct)
                 |> TaskResult.mapError MachineError.Store
 
             match batch with

@@ -105,7 +105,7 @@ let private stateOf (store: Store) name =
     task {
         let! snapshot =
             (store :> IStateReader<Entity, TestState, TestEvent, TestAction>)
-                .TryGetSnapshot(testMachine, entity name, noCancellation)
+                .TryGetSnapshotAsync(testMachine, entity name, noCancellation)
 
         return snapshot |> expectOk "snapshot" |> Option.map _.State
     }

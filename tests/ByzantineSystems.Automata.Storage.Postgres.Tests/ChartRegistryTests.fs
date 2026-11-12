@@ -21,7 +21,7 @@ let private identity version fingerprint =
 
 let private register (registry: IChartRegistry) version fingerprint : Task<ChartRegistration> =
     task {
-        let! outcome = registry.Register(identity version fingerprint, noCancellation)
+        let! outcome = registry.RegisterAsync(identity version fingerprint, noCancellation)
         return outcome |> expectOk $"register version {version}"
     }
 
@@ -117,7 +117,7 @@ let tests =
                   { submission (entityId "e1") "k1" (Start 1) with
                       ChartVersion = ChartVersion.create 7 }
 
-              let! outcome = inbox.Submit(unregistered, noCancellation)
+              let! outcome = inbox.SubmitAsync(unregistered, noCancellation)
 
               match outcome with
               | Error(StoreError.NotFound entity) ->
@@ -128,7 +128,7 @@ let tests =
 
               let registry = newRegistry ()
               let! _ = register registry 7 fingerprintA
-              let! accepted = inbox.Submit(unregistered, noCancellation)
+              let! accepted = inbox.SubmitAsync(unregistered, noCancellation)
 
               match accepted |> expectOk "submit once the version is registered" with
               | Accepted _ -> ()
@@ -141,7 +141,7 @@ let tests =
           testTask "a referenced version cannot be deleted" {
               do! reset ()
               let inbox = newInbox ()
-              let! _ = inbox.Submit(submission (entityId "e1") "k1" (Start 1), noCancellation)
+              let! _ = inbox.SubmitAsync(submission (entityId "e1") "k1" (Start 1), noCancellation)
 
               match exec "DELETE FROM fsm.machine_chart_version WHERE version = 1" with
               | Ok() -> failtest "deleting a referenced chart version should have been refused"

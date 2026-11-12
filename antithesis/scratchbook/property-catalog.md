@@ -167,7 +167,7 @@ Covers the at-least-once side-effect channel and its fencing.
 | | |
 |---|---|
 | **Type** | Safety |
-| **Property** | `Complete`/`Reschedule`/`Abandon` with an expired or superseded lease answers `LeaseLost` and changes nothing about the row another worker now holds. |
+| **Property** | `CompleteAsync`/`RescheduleAsync`/`AbandonAsync` with an expired or superseded lease answers `LeaseLost` and changes nothing about the row another worker now holds. |
 | **Invariant** | `Always`: a fenced acknowledgement leaves the action's ownership and status exactly as the current holder left them. |
 | **Antithesis Angle** | Slow handler (throttled container) whose lease expires mid-effect; second worker claims; first worker's ack arrives last. |
 | **Why It Matters** | A stale ack can delete or requeue a delivery another worker owns — duplicated or lost effects. |
@@ -333,7 +333,7 @@ Covers retention, purge and boot — the operator-facing safety net.
 | | |
 |---|---|
 | **Type** | Safety |
-| **Property** | `Suffix` reports `Incomplete` exactly when history at or below the requested `from` instant has been purged (via the `entity_purge` watermark), never by heuristic. |
+| **Property** | `SuffixAsync` reports `Incomplete` exactly when history at or below the requested `from` instant has been purged (via the `entity_purge` watermark), never by heuristic. |
 | **Invariant** | `Always`: `Incomplete` iff `max_purged_effective_at >= from` for that entity. Deterministic counterpart: `ReplayRetentionProperties.fs` (C7, 90e5ed3). |
 | **Antithesis Angle** | Purge and suffix query interleaving across connections (watermark write vs read). |
 | **Why It Matters** | Replay that trusts a heuristic over holes silently reconstructs wrong history. |

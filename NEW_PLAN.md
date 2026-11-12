@@ -304,7 +304,7 @@ Introduce `[<Struct>] type internal EntityKey = private EntityKey of string`, th
 `Param` gains no cases: conversion to `Param.Text` / `Param.Bigint` happens in one `Params` helper per id type.
 
 ### B7. Constrained arguments instead of request-time `invalidArg`
-`Claim`, `ExtendLease`, `Abandon`, `Run`, `Schedule`, `listRecent` and `register` validate their arguments with `invalidArg` inside `Task`-returning members, each at every call. The checks also differ by provider: PostgreSQL `Abandon` does not check `reason`, while SQLite's does (`SqliteActionQueue.fs:141`).
+`ClaimAsync`, `ExtendLeaseAsync`, `AbandonAsync`, `RunAsync`, `ScheduleAsync`, `listRecent` and `register` validate their arguments with `invalidArg` inside `Task`-returning members, each at every call. The checks also differ by provider: PostgreSQL `AbandonAsync` does not check `reason`, while SQLite's does (`SqliteActionQueue.fs:141`).
 
 Make invalid values unrepresentable instead (**public, breaking, unreleased**):
 ```fsharp
@@ -318,7 +318,7 @@ This matters for Phase B0 as well: a provider's interpreter inherits the validat
 
 ### B8. Small CE and interpreter fixes
 - **The interpreter leaks the connection** when a session constructor throws, and `Listener.openDirect` leaks it when `OpenAsync` throws (E19). Hold the connection under `use` until ownership passes, or dispose in a `try/finally` that ownership transfer disarms. The program layer cannot fix this; the interpreter owns sessions.
-- **Claim's corrections read joins the claim** (E32). Today `Claim` makes two runs, `runOnce` claim then `run` correction details. If the second run fails, the batch is leased and the call answers `Error`, so every entity in it stalls for the lease. Make `claim_commands` (and SQLite `claim.sql`) return the correction columns through a `LEFT JOIN`, so a claim is one statement. The shared `CommandInboxProgram` fixes this once for both providers.
+- **ClaimAsync's corrections read joins the claim** (E32). Today `ClaimAsync` makes two runs, `runOnce` claim then `run` correction details. If the second run fails, the batch is leased and the call answers `Error`, so every entity in it stalls for the lease. Make `claim_commands` (and SQLite `claim.sql`) return the correction columns through a `LEFT JOIN`, so a claim is one statement. The shared `CommandInboxProgram` fixes this once for both providers.
 - **`PostgresMachineStore.boot`** uses `taskResult`. Switch it to `backgroundTaskResult`, like the rest of the library.
 - **`StoreBuilder` stays minimal.** Still absent: binding a raw `Task` (a program must not open a second session under the first), `and!` (one connection cannot run two commands at once), `TryWith` (exception translation belongs to the interpreter's single boundary), `Using`. Add `For` only when a program needs a per-element loop. The Phase A finding carries over: the absences are the design.
 - **Two `<summary>` blocks collide** (E18):
@@ -329,7 +329,7 @@ This matters for Phase B0 as well: a provider's interpreter inherits the validat
 ### B9. .NET compliance
 - **Logging:** use `LoggerMessage.Define` cached delegates in `DependencyInjection/Logging.fs` and `Maintenance.fs`, in place of `LogX(eventId, format, box …)`. F# has no source generators, and `Define` is the allocation-free equivalent.
 - **Data source ownership:** `PostgresContext.ofConnectionString` builds an `NpgsqlDataSource` that nobody owns. Remove it from the public surface and keep `PostgresContext.create dataSource policy sink`. Examples build the data source under `use`. A host registers it once, through DI.
-- **Clocks:** `PostgresTemporalStore.ValidAt` reads `DateTimeOffset.UtcNow`. That changes in E (one clock, the database's); until then, use `TimeProvider`.
+- **Clocks:** `PostgresTemporalStore.ValidAtAsync` reads `DateTimeOffset.UtcNow`. That changes in E (one clock, the database's); until then, use `TimeProvider`.
 - **Cancellation:** `SqliteBoot.fs:141` calls `CloseAsync()` without the token. Both migrators stay synchronous, because DbUp is synchronous; document this rather than wrap it in `Task.Run`.
 
 ### B10. Runtime loops become `while` loops (E41)
@@ -345,7 +345,7 @@ F# `task` has no tail calls, so a loop that never ends should keep one pending s
 - On the full-batch path, `do! Task.Yield()` when the poll completed synchronously (*Consuming TAP*, `YieldLoop`). A synchronous store draining a backlog then shares the thread pool fairly, and `StopAsync` is seen promptly.
 
 ### B11. TAP conventions in F#: functional core, Task shell
-Sources: Microsoft's *Asynchronous programming patterns*, *TAP overview*, *Implementing TAP* and *Consuming TAP*. TAP is the recommended pattern; EAP and APM are legacy, and nothing in the repo uses APM. `IWorkNotifications.Listen` takes `onCommands`/`onActions` callbacks, but that is not EAP: there are no events and no `EventArgs`. Passing callbacks at call time is what TAP recommends for progress (`IProgress<T>`), because it avoids handlers registered after the operation starts. They stay as F# functions.
+Sources: Microsoft's *Asynchronous programming patterns*, *TAP overview*, *Implementing TAP* and *Consuming TAP*. TAP is the recommended pattern; EAP and APM are legacy, and nothing in the repo uses APM. `IWorkNotifications.ListenAsync` takes `onCommands`/`onActions` callbacks, but that is not EAP: there are no events and no `EventArgs`. Passing callbacks at call time is what TAP recommends for progress (`IProgress<T>`), because it avoids handlers registered after the operation starts. They stay as F# functions.
 
 | TAP rule | F# form | Change |
 |---|---|---|
@@ -389,14 +389,14 @@ Each fix starts with a failing test that reproduces it on today's schema.
 Today SQLite and PostgreSQL each carry their own `CommandInboxTests`, `ActionQueueTests`, `FinalizeTests`, `HistoryTests` and `ProcessorIntegrationTests`, written twice and already drifting (E29 is one result). The contract each suite defends is the same algebra, so the suite makes that explicit: **every contract rule is a named equation** with the interface operations as constructors and the typed outcomes as observations.
 
 The equation portfolio, each one a property in the suite:
-- **Idempotency:** `Submit(k, r) ▸ Submit(k, r) = AlreadySubmitted` (second submission returns the original command id).
-- **Key honesty:** `Submit(k, r) ▸ Submit(k, r') = Refused(KeyReused …)` once C5 lands.
+- **Idempotency:** `SubmitAsync(k, r) ▸ SubmitAsync(k, r) = AlreadySubmitted` (second submission returns the original command id).
+- **Key honesty:** `SubmitAsync(k, r) ▸ SubmitAsync(k, r') = Refused(KeyReused …)` once C5 lands.
 - **Claim exclusivity:** two claims never return the same command, and never two commands for one entity.
 - **Head-of-line order:** a committed command's successor for the same entity becomes claimable only after it.
-- **Fencing conservation:** `Commit` with an expired token answers `LeaseLost` and writes nothing; the log, snapshot and epoch are unchanged.
-- **Epoch atomicity:** `Commit` with the wrong expected epoch refuses and leaves no partial write.
+- **Fencing conservation:** `CommitAsync` with an expired token answers `LeaseLost` and writes nothing; the log, snapshot and epoch are unchanged.
+- **Epoch atomicity:** `CommitAsync` with the wrong expected epoch refuses and leaves no partial write.
 - **Dead-letter release:** a dead-lettered command releases its entity for the next claim.
-- **History visibility:** a commit appends exactly one transition, visible to `History` at its epoch.
+- **History visibility:** a commit appends exactly one transition, visible to `HistoryAsync` at its epoch.
 
 - **New test library** `tests/ByzantineSystems.Automata.Storage.Conformance` (Expecto, not a test runner itself). It exposes `Conformance.tests : StoreUnderTest -> Test`, where:
   ```fsharp
@@ -410,7 +410,7 @@ The equation portfolio, each one a property in the suite:
 - The suite tests **only through the public interfaces**, one named property per equation above.
 - Lease tests drive time through short real leases, because the clock belongs to the database in both providers. The suite takes a `Delay` from `StoreUnderTest` for that, rather than branching on the provider.
 - Both SQL test projects call `Conformance.tests`. Their duplicated contract tests are deleted, and what stays in them is schema-, SQL- or file-specific (`SchemaContractTests`, `CrossProcessTests`, migrations, boot). Program-level laws that interfaces cannot see live in B0's recording-interpreter tests instead.
-- The reproduction tests below go **into the suite** wherever the bug is observable through the interfaces (C2, C3 for corrupt payloads via a provider hook, C5, C6, C7's `Suffix` once E moves it to `ITransitionLog`). C1 and C4's SQL checks stay PostgreSQL-specific.
+- The reproduction tests below go **into the suite** wherever the bug is observable through the interfaces (C2, C3 for corrupt payloads via a provider hook, C5, C6, C7's `SuffixAsync` once E moves it to `ITransitionLog`). C1 and C4's SQL checks stay PostgreSQL-specific.
 
 ### C1. `fsm.purge_commands` wedges maintenance once a correction is old enough (E1)
 The routine deletes a doomed command's transition, error and dead letters, but not its `fsm.command_correction` row. That foreign key is NO ACTION (`009_correction.sql`), so once any correction passes the retention horizon, every `run_maintenance` fails for every machine.
@@ -422,11 +422,11 @@ The routine deletes a doomed command's transition, error and dead letters, but n
 - **Database-stamped:** take `CLOCK_TIMESTAMP()` *after* the lock, and clamp it with `GREATEST(…, predecessor.received_at)`, where the predecessor is the previous `seq` (one index probe on `command_unique_seq`). A system clock that steps backwards then cannot reorder an entity.
 - **Caller-supplied and earlier than the predecessor:** refuse it as a typed outcome rather than store it (see C5): `SubmissionOutcome.Refused(ArrivedBeforePredecessor predecessorReceivedAt)`.
 - SQLite does the same with the write session's `Now`, which is already read inside the `IMMEDIATE` transaction.
-- The rule is now part of the contract (stated on `ICommandInbox.Submit`).
+- The rule is now part of the contract (stated on `ICommandInbox.SubmitAsync`).
 
 ### C3. One undecodable row wedges a claim batch (E6)
-`Claim` decodes the batch with `List.traverseResultM`. One row whose event no longer decodes fails the whole call, and every other row in the batch stays leased until expiry, is reclaimed, and fails again. The same holds for actions.
-- `Claim` decodes per row. An undecodable command is dead-lettered by the store in a follow-up `run` (fenced by the token it just received), with `CommandFailure.Machine "undecodable: <type>: <message>"`. The rest of the batch is returned. An undecodable action is abandoned the same way, with a durable `action_dead_letter` row.
+`ClaimAsync` decodes the batch with `List.traverseResultM`. One row whose event no longer decodes fails the whole call, and every other row in the batch stays leased until expiry, is reclaimed, and fails again. The same holds for actions.
+- `ClaimAsync` decodes per row. An undecodable command is dead-lettered by the store in a follow-up `run` (fenced by the token it just received), with `CommandFailure.Machine "undecodable: <type>: <message>"`. The rest of the batch is returned. An undecodable action is abandoned the same way, with a durable `action_dead_letter` row.
 - If the follow-up write fails, the row is reclaimed after the lease and the store tries again. The processor's `DeliveryCount > MaxAttempts` path never sees these rows, so the store, not the processor, owns this.
 - Covers SQLite (`SqliteCommandInbox.fs:391`, `SqliteActionQueue.fs:114`) and PostgreSQL.
 
@@ -461,12 +461,12 @@ Resubmitting a key returns the original command, whatever the new request was. A
 A retry whose first attempt committed, but which now sends a rejection, is told `AlreadyFinalized`, and the caller cannot tell its resolution was not the one recorded. Change it to `AlreadyFinalized of stored: Epoch * status: CommandStatus` (**public**). The routine already reads `v_status`.
 
 ### C7. Smaller fixes
-- **`Suffix` completeness heuristic is wrong** (E5). It assumes epoch order equals `effective_at` order, which corrections break. Replace it with a watermark that `purge_commands` maintains:
+- **`SuffixAsync` completeness heuristic is wrong** (E5). It assumes epoch order equals `effective_at` order, which corrections break. Replace it with a watermark that `purge_commands` maintains:
   - an `entity_purge (machine_id, entity_id, max_purged_effective_at)` table, with no nullable columns (the sentinel is `'-infinity'`);
   - `Incomplete = max_purged_effective_at >= from`. This is exact, and costs one row per purged entity.
 - **A correction with an empty belief list leaves no live belief** (E16). The next ordinary commit then reads epoch 0 and collides on `(machine_id, entity_id, epoch)`.
   - `CorrectionCommit.Beliefs` becomes non-empty by type: `Beliefs: CorrectedBelief<'State> * CorrectedBelief<'State> list`.
-  - `ICorrectionStore.Correct` keeps allowing an empty list, because it is an operator tool. It can no longer move the epoch the processor reads (see E2 in Phase E).
+  - `ICorrectionStore.CorrectAsync` keeps allowing an empty list, because it is an operator tool. It can no longer move the epoch the processor reads (see E2 in Phase E).
 - **`Backoff` overflow** (E17): covered by B7.
 
 ### Phase C verification
@@ -476,10 +476,10 @@ Each item above has a reproduction test that fails before the fix:
 - Submit an earlier caller-supplied `ReceivedAt` and expect a refusal (suite).
 - Hand-corrupt one event in a claimable batch, and expect the rest delivered and that one dead-lettered.
 - Register queue A, configure queue B, and expect A to be used.
-- Commit actions with no queue registered and expect a named raise.
+- `CommitAsync` actions with no queue registered and expect a named raise.
 - Reuse a key with a different event and expect `KeyReused` (suite).
 - Run a finalize retry with a different resolution and check the reported status (suite).
-- Purge, correct, then `Suffix` reports `Incomplete` exactly.
+- Purge, correct, then `SuffixAsync` reports `Incomplete` exactly.
 
 C0 itself: both SQL providers pass the suite, and the per-provider tests it replaces are deleted in the same change. The coverage report (`coverlet`) must not drop for either provider.
 
@@ -585,7 +585,7 @@ Every ordinary commit today writes about **5 to 6 rows plus one per action**:
 - the trigger's history copy;
 - the command status, and promotion of the next head.
 
-`instance_state` also keeps one closed valid-time row per commit forever, because no retention removes it (E3 below). Most machines only ever read the current snapshot. A plain upsert makes it **3 to 4 rows plus actions**. The timeline is worth its cost only where someone asks `AsOf`.
+`instance_state` also keeps one closed valid-time row per commit forever, because no retention removes it (E3 below). Most machines only ever read the current snapshot. A plain upsert makes it **3 to 4 rows plus actions**. The timeline is worth its cost only where someone asks `AsOfAsync`.
 
 ### E1. Layout
 - **`<schema>` (core, always installed):**
@@ -614,7 +614,7 @@ CREATE TABLE $schema$.entity_state (
     PRIMARY KEY (machine_id, entity_id));
 CREATE INDEX entity_state_command_idx ON $schema$.entity_state (command_id);
 ```
-- **It is the only authority for an entity's epoch, in both modes.** Commit reads it `FOR UPDATE`.
+- **It is the only authority for an entity's epoch, in both modes.** `CommitAsync` reads it `FOR UPDATE`.
   - This fixes E16 structurally. A correction always rewrites `entity_state` to its own epoch, whatever its belief list says, so no operation can make the processor read a stale epoch.
 - **Edge (E20): the FK conflicts with purge.** The snapshot points at the last *succeeded* command. Purge keeps only the newest command, which may be a later rejected one, so the snapshot's command is purgeable and the FK would abort the whole purge batch.
   - `purge_commands` excludes `command_id IN (SELECT command_id FROM entity_state)` (served by the index above).
@@ -647,28 +647,28 @@ type PostgresBitemporalMachineStore<…>(options)    // the core plus ITemporalR
 - `BeliefModel` describes PostgreSQL's choice only. It is not a property every store has.
 
 ### E5. Corrections: shipped in the temporal module, open to implement over the core
-Today the runtime needs `ITemporalReader` (only for the state just before `T`, `Correction.fs:45`) and `IReplayStore` (`Suffix` plus `CommitCorrection`). Split that into the smallest interfaces a third party would implement (**public**):
+Today the runtime needs `ITemporalReader` (only for the state just before `T`, `Correction.fs:45`) and `IReplayStore` (`SuffixAsync` plus `CommitCorrectionAsync`). Split that into the smallest interfaces a third party would implement (**public**):
 ```fsharp
 /// Reading the committed log. Core tables only, so the core stores implement it.
 type ITransitionLog<'EntityId, 'State, 'Event, 'Action> =
-    abstract Suffix : MachineId * 'EntityId * from: DateTimeOffset * limit: int * CancellationToken
+    abstract SuffixAsync : MachineId * 'EntityId * from: DateTimeOffset * limit: int * cancellationToken: CancellationToken
                       -> Task<Result<ReplaySuffix<…>, StoreError>>
 
 /// What the entity was just before an instant. The temporal store answers from beliefs; an
 /// application can answer from the transition log (the to_state of the last transition
 /// effective before T) or from its own records.
 type IPriorState<'EntityId, 'State> =
-    abstract Before : MachineId * 'EntityId * at: DateTimeOffset * CancellationToken
+    abstract BeforeAsync : MachineId * 'EntityId * at: DateTimeOffset * cancellationToken: CancellationToken
                       -> Task<Result<Snapshot<'State> option, StoreError>>
 
 /// Committing a correction, fenced like any commit.
 type ICorrectionCommitter<'EntityId, 'State, 'Event, 'Action> =
-    abstract CommitCorrection : CommandId * LeaseToken<CommandWork> * expected: Epoch
-                                * CorrectionCommit<…> * CancellationToken
+    abstract CommitCorrectionAsync : CommandId * LeaseToken<CommandWork> * expected: Epoch
+                                     * CorrectionCommit<…> * cancellationToken: CancellationToken
                                 -> Task<Result<FinalizeOutcome, StoreError>>
 ```
 - `Store.tryCorrections` returns `CorrectionCapability option`, a record holding all three. It is `Some` only when the store implements all three at the machine's exact types. `Correction.plan` and `Replay` depend on that record only.
-- `IReplayStore` is removed; `ITemporalReader` stays for `ValidAt`/`AsOf`.
+- `IReplayStore` is removed; `ITemporalReader` stays for `ValidAtAsync`/`AsOfAsync`.
 - **What a third party gets from core PostgreSQL:**
   - core routines that run inside the caller's own transaction:
     - `$schema$.command_standing(command_id, token)` returns the lease/fence verdict;
@@ -685,14 +685,14 @@ type ICorrectionCommitter<'EntityId, 'State, 'Event, 'Action> =
 
 ### E6. Bugs fixed while moving the temporal code
 - **`system_time` can go backwards or be zero-width** (E13).
-  - `STATEMENT_TIMESTAMP()` is fixed for a whole top-level statement, including every function it calls. Under concurrency it can also be *earlier* than the `LOWER(system_time)` a concurrent transaction committed: for example, `Correct` blocked behind a finalize.
+  - `STATEMENT_TIMESTAMP()` is fixed for a whole top-level statement, including every function it calls. Under concurrency it can also be *earlier* than the `LOWER(system_time)` a concurrent transaction committed: for example, `CorrectAsync` blocked behind a finalize.
   - The trigger then builds `[lower, at)` with `at < lower`, and the range constructor raises.
   - Fix: `at := GREATEST(STATEMENT_TIMESTAMP(), LOWER(OLD.system_time))`. When `at = LOWER(OLD.system_time)`, the superseded belief was never observable, so it is not archived. Both cases are tested.
-- **`ICorrectionStore.Correct` is unfenced** (E4). It writes beliefs with no lease and no epoch, racing the inbox.
+- **`ICorrectionStore.CorrectAsync` is unfenced** (E4). It writes beliefs with no lease and no epoch, racing the inbox.
   - It takes `expected: Epoch`, runs under the entity's advisory lock, and answers `CorrectionOutcome.Conflict of actual: Epoch` (**public, new case**) when `entity_state` moved.
   - It still never touches `entity_state`, because it is a belief-only operator tool.
 - **Two clocks in the read paths** (E14).
-  - `ValidAt` asks the database for `upper(system_time) = 'infinity'` instead of passing an application-side "now".
+  - `ValidAtAsync` asks the database for `upper(system_time) = 'infinity'` instead of passing an application-side "now".
   - The `belief_cold` cutoff uses `date_trunc('day', now() AT TIME ZONE 'UTC')`, so pg_cron and the application agree whatever their session `TimeZone`.
   - Drop `belief_cold_state` and derive staleness from `max(cutoff)` in the materialised view. The pg_cron job can only `REFRESH … CONCURRENTLY`, which cannot run inside a transaction block, so it could never mark the state anyway.
 - **`purge_belief_history` is unbatched and unindexed** (E15).
@@ -715,7 +715,7 @@ type ICorrectionCommitter<'EntityId, 'State, 'Event, 'Action> =
 - A bitemporal store against a snapshot-only database is refused at boot.
 
 **Opt-in later:**
-- Commit in snapshot mode, migrate with `Bitemporal`, then `ValidAt` returns the seeded belief, and new commits extend the timeline.
+- Commit in snapshot mode, migrate with `Bitemporal`, then `ValidAtAsync` returns the seeded belief, and new commits extend the timeline.
 
 **A third-party correction:**
 - A test-only `IPriorState` (derived from the transition log) plus an `ICorrectionCommitter` built on the core routines replays a correction on a snapshot-mode schema.
@@ -778,7 +778,7 @@ These are unchanged from the previous plan's Phase B:
 - purge removes the header and the child;
 - mismatched array lengths (and an **empty** array, and a NULL element) are rejected without writing;
 - a malformed pgmq message is abandoned while the rest of the batch is delivered;
-- `event` and `from_state` read back through `History` at epoch 0, at a later epoch, and after a correction;
+- `event` and `from_state` read back through `HistoryAsync` at epoch 0, at a later epoch, and after a correction;
 - the payload benchmark.
 
 The C0 suite passes unchanged: G changes storage, not behaviour.
@@ -841,8 +841,8 @@ Added:
 | E1 | `purge_commands` does not delete `command_correction`, and its NO ACTION FK fails every maintenance run | `R__maintenance_routines.sql:132` | C1 |
 | E2 | `received_at` is stamped before the advisory lock, so it can disagree with `seq`. Out-of-order `effective_at` makes `close_and_open` raise, and retries end in a dead letter. Caller-supplied `ReceivedAt` can do the same. | `R__command_routines.sql:162`, `R__temporal_routines.sql:186`, `CommandProcessor.fs:372` | C2 |
 | E3 | `instance_state` keeps one closed valid-time row per commit, and no retention removes them | `close_and_open` | E3 (documented) |
-| E4 | `ICorrectionStore.Correct` is not fenced | `PostgresTemporalStore.fs` | E6 |
-| E5 | The `Suffix` completeness heuristic assumes epoch order equals `effective_at` order | `PostgresCommandProcessorStore.fs:469` | C7 |
+| E4 | `ICorrectionStore.CorrectAsync` is not fenced | `PostgresTemporalStore.fs` | E6 |
+| E5 | The `SuffixAsync` completeness heuristic assumes epoch order equals `effective_at` order | `PostgresCommandProcessorStore.fs:469` | C7 |
 | E6 | One undecodable row fails the whole claim, and the batch stays leased in a loop (commands and actions) | both inboxes and both action queues | C3 |
 | E7 | The action queue is client-supplied per commit, and an empty string drops actions silently | `finalize_command` | C4 |
 | E8 | A reused idempotency key with a different request is answered with the original | `submit_command`, `submit_correction` | C5 |
@@ -852,7 +852,7 @@ Added:
 | E12 | `db-reset` leaks pgmq queues | `Makefile:147` | D7 |
 | E13 | Trigger `system_time` can go backwards or be zero-width | `temporal_versioning` | E6 |
 | E13b | `array_length` of an empty array is NULL and passes a length check | G3 routines | G3 |
-| E14 | `ValidAt` uses the application clock; the cold cutoff depends on session `TimeZone`; the cron refresh never marks its state | `PostgresTemporalStore.fs:131`, `008`, `R__maintenance` | E6 |
+| E14 | `ValidAtAsync` uses the application clock; the cold cutoff depends on session `TimeZone`; the cron refresh never marks its state | `PostgresTemporalStore.fs:131`, `008`, `R__maintenance` | E6 |
 | E15 | Belief-history purge is unbatched and unindexed | `purge_belief_history` | E6 |
 | E16 | An empty correction leaves no live belief, so the epoch regresses and the next commit hits a PK violation | `correct_beliefs` | C7 + E2 |
 | E17 | `int TotalMilliseconds` overflows above about 24.8 days | `PostgresCommandInbox.fs:382`, `PostgresActionQueue.fs:190` | B7 |
@@ -867,7 +867,7 @@ Added:
 | E26 | A client without the temporal store, against a bitemporal schema, would bypass the timeline | new | E3 |
 | E27 | SQLite accepts correction commands it can never process | `SqliteCommandInbox.fs:320` | E5 |
 | E28 | `Machine.correct` submits regardless of capability | `Machine.fs:360` | E5 |
-| E29 | PostgreSQL `Abandon` does not validate `reason`; SQLite does | `PostgresActionQueue.fs` | B7 (`Reason` type), C0 (one suite) |
+| E29 | PostgreSQL `AbandonAsync` does not validate `reason`; SQLite does | `PostgresActionQueue.fs` | B7 (`Reason` type), C0 (one suite) |
 | E30 | DbUp `$name$` substitution collides with named dollar-quote tags | migrations | D3 |
 | E31 | Decoders call throwing constructors | several | B5 |
 | E32 | The claim plus correction-details read is two runs; a failed second run stalls the leased batch | `PostgresCommandInbox.fs:369` | B8 |

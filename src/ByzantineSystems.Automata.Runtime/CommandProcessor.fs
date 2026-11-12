@@ -97,7 +97,7 @@ type CommandProcessor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: e
     let machineName = MachineId.value machineId
 
     // The aggregate store is used through one capability at a time. This is not ceremony: the
-    // inbox and the action queue both declare Claim and Reschedule with the same shape, so a
+    // inbox and the action queue both declare ClaimAsync and RescheduleAsync with the same shape, so a
     // call on the aggregate is genuinely ambiguous, and naming the capability is what says
     // which one a line means.
     let inbox = config.Store :> ICommandInbox<'EntityId, 'Event>
@@ -107,7 +107,7 @@ type CommandProcessor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: e
         config.Store :> ICommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
 
     let snapshotOf (entityId: 'EntityId) (ct: CancellationToken) =
-        reader.TryGetSnapshot(machineId, entityId, ct)
+        reader.TryGetSnapshotAsync(machineId, entityId, ct)
         |> TaskResult.mapError MachineError.Store
         |> TaskResult.map (function
             // An entity with no belief has never committed. Its first command resolves from the
@@ -130,7 +130,7 @@ type CommandProcessor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: e
                     if Object.ReferenceEquals(finished, work :> Task) then
                         renewing <- false
                     else
-                        match! inbox.ExtendLease(leased.Work.CommandId, leased.Token, leaseDuration, ct) with
+                        match! inbox.ExtendLeaseAsync(leased.Work.CommandId, leased.Token, leaseDuration, ct) with
                         | Ok Updated -> ()
                         | Ok(LeaseUpdateOutcome.LeaseLost)
                         | Error _ -> renewing <- false
@@ -211,7 +211,7 @@ type CommandProcessor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: e
 
     let reschedule (leased: LeasedCommand<'EntityId, 'Event>) (ct: CancellationToken) =
         task {
-            match! inbox.Reschedule(leased.Work.CommandId, leased.Token, policy.Backoff, ct) with
+            match! inbox.RescheduleAsync(leased.Work.CommandId, leased.Token, policy.Backoff, ct) with
             | Ok Updated -> return Deferred
             | Ok(LeaseUpdateOutcome.LeaseLost)
             | Error _ -> return Fenced
@@ -296,12 +296,12 @@ type CommandProcessor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: e
         match disposition with
         | Retry when record.Attempts + 1 >= policy.MaxAttempts ->
             terminate
-                (fun args -> processor.DeadLetter args)
+                (fun args -> processor.DeadLetterAsync args)
                 (CommandFailure.Machine $"gave up after %d{record.Attempts + 1} attempts")
                 Abandoned
         | Retry -> reschedule leased ct
-        | Reject failure -> terminate (fun args -> processor.Reject args) failure Refused
-        | DeadLetter failure -> terminate (fun args -> processor.DeadLetter args) failure Abandoned
+        | Reject failure -> terminate (fun args -> processor.RejectAsync args) failure Refused
+        | DeadLetter failure -> terminate (fun args -> processor.DeadLetterAsync args) failure Abandoned
         | Escalate reason -> Task.FromResult(Escalating(record.CommandId, reason))
 
     /// <summary>
@@ -331,7 +331,7 @@ type CommandProcessor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: e
 
                 match! renewWhile leased planned ct with
                 | Ok(plan, expected) ->
-                    match! replay.CommitCorrection(record.CommandId, leased.Token, expected, plan.Commit, ct) with
+                    match! replay.CommitCorrectionAsync(record.CommandId, leased.Token, expected, plan.Commit, ct) with
                     | Ok outcome -> return! interpretCommit leased plan.Commit.Transition outcome ct
                     | Error error -> return! classify error
                 | Error(CorrectionError.Replay error) -> return! deadLetter (CommandFailure.Replay error)
@@ -375,7 +375,7 @@ type CommandProcessor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: e
                             resolution
 
                     let! outcome =
-                        processor.Commit(record.CommandId, leased.Token, epoch, draft, ct)
+                        processor.CommitAsync(record.CommandId, leased.Token, epoch, draft, ct)
                         |> TaskResult.mapError MachineError.Store
 
                     return draft, outcome
@@ -452,7 +452,7 @@ type CommandProcessor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: e
     member _.PollAsync(ct: CancellationToken) : Task<Result<PollReport, MachineError<'Err>>> =
         taskResult {
             let! batch =
-                inbox.Claim(machineId, claimBatch, leaseDuration, ct)
+                inbox.ClaimAsync(machineId, claimBatch, leaseDuration, ct)
                 |> TaskResult.mapError MachineError.Store
 
             match batch with

@@ -428,7 +428,7 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
 
     interface IStateReader<'EntityId, 'State, 'Event, 'Action> with
 
-        member _.TryGetSnapshot(machineId, entityId, ct) =
+        member _.TryGetSnapshotAsync(machineId, entityId, cancellationToken) =
             Sql.readProgram
                 context
                 (StoreProgram.tryQueryOne
@@ -436,9 +436,9 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                     [ Params.machineId "machine_id" machineId
                       Params.entityKey "entity_id" (encodeEntityId entityId) ]
                     snapshotRow)
-                ct
+                cancellationToken
 
-        member _.History(machineId, entityId, paging, ct) =
+        member _.HistoryAsync(machineId, entityId, paging, cancellationToken) =
             // An absent cursor is zero rather than a null, because transition_epoch_positive
             // forbids a stored epoch of zero. One query shape then serves every page.
             let after =
@@ -455,30 +455,31 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                       "after", Param.Bigint after
                       "limit", Param.Int(Page.limit paging) ]
                     (transitionRow >> toTransition))
-                ct
+                cancellationToken
 
     interface ICommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err> with
 
-        member _.Commit(commandId, token, expected, draft, ct) =
+        member _.CommitAsync(commandId, token, expected, draft, cancellationToken) =
             backgroundTaskResult {
                 let! encoded = encodeDraft draft
-                return! Sql.runProgram context (finalize commandId token (Commit(expected, encoded))) ct
+                return! Sql.runProgram context (finalize commandId token (Commit(expected, encoded))) cancellationToken
             }
 
-        member _.Reject(commandId, token, error, ct) = fail Reject commandId token error ct
+        member _.RejectAsync(commandId, token, error, cancellationToken) =
+            fail Reject commandId token error cancellationToken
 
-        member _.DeadLetter(commandId, token, error, ct) =
-            fail DeadLetter commandId token error ct
+        member _.DeadLetterAsync(commandId, token, error, cancellationToken) =
+            fail DeadLetter commandId token error cancellationToken
 
-        member _.TryGetResult(commandId, ct) =
+        member _.TryGetResultAsync(commandId, cancellationToken) =
             Sql.readProgram
                 context
                 (StoreProgram.tryQueryOne transitionResult [ Params.commandId "command_id" commandId ] resultRow)
-                ct
+                cancellationToken
 
     interface IReplayStore<'EntityId, 'State, 'Event, 'Action> with
 
-        member _.Suffix(machineId, entityId, from, limit, ct) =
+        member _.SuffixAsync(machineId, entityId, from, limit, cancellationToken) =
             Sql.readProgram
                 context
                 (store {
@@ -512,9 +513,9 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                         { Transitions = suffix
                           Incomplete = incomplete }
                 })
-                ct
+                cancellationToken
 
-        member _.CommitCorrection(commandId, token, expected, commit, ct) =
+        member _.CommitCorrectionAsync(commandId, token, expected, commit, cancellationToken) =
             backgroundTaskResult {
                 // Everything is encoded before anything is sent, so a state that will not encode
                 // fails the correction rather than half-writing it.
@@ -541,5 +542,5 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                               "exited", Param.TextArray(states draft.Exited)
                               "entered", Param.TextArray(states draft.Entered) ]
                             (finalizeOutcome expected))
-                        ct
+                        cancellationToken
             }

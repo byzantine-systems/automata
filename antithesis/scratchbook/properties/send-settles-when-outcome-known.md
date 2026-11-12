@@ -29,7 +29,7 @@
 #### Outcome shape for purged-while-awaited commands
 
 - Examined: `Machine.awaitSettled` (`Runtime/Machine.fs:399-421`) and its
-  `Ok None` arm; `TryGetResult` semantics in `Storage/Processing.fs`;
+  `Ok None` arm; `TryGetResultAsync` semantics in `Storage/Processing.fs`;
   `purge_commands` retention behavior; `CommandResult` union shape;
   `docs/public-api.md` send/commandResult contract text.
 - Found: the poll loop has no exit for a command row that no longer exists;

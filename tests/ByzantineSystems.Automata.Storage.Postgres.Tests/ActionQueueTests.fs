@@ -16,8 +16,8 @@ let private effectiveAt = DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero)
 
 let private leased (inbox: Inbox) (name: string) (key: string) : Task<Claimed> =
     task {
-        let! _ = inbox.Submit(submission (entity name) key (Start 1), noCancellation)
-        let! claimed = inbox.Claim(machine, ClaimBatch.create 50, lease, noCancellation)
+        let! _ = inbox.SubmitAsync(submission (entity name) key (Start 1), noCancellation)
+        let! claimed = inbox.ClaimAsync(machine, ClaimBatch.create 50, lease, noCancellation)
 
         return
             claimed
@@ -30,7 +30,7 @@ let private leased (inbox: Inbox) (name: string) (key: string) : Task<Claimed> =
 let private commit (processor: Processor) (held: Claimed) =
     task {
         let! outcome =
-            processor.Commit(
+            processor.CommitAsync(
                 held.Work.CommandId,
                 held.Token,
                 Epoch.initial,
@@ -43,7 +43,7 @@ let private commit (processor: Processor) (held: Claimed) =
 
 let private claimActions (queue: Actions) =
     task {
-        let! claimed = queue.Claim(machine, ClaimBatch.create 50, actionLease, noCancellation)
+        let! claimed = queue.ClaimAsync(machine, ClaimBatch.create 50, actionLease, noCancellation)
         return claimed |> expectOk "claim actions"
     }
 
@@ -88,7 +88,7 @@ let tests =
 
               let! outcome =
                   (newProcessor ())
-                      .Commit(
+                      .CommitAsync(
                           held.Work.CommandId,
                           held.Token,
                           Epoch.initial,
@@ -119,11 +119,11 @@ let tests =
                       ActionDelivery.Discard
                   |> PostgresMachineStore
 
-              let! booted = (store :> IStoreBoot).Boot(machine, noCancellation)
+              let! booted = (store :> IStoreBoot).BootAsync(machine, noCancellation)
               Expect.equal (booted |> expectOk "boot") BootReport.Ready "discard is a valid boot policy"
               let! held = leased (store :> Inbox) "discard" "key"
               let! _ = commit (store :> Processor) held
-              let! result = (store :> Processor).TryGetResult(held.Work.CommandId, noCancellation)
+              let! result = (store :> Processor).TryGetResultAsync(held.Work.CommandId, noCancellation)
 
               match result |> expectOk "result" with
               | Some(CommandResult.Committed transition) ->
@@ -131,7 +131,7 @@ let tests =
               | other -> failtestf "expected a committed transition, got %A" other
 
               Expect.equal (queueDepth ()) 0L "there is no delivery"
-              let! actions = (store :> Actions).Claim(machine, ClaimBatch.create 10, actionLease, noCancellation)
+              let! actions = (store :> Actions).ClaimAsync(machine, ClaimBatch.create 10, actionLease, noCancellation)
               Expect.equal (actions |> expectOk "claim") [] "the discard consumer needs no physical queue"
 
               exec "SELECT * FROM fsm.run_maintenance(100); SELECT * FROM fsm.notify_pending();"
@@ -163,7 +163,7 @@ let tests =
               // exactly what enqueueing inside the transaction prevents.
               let! outcome =
                   (newProcessor ())
-                      .Commit(
+                      .CommitAsync(
                           held.Work.CommandId,
                           LeaseToken.ofInt64 999999L,
                           Epoch.initial,
@@ -182,7 +182,7 @@ let tests =
 
               let! _ =
                   (newProcessor ())
-                      .Reject(held.Work.CommandId, held.Token, CommandFailure.Domain(Refused "no"), noCancellation)
+                      .RejectAsync(held.Work.CommandId, held.Token, CommandFailure.Domain(Refused "no"), noCancellation)
 
               Expect.equal 0L (queueDepth ()) "a refused command asked for nothing"
           }
@@ -215,7 +215,7 @@ let tests =
               let! claimed = claimActions queue
               let action: LeasedAction<Entity, TestAction> = List.exactlyOne claimed
 
-              let! outcome = queue.Complete(action, noCancellation)
+              let! outcome = queue.CompleteAsync(action, noCancellation)
               Expect.equal Updated (outcome |> expectOk "complete") "delivered"
               Expect.equal 0L (queueDepth ()) "the message left the queue"
           }
@@ -237,7 +237,7 @@ let tests =
                   { action with
                       DeliveryCount = action.DeliveryCount - 1 }
 
-              let! outcome = queue.Complete(stale, noCancellation)
+              let! outcome = queue.CompleteAsync(stale, noCancellation)
               Expect.equal LeaseUpdateOutcome.LeaseLost (outcome |> expectOk "complete") "fenced out"
               Expect.equal 1L (queueDepth ()) "the message is untouched"
           }
@@ -256,7 +256,7 @@ let tests =
                   { action with
                       DeliveryCount = action.DeliveryCount + 7 }
 
-              let! outcome = queue.Reschedule(stale, Backoff.defaults, noCancellation)
+              let! outcome = queue.RescheduleAsync(stale, Backoff.defaults, noCancellation)
               Expect.equal LeaseUpdateOutcome.LeaseLost (outcome |> expectOk "reschedule") "fenced out"
           }
 
@@ -274,7 +274,7 @@ let tests =
                   { action with
                       DeliveryCount = action.DeliveryCount - 1 }
 
-              let! outcome = queue.Abandon(stale, Reason.create "gave up", noCancellation)
+              let! outcome = queue.AbandonAsync(stale, Reason.create "gave up", noCancellation)
               Expect.equal LeaseUpdateOutcome.LeaseLost (outcome |> expectOk "abandon") "fenced out"
               Expect.equal 0L (deadLetterCount ()) "and nothing was recorded"
           }
@@ -289,7 +289,7 @@ let tests =
               let! claimed = claimActions queue
               let action: LeasedAction<Entity, TestAction> = List.exactlyOne claimed
 
-              let! outcome = queue.Abandon(action, Reason.create "the destination refused it", noCancellation)
+              let! outcome = queue.AbandonAsync(action, Reason.create "the destination refused it", noCancellation)
               Expect.equal Updated (outcome |> expectOk "abandon") "given up on"
               Expect.equal 0L (queueDepth ()) "the message left the queue"
               Expect.equal 1L (deadLetterCount ()) "and the fact was recorded"
@@ -313,7 +313,7 @@ let tests =
 
               // Return it to the queue immediately, then claim again.
               let! _ =
-                  queue.Reschedule(
+                  queue.RescheduleAsync(
                       firstAction,
                       Backoff.create (TimeSpan.FromMilliseconds 1.) (TimeSpan.FromMilliseconds 1.),
                       noCancellation

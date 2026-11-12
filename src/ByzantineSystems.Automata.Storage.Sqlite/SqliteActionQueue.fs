@@ -126,7 +126,7 @@ type SqliteActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'EntityId
 
     interface IActionQueue<'EntityId, 'Action> with
 
-        member _.Claim(machineId, batch, lease, ct) =
+        member _.ClaimAsync(machineId, batch, lease, cancellationToken) =
             // Not idempotent, like the command claim: a claim whose outcome was lost may have
             // leased the rows, and repeating it leases more while the first batch stays invisible.
             // The dispatcher polls again shortly, which recovers faster.
@@ -135,7 +135,7 @@ type SqliteActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'EntityId
                     Sql.writeProgramOnceWith
                         context
                         (claim machineId (ClaimBatch.value batch) (LeaseDuration.value lease))
-                        ct
+                        cancellationToken
 
                 return!
                     ClaimRecovery.collect
@@ -146,20 +146,20 @@ type SqliteActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'EntityId
                                   "@ordinal", Param.Integer row.ordinal
                                   "@lease_token", Param.Integer row.lease_token ]
                                 reason
-                                ct
+                                cancellationToken
                             |> TaskResult.map ignore)
                         rows
-                        ct
+                        cancellationToken
             }
 
-        member _.Complete(action, ct) =
+        member _.CompleteAsync(action, cancellationToken) =
             Sql.writeProgram
                 context
                 (StoreProgram.executeCount completeAction (fence action)
                  |> StoreProgram.map CommandMapping.leaseOutcome)
-                ct
+                cancellationToken
 
-        member _.Reschedule(action, backoff, ct) =
+        member _.RescheduleAsync(action, backoff, cancellationToken) =
             Sql.writeProgramWith
                 context
                 (fun now ->
@@ -170,7 +170,7 @@ type SqliteActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'EntityId
                              "@base_us", Param.Integer(CommandMapping.micros (Backoff.baseDelay backoff))
                              "@cap_us", Param.Integer(CommandMapping.micros (Backoff.ceiling backoff)) ])
                     |> StoreProgram.map CommandMapping.leaseOutcome)
-                ct
+                cancellationToken
 
-        member _.Abandon(action, reason, ct) =
-            abandon (fence action) (Reason.value reason) ct
+        member _.AbandonAsync(action, reason, cancellationToken) =
+            abandon (fence action) (Reason.value reason) cancellationToken

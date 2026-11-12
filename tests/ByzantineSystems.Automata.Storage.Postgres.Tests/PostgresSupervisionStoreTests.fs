@@ -38,10 +38,12 @@ let tests =
                       "worker crashed: connection lost"
                       (startTime.AddSeconds 1.0)
 
-              do! store.Record(started, noCancellation) |> mapTask (expectOkUnit "record started")
+              do!
+                  store.RecordAsync(started, noCancellation)
+                  |> mapTask (expectOkUnit "record started")
 
               do!
-                  store.Record(restarted, noCancellation)
+                  store.RecordAsync(restarted, noCancellation)
                   |> mapTask (expectOkUnit "record restarted")
 
               let! result = PostgresSupervisionQueries.listRecent (context ()) (ClaimBatch.create 1) noCancellation

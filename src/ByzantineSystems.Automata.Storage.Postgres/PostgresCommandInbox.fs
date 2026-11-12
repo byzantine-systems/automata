@@ -278,13 +278,13 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
 
     interface ICommandInbox<'EntityId, 'Event> with
 
-        member _.Submit(submission, ct) =
+        member _.SubmitAsync(submission, cancellationToken) =
             let entityId = encodeEntityId submission.EntityId
 
             backgroundTaskResult {
                 let! encodedEvent = options.EventCodec.Encode submission.Event |> Result.mapError Db.toStoreError
 
-                match! Sql.attemptProgram context (submit submission encodedEvent entityId) ct with
+                match! Sql.attemptProgram context (submit submission encodedEvent entityId) cancellationToken with
                 | Db.Answered outcome -> return! outcome
                 | Db.Refused(Db.ForeignKey "command_chart_version_fkey", _) ->
                     // The version this command pins was never registered, so nothing records
@@ -297,11 +297,11 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
                 | Db.Refused(Db.Unique "command_unique_idem", _) ->
                     // A writer outside the routine raced the unique constraint. Recheck identity
                     // atomically instead of treating every request under the key as equal.
-                    return! Sql.runProgram context (submit submission encodedEvent entityId) ct
+                    return! Sql.runProgram context (submit submission encodedEvent entityId) cancellationToken
                 | Db.Refused(_, cause) -> return! Error(StoreError.Unexpected cause)
             }
 
-        member _.Claim(machineId, batch, lease, ct) =
+        member _.ClaimAsync(machineId, batch, lease, cancellationToken) =
             // Claiming is the one call here that must not be repeated automatically. It is not
             // idempotent: a claim whose reply was lost has already leased a batch, and a retry
             // leases a second one while the first stays invisible until its lease lapses. The
@@ -316,7 +316,7 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
                               "batch", Param.Int(ClaimBatch.value batch)
                               "lease", Param.Interval(LeaseDuration.value lease) ]
                             (fun reader -> Ok(commandRow reader, correctionOption reader)))
-                        ct
+                        cancellationToken
 
                 return!
                     ClaimRecovery.collect
@@ -330,12 +330,12 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
                                       "lease_token", Param.Bigint row.lease_token
                                       "reason", Param.Text reason ]
                                     (fun _ -> Ok()))
-                                ct)
+                                cancellationToken)
                         rows
-                        ct
+                        cancellationToken
             }
 
-        member _.Reschedule(commandId, leaseToken, backoff, ct) =
+        member _.RescheduleAsync(commandId, leaseToken, backoff, cancellationToken) =
             Sql.runProgram
                 context
                 (leaseUpdate
@@ -344,9 +344,9 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
                       Params.commandLease "lease_token" leaseToken
                       "base_ms", Param.Int(int (Backoff.baseDelay backoff).TotalMilliseconds)
                       "cap_ms", Param.Int(int (Backoff.ceiling backoff).TotalMilliseconds) ])
-                ct
+                cancellationToken
 
-        member _.ExtendLease(commandId, leaseToken, lease, ct) =
+        member _.ExtendLeaseAsync(commandId, leaseToken, lease, cancellationToken) =
             Sql.runProgram
                 context
                 (leaseUpdate
@@ -354,13 +354,13 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
                     [ Params.commandId "command_id" commandId
                       Params.commandLease "lease_token" leaseToken
                       "lease", Param.Interval(LeaseDuration.value lease) ])
-                ct
+                cancellationToken
 
-        member _.TryGet(commandId, ct) =
+        member _.TryGetAsync(commandId, cancellationToken) =
             Sql.readProgram
                 context
                 (StoreProgram.tryQueryOne commandById [ Params.commandId "command_id" commandId ] recordRow)
-                ct
+                cancellationToken
 
-        member _.TryFind(machineId, entityId, idempotencyKey, ct) =
-            findExisting machineId (encodeEntityId entityId) idempotencyKey ct
+        member _.TryFindAsync(machineId, entityId, idempotencyKey, cancellationToken) =
+            findExisting machineId (encodeEntityId entityId) idempotencyKey cancellationToken

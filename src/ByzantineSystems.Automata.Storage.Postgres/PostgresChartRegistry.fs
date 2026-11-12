@@ -61,7 +61,7 @@ type PostgresChartRegistry(options: ChartRegistryOptions) =
 
     interface IChartRegistry with
 
-        member _.Register(identity, ct) =
+        member _.RegisterAsync(identity, cancellationToken) =
             let registrationRow reader =
                 result {
                     let! tag = EnumCodec.read Row.string registrationTag "registration" reader
@@ -81,11 +81,11 @@ type PostgresChartRegistry(options: ChartRegistryOptions) =
                     (key identity.MachineId identity.Version
                      @ [ "fingerprint", Param.Text(ChartFingerprint.value identity.Fingerprint) ])
                     registrationRow)
-                ct
+                cancellationToken
 
-        member _.TryGet(machineId, version, ct) =
+        member _.TryGetAsync(machineId, version, cancellationToken) =
             Sql.readProgram
                 context
                 (StoreProgram.tryQueryOne byVersion (key machineId version) (fun reader ->
                     parse (Row.string reader "fingerprint")))
-                ct
+                cancellationToken

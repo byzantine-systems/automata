@@ -18,7 +18,7 @@ let private effectiveAt = DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero)
 let private commit (fixture: Fixture) (name: string) (key: string) (toState: TestState) : Task =
     task {
         let! held = leased (inboxOf fixture) (entity name) key
-        let! snapshot = (readerOf fixture).TryGetSnapshot(testMachine, entity name, noCancellation)
+        let! snapshot = (readerOf fixture).TryGetSnapshotAsync(testMachine, entity name, noCancellation)
 
         let expected =
             snapshot
@@ -28,7 +28,7 @@ let private commit (fixture: Fixture) (name: string) (key: string) (toState: Tes
 
         let! outcome =
             (processorOf fixture)
-                .Commit(
+                .CommitAsync(
                     held.Work.CommandId,
                     held.Token,
                     expected,
@@ -41,7 +41,7 @@ let private commit (fixture: Fixture) (name: string) (key: string) (toState: Tes
 
 let private page (fixture: Fixture) (name: string) (paging: Page) : Task<Committed list> =
     task {
-        let! rows = (readerOf fixture).History(testMachine, entity name, paging, noCancellation)
+        let! rows = (readerOf fixture).HistoryAsync(testMachine, entity name, paging, noCancellation)
         return rows |> expectOk "history"
     }
 

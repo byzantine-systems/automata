@@ -149,7 +149,7 @@ type PostgresActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'Entity
 
     interface IActionQueue<'EntityId, 'Action> with
 
-        member _.Claim(_, batch, lease, ct) =
+        member _.ClaimAsync(_, batch, lease, cancellationToken) =
             // Not idempotent, like the command claim: a claim whose reply was lost has already
             // leased the messages, and repeating it leases more while the first batch stays
             // invisible. The dispatcher polls again shortly, which recovers faster.
@@ -168,7 +168,7 @@ type PostgresActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'Entity
                         ))
 
             backgroundTaskResult {
-                let! claimed = Sql.runProgramOnce context claim ct
+                let! claimed = Sql.runProgramOnce context claim cancellationToken
 
                 return!
                     ClaimRecovery.collect
@@ -188,21 +188,22 @@ type PostgresActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'Entity
                                  @ [ "msg_id", Param.Bigint messageId
                                      "read_ct", Param.Int deliveries
                                      "reason", Param.Text reason ])
-                                ct
+                                cancellationToken
                             |> TaskResult.map ignore)
                         claimed
-                        ct
+                        cancellationToken
             }
 
-        member _.Complete(action, ct) = fenced completeAction (fence action) ct
+        member _.CompleteAsync(action, cancellationToken) =
+            fenced completeAction (fence action) cancellationToken
 
-        member _.Reschedule(action, backoff, ct) =
+        member _.RescheduleAsync(action, backoff, cancellationToken) =
             fenced
                 rescheduleAction
                 (fence action
                  @ [ "base_ms", Param.Int(int (Backoff.baseDelay backoff).TotalMilliseconds)
                      "cap_ms", Param.Int(int (Backoff.ceiling backoff).TotalMilliseconds) ])
-                ct
+                cancellationToken
 
-        member _.Abandon(action, reason, ct) =
-            fenced abandonAction (fence action @ [ "reason", Param.Text(Reason.value reason) ]) ct
+        member _.AbandonAsync(action, reason, cancellationToken) =
+            fenced abandonAction (fence action @ [ "reason", Param.Text(Reason.value reason) ]) cancellationToken

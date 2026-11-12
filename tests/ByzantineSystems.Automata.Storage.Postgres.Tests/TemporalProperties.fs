@@ -70,7 +70,7 @@ let private okOf (result: Result<'a, StoreError>) : 'a option =
 /// <summary>The state <c>ValidAt</c> answers with, or <c>None</c> when the store erred.</summary>
 let private validState (at: DateTimeOffset) : Task<TestState option> =
     task {
-        let! result = (newTemporalReader ()).ValidAt(machine, entity "e1", at, noCancellation)
+        let! result = (newTemporalReader ()).ValidAtAsync(machine, entity "e1", at, noCancellation)
 
         return result |> okOf |> Option.bind (Option.map _.Snapshot.State)
     }
@@ -107,7 +107,7 @@ let private timelineProperty name maxTests =
                                         None
 
                                 let! found =
-                                    (newTemporalReader ()).ValidAt(machine, entity "e1", instant, noCancellation)
+                                    (newTemporalReader ()).ValidAtAsync(machine, entity "e1", instant, noCancellation)
 
                                 ok <-
                                     match found |> okOf with
@@ -158,7 +158,7 @@ let private correctionProperty name maxTests =
                         replacement
                         |> List.map (fun (at, state, epoch) -> correctedBelief at state epoch)
 
-                    let! outcome = (newCorrections ()).Correct(machine, entity "e1", cut, beliefs, noCancellation)
+                    let! outcome = (newCorrections ()).CorrectAsync(machine, entity "e1", cut, beliefs, noCancellation)
                     let mutable ok = (outcome |> okOf).IsSome
 
                     if ok then

@@ -372,7 +372,7 @@ type internal AutomataHostedService<'EntityId, 'State, 'Event, 'Action, 'Err, 'E
                       Reason = event.Reason
                       At = event.At }
 
-                let! stored = auditStore.Record(record, ct)
+                let! stored = auditStore.RecordAsync(record, ct)
 
                 match stored with
                 | Ok() -> AutomataLog.supervisionEvent logger options.MachineKey event

@@ -51,17 +51,18 @@ let private finalizeProperty =
                         { submission (entity name) "c1" (Start 10) with
                             Kind = CommandKind.Correction(at, CorrectionPolicy.defaults) }
 
-                    let! _ = (newInbox ()).Submit(correction, noCancellation)
+                    let! _ = (newInbox ()).SubmitAsync(correction, noCancellation)
 
                     let! claimed =
-                        (newInbox ()).Claim(machine, ClaimBatch.create 1, LeaseDuration.create lease, noCancellation)
+                        (newInbox ())
+                            .ClaimAsync(machine, ClaimBatch.create 1, LeaseDuration.create lease, noCancellation)
 
                     let held = claimed |> expectOk "claim" |> List.exactlyOne
 
                     if case.Rescheduled then
                         let! rescheduled =
                             (newInbox ())
-                                .Reschedule(
+                                .RescheduleAsync(
                                     held.Work.CommandId,
                                     held.Token,
                                     Backoff.create (TimeSpan.FromMilliseconds 1.) (TimeSpan.FromMilliseconds 1.),
@@ -79,7 +80,7 @@ let private finalizeProperty =
 
                     let! outcome =
                         (newReplayStore ())
-                            .CommitCorrection(
+                            .CommitCorrectionAsync(
                                 held.Work.CommandId,
                                 presented,
                                 Epoch.initial,

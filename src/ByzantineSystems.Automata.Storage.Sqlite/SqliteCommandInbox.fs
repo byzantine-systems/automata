@@ -400,16 +400,16 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
 
     interface ICommandInbox<'EntityId, 'Event> with
 
-        member _.Submit(submission, ct) =
+        member _.SubmitAsync(submission, cancellationToken) =
             let entityId = encodeEntityId submission.EntityId
 
             // Encoded before the write begins, so the transaction only writes.
             backgroundTaskResult {
                 let! encodedEvent = options.EventCodec.Encode submission.Event |> Result.mapError Db.toStoreError
-                return! Sql.writeProgramWith context (submit submission entityId encodedEvent) ct
+                return! Sql.writeProgramWith context (submit submission entityId encodedEvent) cancellationToken
             }
 
-        member _.Claim(machineId, batch, lease, ct) =
+        member _.ClaimAsync(machineId, batch, lease, cancellationToken) =
             // Claiming is the one call that must not be repeated automatically. A claim whose
             // outcome was lost may have leased a batch, and a retry would lease a second one
             // while the first stays invisible until its lease lapses. The worker polls again in a
@@ -419,7 +419,7 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
                     Sql.writeProgramOnceWith
                         context
                         (claim machineId (ClaimBatch.value batch) (LeaseDuration.value lease))
-                        ct
+                        cancellationToken
 
                 return!
                     ClaimRecovery.collect
@@ -450,12 +450,12 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
                                                     [ "@machine_id", Param.Text row.machine_id
                                                       "@entity_id", Param.Text row.entity_id ]
                                     })
-                                ct)
+                                cancellationToken)
                         rows
-                        ct
+                        cancellationToken
             }
 
-        member _.Reschedule(commandId, leaseToken, backoff, ct) =
+        member _.RescheduleAsync(commandId, leaseToken, backoff, cancellationToken) =
             Sql.writeProgramWith
                 context
                 (fun now ->
@@ -469,9 +469,9 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
                               "@cap_us", Param.Integer(CommandMapping.micros (Backoff.ceiling backoff)) ]
                         )
                     ))
-                ct
+                cancellationToken
 
-        member _.ExtendLease(commandId, leaseToken, lease, ct) =
+        member _.ExtendLeaseAsync(commandId, leaseToken, lease, cancellationToken) =
             Sql.writeProgramWith
                 context
                 (fun now ->
@@ -483,13 +483,13 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
                               "@deadline", Param.Integer(Instant.add now (LeaseDuration.value lease)) ]
                         )
                     ))
-                ct
+                cancellationToken
 
-        member _.TryGet(commandId, ct) =
+        member _.TryGetAsync(commandId, cancellationToken) =
             Sql.readProgram
                 context
                 (StoreProgram.tryQueryOne commandById [ Params.commandId "@command_id" commandId ] recordRow)
-                ct
+                cancellationToken
 
-        member _.TryFind(machineId, entityId, idempotencyKey, ct) =
-            findExisting machineId (encodeEntityId entityId) idempotencyKey ct
+        member _.TryFindAsync(machineId, entityId, idempotencyKey, cancellationToken) =
+            findExisting machineId (encodeEntityId entityId) idempotencyKey cancellationToken

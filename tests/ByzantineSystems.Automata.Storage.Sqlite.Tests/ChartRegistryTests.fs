@@ -18,7 +18,7 @@ let private identity version fingerprint =
 
 let private register (registry: IChartRegistry) version fingerprint : Task<ChartRegistration> =
     task {
-        let! outcome = registry.Register(identity version fingerprint, noCancellation)
+        let! outcome = registry.RegisterAsync(identity version fingerprint, noCancellation)
         return outcome |> expectOk $"register version {version}"
     }
 

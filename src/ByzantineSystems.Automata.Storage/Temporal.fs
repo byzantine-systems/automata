@@ -48,12 +48,12 @@ type Belief<'EntityId, 'State> =
 type ITemporalReader<'EntityId, 'State> =
 
     /// <summary>
-    /// Today's opinion about an instant of business time. Equivalent to <c>AsOf</c> with
+    /// Today's opinion about an instant of business time. Equivalent to <c>AsOfAsync</c> with
     /// <c>knownAt</c> set to now, and offered separately because that is the question most
     /// callers actually have.
     /// </summary>
-    abstract ValidAt:
-        machineId: MachineId * entityId: 'EntityId * validAt: DateTimeOffset * ct: CancellationToken ->
+    abstract ValidAtAsync:
+        machineId: MachineId * entityId: 'EntityId * validAt: DateTimeOffset * cancellationToken: CancellationToken ->
             Task<Result<Belief<'EntityId, 'State> option, StoreError>>
 
     /// <summary>
@@ -63,12 +63,12 @@ type ITemporalReader<'EntityId, 'State> =
     /// of mind: the same instant in the world, two different answers, and the difference is the
     /// explanation an operator is asking for.
     /// </summary>
-    abstract AsOf:
+    abstract AsOfAsync:
         machineId: MachineId *
         entityId: 'EntityId *
         validAt: DateTimeOffset *
         knownAt: DateTimeOffset *
-        ct: CancellationToken ->
+        cancellationToken: CancellationToken ->
             Task<Result<Belief<'EntityId, 'State> option, StoreError>>
 
 /// <summary>
@@ -128,7 +128,7 @@ type ICorrectionStore<'EntityId, 'State> =
     /// <paramref name="beliefs" />, in one transaction.
     ///
     /// Superseded beliefs are archived rather than overwritten, so the previous opinion stays
-    /// answerable through <c>AsOf</c>. That is the whole point: a correction that erased what it
+    /// answerable through <c>AsOfAsync</c>. That is the whole point: a correction that erased what it
     /// replaced would leave an audit record claiming the new answer had always been the answer.
     ///
     /// The beliefs must be ordered by <c>ValidFrom</c>: when non-empty, the first starts exactly
@@ -139,12 +139,12 @@ type ICorrectionStore<'EntityId, 'State> =
     /// An empty list asserts that the entity had no belief from <paramref name="validFrom" />
     /// onward, which is how a correction undoes one rather than replacing it.
     /// </summary>
-    abstract Correct:
+    abstract CorrectAsync:
         machineId: MachineId *
         entityId: 'EntityId *
         validFrom: DateTimeOffset *
         beliefs: CorrectedBelief<'State> list *
-        ct: CancellationToken ->
+        cancellationToken: CancellationToken ->
             Task<Result<CorrectionOutcome, StoreError>>
 
 /// <summary>The committed events a correction has to re-decide.</summary>
@@ -195,18 +195,22 @@ type IReplayStore<'EntityId, 'State, 'Event, 'Action> =
     /// <paramref name="limit" /> of them. Asking for one more than a budget allows is how a caller
     /// learns the budget would be exceeded.
     /// </summary>
-    abstract Suffix:
-        machineId: MachineId * entityId: 'EntityId * from: DateTimeOffset * limit: int * ct: CancellationToken ->
+    abstract SuffixAsync:
+        machineId: MachineId *
+        entityId: 'EntityId *
+        from: DateTimeOffset *
+        limit: int *
+        cancellationToken: CancellationToken ->
             Task<Result<ReplaySuffix<'EntityId, 'State, 'Event, 'Action>, StoreError>>
 
     /// <summary>
     /// Commits a correction, fenced like any other commit: the lease must still be held and the
     /// entity must still be at <paramref name="expected" />, or nothing is written.
     /// </summary>
-    abstract CommitCorrection:
+    abstract CommitCorrectionAsync:
         commandId: CommandId *
         token: LeaseToken<CommandWork> *
         expected: Epoch *
         commit: CorrectionCommit<'EntityId, 'State, 'Event, 'Action> *
-        ct: CancellationToken ->
+        cancellationToken: CancellationToken ->
             Task<Result<FinalizeOutcome, StoreError>>

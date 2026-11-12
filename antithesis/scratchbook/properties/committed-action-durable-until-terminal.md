@@ -9,7 +9,7 @@
   SQLite machine-keyed action table; dead-letter records for undeliverable
   actions (`action_dead_letter` per C3).
 - Failure scenario: worker dies between the external effect and
-  `Complete` (redelivery, fine); or between claim and effect with the lease
+  `CompleteAsync` (redelivery, fine); or between claim and effect with the lease
   expiring into a gap where no row is claimable (loss, forbidden).
 - Key observation: at-least-once means duplicates are *not* violations here;
   only disappearance is.

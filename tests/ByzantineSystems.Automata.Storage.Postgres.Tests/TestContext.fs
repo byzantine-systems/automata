@@ -407,7 +407,7 @@ let newMaintenance () : IDatabaseMaintenance =
 let boot (retention: RetentionPolicy) : Task<unit> =
     task {
         let store = newMachineStore retention :> IStoreBoot
-        let! report = store.Boot(machine, noCancellation)
+        let! report = store.BootAsync(machine, noCancellation)
 
         match report with
         | Ok BootReport.Ready -> ()

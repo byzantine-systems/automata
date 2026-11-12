@@ -27,7 +27,7 @@ let private keepCommandsFor span =
 
 let private submit (name: string) (key: string) =
     task {
-        let! outcome = (newInbox ()).Submit(submission (entity name) key (Start 1), noCancellation)
+        let! outcome = (newInbox ()).SubmitAsync(submission (entity name) key (Start 1), noCancellation)
         return outcome |> expectOk "submit" |> commandIdOf
     }
 
@@ -37,13 +37,13 @@ let private submitCorrection (name: string) (key: string) =
             { submission (entity name) key (Start 1) with
                 Kind = CommandKind.Correction(effectiveAt, CorrectionPolicy.defaults) }
 
-        let! outcome = (newInbox ()).Submit(correction, noCancellation)
+        let! outcome = (newInbox ()).SubmitAsync(correction, noCancellation)
         return outcome |> expectOk "submit correction" |> commandIdOf
     }
 
 let private claimed (key: string) =
     task {
-        let! batch = (newInbox ()).Claim(machine, ClaimBatch.create 50, LeaseDuration.create lease, noCancellation)
+        let! batch = (newInbox ()).ClaimAsync(machine, ClaimBatch.create 50, LeaseDuration.create lease, noCancellation)
 
         return
             batch
@@ -56,7 +56,7 @@ let private commit (leased: LeasedCommand<Entity, TestEvent>) (expected: Epoch) 
     task {
         let! outcome =
             (newProcessor ())
-                .Commit(
+                .CommitAsync(
                     leased.Work.CommandId,
                     leased.Token,
                     expected,
@@ -71,14 +71,14 @@ let private reject (leased: LeasedCommand<Entity, TestEvent>) =
     task {
         let! outcome =
             (newProcessor ())
-                .Reject(leased.Work.CommandId, leased.Token, CommandFailure.Machine "refused", noCancellation)
+                .RejectAsync(leased.Work.CommandId, leased.Token, CommandFailure.Machine "refused", noCancellation)
 
         outcome |> expectOk "reject" |> ignore
     }
 
 let private run (batch: int) =
     task {
-        let! reports = (newMaintenance ()).Run(ClaimBatch.create batch, noCancellation)
+        let! reports = (newMaintenance ()).RunAsync(ClaimBatch.create batch, noCancellation)
         return reports |> expectOk "run"
     }
 
@@ -115,7 +115,7 @@ let private settle (conn: NpgsqlConnection) (quiet: TimeSpan) =
 
 let private notify () =
     task {
-        let! tick = (newMaintenance ()).NotifyPending noCancellation
+        let! tick = (newMaintenance ()).NotifyPendingAsync noCancellation
         return tick |> expectOk "notify"
     }
 
@@ -241,13 +241,13 @@ let bootTests =
                       (ActionDelivery.Deliver(ActionQueueName.create actionQueue))
                   |> PostgresMachineStore
 
-              let! booted = (store :> IStoreBoot).Boot(machine, noCancellation)
+              let! booted = (store :> IStoreBoot).BootAsync(machine, noCancellation)
               Expect.equal (booted |> expectOk "boot") BootReport.Ready "the defaults are a working store"
 
               let inbox = store :> ICommandInbox<Entity, TestEvent>
-              let! submitted = inbox.Submit(submission (entity "e1") "k1" (Start 1), noCancellation)
+              let! submitted = inbox.SubmitAsync(submission (entity "e1") "k1" (Start 1), noCancellation)
               let commandId = submitted |> expectOk "submit" |> commandIdOf
-              let! found = inbox.TryGet(commandId, noCancellation)
+              let! found = inbox.TryGetAsync(commandId, noCancellation)
 
               Expect.equal
                   (found |> expectOk "read" |> Option.map (fun record -> record.Event))
@@ -369,7 +369,7 @@ let retentionTests =
               for key in [ "k1"; "k2"; "k3" ] do
                   let! _ = submit "e1" key
                   let! leased = claimed key
-                  let! snapshot = (newReader ()).TryGetSnapshot(machine, entity "e1", noCancellation)
+                  let! snapshot = (newReader ()).TryGetSnapshotAsync(machine, entity "e1", noCancellation)
 
                   let expected =
                       snapshot
@@ -426,10 +426,11 @@ let retentionTests =
               let! _ = commit first Epoch.initial
 
               let! actions =
-                  (newActionQueue ()).Claim(machine, ClaimBatch.create 10, LeaseDuration.create lease, noCancellation)
+                  (newActionQueue ())
+                      .ClaimAsync(machine, ClaimBatch.create 10, LeaseDuration.create lease, noCancellation)
 
               for action in actions |> expectOk "claim actions" do
-                  let! _ = (newActionQueue ()).Complete(action, noCancellation)
+                  let! _ = (newActionQueue ()).CompleteAsync(action, noCancellation)
                   ()
 
               arrange $"UPDATE pgmq.a_{actionQueue} SET archived_at = now() - interval '2 hours'"
@@ -477,7 +478,8 @@ let reaperTests =
               Expect.equal (reportFor reports).Reaped 0L "inside the grace period"
 
               let! extended =
-                  (newInbox ()).ExtendLease(held.Work.CommandId, held.Token, LeaseDuration.create lease, noCancellation)
+                  (newInbox ())
+                      .ExtendLeaseAsync(held.Work.CommandId, held.Token, LeaseDuration.create lease, noCancellation)
 
               Expect.equal (extended |> expectOk "extend") Updated "its holder can still keep it"
           } ]
@@ -502,13 +504,13 @@ let driftTests =
                   "and does not repair it"
 
               let maintenance = newMaintenance ()
-              let! drift = maintenance.DetectDrift noCancellation
+              let! drift = maintenance.DetectDriftAsync noCancellation
               Expect.equal (drift |> expectOk "detect" |> List.length) 1 "detection names the command"
 
-              let! repaired = maintenance.RepairDrift noCancellation
+              let! repaired = maintenance.RepairDriftAsync noCancellation
               Expect.equal (repaired |> expectOk "repair" |> List.length) 1 "repair changes exactly it"
 
-              let! after = maintenance.DetectDrift noCancellation
+              let! after = maintenance.DetectDriftAsync noCancellation
               Expect.isEmpty (after |> expectOk "detect again") "healthy afterwards"
           } ]
 
@@ -526,7 +528,7 @@ let private oldBelief () =
 let private heldAt (knownAt: DateTimeOffset) =
     task {
         let! belief =
-            (newTemporalReader ()).AsOf(machine, entity "e1", effectiveAt.AddHours 16., knownAt, noCancellation)
+            (newTemporalReader ()).AsOfAsync(machine, entity "e1", effectiveAt.AddHours 16., knownAt, noCancellation)
 
         return belief |> expectOk "as of" |> Option.map (fun b -> b.Snapshot.State)
     }
@@ -645,7 +647,7 @@ let notifyTests =
                   { submission (entity "e1") "k1" (Start 1) with
                       VisibleAt = Some(DateTimeOffset.UtcNow.AddHours 1.) }
 
-              let! _ = (newInbox ()).Submit(later, noCancellation)
+              let! _ = (newInbox ()).SubmitAsync(later, noCancellation)
               let! conn, heard = listenOn "fsm_command"
               use _ = conn
 
@@ -686,7 +688,7 @@ let notifyTests =
               let store = newMachineStore RetentionPolicy.keepEverything :> IWorkNotifications
 
               let listening =
-                  store.Listen(
+                  store.ListenAsync(
                       machine,
                       (fun () -> Interlocked.Increment commands |> ignore),
                       (fun () -> Interlocked.Increment actions |> ignore),
@@ -725,7 +727,7 @@ let cronTests =
               let maintenance = newMaintenance ()
 
               let! scheduling =
-                  maintenance.Schedule(
+                  maintenance.ScheduleAsync(
                       TimeSpan.FromSeconds 1.,
                       TimeSpan.FromMinutes 1.,
                       ClaimBatch.create 100,
@@ -740,7 +742,7 @@ let cronTests =
 
               Expect.equal (scheduling |> expectOk "schedule") expected "the database cannot run it"
 
-              let! removed = maintenance.Unschedule noCancellation
+              let! removed = maintenance.UnscheduleAsync noCancellation
               Expect.equal (removed |> expectOk "unschedule") 0 "nothing to remove"
           }
 
@@ -777,7 +779,7 @@ let cronTests =
 
               for _ in 1..2 do
                   let! scheduled =
-                      maintenance.Schedule(
+                      maintenance.ScheduleAsync(
                           TimeSpan.FromSeconds 1.,
                           TimeSpan.FromMinutes 1.,
                           ClaimBatch.create 100,
@@ -788,7 +790,7 @@ let cronTests =
 
               Expect.equal (jobs ()) 3L "asserting again updates rather than duplicating"
 
-              let! removed = maintenance.Unschedule noCancellation
+              let! removed = maintenance.UnscheduleAsync noCancellation
               Expect.equal (removed |> expectOk "unschedule") 3 "all three, by name"
               Expect.equal (jobs ()) 0L "nothing left calling a schema that may be dropped next"
           } ]

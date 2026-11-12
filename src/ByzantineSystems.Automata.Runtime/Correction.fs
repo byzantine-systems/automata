@@ -41,11 +41,11 @@ module internal Correction =
             let reader = config.Store :> IStateReader<'EntityId, 'State, 'Event, 'Action>
 
             taskResult {
-                let! live = reader.TryGetSnapshot(config.MachineId, entityId, ct)
-                let! before = temporal.ValidAt(config.MachineId, entityId, justBefore at, ct)
+                let! live = reader.TryGetSnapshotAsync(config.MachineId, entityId, ct)
+                let! before = temporal.ValidAtAsync(config.MachineId, entityId, justBefore at, ct)
                 // One more than the budget, which is how an over-long suffix is told apart from
                 // one exactly at the limit.
-                let! suffix = replay.Suffix(config.MachineId, entityId, at, policy.ReplayLimit + 1, ct)
+                let! suffix = replay.SuffixAsync(config.MachineId, entityId, at, policy.ReplayLimit + 1, ct)
 
                 return live, before, suffix
             }

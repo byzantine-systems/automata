@@ -51,8 +51,8 @@ let private runRegistryTrace (fresh: unit -> Task<IChartRegistry>) generated =
                             | Some stored when stored = chart.Fingerprint -> ChartRegistration.Matched, model
                             | Some stored -> ChartRegistration.Mismatched stored, model
 
-                        let! actual = registry.Register(chart, CancellationToken.None)
-                        let! found = registry.TryGet(chart.MachineId, chart.Version, CancellationToken.None)
+                        let! actual = registry.RegisterAsync(chart, CancellationToken.None)
+                        let! found = registry.TryGetAsync(chart.MachineId, chart.Version, CancellationToken.None)
 
                         match actual, found with
                         | Ok registration, Ok fingerprint when
@@ -63,7 +63,7 @@ let private runRegistryTrace (fresh: unit -> Task<IChartRegistry>) generated =
                     | Read(machineSeed, versionSeed) ->
                         let chart = identity machineSeed versionSeed 0uy
                         let key = machineSeed % 4uy, versionSeed % 4uy
-                        let! actual = registry.TryGet(chart.MachineId, chart.Version, CancellationToken.None)
+                        let! actual = registry.TryGetAsync(chart.MachineId, chart.Version, CancellationToken.None)
 
                         match actual with
                         | Ok fingerprint when fingerprint = Map.tryFind key model -> return! run model rest
@@ -383,7 +383,7 @@ let private runInboxTrace
                             |> Seq.tryFind (fun tracked -> tracked.Entity = name && tracked.Key = idempotencyKey)
                         with
                         | Some tracked ->
-                            let! outcome = stores.Inbox.Submit(submission, ct)
+                            let! outcome = stores.Inbox.SubmitAsync(submission, ct)
 
                             match outcome with
                             | Ok(AlreadySubmitted found) when found = tracked.Id && event = tracked.Event ->
@@ -397,7 +397,7 @@ let private runInboxTrace
                             | _ -> return false
                         | None ->
                             let before = stores.Now()
-                            let! outcome = stores.Inbox.Submit(submission, ct)
+                            let! outcome = stores.Inbox.SubmitAsync(submission, ct)
 
                             match outcome with
                             | Ok(Accepted id) ->
@@ -440,7 +440,7 @@ let private runInboxTrace
                             let batchLimit = batchOf batch
 
                             let! claimed =
-                                stores.Inbox.Claim(env.Machine, ClaimBatch.create batchLimit, env.ClaimLease, ct)
+                                stores.Inbox.ClaimAsync(env.Machine, ClaimBatch.create batchLimit, env.ClaimLease, ct)
 
                             match claimed with
                             | Error _ -> return false
@@ -553,7 +553,7 @@ let private runInboxTrace
 
                                 match finishKindOf kind with
                                 | 0 ->
-                                    let! outcome = stores.Processor.Reject(tracked.Id, tokenId, failure, ct)
+                                    let! outcome = stores.Processor.RejectAsync(tracked.Id, tokenId, failure, ct)
 
                                     match outcome with
                                     | Ok(Finalized committed) when committed = Epoch.initial ->
@@ -563,7 +563,7 @@ let private runInboxTrace
                                         return! loop rest
                                     | _ -> return false
                                 | 1 ->
-                                    let! outcome = stores.Processor.DeadLetter(tracked.Id, tokenId, failure, ct)
+                                    let! outcome = stores.Processor.DeadLetterAsync(tracked.Id, tokenId, failure, ct)
 
                                     match outcome with
                                     | Ok(Finalized committed) when committed = Epoch.initial ->
@@ -574,12 +574,12 @@ let private runInboxTrace
                                     | _ -> return false
                                 | 2 ->
                                     let before = stores.Now()
-                                    let! outcome = stores.Inbox.Reschedule(tracked.Id, tokenId, env.Backoff, ct)
+                                    let! outcome = stores.Inbox.RescheduleAsync(tracked.Id, tokenId, env.Backoff, ct)
 
                                     match outcome with
                                     | Ok Updated ->
                                         let after = stores.Now()
-                                        let! record = stores.Inbox.TryGet(tracked.Id, ct)
+                                        let! record = stores.Inbox.TryGetAsync(tracked.Id, ct)
 
                                         let readBackOk =
                                             match record with
@@ -602,7 +602,8 @@ let private runInboxTrace
                                             return false
                                     | _ -> return false
                                 | _ ->
-                                    let! outcome = stores.Inbox.ExtendLease(tracked.Id, tokenId, env.ClaimLease, ct)
+                                    let! outcome =
+                                        stores.Inbox.ExtendLeaseAsync(tracked.Id, tokenId, env.ClaimLease, ct)
 
                                     match outcome with
                                     | Ok Updated ->
@@ -637,7 +638,7 @@ let private runInboxTrace
                                 let expected = expectedEpoch expected actual
 
                                 let! outcome =
-                                    stores.Processor.Commit(
+                                    stores.Processor.CommitAsync(
                                         tracked.Id,
                                         LeaseToken.ofInt64 token,
                                         expected,
@@ -657,7 +658,13 @@ let private runInboxTrace
                                 let before = stores.Now()
 
                                 let! outcome =
-                                    stores.Processor.Commit(tracked.Id, LeaseToken.ofInt64 token, expected, draft, ct)
+                                    stores.Processor.CommitAsync(
+                                        tracked.Id,
+                                        LeaseToken.ofInt64 token,
+                                        expected,
+                                        draft,
+                                        ct
+                                    )
 
                                 let after = stores.Now()
 
@@ -730,7 +737,7 @@ let private runInboxTrace
 
                                 match tracked.Status with
                                 | Finished(CommittedResult(expected, committed, draft, _, _)) ->
-                                    let! outcome = stores.Processor.Commit(tracked.Id, token, expected, draft, ct)
+                                    let! outcome = stores.Processor.CommitAsync(tracked.Id, token, expected, draft, ct)
 
                                     if outcome = Ok(AlreadyFinalized(committed, CommandStatus.Succeeded)) then
                                         classes.Add "commit-already"
@@ -738,7 +745,7 @@ let private runInboxTrace
                                     else
                                         return false
                                 | Finished(RejectedResult failure) ->
-                                    let! outcome = stores.Processor.Reject(tracked.Id, token, failure, ct)
+                                    let! outcome = stores.Processor.RejectAsync(tracked.Id, token, failure, ct)
 
                                     if outcome = Ok(AlreadyFinalized(Epoch.initial, CommandStatus.Rejected)) then
                                         classes.Add "reject-already"
@@ -746,7 +753,7 @@ let private runInboxTrace
                                     else
                                         return false
                                 | Finished(DeadLetterResult failure) ->
-                                    let! outcome = stores.Processor.DeadLetter(tracked.Id, token, failure, ct)
+                                    let! outcome = stores.Processor.DeadLetterAsync(tracked.Id, token, failure, ct)
 
                                     if outcome = Ok(AlreadyFinalized(Epoch.initial, CommandStatus.DeadLettered)) then
                                         classes.Add "deadletter-already"
@@ -784,17 +791,21 @@ let private runInboxTrace
                                     task {
                                         match kindIndex with
                                         | 0 ->
-                                            let! outcome = stores.Processor.Reject(tracked.Id, stale, failure, ct)
+                                            let! outcome = stores.Processor.RejectAsync(tracked.Id, stale, failure, ct)
                                             return outcome = Ok FinalizeOutcome.LeaseLost
                                         | 1 ->
-                                            let! outcome = stores.Processor.DeadLetter(tracked.Id, stale, failure, ct)
+                                            let! outcome =
+                                                stores.Processor.DeadLetterAsync(tracked.Id, stale, failure, ct)
+
                                             return outcome = Ok FinalizeOutcome.LeaseLost
                                         | 2 ->
-                                            let! outcome = stores.Inbox.Reschedule(tracked.Id, stale, env.Backoff, ct)
+                                            let! outcome =
+                                                stores.Inbox.RescheduleAsync(tracked.Id, stale, env.Backoff, ct)
+
                                             return outcome = Ok LeaseUpdateOutcome.LeaseLost
                                         | _ ->
                                             let! outcome =
-                                                stores.Inbox.ExtendLease(tracked.Id, stale, env.ClaimLease, ct)
+                                                stores.Inbox.ExtendLeaseAsync(tracked.Id, stale, env.ClaimLease, ct)
 
                                             return outcome = Ok LeaseUpdateOutcome.LeaseLost
                                     }
@@ -802,7 +813,7 @@ let private runInboxTrace
                                 if not fenced then
                                     return false
                                 else
-                                    let! record = stores.Inbox.TryGet(tracked.Id, ct)
+                                    let! record = stores.Inbox.TryGetAsync(tracked.Id, ct)
 
                                     let untouched =
                                         match record with
@@ -824,7 +835,7 @@ let private runInboxTrace
                         let name = entityName entity
                         let idempotencyKey = keyName key
 
-                        let! found = stores.Inbox.TryFind(env.Machine, entityId name, idempotencyKey, ct)
+                        let! found = stores.Inbox.TryFindAsync(env.Machine, entityId name, idempotencyKey, ct)
 
                         match
                             commands
@@ -866,7 +877,7 @@ let private runInboxTrace
                             |> Seq.tryFind (fun tracked -> tracked.Entity = name && tracked.Key = idempotencyKey)
                         with
                         | Some tracked ->
-                            let! observed = stores.Processor.TryGetResult(tracked.Id, ct)
+                            let! observed = stores.Processor.TryGetResultAsync(tracked.Id, ct)
 
                             match observed with
                             | Ok result when resultMatches tracked result ->
@@ -880,7 +891,7 @@ let private runInboxTrace
                                 return! loop rest
                             | _ -> return false
                         | None ->
-                            let! observed = stores.Processor.TryGetResult(CommandId.ofInt64 404L, ct)
+                            let! observed = stores.Processor.TryGetResultAsync(CommandId.ofInt64 404L, ct)
 
                             match observed with
                             | Ok None ->
@@ -992,7 +1003,9 @@ type FakeInbox(env: ContractInboxEnv) =
 
     interface ContractInbox with
 
-        member _.Submit(submission: CommandSubmission<ContractEntityId, ContractEvent>, _ct: CancellationToken) =
+        member _.SubmitAsync
+            (submission: CommandSubmission<ContractEntityId, ContractEvent>, cancellationToken: CancellationToken)
+            =
             match
                 rows
                 |> Seq.tryFind (fun row -> row.EntityId = submission.EntityId && row.Key = submission.IdempotencyKey)
@@ -1027,7 +1040,9 @@ type FakeInbox(env: ContractInboxEnv) =
                 rows.Add row
                 Task.FromResult(Ok(Accepted row.Id))
 
-        member _.Claim(_machine: MachineId, batch: ClaimBatch, lease: LeaseDuration, _ct: CancellationToken) =
+        member _.ClaimAsync
+            (_machine: MachineId, batch: ClaimBatch, lease: LeaseDuration, cancellationToken: CancellationToken)
+            =
             let claimed =
                 rows
                 |> Seq.filter nonTerminal
@@ -1060,9 +1075,13 @@ type FakeInbox(env: ContractInboxEnv) =
 
             Task.FromResult(Ok leased)
 
-        member _.Reschedule
-            (commandId: CommandId, token: LeaseToken<CommandWork>, _backoff: Backoff, _ct: CancellationToken)
-            =
+        member _.RescheduleAsync
+            (
+                commandId: CommandId,
+                token: LeaseToken<CommandWork>,
+                _backoff: Backoff,
+                cancellationToken: CancellationToken
+            ) =
             match rows |> Seq.tryFind (fun row -> row.Id = commandId) with
             | Some row when live row token ->
                 row.Status <- Ready
@@ -1072,22 +1091,28 @@ type FakeInbox(env: ContractInboxEnv) =
                 Task.FromResult(Ok Updated)
             | _ -> Task.FromResult(Ok LeaseUpdateOutcome.LeaseLost)
 
-        member _.ExtendLease
-            (commandId: CommandId, token: LeaseToken<CommandWork>, lease: LeaseDuration, _ct: CancellationToken)
-            =
+        member _.ExtendLeaseAsync
+            (
+                commandId: CommandId,
+                token: LeaseToken<CommandWork>,
+                lease: LeaseDuration,
+                cancellationToken: CancellationToken
+            ) =
             match rows |> Seq.tryFind (fun row -> row.Id = commandId) with
             | Some row when live row token ->
                 row.Deadline <- now + LeaseDuration.value lease
                 Task.FromResult(Ok Updated)
             | _ -> Task.FromResult(Ok LeaseUpdateOutcome.LeaseLost)
 
-        member _.TryGet(commandId: CommandId, _ct: CancellationToken) =
+        member _.TryGetAsync(commandId: CommandId, cancellationToken: CancellationToken) =
             rows
             |> Seq.tryFind (fun row -> row.Id = commandId)
             |> Option.map recordOf
             |> fun found -> Task.FromResult(Ok found)
 
-        member _.TryFind(_machine: MachineId, entity: ContractEntityId, key: string, _ct: CancellationToken) =
+        member _.TryFindAsync
+            (_machine: MachineId, entity: ContractEntityId, key: string, cancellationToken: CancellationToken)
+            =
             rows
             |> Seq.tryFind (fun row -> row.EntityId = entity && row.Key = key)
             |> Option.map recordOf
@@ -1095,7 +1120,7 @@ type FakeInbox(env: ContractInboxEnv) =
 
     interface ContractProcessor with
 
-        member _.Commit(commandId, token, expected, draft, _ct) =
+        member _.CommitAsync(commandId, token, expected, draft, cancellationToken) =
             match rows |> Seq.tryFind (fun row -> row.Id = commandId) with
             | Some row when row.Status = Succeeded || row.Status = Rejected || row.Status = Dead ->
                 if row.Token <> LeaseToken.value token then
@@ -1134,7 +1159,7 @@ type FakeInbox(env: ContractInboxEnv) =
                     Task.FromResult(Ok(Finalized committed))
             | _ -> Task.FromResult(Ok FinalizeOutcome.LeaseLost)
 
-        member _.Reject(commandId: CommandId, token: LeaseToken<CommandWork>, failure, _ct) =
+        member _.RejectAsync(commandId: CommandId, token: LeaseToken<CommandWork>, failure, cancellationToken) =
             match rows |> Seq.tryFind (fun row -> row.Id = commandId) with
             | Some row when row.Status = Rejected && row.Token = LeaseToken.value token ->
                 Task.FromResult(Ok(AlreadyFinalized(Epoch.initial, CommandStatus.Rejected)))
@@ -1144,7 +1169,7 @@ type FakeInbox(env: ContractInboxEnv) =
                 Task.FromResult(Ok(Finalized Epoch.initial))
             | _ -> Task.FromResult(Ok FinalizeOutcome.LeaseLost)
 
-        member _.DeadLetter(commandId: CommandId, token: LeaseToken<CommandWork>, failure, _ct) =
+        member _.DeadLetterAsync(commandId: CommandId, token: LeaseToken<CommandWork>, failure, cancellationToken) =
             match rows |> Seq.tryFind (fun row -> row.Id = commandId) with
             | Some row when row.Status = Dead && row.Token = LeaseToken.value token ->
                 Task.FromResult(Ok(AlreadyFinalized(Epoch.initial, CommandStatus.DeadLettered)))
@@ -1154,7 +1179,7 @@ type FakeInbox(env: ContractInboxEnv) =
                 Task.FromResult(Ok(Finalized Epoch.initial))
             | _ -> Task.FromResult(Ok FinalizeOutcome.LeaseLost)
 
-        member _.TryGetResult(commandId, _ct) =
+        member _.TryGetResultAsync(commandId, cancellationToken) =
             rows
             |> Seq.tryFind (fun row -> row.Id = commandId)
             |> Option.map (fun row -> defaultArg row.Result CommandResult.Pending)
@@ -1281,13 +1306,13 @@ let requestIdentityProperty name maxTests (env: ContractInboxEnv) =
                               ChartVersion = ChartVersion.create (ChartVersion.value env.Version + 1) }
                           { original with Kind = correction } ]
 
-                    let! first = stores.Inbox.Submit(original, ct)
-                    let! before = stores.Inbox.TryFind(env.Machine, entity, original.IdempotencyKey, ct)
+                    let! first = stores.Inbox.SubmitAsync(original, ct)
+                    let! before = stores.Inbox.TryFindAsync(env.Machine, entity, original.IdempotencyKey, ct)
 
                     match first with
                     | Ok(Accepted commandId) ->
                         let! retry =
-                            stores.Inbox.Submit(
+                            stores.Inbox.SubmitAsync(
                                 { original with
                                     VisibleAt = Some(stores.Now().AddDays 1.)
                                     ReceivedAt = Some at
@@ -1300,14 +1325,14 @@ let requestIdentityProperty name maxTests (env: ContractInboxEnv) =
                         Expect.equal retry (Ok(AlreadySubmitted commandId)) "retry metadata does not redefine identity"
 
                         for request in changed do
-                            let! outcome = stores.Inbox.Submit(request, ct)
+                            let! outcome = stores.Inbox.SubmitAsync(request, ct)
 
                             Expect.equal
                                 outcome
                                 (Ok(SubmissionOutcome.Refused(KeyReused commandId)))
                                 "a changed request is refused"
 
-                        let! after = stores.Inbox.TryFind(env.Machine, entity, original.IdempotencyKey, ct)
+                        let! after = stores.Inbox.TryFindAsync(env.Machine, entity, original.IdempotencyKey, ct)
                         Expect.equal after before "refused submissions do not alter the original"
 
                         let correctionRequest =
@@ -1315,11 +1340,11 @@ let requestIdentityProperty name maxTests (env: ContractInboxEnv) =
                                 IdempotencyKey = "correction"
                                 Kind = correction }
 
-                        let! acceptedCorrection = stores.Inbox.Submit(correctionRequest, ct)
+                        let! acceptedCorrection = stores.Inbox.SubmitAsync(correctionRequest, ct)
 
                         match acceptedCorrection with
                         | Ok(Accepted correctionId) ->
-                            let! same = stores.Inbox.Submit(correctionRequest, ct)
+                            let! same = stores.Inbox.SubmitAsync(correctionRequest, ct)
 
                             Expect.equal
                                 same
@@ -1339,14 +1364,14 @@ let requestIdentityProperty name maxTests (env: ContractInboxEnv) =
                                       { CorrectionPolicy.defaults with
                                           OnDivergence = Divergence.Truncate }
                                   ) ] do
-                                let! outcome = stores.Inbox.Submit({ correctionRequest with Kind = kind }, ct)
+                                let! outcome = stores.Inbox.SubmitAsync({ correctionRequest with Kind = kind }, ct)
 
                                 Expect.equal
                                     outcome
                                     (Ok(SubmissionOutcome.Refused(KeyReused correctionId)))
                                     "correction fields define identity"
 
-                            let! next = stores.Inbox.TryFind(env.Machine, entity, "correction", ct)
+                            let! next = stores.Inbox.TryFindAsync(env.Machine, entity, "correction", ct)
 
                             Expect.equal
                                 (next |> Result.map (Option.map _.Sequence))
@@ -1376,11 +1401,11 @@ let arrivalOrderProperty name maxTests (env: ContractInboxEnv) =
                             ReceivedAt = Some at }
 
                     let ct = CancellationToken.None
-                    let! first = stores.Inbox.Submit(original, ct)
+                    let! first = stores.Inbox.SubmitAsync(original, ct)
                     Expect.isOk first "the first arrival is unconstrained"
 
                     let! earlier =
-                        stores.Inbox.Submit(
+                        stores.Inbox.SubmitAsync(
                             { original with
                                 IdempotencyKey = "earlier"
                                 ReceivedAt = Some(at.AddSeconds -1.) },
@@ -1393,7 +1418,7 @@ let arrivalOrderProperty name maxTests (env: ContractInboxEnv) =
                         "an earlier caller arrival is refused"
 
                     let! stamped =
-                        stores.Inbox.Submit(
+                        stores.Inbox.SubmitAsync(
                             { original with
                                 IdempotencyKey = "stamped"
                                 ReceivedAt = None },
@@ -1401,7 +1426,7 @@ let arrivalOrderProperty name maxTests (env: ContractInboxEnv) =
                         )
 
                     Expect.isOk stamped "database time is clamped rather than refused"
-                    let! found = stores.Inbox.TryFind(env.Machine, entity, "stamped", ct)
+                    let! found = stores.Inbox.TryFindAsync(env.Machine, entity, "stamped", ct)
 
                     match found with
                     | Ok(Some row) ->
@@ -1410,7 +1435,7 @@ let arrivalOrderProperty name maxTests (env: ContractInboxEnv) =
                     | other -> failtestf "expected the stamped arrival, got %A" other
 
                     let! equal =
-                        stores.Inbox.Submit(
+                        stores.Inbox.SubmitAsync(
                             { original with
                                 IdempotencyKey = "equal" },
                             ct
@@ -1419,7 +1444,7 @@ let arrivalOrderProperty name maxTests (env: ContractInboxEnv) =
                     Expect.isOk equal "equal caller arrivals are permitted"
 
                     let! correction =
-                        stores.Inbox.Submit(
+                        stores.Inbox.SubmitAsync(
                             { original with
                                 IdempotencyKey = "correction"
                                 Kind = CommandKind.Correction(at.AddDays -1., CorrectionPolicy.defaults) },
@@ -1427,7 +1452,7 @@ let arrivalOrderProperty name maxTests (env: ContractInboxEnv) =
                         )
 
                     Expect.isOk correction "correction arrival time is also clamped"
-                    let! foundCorrection = stores.Inbox.TryFind(env.Machine, entity, "correction", ct)
+                    let! foundCorrection = stores.Inbox.TryFindAsync(env.Machine, entity, "correction", ct)
 
                     Expect.equal
                         (foundCorrection |> Result.map (Option.map _.ReceivedAt))
@@ -1479,7 +1504,7 @@ let finalizeProperty name maxTests (env: ContractInboxEnv) =
 
         let claimKey (stores: ContractStores) key =
             task {
-                match! stores.Inbox.Claim(env.Machine, ClaimBatch.create 2, env.ClaimLease, ct) with
+                match! stores.Inbox.ClaimAsync(env.Machine, ClaimBatch.create 2, env.ClaimLease, ct) with
                 | Ok claimed -> return claimed |> List.tryFind (fun held -> held.Work.IdempotencyKey = key)
                 | Error _ -> return None
             }
@@ -1491,7 +1516,7 @@ let finalizeProperty name maxTests (env: ContractInboxEnv) =
                 let event = eventOf payload
                 let target = contractSubmission env entity "target" event
 
-                match! stores.Inbox.Submit(target, ct) with
+                match! stores.Inbox.SubmitAsync(target, ct) with
                 | Error _ -> return None
                 | Ok _ ->
                     let! siblingSubmitted =
@@ -1500,7 +1525,7 @@ let finalizeProperty name maxTests (env: ContractInboxEnv) =
                                 let siblingPayload = byte ((int payload + 1) % 256)
 
                                 let! outcome =
-                                    stores.Inbox.Submit(
+                                    stores.Inbox.SubmitAsync(
                                         contractSubmission env entity "sibling" (eventOf siblingPayload),
                                         ct
                                     )
@@ -1537,10 +1562,10 @@ let finalizeProperty name maxTests (env: ContractInboxEnv) =
                     let before = stores.Now()
 
                     let! firstOutcome =
-                        stores.Processor.Commit(first.Work.CommandId, first.Token, Epoch.initial, firstDraft, ct)
+                        stores.Processor.CommitAsync(first.Work.CommandId, first.Token, Epoch.initial, firstDraft, ct)
 
                     let after = stores.Now()
-                    let! firstResult = stores.Processor.TryGetResult(first.Work.CommandId, ct)
+                    let! firstResult = stores.Processor.TryGetResultAsync(first.Work.CommandId, ct)
                     let! second = claimKey stores "sibling"
 
                     match second with
@@ -1553,10 +1578,22 @@ let finalizeProperty name maxTests (env: ContractInboxEnv) =
                             contractDraft env second.Work.EntityId second.Work.Event secondPayload firstDraft.ToState
 
                         let! secondOutcome =
-                            stores.Processor.Commit(second.Work.CommandId, second.Token, firstEpoch, secondDraft, ct)
+                            stores.Processor.CommitAsync(
+                                second.Work.CommandId,
+                                second.Token,
+                                firstEpoch,
+                                secondDraft,
+                                ct
+                            )
 
                         let! repeated =
-                            stores.Processor.Commit(first.Work.CommandId, first.Token, Epoch.initial, firstDraft, ct)
+                            stores.Processor.CommitAsync(
+                                first.Work.CommandId,
+                                first.Token,
+                                Epoch.initial,
+                                firstDraft,
+                                ct
+                            )
 
                         return
                             firstOutcome = Ok(Finalized firstEpoch)
@@ -1572,9 +1609,11 @@ let finalizeProperty name maxTests (env: ContractInboxEnv) =
                 | Some(stores, held) ->
                     let draft = contractDraft env held.Work.EntityId held.Work.Event payload Idle
                     let ahead = Epoch.next Epoch.initial
-                    let! conflict = stores.Processor.Commit(held.Work.CommandId, held.Token, ahead, draft, ct)
-                    let! pending = stores.Processor.TryGetResult(held.Work.CommandId, ct)
-                    let! recovered = stores.Processor.Commit(held.Work.CommandId, held.Token, Epoch.initial, draft, ct)
+                    let! conflict = stores.Processor.CommitAsync(held.Work.CommandId, held.Token, ahead, draft, ct)
+                    let! pending = stores.Processor.TryGetResultAsync(held.Work.CommandId, ct)
+
+                    let! recovered =
+                        stores.Processor.CommitAsync(held.Work.CommandId, held.Token, Epoch.initial, draft, ct)
 
                     return
                         conflict = Ok(Conflict(ahead, Epoch.initial))
@@ -1589,13 +1628,13 @@ let finalizeProperty name maxTests (env: ContractInboxEnv) =
                 | Some(stores, held) ->
                     let finalize () =
                         if reject then
-                            stores.Processor.Reject(held.Work.CommandId, held.Token, failure, ct)
+                            stores.Processor.RejectAsync(held.Work.CommandId, held.Token, failure, ct)
                         else
-                            stores.Processor.DeadLetter(held.Work.CommandId, held.Token, failure, ct)
+                            stores.Processor.DeadLetterAsync(held.Work.CommandId, held.Token, failure, ct)
 
                     let! first = finalize ()
                     let! repeated = finalize ()
-                    let! result = stores.Processor.TryGetResult(held.Work.CommandId, ct)
+                    let! result = stores.Processor.TryGetResultAsync(held.Work.CommandId, ct)
                     let! sibling = claimKey stores "sibling"
 
                     let expectedResult =
@@ -1642,9 +1681,11 @@ let finalizeProperty name maxTests (env: ContractInboxEnv) =
                 | Some(stores, held) ->
                     let draft = contractDraft env held.Work.EntityId held.Work.Event payload Idle
                     let stale = LeaseToken.ofInt64 (max 0L (LeaseToken.value held.Token - 1L))
-                    let! fenced = stores.Processor.Commit(held.Work.CommandId, stale, Epoch.initial, draft, ct)
-                    let! pending = stores.Processor.TryGetResult(held.Work.CommandId, ct)
-                    let! recovered = stores.Processor.Commit(held.Work.CommandId, held.Token, Epoch.initial, draft, ct)
+                    let! fenced = stores.Processor.CommitAsync(held.Work.CommandId, stale, Epoch.initial, draft, ct)
+                    let! pending = stores.Processor.TryGetResultAsync(held.Work.CommandId, ct)
+
+                    let! recovered =
+                        stores.Processor.CommitAsync(held.Work.CommandId, held.Token, Epoch.initial, draft, ct)
 
                     return
                         fenced = Ok FinalizeOutcome.LeaseLost
@@ -1660,7 +1701,10 @@ let finalizeProperty name maxTests (env: ContractInboxEnv) =
                     do! stores.Advance(LeaseDuration.value env.ClaimLease + env.Margin + env.Ticks 20)
 
                     let draft = contractDraft env held.Work.EntityId held.Work.Event payload Idle
-                    let! outcome = stores.Processor.Commit(held.Work.CommandId, held.Token, Epoch.initial, draft, ct)
+
+                    let! outcome =
+                        stores.Processor.CommitAsync(held.Work.CommandId, held.Token, Epoch.initial, draft, ct)
+
                     return outcome = Ok(Finalized(Epoch.next Epoch.initial))
             }
 
@@ -1680,17 +1724,17 @@ let finalizeProperty name maxTests (env: ContractInboxEnv) =
                         let before = stores.Now()
 
                         let! fenced =
-                            stores.Processor.Commit(stale.Work.CommandId, stale.Token, Epoch.initial, draft, ct)
+                            stores.Processor.CommitAsync(stale.Work.CommandId, stale.Token, Epoch.initial, draft, ct)
 
                         let! committed =
-                            stores.Processor.Commit(holder.Work.CommandId, holder.Token, Epoch.initial, draft, ct)
+                            stores.Processor.CommitAsync(holder.Work.CommandId, holder.Token, Epoch.initial, draft, ct)
 
                         let after = stores.Now()
 
                         let! terminalFenced =
-                            stores.Processor.Commit(stale.Work.CommandId, stale.Token, Epoch.initial, draft, ct)
+                            stores.Processor.CommitAsync(stale.Work.CommandId, stale.Token, Epoch.initial, draft, ct)
 
-                        let! result = stores.Processor.TryGetResult(holder.Work.CommandId, ct)
+                        let! result = stores.Processor.TryGetResultAsync(holder.Work.CommandId, ct)
                         let epoch = Epoch.next Epoch.initial
 
                         return
@@ -1712,13 +1756,15 @@ let finalizeProperty name maxTests (env: ContractInboxEnv) =
                     let draft = contractDraft env held.Work.EntityId held.Work.Event payload Idle
                     let epoch = Epoch.next Epoch.initial
 
-                    let! committed = stores.Processor.Commit(held.Work.CommandId, held.Token, Epoch.initial, draft, ct)
+                    let! committed =
+                        stores.Processor.CommitAsync(held.Work.CommandId, held.Token, Epoch.initial, draft, ct)
 
                     // The command committed; a late rejection and a late dead letter are both
                     // told the stored status rather than what they asked for.
-                    let! lateRejection = stores.Processor.Reject(held.Work.CommandId, held.Token, failure, ct)
+                    let! lateRejection = stores.Processor.RejectAsync(held.Work.CommandId, held.Token, failure, ct)
 
-                    let! lateDeadLetter = stores.Processor.DeadLetter(held.Work.CommandId, held.Token, failure, ct)
+                    let! lateDeadLetter =
+                        stores.Processor.DeadLetterAsync(held.Work.CommandId, held.Token, failure, ct)
 
                     match! claimKey stores "sibling" with
                     | None -> return false
@@ -1728,10 +1774,11 @@ let finalizeProperty name maxTests (env: ContractInboxEnv) =
                         // epoch after the first command committed.
                         let siblingPayload = byte ((int payload + 1) % 256)
 
-                        let! rejected = stores.Processor.Reject(sibling.Work.CommandId, sibling.Token, failure, ct)
+                        let! rejected =
+                            stores.Processor.RejectAsync(sibling.Work.CommandId, sibling.Token, failure, ct)
 
                         let! lateCommit =
-                            stores.Processor.Commit(
+                            stores.Processor.CommitAsync(
                                 sibling.Work.CommandId,
                                 sibling.Token,
                                 epoch,
@@ -1786,11 +1833,11 @@ let readyTokenProperty name maxTests (env: ContractInboxEnv) =
                           ReceivedAt = None
                           Audit = AuditContext.empty }
 
-                    match! stores.Inbox.Submit(submission, CancellationToken.None) with
+                    match! stores.Inbox.SubmitAsync(submission, CancellationToken.None) with
                     | Error _ -> return false
                     | Ok _ ->
                         match!
-                            stores.Inbox.Claim(
+                            stores.Inbox.ClaimAsync(
                                 env.Machine,
                                 ClaimBatch.create 1,
                                 env.ClaimLease,
@@ -1801,7 +1848,7 @@ let readyTokenProperty name maxTests (env: ContractInboxEnv) =
                         | Ok [] -> return false
                         | Ok(held :: _) ->
                             match!
-                                stores.Inbox.Reschedule(
+                                stores.Inbox.RescheduleAsync(
                                     held.Work.CommandId,
                                     held.Token,
                                     env.Backoff,
@@ -1832,7 +1879,7 @@ let readyTokenProperty name maxTests (env: ContractInboxEnv) =
                                               Status = Running
                                               EffectiveAt = DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero) }
 
-                                        stores.Processor.Commit(
+                                        stores.Processor.CommitAsync(
                                             held.Work.CommandId,
                                             nobody,
                                             Epoch.initial,
@@ -1840,14 +1887,14 @@ let readyTokenProperty name maxTests (env: ContractInboxEnv) =
                                             CancellationToken.None
                                         )
                                     | 1 ->
-                                        stores.Processor.Reject(
+                                        stores.Processor.RejectAsync(
                                             held.Work.CommandId,
                                             nobody,
                                             failure,
                                             CancellationToken.None
                                         )
                                     | _ ->
-                                        stores.Processor.DeadLetter(
+                                        stores.Processor.DeadLetterAsync(
                                             held.Work.CommandId,
                                             nobody,
                                             failure,
@@ -1855,7 +1902,7 @@ let readyTokenProperty name maxTests (env: ContractInboxEnv) =
                                         )
 
                                 let! result =
-                                    stores.Processor.TryGetResult(held.Work.CommandId, CancellationToken.None)
+                                    stores.Processor.TryGetResultAsync(held.Work.CommandId, CancellationToken.None)
 
                                 return
                                     outcome = Ok FinalizeOutcome.LeaseLost
@@ -2032,7 +2079,7 @@ let private runHistory (env: ContractHistoryEnv) (stores: ContractHistoryStores)
             (expected: CompiledRow list)
             : Task<bool> =
             task {
-                match! stores.Reader.History(machine, entity, page, ct) with
+                match! stores.Reader.HistoryAsync(machine, entity, page, ct) with
                 | Ok rows -> return rowsMatch env rows expected
                 | Error _ -> return false
             }
@@ -2043,7 +2090,7 @@ let private runHistory (env: ContractHistoryEnv) (stores: ContractHistoryStores)
             (expected: Snapshot<ContractState> option)
             : Task<bool> =
             task {
-                match! stores.Reader.TryGetSnapshot(machine, entity, ct) with
+                match! stores.Reader.TryGetSnapshotAsync(machine, entity, ct) with
                 | Ok actual -> return actual = expected
                 | Error _ -> return false
             }
@@ -2078,16 +2125,16 @@ let private runHistory (env: ContractHistoryEnv) (stores: ContractHistoryStores)
                       ReceivedAt = None
                       Audit = AuditContext.empty }
 
-                match! stores.Inbox.Submit(submission, ct) with
+                match! stores.Inbox.SubmitAsync(submission, ct) with
                 | Error _ -> return false
                 | Ok _ ->
                     let before = stores.Now()
 
-                    match! stores.Inbox.Claim(env.Machine, ClaimBatch.create 1, lease, ct) with
+                    match! stores.Inbox.ClaimAsync(env.Machine, ClaimBatch.create 1, lease, ct) with
                     | Error _ -> return false
                     | Ok [] -> return false
                     | Ok(held :: _) when held.Work.IdempotencyKey = key ->
-                        match! stores.Processor.Commit(held.Work.CommandId, held.Token, expected, draft, ct) with
+                        match! stores.Processor.CommitAsync(held.Work.CommandId, held.Token, expected, draft, ct) with
                         | Ok(Finalized committed) when committed = Epoch.next expected ->
                             let after = stores.Now()
 
@@ -2158,7 +2205,7 @@ let private runHistory (env: ContractHistoryEnv) (stores: ContractHistoryStores)
                     let page = Page.create 3
                     let expected = expectedPage page log
 
-                    match! stores.Reader.History(env.Machine, entityId name, page, ct) with
+                    match! stores.Reader.HistoryAsync(env.Machine, entityId name, page, ct) with
                     | Ok rows ->
                         if rowsMatch env rows expected then
                             beforePages.Add(name, page, rows)
@@ -2173,7 +2220,7 @@ let private runHistory (env: ContractHistoryEnv) (stores: ContractHistoryStores)
                 match pinned with
                 | [] -> return true
                 | (name, page, beforeRows) :: rest ->
-                    match! stores.Reader.History(env.Machine, entityId name, page, ct) with
+                    match! stores.Reader.HistoryAsync(env.Machine, entityId name, page, ct) with
                     | Ok afterRows ->
                         let stable =
                             if List.length beforeRows >= Page.limit page then
@@ -2208,7 +2255,7 @@ let private runHistory (env: ContractHistoryEnv) (stores: ContractHistoryStores)
 
                     let expected = expectedPage page log
 
-                    match! stores.Reader.History(env.Machine, entityId name, page, ct) with
+                    match! stores.Reader.HistoryAsync(env.Machine, entityId name, page, ct) with
                     | Ok rows when rowsMatch env rows expected -> return! checkPageSeeds rest
                     | _ -> return false
             }

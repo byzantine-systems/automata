@@ -591,7 +591,7 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
 
     interface IStateReader<'EntityId, 'State, 'Event, 'Action> with
 
-        member _.TryGetSnapshot(machineId, entityId, ct) =
+        member _.TryGetSnapshotAsync(machineId, entityId, cancellationToken) =
             Sql.readProgram
                 context
                 (StoreProgram.tryQueryOne
@@ -599,9 +599,9 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                     [ Params.machineId "@machine_id" machineId
                       Params.entityKey "@entity_id" (encodeEntityId entityId) ]
                     snapshotRow)
-                ct
+                cancellationToken
 
-        member _.History(machineId, entityId, paging, ct) =
+        member _.HistoryAsync(machineId, entityId, paging, cancellationToken) =
             // An absent cursor is zero, which transition_epoch_positive makes smaller than any
             // stored epoch, so one query shape serves every page.
             let after =
@@ -618,25 +618,26 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                       "@after", Param.Integer after
                       "@limit", Param.Integer(int64 (Page.limit paging)) ]
                     (transitionRow >> toTransition))
-                ct
+                cancellationToken
 
     interface ICommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err> with
 
-        member _.Commit(commandId, token, expected, draft, ct) =
+        member _.CommitAsync(commandId, token, expected, draft, cancellationToken) =
             // Encoded before the write begins: one file has one writer, so codec work inside the
             // transaction would be time every machine sharing the file waits for.
             backgroundTaskResult {
                 let! encoded = encodeDraft draft
-                return! finalize commandId token (Commit(expected, encoded)) ct
+                return! finalize commandId token (Commit(expected, encoded)) cancellationToken
             }
 
-        member _.Reject(commandId, token, error, ct) = fail Reject commandId token error ct
+        member _.RejectAsync(commandId, token, error, cancellationToken) =
+            fail Reject commandId token error cancellationToken
 
-        member _.DeadLetter(commandId, token, error, ct) =
-            fail DeadLetter commandId token error ct
+        member _.DeadLetterAsync(commandId, token, error, cancellationToken) =
+            fail DeadLetter commandId token error cancellationToken
 
-        member _.TryGetResult(commandId, ct) =
+        member _.TryGetResultAsync(commandId, cancellationToken) =
             Sql.readProgram
                 context
                 (StoreProgram.tryQueryOne commandResult [ Params.commandId "@command_id" commandId ] resultRow)
-                ct
+                cancellationToken

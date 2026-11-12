@@ -105,7 +105,7 @@ type PostgresTemporalStore<'EntityId, 'State>(options: TemporalOptions<'EntityId
         }
 
     /// <summary>
-    /// One as-of read, from fsm.belief. <c>ValidAt</c> is this with <c>knownAt</c> set to now
+    /// One as-of read, from fsm.belief. <c>ValidAtAsync</c> is this with <c>knownAt</c> set to now
     /// rather than a second query: two queries that have to agree are two queries that can drift.
     ///
     /// Both windows are half-open by constraint, so <c>from &lt;= t &lt; to</c> on the view's
@@ -127,18 +127,18 @@ type PostgresTemporalStore<'EntityId, 'State>(options: TemporalOptions<'EntityId
 
     interface ITemporalReader<'EntityId, 'State> with
 
-        member _.ValidAt(machineId, entityId, validAt, ct) =
+        member _.ValidAtAsync(machineId, entityId, validAt, cancellationToken) =
             // The clock is read here and nowhere else in this type. "What do we think now" is the
             // one temporal question whose second coordinate is the present; a caller wanting any
             // other one calls AsOf and says so.
-            asOf machineId entityId validAt (options.TimeProvider.GetUtcNow()) ct
+            asOf machineId entityId validAt (options.TimeProvider.GetUtcNow()) cancellationToken
 
-        member _.AsOf(machineId, entityId, validAt, knownAt, ct) =
-            asOf machineId entityId validAt knownAt ct
+        member _.AsOfAsync(machineId, entityId, validAt, knownAt, cancellationToken) =
+            asOf machineId entityId validAt knownAt cancellationToken
 
     interface ICorrectionStore<'EntityId, 'State> with
 
-        member _.Correct(machineId, entityId, validFrom, beliefs, ct) =
+        member _.CorrectAsync(machineId, entityId, validFrom, beliefs, cancellationToken) =
             backgroundTaskResult {
                 // The whole timeline is encoded before anything is sent.
                 let! payload = BeliefPayload.encode options.StateCodec beliefs
@@ -153,7 +153,7 @@ type PostgresTemporalStore<'EntityId, 'State>(options: TemporalOptions<'EntityId
                               "valid_from", Param.Timestamp validFrom
                               "beliefs", Param.Jsonb payload ]
                             (fun reader -> Row.int32 reader "superseded" |> Ok))
-                        ct
+                        cancellationToken
 
                 return
                     match superseded with

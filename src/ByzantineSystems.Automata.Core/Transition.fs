@@ -40,7 +40,7 @@ type InstanceStatus =
 
 /// <summary>
 /// The materialised state of one entity together with its concurrency token and lifecycle
-/// status. The epoch travels with the snapshot so <c>Commit</c> can be given the expected
+/// status. The epoch travels with the snapshot so <c>CommitAsync</c> can be given the expected
 /// value without a separate <c>GetEpoch</c> round trip.
 /// </summary>
 type Snapshot<'State> =

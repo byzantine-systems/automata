@@ -89,4 +89,5 @@ type SupervisionRecord =
 type ISupervisionEventStore =
 
     /// <summary>Records one supervision fact.</summary>
-    abstract Record: record: SupervisionRecord * ct: CancellationToken -> Task<Result<unit, StoreError>>
+    abstract RecordAsync:
+        record: SupervisionRecord * cancellationToken: CancellationToken -> Task<Result<unit, StoreError>>

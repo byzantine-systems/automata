@@ -95,7 +95,7 @@ type Machine<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: equality>
     /// when the store listens to nothing, and neither is a reason to go round again.
     let listenOnce (notifications: IWorkNotifications) (ct: CancellationToken) () : Task<bool> =
         backgroundTask {
-            match! notifications.Listen(config.MachineId, commandSignal.TrySignal, actionSignal.TrySignal, ct) with
+            match! notifications.ListenAsync(config.MachineId, commandSignal.TrySignal, actionSignal.TrySignal, ct) with
             | Ok() -> return false
             | Error error ->
                 listenerFailed error
@@ -147,11 +147,11 @@ type Machine<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: equality>
     member _.StartAsync(registry: IChartRegistry, ct: CancellationToken) : Task<Result<Startup, StoreError>> =
         let boot () =
             match Store.tryBoot config.Store with
-            | Some store -> store.Boot(config.MachineId, ct)
+            | Some store -> store.BootAsync(config.MachineId, ct)
             | None -> Task.FromResult(Ok BootReport.Ready)
 
         let register () =
-            registry.Register(
+            registry.RegisterAsync(
                 { MachineId = config.MachineId
                   Version = config.ChartVersion
                   Fingerprint = Chart.fingerprint config.Chart },
@@ -166,7 +166,7 @@ type Machine<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: equality>
             |> List.filter (fun (version, _) -> version <> config.ChartVersion)
             |> List.map (fun (version, chart) ->
                 task {
-                    match! registry.TryGet(config.MachineId, version, ct) with
+                    match! registry.TryGetAsync(config.MachineId, version, ct) with
                     | Ok(Some stored) when stored <> Chart.fingerprint chart ->
                         return
                             Ok(
@@ -320,7 +320,7 @@ module Machine =
 
             let! outcome =
                 (inboxOf machine)
-                    .Submit(
+                    .SubmitAsync(
                         { MachineId = machine.MachineId
                           EntityId = entityId
                           IdempotencyKey = EventEnvelope.idempotencyKey envelope
@@ -390,7 +390,7 @@ module Machine =
         (commandId: CommandId)
         (ct: CancellationToken)
         : Task<Result<CommandResult<'EntityId, 'State, 'Event, 'Action, 'Err> option, MachineError<'Err>>> =
-        (processorOf machine).TryGetResult(commandId, ct)
+        (processorOf machine).TryGetResultAsync(commandId, ct)
         |> TaskResult.mapError MachineError.Store
 
     /// Polls the store for a command's outcome, raced against the local notification, until it
@@ -450,7 +450,7 @@ module Machine =
         taskResult {
             do! machine.TryAcceptWork()
 
-            // Every retry passes through Submit's request-identity check. A lookup by key alone
+            // Every retry passes through SubmitAsync's request-identity check. A lookup by key alone
             // cannot distinguish an identical retry from a different request using that key.
             let! submitted = enqueue machine entityId envelope ct
 
@@ -477,7 +477,7 @@ module Machine =
         (entityId: 'EntityId)
         (ct: CancellationToken)
         : Task<Result<Snapshot<'State> option, MachineError<'Err>>> =
-        (stateReaderOf machine).TryGetSnapshot(machine.MachineId, entityId, ct)
+        (stateReaderOf machine).TryGetSnapshotAsync(machine.MachineId, entityId, ct)
         |> TaskResult.mapError MachineError.Store
 
     /// <summary>
@@ -497,7 +497,7 @@ module Machine =
         (paging: Page)
         (ct: CancellationToken)
         : Task<Result<CommittedTransition<'EntityId, 'State, 'Event, 'Action> list, MachineError<'Err>>> =
-        (stateReaderOf machine).History(machine.MachineId, entityId, paging, ct)
+        (stateReaderOf machine).HistoryAsync(machine.MachineId, entityId, paging, ct)
         |> TaskResult.mapError MachineError.Store
 
     /// <summary>
@@ -512,7 +512,7 @@ module Machine =
     /// <example>
     /// <code lang="fsharp">
     /// match Machine.temporal machine with
-    /// | Some reader -> reader.AsOf(Machine.machineId machine, orderId, validAt, knownAt, ct)
+    /// | Some reader -> reader.AsOfAsync(Machine.machineId machine, orderId, validAt, knownAt, ct)
     /// | None -> failwith "this store does not keep history"
     /// </code>
     /// </example>

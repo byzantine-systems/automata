@@ -22,7 +22,7 @@ let private defects check =
 let private boot (connectionString: string) : Task<BootReport> =
     task {
         let store = storeOf (contextFor connectionString) :> IStoreBoot
-        let! report = store.Boot(testMachine, noCancellation)
+        let! report = store.BootAsync(testMachine, noCancellation)
         return report |> expectOk "boot"
     }
 

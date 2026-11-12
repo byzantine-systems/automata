@@ -153,13 +153,13 @@ let private correctAndSettle built name key amount h policy =
 
 let private believedAt name (validAt: DateTimeOffset) =
     task {
-        let! belief = (newTemporalReader ()).ValidAt(machine, entity name, validAt, noCancellation)
+        let! belief = (newTemporalReader ()).ValidAtAsync(machine, entity name, validAt, noCancellation)
         return belief |> expectOk "ValidAt" |> Option.map _.Snapshot.State
     }
 
 let private liveState name =
     task {
-        let! snapshot = (newReader ()).TryGetSnapshot(machine, entity name, noCancellation)
+        let! snapshot = (newReader ()).TryGetSnapshotAsync(machine, entity name, noCancellation)
         return snapshot |> expectOk "snapshot" |> Option.map _.State
     }
 
@@ -182,7 +182,7 @@ let tests =
 
               let! before =
                   (newTemporalReader ())
-                      .AsOf(machine, entity "c", hour 12 + TimeSpan.FromMinutes 30., knownBefore, noCancellation)
+                      .AsOfAsync(machine, entity "c", hour 12 + TimeSpan.FromMinutes 30., knownBefore, noCancellation)
 
               Expect.equal
                   (before |> expectOk "AsOf" |> Option.map _.Snapshot.State)
@@ -216,7 +216,7 @@ let tests =
               let! _ = Machine.enqueue built (entity "queued") (at "queued" "s3" 5 13) noCancellation
 
               let! claimed =
-                  inbox.Claim(
+                  inbox.ClaimAsync(
                       machine,
                       ClaimBatch.create 1,
                       LeaseDuration.create (TimeSpan.FromMinutes 1.),
@@ -241,7 +241,7 @@ let tests =
               | Error error -> failtestf "the poll failed: %A" error
 
               let! released =
-                  inbox.Reschedule(
+                  inbox.RescheduleAsync(
                       head.Work.CommandId,
                       head.Token,
                       Backoff.create (TimeSpan.FromMilliseconds 1.) (TimeSpan.FromMilliseconds 1.),
@@ -302,7 +302,7 @@ let tests =
               arrange
                   "UPDATE fsm.command SET received_at = now() - interval '2 hours' WHERE entity_id = 'retained' AND seq = 1"
 
-              let! reports = (newMaintenance ()).Run(ClaimBatch.create 100, noCancellation)
+              let! reports = (newMaintenance ()).RunAsync(ClaimBatch.create 100, noCancellation)
               reports |> expectOk "maintenance" |> ignore
 
               match!
@@ -406,10 +406,10 @@ let tests =
                   { submission (entity "e1") "c1" (Start 10) with
                       Kind = CommandKind.Correction(at, CorrectionPolicy.defaults) }
 
-              let! _ = inbox.Submit(correction, noCancellation)
+              let! _ = inbox.SubmitAsync(correction, noCancellation)
 
               let! claimed =
-                  inbox.Claim(
+                  inbox.ClaimAsync(
                       machine,
                       ClaimBatch.create 1,
                       LeaseDuration.create (TimeSpan.FromMinutes 1.),
@@ -419,7 +419,7 @@ let tests =
               let held = claimed |> expectOk "claim" |> List.exactlyOne
 
               let! rescheduled =
-                  inbox.Reschedule(
+                  inbox.RescheduleAsync(
                       held.Work.CommandId,
                       held.Token,
                       Backoff.create (TimeSpan.FromMilliseconds 1.) (TimeSpan.FromMilliseconds 1.),
@@ -443,7 +443,7 @@ let tests =
 
               let! outcome =
                   (newReplayStore ())
-                      .CommitCorrection(
+                      .CommitCorrectionAsync(
                           held.Work.CommandId,
                           LeaseToken.ofInt64 0L,
                           Epoch.initial,

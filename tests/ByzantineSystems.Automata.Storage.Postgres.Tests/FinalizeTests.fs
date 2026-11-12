@@ -18,7 +18,7 @@ let private effectiveAt = DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero)
 /// entity: any other entity with a claimable head would otherwise be returned instead, silently.
 let private claimKey (inbox: Inbox) (key: string) : Task<Claimed> =
     task {
-        let! claimed = inbox.Claim(machine, ClaimBatch.create 50, lease, noCancellation)
+        let! claimed = inbox.ClaimAsync(machine, ClaimBatch.create 50, lease, noCancellation)
 
         return
             claimed
@@ -29,14 +29,14 @@ let private claimKey (inbox: Inbox) (key: string) : Task<Claimed> =
 
 let private leased (inbox: Inbox) (name: string) (key: string) : Task<Claimed> =
     task {
-        let! _ = inbox.Submit(submission (entity name) key (Start 1), noCancellation)
+        let! _ = inbox.SubmitAsync(submission (entity name) key (Start 1), noCancellation)
         return! claimKey inbox key
     }
 
 let private commit (processor: Processor) (held: Claimed) (expected: Epoch) (toState: TestState) =
     task {
         let! outcome =
-            processor.Commit(
+            processor.CommitAsync(
                 held.Work.CommandId,
                 held.Token,
                 expected,
@@ -62,7 +62,7 @@ let tests =
               do! reset ()
               let inbox = newInbox ()
               let! held = leased inbox "e1" "first"
-              let! _ = inbox.Submit(submission (entity "e1") "second" Finish, noCancellation)
+              let! _ = inbox.SubmitAsync(submission (entity "e1") "second" Finish, noCancellation)
 
               let! outcome = commit (newProcessor ()) held Epoch.initial (Active 7)
 
@@ -89,13 +89,13 @@ let tests =
               let processor = newProcessor ()
               let! _ = commit processor first Epoch.initial (Active 1)
 
-              let! _ = inbox.Submit(submission (entity "e1") "k2" Finish, noCancellation)
+              let! _ = inbox.SubmitAsync(submission (entity "e1") "k2" Finish, noCancellation)
               let! second = claimKey inbox "k2"
 
               // An effective instant before the live belief's lower bound, which close_and_open
               // refuses. By then the transition row has already been inserted.
               let! outcome =
-                  processor.Commit(
+                  processor.CommitAsync(
                       second.Work.CommandId,
                       second.Token,
                       Epoch.next Epoch.initial,
@@ -146,7 +146,7 @@ let tests =
               let! first = leased inbox "e1" "k1"
 
               let! _ =
-                  processor.Commit(
+                  processor.CommitAsync(
                       first.Work.CommandId,
                       first.Token,
                       Epoch.initial,
@@ -154,12 +154,12 @@ let tests =
                       noCancellation
                   )
 
-              let! _ = inbox.Submit(submission (entity "e2") "k2" (Start 2), noCancellation)
+              let! _ = inbox.SubmitAsync(submission (entity "e2") "k2" (Start 2), noCancellation)
               let! second = claimKey inbox "k2"
 
               // A wildly back-dated business instant on the second command.
               let! _ =
-                  processor.Commit(
+                  processor.CommitAsync(
                       second.Work.CommandId,
                       second.Token,
                       Epoch.initial,
