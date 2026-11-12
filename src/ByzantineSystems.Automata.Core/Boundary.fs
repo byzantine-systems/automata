@@ -93,15 +93,15 @@ module Recurring =
 
     /// <summary>Runs the step for as long as it answers <c>true</c> and nobody cancels.</summary>
     let repeat (step: unit -> Task<bool>) (ct: CancellationToken) : Task<unit> =
-        let rec loop () =
-            backgroundTask {
-                match! unlessCanceled ct step with
-                | Some true -> return! loop ()
-                | Some false
-                | None -> return ()
-            }
+        backgroundTask {
+            let mutable running = true
 
-        loop ()
+            while running do
+                match! unlessCanceled ct step with
+                | Some true -> ()
+                | Some false
+                | None -> running <- false
+        }
 
     /// <summary>Runs the tick, then waits the interval, until cancelled.</summary>
     let every

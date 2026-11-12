@@ -274,36 +274,36 @@ type ActionDispatcher<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectError whe
                     return false
             }
 
-        let rec loop (totals: DeliveryReport) =
-            task {
+        task {
+            let mutable totals = DeliveryReport.empty
+            let mutable running = true
+
+            while running do
                 if ct.IsCancellationRequested then
-                    return totals
+                    running <- false
                 else
                     let! outcome = this.PollAsync ct
 
-                    let totals =
-                        match outcome with
-                        | Ok report -> DeliveryReport.add totals report
-                        | Error error ->
-                            logger.LogWarning(
-                                DispatcherEvents.pollFailed,
-                                "Action poll failed for machine {MachineId}: {Failure}.",
-                                machineName,
-                                (match error with
-                                 | Store _ -> "store"
-                                 | Timeout _ -> "timeout"
-                                 | CircuitOpen _ -> "circuit-open"
-                                 | _ -> "unclassified")
-                            )
-
-                            totals
+                    match outcome with
+                    | Ok report -> totals <- DeliveryReport.add totals report
+                    | Error error ->
+                        logger.LogWarning(
+                            DispatcherEvents.pollFailed,
+                            "Action poll failed for machine {MachineId}: {Failure}.",
+                            machineName,
+                            (match error with
+                             | Store _ -> "store"
+                             | Timeout _ -> "timeout"
+                             | CircuitOpen _ -> "circuit-open"
+                             | _ -> "unclassified")
+                        )
 
                     match outcome with
-                    | Ok report when report.Claimed = ClaimBatch.value claimBatch -> return! loop totals
+                    | Ok report when report.Claimed = ClaimBatch.value claimBatch -> do! Task.Yield()
                     | _ ->
                         match! waitForWork () with
-                        | true -> return! loop totals
-                        | false -> return totals
-            }
+                        | true -> ()
+                        | false -> running <- false
 
-        loop DeliveryReport.empty
+            return totals
+        }

@@ -120,20 +120,20 @@ type CommandProcessor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: e
     /// fence says somebody else owns the command. Renewing past that point would be arguing
     /// with a decision the database has already made.
     let renewWhile (leased: LeasedCommand<'EntityId, 'Event>) (work: Task<'T>) (ct: CancellationToken) =
-        let rec renew () =
+        let renew () =
             task {
-                if work.IsCompleted then
-                    return ()
-                else
+                let mutable renewing = not work.IsCompleted
+
+                while renewing do
                     let! finished = Task.WhenAny(work :> Task, Task.Delay(policy.RenewAfter, config.TimeProvider, ct))
 
                     if Object.ReferenceEquals(finished, work :> Task) then
-                        return ()
+                        renewing <- false
                     else
                         match! inbox.ExtendLease(leased.Work.CommandId, leased.Token, leaseDuration, ct) with
-                        | Ok Updated -> return! renew ()
+                        | Ok Updated -> ()
                         | Ok(LeaseUpdateOutcome.LeaseLost)
-                        | Error _ -> return ()
+                        | Error _ -> renewing <- false
             }
 
         task {
@@ -503,24 +503,33 @@ type CommandProcessor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: e
                     return false
             }
 
-        let rec loop (totals: PollSummary) =
-            task {
+        task {
+            let mutable totals = PollSummary.empty
+            let mutable running = true
+            let mutable stopped = ProcessorStop.Drained totals
+
+            while running do
                 if ct.IsCancellationRequested then
-                    return ProcessorStop.Drained totals
+                    stopped <- ProcessorStop.Drained totals
+                    running <- false
                 else
                     match! this.PollAsync ct with
                     | Ok report ->
-                        let totals = PollSummary.add totals report.Summary
+                        totals <- PollSummary.add totals report.Summary
 
                         match report.Escalation with
-                        | Some(commandId, reason) -> return ProcessorStop.Escalated(commandId, reason, totals)
+                        | Some(commandId, reason) ->
+                            stopped <- ProcessorStop.Escalated(commandId, reason, totals)
+                            running <- false
                         // A full batch means there is probably more waiting, so going straight
                         // round again drains a backlog at claim speed rather than poll speed.
-                        | None when report.Summary.Claimed = ClaimBatch.value claimBatch -> return! loop totals
+                        | None when report.Summary.Claimed = ClaimBatch.value claimBatch -> do! Task.Yield()
                         | None ->
                             match! waitForWork () with
-                            | true -> return! loop totals
-                            | false -> return ProcessorStop.Drained totals
+                            | true -> ()
+                            | false ->
+                                stopped <- ProcessorStop.Drained totals
+                                running <- false
                     | Error error ->
                         logger.LogWarning(
                             ProcessorEvents.pollFailed,
@@ -536,8 +545,10 @@ type CommandProcessor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: e
                         )
 
                         match! waitForWork () with
-                        | true -> return! loop totals
-                        | false -> return ProcessorStop.Drained totals
-            }
+                        | true -> ()
+                        | false ->
+                            stopped <- ProcessorStop.Drained totals
+                            running <- false
 
-        loop PollSummary.empty
+            return stopped
+        }

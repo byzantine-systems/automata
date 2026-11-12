@@ -394,30 +394,39 @@ module Machine =
         |> TaskResult.mapError MachineError.Store
 
     /// Polls the store for a command's outcome, raced against the local notification, until it
-    /// settles. Outside send's own computation expression so the recursion does not force a
-    /// dynamic state machine on every call.
-    let rec private awaitSettled
+    /// settles. Outside send's own computation expression so the polling state stays isolated
+    /// from submission and waiter cleanup.
+    let private awaitSettled
         (machine: Machine<'EntityId, 'State, 'Event, 'Action, 'Err>)
         (identifier: CommandId)
         (notified: Task<CommandResult<'EntityId, 'State, 'Event, 'Action, 'Err>>)
         (ct: CancellationToken)
         : Task<Result<CommandResult<'EntityId, 'State, 'Event, 'Action, 'Err>, MachineError<'Err>>> =
         task {
-            match! commandResult machine identifier ct with
-            | Error error -> return Error error
-            | Ok(Some CommandResult.Pending)
-            | Ok None ->
-                let delay =
-                    Task.Delay(machine.ResultPollInterval, machine.RuntimeConfig.TimeProvider, ct)
+            let mutable waiting = true
+            let mutable outcome = Ok CommandResult.Pending
 
-                let! first = Task.WhenAny(notified :> Task, delay)
+            while waiting do
+                match! commandResult machine identifier ct with
+                | Error error ->
+                    outcome <- Error error
+                    waiting <- false
+                | Ok(Some CommandResult.Pending)
+                | Ok None ->
+                    let delay =
+                        Task.Delay(machine.ResultPollInterval, machine.RuntimeConfig.TimeProvider, ct)
 
-                if Object.ReferenceEquals(first, notified :> Task) then
-                    let! result = notified
-                    return Ok result
-                else
-                    return! awaitSettled machine identifier notified ct
-            | Ok(Some settled) -> return Ok settled
+                    let! first = Task.WhenAny(notified :> Task, delay)
+
+                    if Object.ReferenceEquals(first, notified :> Task) then
+                        let! result = notified
+                        outcome <- Ok result
+                        waiting <- false
+                | Ok(Some settled) ->
+                    outcome <- Ok settled
+                    waiting <- false
+
+            return outcome
         }
 
     /// <summary>
