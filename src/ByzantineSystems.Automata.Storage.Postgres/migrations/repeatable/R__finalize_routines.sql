@@ -114,8 +114,7 @@ BEGIN
                         t.epoch
                     FROM fsm.transition t
                     WHERE
-                        t.command_id = p_command_id), p_expected_epoch),
-                v_status;
+                        t.command_id = p_command_id), p_expected_epoch), v_status;
         ELSE
             RETURN QUERY
             SELECT
@@ -244,3 +243,4 @@ BEGIN
         p_status;
 END
 $$;
+
