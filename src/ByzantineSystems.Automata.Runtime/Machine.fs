@@ -49,9 +49,9 @@ type Machine<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: equality>
         (background: Task list)
         (ct: CancellationToken)
         =
-        task {
+        backgroundTask {
             let stopComponents =
-                task {
+                backgroundTask {
                     observerBus |> Option.iter _.Complete()
                     lifetime |> Option.iter _.Cancel()
 
@@ -165,7 +165,7 @@ type Machine<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: equality>
             ChartCatalog.entries config.Catalog
             |> List.filter (fun (version, _) -> version <> config.ChartVersion)
             |> List.map (fun (version, chart) ->
-                task {
+                backgroundTask {
                     match! registry.TryGetAsync(config.MachineId, version, ct) with
                     | Ok(Some stored) when stored <> Chart.fingerprint chart ->
                         return
@@ -202,7 +202,7 @@ type Machine<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: equality>
                 | Stopping _
                 | Stopped _ -> invalidOp "A stopped machine cannot be started again.")
 
-        taskResult {
+        backgroundTaskResult {
             ct.ThrowIfCancellationRequested()
 
             // The store first, because the catalog check reads it: a schema that is missing
@@ -315,7 +315,7 @@ module Machine =
         (envelope: EventEnvelope<'Event>)
         (ct: CancellationToken)
         : Task<Result<SubmissionOutcome, MachineError<'Err>>> =
-        taskResult {
+        backgroundTaskResult {
             do! machine.TryAcceptWork()
 
             let! outcome =
@@ -402,7 +402,7 @@ module Machine =
         (notified: Task<CommandResult<'EntityId, 'State, 'Event, 'Action, 'Err>>)
         (ct: CancellationToken)
         : Task<Result<CommandResult<'EntityId, 'State, 'Event, 'Action, 'Err>, MachineError<'Err>>> =
-        task {
+        backgroundTask {
             let mutable waiting = true
             let mutable outcome = Ok CommandResult.Pending
 
@@ -447,7 +447,7 @@ module Machine =
         (envelope: EventEnvelope<'Event>)
         (ct: CancellationToken)
         : Task<Result<CommandResult<'EntityId, 'State, 'Event, 'Action, 'Err>, MachineError<'Err>>> =
-        taskResult {
+        backgroundTaskResult {
             do! machine.TryAcceptWork()
 
             // Every retry passes through SubmitAsync's request-identity check. A lookup by key alone

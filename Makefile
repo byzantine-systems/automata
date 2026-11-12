@@ -52,9 +52,12 @@ PROJECT_FILES := $(wildcard src/*/*.fsproj tests/*/*.fsproj tools/*/*.fsproj exa
 RESTORE_INPUTS := Makefile $(SOLUTION) global.json nuget.config $(PROJECT_FILES) \
 	$(wildcard Directory.Build.* Directory.Packages.*)
 
-.PHONY: build test test-unit test-integration coverage migrate schema-generate schema-check migrate-sqlite-schema schema-generate-sqlite schema-check-sqlite run-example run-example-supervision run-example-hosted db db-reset fmt docs nix-lock pack package-smoke push
+.PHONY: async-context-check build test test-unit test-integration coverage migrate schema-generate schema-check migrate-sqlite-schema schema-generate-sqlite schema-check-sqlite run-example run-example-supervision run-example-hosted db db-reset fmt docs nix-lock pack package-smoke push
 
-build:
+async-context-check:
+	bash scripts/verify-async-context.sh
+
+build: async-context-check
 	$(DOTNET) build $(SOLUTION) -m:1
 
 test: test-unit

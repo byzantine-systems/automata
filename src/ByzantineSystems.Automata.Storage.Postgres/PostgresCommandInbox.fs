@@ -47,8 +47,12 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
     let context = options.Context
 
     let encodeEntityId entityId =
-        options.EntityIdEncode entityId
-        |> ByzantineSystems.Automata.Storage.Internal.EntityKey.ofString
+        let key =
+            options.EntityIdEncode entityId
+            |> ByzantineSystems.Automata.Storage.Internal.EntityKey.ofString
+
+        Tap.requireEntityKey "entityId" key
+        key
 
     let submitCommand = StatementKey.create "command" "submit" |> Sql.prepareProgram
 
@@ -279,88 +283,112 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
     interface ICommandInbox<'EntityId, 'Event> with
 
         member _.SubmitAsync(submission, cancellationToken) =
-            let entityId = encodeEntityId submission.EntityId
+            Tap.requireArg (nameof submission) submission
+            Tap.requireArg "submission.EntityId" submission.EntityId
+            Tap.requireArg "submission.IdempotencyKey" submission.IdempotencyKey
 
-            backgroundTaskResult {
-                let! encodedEvent = options.EventCodec.Encode submission.Event |> Result.mapError Db.toStoreError
+            Tap.start cancellationToken (fun () ->
+                let entityId = encodeEntityId submission.EntityId
 
-                match! Sql.attemptProgram context (submit submission encodedEvent entityId) cancellationToken with
-                | Db.Answered outcome -> return! outcome
-                | Db.Refused(Db.ForeignKey "command_chart_version_fkey", _) ->
-                    // The version this command pins was never registered, so nothing records
-                    // which chart it refers to and a replay could not resolve it.
-                    return!
-                        Error(
-                            StoreError.NotFound
-                                $"chart version %d{ChartVersion.value submission.ChartVersion} of machine %s{MachineId.value submission.MachineId}"
-                        )
-                | Db.Refused(Db.Unique "command_unique_idem", _) ->
-                    // A writer outside the routine raced the unique constraint. Recheck identity
-                    // atomically instead of treating every request under the key as equal.
-                    return! Sql.runProgram context (submit submission encodedEvent entityId) cancellationToken
-                | Db.Refused(_, cause) -> return! Error(StoreError.Unexpected cause)
-            }
+                backgroundTaskResult {
+                    let! encodedEvent = options.EventCodec.Encode submission.Event |> Result.mapError Db.toStoreError
+
+                    match! Sql.attemptProgram context (submit submission encodedEvent entityId) cancellationToken with
+                    | Db.Answered outcome -> return! outcome
+                    | Db.Refused(Db.ForeignKey "command_chart_version_fkey", _) ->
+                        // The version this command pins was never registered, so nothing records
+                        // which chart it refers to and a replay could not resolve it.
+                        return!
+                            Error(
+                                StoreError.NotFound
+                                    $"chart version %d{ChartVersion.value submission.ChartVersion} of machine %s{MachineId.value submission.MachineId}"
+                            )
+                    | Db.Refused(Db.Unique "command_unique_idem", _) ->
+                        // A writer outside the routine raced the unique constraint. Recheck identity
+                        // atomically instead of treating every request under the key as equal.
+                        return! Sql.runProgram context (submit submission encodedEvent entityId) cancellationToken
+                    | Db.Refused(_, cause) -> return! Error(StoreError.Unexpected cause)
+                })
 
         member _.ClaimAsync(machineId, batch, lease, cancellationToken) =
+            Tap.requireMachineId (nameof machineId) machineId
+
             // Claiming is the one call here that must not be repeated automatically. It is not
             // idempotent: a claim whose reply was lost has already leased a batch, and a retry
             // leases a second one while the first stays invisible until its lease lapses. The
             // worker polls again in a moment, which recovers sooner than a retry would.
-            backgroundTaskResult {
-                let! rows =
-                    Sql.runProgramOnce
-                        context
-                        (StoreProgram.queryRows
-                            claimCommands
-                            [ Params.machineId "machine_id" machineId
-                              "batch", Param.Int(ClaimBatch.value batch)
-                              "lease", Param.Interval(LeaseDuration.value lease) ]
-                            (fun reader -> Ok(commandRow reader, correctionOption reader)))
-                        cancellationToken
+            Tap.start cancellationToken (fun () ->
+                backgroundTaskResult {
+                    let! rows =
+                        Sql.runProgramOnce
+                            context
+                            (StoreProgram.queryRows
+                                claimCommands
+                                [ Params.machineId "machine_id" machineId
+                                  "batch", Param.Int(ClaimBatch.value batch)
+                                  "lease", Param.Interval(LeaseDuration.value lease) ]
+                                (fun reader -> Ok(commandRow reader, correctionOption reader)))
+                            cancellationToken
 
-                return!
-                    ClaimRecovery.collect
-                        leasedRow
-                        (fun (row, _) reason ->
-                            Sql.runProgram
-                                context
-                                (StoreProgram.queryOne
-                                    deadLetterUndecodable
-                                    [ "command_id", Param.Bigint row.command_id
-                                      "lease_token", Param.Bigint row.lease_token
-                                      "reason", Param.Text reason ]
-                                    (fun _ -> Ok()))
-                                cancellationToken)
-                        rows
-                        cancellationToken
-            }
+                    return!
+                        ClaimRecovery.collect
+                            leasedRow
+                            (fun (row, _) reason ->
+                                Sql.runProgram
+                                    context
+                                    (StoreProgram.queryOne
+                                        deadLetterUndecodable
+                                        [ "command_id", Param.Bigint row.command_id
+                                          "lease_token", Param.Bigint row.lease_token
+                                          "reason", Param.Text reason ]
+                                        (fun _ -> Ok()))
+                                    cancellationToken)
+                            rows
+                            cancellationToken
+                })
 
         member _.RescheduleAsync(commandId, leaseToken, backoff, cancellationToken) =
-            Sql.runProgram
-                context
-                (leaseUpdate
-                    rescheduleCommand
-                    [ Params.commandId "command_id" commandId
-                      Params.commandLease "lease_token" leaseToken
-                      "base_ms", Param.Int(int (Backoff.baseDelay backoff).TotalMilliseconds)
-                      "cap_ms", Param.Int(int (Backoff.ceiling backoff).TotalMilliseconds) ])
-                cancellationToken
+            Tap.requireArg (nameof commandId) commandId
+            Tap.requireArg (nameof leaseToken) leaseToken
+
+            Tap.start cancellationToken (fun () ->
+                Sql.runProgram
+                    context
+                    (leaseUpdate
+                        rescheduleCommand
+                        [ Params.commandId "command_id" commandId
+                          Params.commandLease "lease_token" leaseToken
+                          "base_ms", Param.Int(int (Backoff.baseDelay backoff).TotalMilliseconds)
+                          "cap_ms", Param.Int(int (Backoff.ceiling backoff).TotalMilliseconds) ])
+                    cancellationToken)
 
         member _.ExtendLeaseAsync(commandId, leaseToken, lease, cancellationToken) =
-            Sql.runProgram
-                context
-                (leaseUpdate
-                    extendLease
-                    [ Params.commandId "command_id" commandId
-                      Params.commandLease "lease_token" leaseToken
-                      "lease", Param.Interval(LeaseDuration.value lease) ])
-                cancellationToken
+            Tap.requireArg (nameof commandId) commandId
+            Tap.requireArg (nameof leaseToken) leaseToken
+
+            Tap.start cancellationToken (fun () ->
+                Sql.runProgram
+                    context
+                    (leaseUpdate
+                        extendLease
+                        [ Params.commandId "command_id" commandId
+                          Params.commandLease "lease_token" leaseToken
+                          "lease", Param.Interval(LeaseDuration.value lease) ])
+                    cancellationToken)
 
         member _.TryGetAsync(commandId, cancellationToken) =
-            Sql.readProgram
-                context
-                (StoreProgram.tryQueryOne commandById [ Params.commandId "command_id" commandId ] recordRow)
-                cancellationToken
+            Tap.requireArg (nameof commandId) commandId
+
+            Tap.start cancellationToken (fun () ->
+                Sql.readProgram
+                    context
+                    (StoreProgram.tryQueryOne commandById [ Params.commandId "command_id" commandId ] recordRow)
+                    cancellationToken)
 
         member _.TryFindAsync(machineId, entityId, idempotencyKey, cancellationToken) =
-            findExisting machineId (encodeEntityId entityId) idempotencyKey cancellationToken
+            Tap.requireMachineId (nameof machineId) machineId
+            Tap.requireArg (nameof entityId) entityId
+            Tap.requireArg (nameof idempotencyKey) idempotencyKey
+
+            Tap.start cancellationToken (fun () ->
+                findExisting machineId (encodeEntityId entityId) idempotencyKey cancellationToken)

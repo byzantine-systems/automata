@@ -41,8 +41,12 @@ type PostgresTemporalStore<'EntityId, 'State>(options: TemporalOptions<'EntityId
     let context = options.Context
 
     let encodeEntityId entityId =
-        options.EntityIdEncode entityId
-        |> ByzantineSystems.Automata.Storage.Internal.EntityKey.ofString
+        let key =
+            options.EntityIdEncode entityId
+            |> ByzantineSystems.Automata.Storage.Internal.EntityKey.ofString
+
+        Tap.requireEntityKey "entityId" key
+        key
 
     let beliefAsOf = StatementKey.create "belief" "as_of" |> Sql.prepareProgram
     let correctBeliefs = StatementKey.create "belief" "correct" |> Sql.prepareProgram
@@ -128,35 +132,49 @@ type PostgresTemporalStore<'EntityId, 'State>(options: TemporalOptions<'EntityId
     interface ITemporalReader<'EntityId, 'State> with
 
         member _.ValidAtAsync(machineId, entityId, validAt, cancellationToken) =
-            // The clock is read here and nowhere else in this type. "What do we think now" is the
-            // one temporal question whose second coordinate is the present; a caller wanting any
-            // other one calls AsOf and says so.
-            asOf machineId entityId validAt (options.TimeProvider.GetUtcNow()) cancellationToken
+            Tap.requireMachineId (nameof machineId) machineId
+            Tap.requireArg (nameof entityId) entityId
+
+            // The clock is read inside the started work and nowhere else in this type. "What do
+            // we think now" is the one temporal question whose second coordinate is the present;
+            // a caller wanting any other one calls AsOf and says so.
+            Tap.start cancellationToken (fun () ->
+                asOf machineId entityId validAt (options.TimeProvider.GetUtcNow()) cancellationToken)
 
         member _.AsOfAsync(machineId, entityId, validAt, knownAt, cancellationToken) =
-            asOf machineId entityId validAt knownAt cancellationToken
+            Tap.requireMachineId (nameof machineId) machineId
+            Tap.requireArg (nameof entityId) entityId
+
+            Tap.start cancellationToken (fun () -> asOf machineId entityId validAt knownAt cancellationToken)
 
     interface ICorrectionStore<'EntityId, 'State> with
 
         member _.CorrectAsync(machineId, entityId, validFrom, beliefs, cancellationToken) =
-            backgroundTaskResult {
-                // The whole timeline is encoded before anything is sent.
-                let! payload = BeliefPayload.encode options.StateCodec beliefs
+            Tap.requireMachineId (nameof machineId) machineId
+            Tap.requireArg (nameof entityId) entityId
+            Tap.requireArg (nameof beliefs) beliefs
 
-                let! superseded =
-                    Sql.runProgram
-                        context
-                        (StoreProgram.queryOne
-                            correctBeliefs
-                            [ Params.machineId "machine_id" machineId
-                              Params.entityKey "entity_id" (encodeEntityId entityId)
-                              "valid_from", Param.Timestamp validFrom
-                              "beliefs", Param.Jsonb payload ]
-                            (fun reader -> Row.int32 reader "superseded" |> Ok))
-                        cancellationToken
+            Tap.start cancellationToken (fun () ->
+                let key = encodeEntityId entityId
 
-                return
-                    match superseded with
-                    | 0 -> NothingSuperseded
-                    | superseded -> Corrected superseded
-            }
+                backgroundTaskResult {
+                    // The whole timeline is encoded before anything is sent.
+                    let! payload = BeliefPayload.encode options.StateCodec beliefs
+
+                    let! superseded =
+                        Sql.runProgram
+                            context
+                            (StoreProgram.queryOne
+                                correctBeliefs
+                                [ Params.machineId "machine_id" machineId
+                                  Params.entityKey "entity_id" key
+                                  "valid_from", Param.Timestamp validFrom
+                                  "beliefs", Param.Jsonb payload ]
+                                (fun reader -> Row.int32 reader "superseded" |> Ok))
+                            cancellationToken
+
+                    return
+                        match superseded with
+                        | 0 -> NothingSuperseded
+                        | superseded -> Corrected superseded
+                })

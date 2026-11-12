@@ -38,14 +38,14 @@ type internal ObserverDispatcher<'EntityId, 'State, 'Event, 'Action>
 
     /// <summary>Drains the channel until completed or cancelled, observing each transition.</summary>
     member _.RunAsync(ct: CancellationToken) : Task =
-        task {
+        backgroundTask {
             let mutable draining = true
 
             while draining do
                 // Cancellation ends the loop; anything else is a defect in the channel itself
                 // and is left to propagate to whoever owns this task.
                 let! ready =
-                    task {
+                    backgroundTask {
                         try
                             return! reader.WaitToReadAsync(ct).AsTask()
                         with :? System.OperationCanceledException when ct.IsCancellationRequested ->

@@ -37,7 +37,7 @@ module TaskOutcome =
 
     /// <summary>Captures the completion of a task returning a value.</summary>
     let capture (work: Task<'T>) : Task<Result<'T, exn>> =
-        task {
+        backgroundTask {
             try
                 let! value = work
                 return Ok value
@@ -47,7 +47,7 @@ module TaskOutcome =
 
     /// <summary>Captures the completion of a task returning nothing.</summary>
     let captureUnit (work: Task) : Task<Result<unit, exn>> =
-        task {
+        backgroundTask {
             do! work
             return ()
         }

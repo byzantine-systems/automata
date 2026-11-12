@@ -27,3 +27,14 @@
 - None. The two SqlHydra-generated context factories are unsupported public
   surface and remain exact source-guard exceptions rather than handwritten
   B11 boundaries.
+
+## Deterministic validation
+
+- `MachineTests.fs` runs `Machine.send(...).Result` on a dedicated thread with
+  a non-pumping `SynchronizationContext`, while `StubStore.SubmitAsync`
+  completes asynchronously from the thread pool. The call completes within
+  the bounded deadline with the context-free builders.
+- Replacing only `Machine.send`'s `backgroundTaskResult` with `taskResult`
+  reproduced the two-second timeout, while
+  `scripts/verify-async-context.sh` independently named and rejected the same
+  source mutation. The mutation was restored after both oracles fired.

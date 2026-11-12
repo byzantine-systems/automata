@@ -128,7 +128,7 @@ type ActionDispatcher<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectError whe
         | Ok(Ok()) -> ()
 
     let deliver (action: LeasedAction<'EntityId, 'Action>) (ct: CancellationToken) =
-        task {
+        backgroundTask {
             if poisoned action then
                 let reason =
                     Reason.create $"delivered %d{action.DeliveryCount} times without an outcome"
@@ -224,7 +224,7 @@ type ActionDispatcher<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectError whe
 
     /// <summary>Claims one batch of actions and delivers them, bounded by the policy's concurrency.</summary>
     member _.PollAsync(ct: CancellationToken) : Task<Result<DeliveryReport, MachineError<'Err>>> =
-        taskResult {
+        backgroundTaskResult {
             let! batch =
                 queue.ClaimAsync(machineId, claimBatch, leaseDuration, ct)
                 |> TaskResult.mapError MachineError.Store
@@ -242,7 +242,7 @@ type ActionDispatcher<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectError whe
                 use gate = new SemaphoreSlim(policy.Concurrency)
 
                 let run (action: LeasedAction<'EntityId, 'Action>) =
-                    task {
+                    backgroundTask {
                         do! gate.WaitAsync ct
 
                         try
@@ -266,7 +266,7 @@ type ActionDispatcher<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectError whe
     /// </summary>
     member this.RunAsync(ct: CancellationToken) : Task<DeliveryReport> =
         let waitForWork () =
-            task {
+            backgroundTask {
                 try
                     let! _ = signal.WaitOrTimeoutAsync(policy.PollingInterval, config.TimeProvider, ct)
                     return true
@@ -274,7 +274,7 @@ type ActionDispatcher<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectError whe
                     return false
             }
 
-        task {
+        backgroundTask {
             let mutable totals = DeliveryReport.empty
             let mutable running = true
 

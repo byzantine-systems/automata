@@ -184,10 +184,13 @@ type SqliteMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     /// </summary>
     interface IStoreBoot with
 
-        member _.BootAsync(_, cancellationToken) =
-            Boot.inspect options.Context cancellationToken
-            |> TaskResult.map (function
-                | [] -> BootReport.Ready
-                | defects -> BootReport.Refused defects)
+        member _.BootAsync(machineId, cancellationToken) =
+            Tap.requireMachineId (nameof machineId) machineId
+
+            Tap.start cancellationToken (fun () ->
+                Boot.inspect options.Context cancellationToken
+                |> TaskResult.map (function
+                    | [] -> BootReport.Ready
+                    | defects -> BootReport.Refused defects))
 
     interface IMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>

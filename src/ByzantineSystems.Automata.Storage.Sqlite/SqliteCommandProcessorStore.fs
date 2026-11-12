@@ -167,8 +167,12 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     let context = options.Context
 
     let encodeEntityId entityId =
-        options.EntityIdEncode entityId
-        |> ByzantineSystems.Automata.Storage.Internal.EntityKey.ofString
+        let key =
+            options.EntityIdEncode entityId
+            |> ByzantineSystems.Automata.Storage.Internal.EntityKey.ofString
+
+        Tap.requireEntityKey "entityId" key
+        key
 
     let statement domain operation =
         StatementKey.create domain operation |> Sql.prepareProgram
@@ -592,52 +596,76 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     interface IStateReader<'EntityId, 'State, 'Event, 'Action> with
 
         member _.TryGetSnapshotAsync(machineId, entityId, cancellationToken) =
-            Sql.readProgram
-                context
-                (StoreProgram.tryQueryOne
-                    entitySnapshot
-                    [ Params.machineId "@machine_id" machineId
-                      Params.entityKey "@entity_id" (encodeEntityId entityId) ]
-                    snapshotRow)
-                cancellationToken
+            Tap.requireMachineId (nameof machineId) machineId
+            Tap.requireArg (nameof entityId) entityId
+
+            Tap.start cancellationToken (fun () ->
+                Sql.readProgram
+                    context
+                    (StoreProgram.tryQueryOne
+                        entitySnapshot
+                        [ Params.machineId "@machine_id" machineId
+                          Params.entityKey "@entity_id" (encodeEntityId entityId) ]
+                        snapshotRow)
+                    cancellationToken)
 
         member _.HistoryAsync(machineId, entityId, paging, cancellationToken) =
-            // An absent cursor is zero, which transition_epoch_positive makes smaller than any
-            // stored epoch, so one query shape serves every page.
-            let after =
-                Page.cursor paging
-                |> Option.map (Epoch.value >> int64)
-                |> Option.defaultValue 0L
+            Tap.requireMachineId (nameof machineId) machineId
+            Tap.requireArg (nameof entityId) entityId
 
-            Sql.readProgram
-                context
-                (StoreProgram.queryRows
-                    historyPage
-                    [ Params.machineId "@machine_id" machineId
-                      Params.entityKey "@entity_id" (encodeEntityId entityId)
-                      "@after", Param.Integer after
-                      "@limit", Param.Integer(int64 (Page.limit paging)) ]
-                    (transitionRow >> toTransition))
-                cancellationToken
+            Tap.start cancellationToken (fun () ->
+                // An absent cursor is zero, which transition_epoch_positive makes smaller than any
+                // stored epoch, so one query shape serves every page.
+                let after =
+                    Page.cursor paging
+                    |> Option.map (Epoch.value >> int64)
+                    |> Option.defaultValue 0L
+
+                Sql.readProgram
+                    context
+                    (StoreProgram.queryRows
+                        historyPage
+                        [ Params.machineId "@machine_id" machineId
+                          Params.entityKey "@entity_id" (encodeEntityId entityId)
+                          "@after", Param.Integer after
+                          "@limit", Param.Integer(int64 (Page.limit paging)) ]
+                        (transitionRow >> toTransition))
+                    cancellationToken)
 
     interface ICommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err> with
 
         member _.CommitAsync(commandId, token, expected, draft, cancellationToken) =
+            Tap.requireArg (nameof commandId) commandId
+            Tap.requireArg (nameof token) token
+            Tap.requireArg (nameof draft) draft
+
             // Encoded before the write begins: one file has one writer, so codec work inside the
             // transaction would be time every machine sharing the file waits for.
-            backgroundTaskResult {
-                let! encoded = encodeDraft draft
-                return! finalize commandId token (Commit(expected, encoded)) cancellationToken
-            }
+            Tap.start cancellationToken (fun () ->
+                backgroundTaskResult {
+                    let! encoded = encodeDraft draft
+                    return! finalize commandId token (Commit(expected, encoded)) cancellationToken
+                })
 
         member _.RejectAsync(commandId, token, error, cancellationToken) =
-            fail Reject commandId token error cancellationToken
+            Tap.requireArg (nameof commandId) commandId
+            Tap.requireArg (nameof token) token
+            Tap.requireArg (nameof error) error
+
+            Tap.start cancellationToken (fun () -> fail Reject commandId token error cancellationToken)
 
         member _.DeadLetterAsync(commandId, token, error, cancellationToken) =
-            fail DeadLetter commandId token error cancellationToken
+            Tap.requireArg (nameof commandId) commandId
+            Tap.requireArg (nameof token) token
+            Tap.requireArg (nameof error) error
+
+            Tap.start cancellationToken (fun () -> fail DeadLetter commandId token error cancellationToken)
 
         member _.TryGetResultAsync(commandId, cancellationToken) =
-            Sql.readProgram
-                context
-                (StoreProgram.tryQueryOne commandResult [ Params.commandId "@command_id" commandId ] resultRow)
-                cancellationToken
+            Tap.requireArg (nameof commandId) commandId
+
+            Tap.start cancellationToken (fun () ->
+                Sql.readProgram
+                    context
+                    (StoreProgram.tryQueryOne commandResult [ Params.commandId "@command_id" commandId ] resultRow)
+                    cancellationToken)

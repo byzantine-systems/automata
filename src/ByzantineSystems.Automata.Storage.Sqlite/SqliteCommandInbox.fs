@@ -134,8 +134,12 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
     let context = options.Context
 
     let encodeEntityId entityId =
-        options.EntityIdEncode entityId
-        |> ByzantineSystems.Automata.Storage.Internal.EntityKey.ofString
+        let key =
+            options.EntityIdEncode entityId
+            |> ByzantineSystems.Automata.Storage.Internal.EntityKey.ofString
+
+        Tap.requireEntityKey "entityId" key
+        key
 
     let findByKey = StatementKey.create "command" "find_by_key" |> Sql.prepareProgram
     let commandById = StatementKey.create "command" "by_id" |> Sql.prepareProgram
@@ -401,95 +405,120 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
     interface ICommandInbox<'EntityId, 'Event> with
 
         member _.SubmitAsync(submission, cancellationToken) =
-            let entityId = encodeEntityId submission.EntityId
+            Tap.requireArg (nameof submission) submission
+            Tap.requireArg "submission.EntityId" submission.EntityId
+            Tap.requireArg "submission.IdempotencyKey" submission.IdempotencyKey
 
-            // Encoded before the write begins, so the transaction only writes.
-            backgroundTaskResult {
-                let! encodedEvent = options.EventCodec.Encode submission.Event |> Result.mapError Db.toStoreError
-                return! Sql.writeProgramWith context (submit submission entityId encodedEvent) cancellationToken
-            }
+            Tap.start cancellationToken (fun () ->
+                // Encoded before the write begins, so the transaction only writes.
+                let entityId = encodeEntityId submission.EntityId
+
+                backgroundTaskResult {
+                    let! encodedEvent = options.EventCodec.Encode submission.Event |> Result.mapError Db.toStoreError
+
+                    return! Sql.writeProgramWith context (submit submission entityId encodedEvent) cancellationToken
+                })
 
         member _.ClaimAsync(machineId, batch, lease, cancellationToken) =
+            Tap.requireMachineId (nameof machineId) machineId
+
             // Claiming is the one call that must not be repeated automatically. A claim whose
             // outcome was lost may have leased a batch, and a retry would lease a second one
             // while the first stays invisible until its lease lapses. The worker polls again in a
             // moment, which recovers sooner than a retry would.
-            backgroundTaskResult {
-                let! rows =
-                    Sql.writeProgramOnceWith
-                        context
-                        (claim machineId (ClaimBatch.value batch) (LeaseDuration.value lease))
-                        cancellationToken
+            Tap.start cancellationToken (fun () ->
+                backgroundTaskResult {
+                    let! rows =
+                        Sql.writeProgramOnceWith
+                            context
+                            (claim machineId (ClaimBatch.value batch) (LeaseDuration.value lease))
+                            cancellationToken
 
-                return!
-                    ClaimRecovery.collect
-                        leasedRow
-                        (fun (row, _) reason ->
-                            Sql.writeProgramWith
-                                context
-                                (fun now ->
-                                    store {
-                                        let! changed =
-                                            StoreProgram.executeCount
-                                                deadLetterUndecodable
-                                                [ "@command_id", Param.Integer row.command_id
-                                                  "@lease_token", Param.Integer row.lease_token ]
-
-                                        if changed = 1 then
-                                            do!
-                                                StoreProgram.executeDiscard
-                                                    insertError
+                    return!
+                        ClaimRecovery.collect
+                            leasedRow
+                            (fun (row, _) reason ->
+                                Sql.writeProgramWith
+                                    context
+                                    (fun now ->
+                                        store {
+                                            let! changed =
+                                                StoreProgram.executeCount
+                                                    deadLetterUndecodable
                                                     [ "@command_id", Param.Integer row.command_id
-                                                      "@error",
-                                                      Param.Text(JsonSerializer.Serialize {| machine = reason |})
-                                                      "@now", Param.Integer now ]
+                                                      "@lease_token", Param.Integer row.lease_token ]
 
-                                            do!
-                                                StoreProgram.executeDiscard
-                                                    promoteHead
-                                                    [ "@machine_id", Param.Text row.machine_id
-                                                      "@entity_id", Param.Text row.entity_id ]
-                                    })
-                                cancellationToken)
-                        rows
-                        cancellationToken
-            }
+                                            if changed = 1 then
+                                                do!
+                                                    StoreProgram.executeDiscard
+                                                        insertError
+                                                        [ "@command_id", Param.Integer row.command_id
+                                                          "@error",
+                                                          Param.Text(JsonSerializer.Serialize {| machine = reason |})
+                                                          "@now", Param.Integer now ]
+
+                                                do!
+                                                    StoreProgram.executeDiscard
+                                                        promoteHead
+                                                        [ "@machine_id", Param.Text row.machine_id
+                                                          "@entity_id", Param.Text row.entity_id ]
+                                        })
+                                    cancellationToken)
+                            rows
+                            cancellationToken
+                })
 
         member _.RescheduleAsync(commandId, leaseToken, backoff, cancellationToken) =
-            Sql.writeProgramWith
-                context
-                (fun now ->
-                    CommandInboxProgram.leaseUpdate (
-                        ChangedRows(
-                            rescheduleCommand,
-                            [ Params.commandId "@command_id" commandId
-                              Params.commandLease "@lease_token" leaseToken
-                              "@now", Param.Integer now
-                              "@base_us", Param.Integer(CommandMapping.micros (Backoff.baseDelay backoff))
-                              "@cap_us", Param.Integer(CommandMapping.micros (Backoff.ceiling backoff)) ]
-                        )
-                    ))
-                cancellationToken
+            Tap.requireArg (nameof commandId) commandId
+            Tap.requireArg (nameof leaseToken) leaseToken
+
+            Tap.start cancellationToken (fun () ->
+                Sql.writeProgramWith
+                    context
+                    (fun now ->
+                        CommandInboxProgram.leaseUpdate (
+                            ChangedRows(
+                                rescheduleCommand,
+                                [ Params.commandId "@command_id" commandId
+                                  Params.commandLease "@lease_token" leaseToken
+                                  "@now", Param.Integer now
+                                  "@base_us", Param.Integer(CommandMapping.micros (Backoff.baseDelay backoff))
+                                  "@cap_us", Param.Integer(CommandMapping.micros (Backoff.ceiling backoff)) ]
+                            )
+                        ))
+                    cancellationToken)
 
         member _.ExtendLeaseAsync(commandId, leaseToken, lease, cancellationToken) =
-            Sql.writeProgramWith
-                context
-                (fun now ->
-                    CommandInboxProgram.leaseUpdate (
-                        ChangedRows(
-                            extendLease,
-                            [ Params.commandId "@command_id" commandId
-                              Params.commandLease "@lease_token" leaseToken
-                              "@deadline", Param.Integer(Instant.add now (LeaseDuration.value lease)) ]
-                        )
-                    ))
-                cancellationToken
+            Tap.requireArg (nameof commandId) commandId
+            Tap.requireArg (nameof leaseToken) leaseToken
+
+            Tap.start cancellationToken (fun () ->
+                Sql.writeProgramWith
+                    context
+                    (fun now ->
+                        CommandInboxProgram.leaseUpdate (
+                            ChangedRows(
+                                extendLease,
+                                [ Params.commandId "@command_id" commandId
+                                  Params.commandLease "@lease_token" leaseToken
+                                  "@deadline", Param.Integer(Instant.add now (LeaseDuration.value lease)) ]
+                            )
+                        ))
+                    cancellationToken)
 
         member _.TryGetAsync(commandId, cancellationToken) =
-            Sql.readProgram
-                context
-                (StoreProgram.tryQueryOne commandById [ Params.commandId "@command_id" commandId ] recordRow)
-                cancellationToken
+            Tap.requireArg (nameof commandId) commandId
+
+            Tap.start cancellationToken (fun () ->
+                Sql.readProgram
+                    context
+                    (StoreProgram.tryQueryOne commandById [ Params.commandId "@command_id" commandId ] recordRow)
+                    cancellationToken)
 
         member _.TryFindAsync(machineId, entityId, idempotencyKey, cancellationToken) =
-            findExisting machineId (encodeEntityId entityId) idempotencyKey cancellationToken
+            Tap.requireMachineId (nameof machineId) machineId
+            Tap.requireArg (nameof entityId) entityId
+            Tap.requireArg (nameof idempotencyKey) idempotencyKey
+
+            Tap.start cancellationToken (fun () ->
+                findExisting machineId (encodeEntityId entityId) idempotencyKey cancellationToken)

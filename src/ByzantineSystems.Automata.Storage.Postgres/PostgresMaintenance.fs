@@ -224,68 +224,74 @@ type PostgresMaintenance(context: PostgresContext) =
     interface IDatabaseMaintenance with
 
         member _.NotifyPendingAsync(cancellationToken) =
-            Sql.runProgram
-                context
-                (StoreProgram.queryOne notifyPending [] (fun row ->
-                    Ok
-                        { Sent = Row.int32 row "sent"
-                          QueueUsage = row.GetDouble(row.GetOrdinal "queue_usage") }))
-                cancellationToken
+            Tap.start cancellationToken (fun () ->
+                Sql.runProgram
+                    context
+                    (StoreProgram.queryOne notifyPending [] (fun row ->
+                        Ok
+                            { Sent = Row.int32 row "sent"
+                              QueueUsage = row.GetDouble(row.GetOrdinal "queue_usage") }))
+                    cancellationToken)
 
         member _.RunAsync(batch, cancellationToken) =
-            backgroundTaskResult {
-                let! reports =
-                    Sql.runProgram
-                        context
-                        (StoreProgram.queryRows
-                            runMaintenance
-                            [ "batch", Param.Int(ClaimBatch.value batch) ]
-                            (fun row ->
-                                result {
-                                    let! machineId =
-                                        Row.string row "machine_id"
-                                        |> MachineId.tryCreate
-                                        |> Result.mapError (Db.decodeFailure "MachineId")
+            Tap.start cancellationToken (fun () ->
+                backgroundTaskResult {
+                    let! reports =
+                        Sql.runProgram
+                            context
+                            (StoreProgram.queryRows
+                                runMaintenance
+                                [ "batch", Param.Int(ClaimBatch.value batch) ]
+                                (fun row ->
+                                    result {
+                                        let! machineId =
+                                            Row.string row "machine_id"
+                                            |> MachineId.tryCreate
+                                            |> Result.mapError (Db.decodeFailure "MachineId")
 
-                                    return
-                                        { MachineId = machineId
-                                          Reaped = Row.int64 row "reaped"
-                                          PurgedCommands = Row.int64 row "purged_commands"
-                                          PurgedBeliefs = Row.int64 row "purged_beliefs"
-                                          PurgedActions = Row.int64 row "purged_actions"
-                                          Drifted = Row.int64 row "drifted" }
-                                }))
-                        cancellationToken
+                                        return
+                                            { MachineId = machineId
+                                              Reaped = Row.int64 row "reaped"
+                                              PurgedCommands = Row.int64 row "purged_commands"
+                                              PurgedBeliefs = Row.int64 row "purged_beliefs"
+                                              PurgedActions = Row.int64 row "purged_actions"
+                                              Drifted = Row.int64 row "drifted" }
+                                    }))
+                            cancellationToken
 
-                do! refreshColdBeliefs cancellationToken
-                return reports
-            }
+                    do! refreshColdBeliefs cancellationToken
+                    return reports
+                })
 
         member _.DetectDriftAsync(cancellationToken) =
-            Sql.readProgram context (StoreProgram.queryRows blockedDrift [] driftRow) cancellationToken
+            Tap.start cancellationToken (fun () ->
+                Sql.readProgram context (StoreProgram.queryRows blockedDrift [] driftRow) cancellationToken)
 
         member _.RepairDriftAsync(cancellationToken) =
-            Sql.runProgram
-                context
-                (StoreProgram.queryRows repairBlocked [] (fun row ->
-                    Ok
-                        { RepairedBlock.CommandId = CommandId.ofInt64 (Row.int64 row "command_id")
-                          Blocked = Row.bool row "blocked" }))
-                cancellationToken
+            Tap.start cancellationToken (fun () ->
+                Sql.runProgram
+                    context
+                    (StoreProgram.queryRows repairBlocked [] (fun row ->
+                        Ok
+                            { RepairedBlock.CommandId = CommandId.ofInt64 (Row.int64 row "command_id")
+                              Blocked = Row.bool row "blocked" }))
+                    cancellationToken)
 
         member _.ScheduleAsync(notifyEvery, runEvery, batch, cancellationToken) =
-            Sql.runProgram
-                context
-                (StoreProgram.queryOne
-                    scheduleMaintenance
-                    [ "notify_every", Param.Interval notifyEvery
-                      "run_every", Param.Interval runEvery
-                      "batch", Param.Int(ClaimBatch.value batch) ]
-                    (fun row -> Row.string row "scheduling" |> schedulingOf))
-                cancellationToken
+            Tap.start cancellationToken (fun () ->
+                Sql.runProgram
+                    context
+                    (StoreProgram.queryOne
+                        scheduleMaintenance
+                        [ "notify_every", Param.Interval notifyEvery
+                          "run_every", Param.Interval runEvery
+                          "batch", Param.Int(ClaimBatch.value batch) ]
+                        (fun row -> Row.string row "scheduling" |> schedulingOf))
+                    cancellationToken)
 
         member _.UnscheduleAsync(cancellationToken) =
-            Sql.runProgram
-                context
-                (StoreProgram.queryOne unscheduleMaintenance [] (fun row -> Row.int32 row "removed" |> Ok))
-                cancellationToken
+            Tap.start cancellationToken (fun () ->
+                Sql.runProgram
+                    context
+                    (StoreProgram.queryOne unscheduleMaintenance [] (fun row -> Row.int32 row "removed" |> Ok))
+                    cancellationToken)

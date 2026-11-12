@@ -40,7 +40,7 @@ module internal Correction =
         | Some temporal, Some replay ->
             let reader = config.Store :> IStateReader<'EntityId, 'State, 'Event, 'Action>
 
-            taskResult {
+            backgroundTaskResult {
                 let! live = reader.TryGetSnapshotAsync(config.MachineId, entityId, ct)
                 let! before = temporal.ValidAtAsync(config.MachineId, entityId, justBefore at, ct)
                 // One more than the budget, which is how an over-long suffix is told apart from

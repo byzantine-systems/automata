@@ -170,8 +170,13 @@ type PostgresWorkNotifications(context: PostgresContext, queue: string, connecti
     interface IWorkNotifications with
 
         member _.ListenAsync(machineId, onCommands, onActions, cancellationToken) =
-            match connection with
-            | ListenerConnection.Off -> Task.FromResult(Ok())
-            | ListenerConnection.SameDataSource
-            | ListenerConnection.Direct _ ->
-                Db.protectOnce (session (MachineId.value machineId) onCommands onActions) cancellationToken
+            Tap.requireMachineId (nameof machineId) machineId
+            Tap.requireArg (nameof onCommands) onCommands
+            Tap.requireArg (nameof onActions) onActions
+
+            Tap.start cancellationToken (fun () ->
+                match connection with
+                | ListenerConnection.Off -> Task.FromResult(Ok())
+                | ListenerConnection.SameDataSource
+                | ListenerConnection.Direct _ ->
+                    Db.protectOnce (session (MachineId.value machineId) onCommands onActions) cancellationToken)

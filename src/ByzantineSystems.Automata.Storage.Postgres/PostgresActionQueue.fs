@@ -141,15 +141,18 @@ type PostgresActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'Entity
     /// Creates this machine's queue if it does not exist yet. Call once at startup: it builds
     /// tables and indexes, which is not a question a hot path should be asking.
     /// </summary>
-    member _.EnsureQueueAsync(ct: CancellationToken) : Task<Result<bool, StoreError>> =
-        Sql.runProgram
-            context
-            (StoreProgram.queryOne ensureQueue queue (fun reader -> Ok(Row.bool reader "created")))
-            ct
+    member _.EnsureQueueAsync(cancellationToken: CancellationToken) : Task<Result<bool, StoreError>> =
+        Tap.start cancellationToken (fun () ->
+            Sql.runProgram
+                context
+                (StoreProgram.queryOne ensureQueue queue (fun reader -> Ok(Row.bool reader "created")))
+                cancellationToken)
 
     interface IActionQueue<'EntityId, 'Action> with
 
-        member _.ClaimAsync(_, batch, lease, cancellationToken) =
+        member _.ClaimAsync(machineId, batch, lease, cancellationToken) =
+            Tap.requireMachineId (nameof machineId) machineId
+
             // Not idempotent, like the command claim: a claim whose reply was lost has already
             // leased the messages, and repeating it leases more while the first batch stays
             // invisible. The dispatcher polls again shortly, which recovers faster.
@@ -167,43 +170,53 @@ type PostgresActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'Entity
                             Row.timestamp reader "vt"
                         ))
 
-            backgroundTaskResult {
-                let! claimed = Sql.runProgramOnce context claim cancellationToken
+            Tap.start cancellationToken (fun () ->
+                backgroundTaskResult {
+                    let! claimed = Sql.runProgramOnce context claim cancellationToken
 
-                return!
-                    ClaimRecovery.collect
-                        (fun (message, messageId, deliveries, visibleUntil) ->
-                            readMessage message
-                            |> Result.map (fun record ->
-                                { Work = record
-                                  // The message's id identifies the claim; the delivery count fences
-                                  // it. Every write below needs both.
-                                  Token = LeaseToken.ofInt64 messageId
-                                  DeliveryCount = deliveries
-                                  ExpiresAt = visibleUntil }))
-                        (fun (_, messageId, deliveries, _) reason ->
-                            fenced
-                                abandonAction
-                                (queue
-                                 @ [ "msg_id", Param.Bigint messageId
-                                     "read_ct", Param.Int deliveries
-                                     "reason", Param.Text reason ])
-                                cancellationToken
-                            |> TaskResult.map ignore)
-                        claimed
-                        cancellationToken
-            }
+                    return!
+                        ClaimRecovery.collect
+                            (fun (message, messageId, deliveries, visibleUntil) ->
+                                readMessage message
+                                |> Result.map (fun record ->
+                                    { Work = record
+                                      // The message's id identifies the claim; the delivery count fences
+                                      // it. Every write below needs both.
+                                      Token = LeaseToken.ofInt64 messageId
+                                      DeliveryCount = deliveries
+                                      ExpiresAt = visibleUntil }))
+                            (fun (_, messageId, deliveries, _) reason ->
+                                fenced
+                                    abandonAction
+                                    (queue
+                                     @ [ "msg_id", Param.Bigint messageId
+                                         "read_ct", Param.Int deliveries
+                                         "reason", Param.Text reason ])
+                                    cancellationToken
+                                |> TaskResult.map ignore)
+                            claimed
+                            cancellationToken
+                })
 
         member _.CompleteAsync(action, cancellationToken) =
-            fenced completeAction (fence action) cancellationToken
+            Tap.requireArg (nameof action) action
+
+            Tap.start cancellationToken (fun () -> fenced completeAction (fence action) cancellationToken)
 
         member _.RescheduleAsync(action, backoff, cancellationToken) =
-            fenced
-                rescheduleAction
-                (fence action
-                 @ [ "base_ms", Param.Int(int (Backoff.baseDelay backoff).TotalMilliseconds)
-                     "cap_ms", Param.Int(int (Backoff.ceiling backoff).TotalMilliseconds) ])
-                cancellationToken
+            Tap.requireArg (nameof action) action
+
+            Tap.start cancellationToken (fun () ->
+                fenced
+                    rescheduleAction
+                    (fence action
+                     @ [ "base_ms", Param.Int(int (Backoff.baseDelay backoff).TotalMilliseconds)
+                         "cap_ms", Param.Int(int (Backoff.ceiling backoff).TotalMilliseconds) ])
+                    cancellationToken)
 
         member _.AbandonAsync(action, reason, cancellationToken) =
-            fenced abandonAction (fence action @ [ "reason", Param.Text(Reason.value reason) ]) cancellationToken
+            Tap.requireArg (nameof action) action
+            Tap.requireArg (nameof reason) reason
+
+            Tap.start cancellationToken (fun () ->
+                fenced abandonAction (fence action @ [ "reason", Param.Text(Reason.value reason) ]) cancellationToken)

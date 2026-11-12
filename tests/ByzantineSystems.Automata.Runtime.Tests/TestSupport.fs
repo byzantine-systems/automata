@@ -103,6 +103,11 @@ type StubStore<'Err>() =
 
     member val SubmitOutcome: Result<SubmissionOutcome, StoreError> = Ok(Accepted(CommandId.ofInt64 1L)) with get, set
 
+    /// Overrides submission when a test needs to control asynchronous completion rather than
+    /// return the scripted outcome immediately.
+    member val SubmitOverride: (CancellationToken -> Task<Result<SubmissionOutcome, StoreError>>) option =
+        None with get, set
+
     member val ResultOutcome: Result<
         CommandResult<EntityId<TestEntity>, TestState, TestEvent, TestAction, 'Err> option,
         StoreError
@@ -126,7 +131,10 @@ type StubStore<'Err>() =
 
     interface ICommandInbox<EntityId<TestEntity>, TestEvent> with
 
-        member this.SubmitAsync(_, cancellationToken) = Task.FromResult this.SubmitOutcome
+        member this.SubmitAsync(_, cancellationToken) =
+            match this.SubmitOverride with
+            | Some submit -> submit cancellationToken
+            | None -> Task.FromResult this.SubmitOutcome
 
         member this.ClaimAsync(_, batch, _, cancellationToken) =
             match this.ClaimOutcome with

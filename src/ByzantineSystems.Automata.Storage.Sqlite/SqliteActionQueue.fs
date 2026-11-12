@@ -127,50 +127,62 @@ type SqliteActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'EntityId
     interface IActionQueue<'EntityId, 'Action> with
 
         member _.ClaimAsync(machineId, batch, lease, cancellationToken) =
+            Tap.requireMachineId (nameof machineId) machineId
+
             // Not idempotent, like the command claim: a claim whose outcome was lost may have
             // leased the rows, and repeating it leases more while the first batch stays invisible.
             // The dispatcher polls again shortly, which recovers faster.
-            backgroundTaskResult {
-                let! rows =
-                    Sql.writeProgramOnceWith
-                        context
-                        (claim machineId (ClaimBatch.value batch) (LeaseDuration.value lease))
-                        cancellationToken
+            Tap.start cancellationToken (fun () ->
+                backgroundTaskResult {
+                    let! rows =
+                        Sql.writeProgramOnceWith
+                            context
+                            (claim machineId (ClaimBatch.value batch) (LeaseDuration.value lease))
+                            cancellationToken
 
-                return!
-                    ClaimRecovery.collect
-                        toLeased
-                        (fun row reason ->
-                            abandon
-                                [ "@command_id", Param.Integer row.command_id
-                                  "@ordinal", Param.Integer row.ordinal
-                                  "@lease_token", Param.Integer row.lease_token ]
-                                reason
-                                cancellationToken
-                            |> TaskResult.map ignore)
-                        rows
-                        cancellationToken
-            }
+                    return!
+                        ClaimRecovery.collect
+                            toLeased
+                            (fun row reason ->
+                                abandon
+                                    [ "@command_id", Param.Integer row.command_id
+                                      "@ordinal", Param.Integer row.ordinal
+                                      "@lease_token", Param.Integer row.lease_token ]
+                                    reason
+                                    cancellationToken
+                                |> TaskResult.map ignore)
+                            rows
+                            cancellationToken
+                })
 
         member _.CompleteAsync(action, cancellationToken) =
-            Sql.writeProgram
-                context
-                (StoreProgram.executeCount completeAction (fence action)
-                 |> StoreProgram.map CommandMapping.leaseOutcome)
-                cancellationToken
+            Tap.requireArg (nameof action) action
+
+            Tap.start cancellationToken (fun () ->
+                Sql.writeProgram
+                    context
+                    (StoreProgram.executeCount completeAction (fence action)
+                     |> StoreProgram.map CommandMapping.leaseOutcome)
+                    cancellationToken)
 
         member _.RescheduleAsync(action, backoff, cancellationToken) =
-            Sql.writeProgramWith
-                context
-                (fun now ->
-                    StoreProgram.executeCount
-                        rescheduleAction
-                        (fence action
-                         @ [ "@now", Param.Integer now
-                             "@base_us", Param.Integer(CommandMapping.micros (Backoff.baseDelay backoff))
-                             "@cap_us", Param.Integer(CommandMapping.micros (Backoff.ceiling backoff)) ])
-                    |> StoreProgram.map CommandMapping.leaseOutcome)
-                cancellationToken
+            Tap.requireArg (nameof action) action
+
+            Tap.start cancellationToken (fun () ->
+                Sql.writeProgramWith
+                    context
+                    (fun now ->
+                        StoreProgram.executeCount
+                            rescheduleAction
+                            (fence action
+                             @ [ "@now", Param.Integer now
+                                 "@base_us", Param.Integer(CommandMapping.micros (Backoff.baseDelay backoff))
+                                 "@cap_us", Param.Integer(CommandMapping.micros (Backoff.ceiling backoff)) ])
+                        |> StoreProgram.map CommandMapping.leaseOutcome)
+                    cancellationToken)
 
         member _.AbandonAsync(action, reason, cancellationToken) =
-            abandon (fence action) (Reason.value reason) cancellationToken
+            Tap.requireArg (nameof action) action
+            Tap.requireArg (nameof reason) reason
+
+            Tap.start cancellationToken (fun () -> abandon (fence action) (Reason.value reason) cancellationToken)

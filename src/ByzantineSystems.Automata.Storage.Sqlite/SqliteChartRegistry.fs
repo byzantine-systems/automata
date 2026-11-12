@@ -31,41 +31,48 @@ type SqliteChartRegistry(options: ChartRegistryOptions) =
     interface IChartRegistry with
 
         member _.RegisterAsync(identity, cancellationToken) =
-            let key =
-                [ "@machine_id", Param.Text(MachineId.value identity.MachineId)
-                  "@version", Param.Integer(int64 (ChartVersion.value identity.Version)) ]
+            Tap.requireArg (nameof identity) identity
 
-            let fingerprint = ChartFingerprint.value identity.Fingerprint
+            Tap.start cancellationToken (fun () ->
+                let key =
+                    [ "@machine_id", Param.Text(MachineId.value identity.MachineId)
+                      "@version", Param.Integer(int64 (ChartVersion.value identity.Version)) ]
 
-            Sql.writeProgramWith
-                context
-                (fun now ->
-                    store {
-                        let! inserted =
-                            StoreProgram.executeCount
-                                register
-                                (key @ [ "@fingerprint", Param.Text fingerprint; "@now", Param.Integer now ])
+                let fingerprint = ChartFingerprint.value identity.Fingerprint
 
-                        if inserted = 1 then
-                            return ChartRegistration.Registered
-                        else
-                            let! stored =
-                                StoreProgram.queryOne byVersion key (fun reader -> Ok(Row.string reader "fingerprint"))
+                Sql.writeProgramWith
+                    context
+                    (fun now ->
+                        store {
+                            let! inserted =
+                                StoreProgram.executeCount
+                                    register
+                                    (key @ [ "@fingerprint", Param.Text fingerprint; "@now", Param.Integer now ])
 
-                            if stored = fingerprint then
-                                return ChartRegistration.Matched
+                            if inserted = 1 then
+                                return ChartRegistration.Registered
                             else
-                                let! parsed = parse stored
-                                return ChartRegistration.Mismatched parsed
-                    })
-                cancellationToken
+                                let! stored =
+                                    StoreProgram.queryOne byVersion key (fun reader ->
+                                        Ok(Row.string reader "fingerprint"))
+
+                                if stored = fingerprint then
+                                    return ChartRegistration.Matched
+                                else
+                                    let! parsed = parse stored
+                                    return ChartRegistration.Mismatched parsed
+                        })
+                    cancellationToken)
 
         member _.TryGetAsync(machineId, version, cancellationToken) =
-            Sql.readProgram
-                context
-                (StoreProgram.tryQueryOne
-                    byVersion
-                    [ "@machine_id", Param.Text(MachineId.value machineId)
-                      "@version", Param.Integer(int64 (ChartVersion.value version)) ]
-                    (fun reader -> parse (Row.string reader "fingerprint")))
-                cancellationToken
+            Tap.requireMachineId (nameof machineId) machineId
+
+            Tap.start cancellationToken (fun () ->
+                Sql.readProgram
+                    context
+                    (StoreProgram.tryQueryOne
+                        byVersion
+                        [ "@machine_id", Param.Text(MachineId.value machineId)
+                          "@version", Param.Integer(int64 (ChartVersion.value version)) ]
+                        (fun reader -> parse (Row.string reader "fingerprint")))
+                    cancellationToken)

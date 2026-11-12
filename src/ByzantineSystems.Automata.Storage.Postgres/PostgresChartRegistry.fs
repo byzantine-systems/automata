@@ -62,30 +62,36 @@ type PostgresChartRegistry(options: ChartRegistryOptions) =
     interface IChartRegistry with
 
         member _.RegisterAsync(identity, cancellationToken) =
-            let registrationRow reader =
-                result {
-                    let! tag = EnumCodec.read Row.string registrationTag "registration" reader
+            Tap.requireArg (nameof identity) identity
 
-                    match tag with
-                    | RegistrationTag.Registered -> return ChartRegistration.Registered
-                    | RegistrationTag.Matched -> return ChartRegistration.Matched
-                    | RegistrationTag.Mismatched ->
-                        let! stored = parse (Row.string reader "stored_fingerprint")
-                        return ChartRegistration.Mismatched stored
-                }
+            Tap.start cancellationToken (fun () ->
+                let registrationRow reader =
+                    result {
+                        let! tag = EnumCodec.read Row.string registrationTag "registration" reader
 
-            Sql.runProgram
-                context
-                (StoreProgram.queryOne
-                    register
-                    (key identity.MachineId identity.Version
-                     @ [ "fingerprint", Param.Text(ChartFingerprint.value identity.Fingerprint) ])
-                    registrationRow)
-                cancellationToken
+                        match tag with
+                        | RegistrationTag.Registered -> return ChartRegistration.Registered
+                        | RegistrationTag.Matched -> return ChartRegistration.Matched
+                        | RegistrationTag.Mismatched ->
+                            let! stored = parse (Row.string reader "stored_fingerprint")
+                            return ChartRegistration.Mismatched stored
+                    }
+
+                Sql.runProgram
+                    context
+                    (StoreProgram.queryOne
+                        register
+                        (key identity.MachineId identity.Version
+                         @ [ "fingerprint", Param.Text(ChartFingerprint.value identity.Fingerprint) ])
+                        registrationRow)
+                    cancellationToken)
 
         member _.TryGetAsync(machineId, version, cancellationToken) =
-            Sql.readProgram
-                context
-                (StoreProgram.tryQueryOne byVersion (key machineId version) (fun reader ->
-                    parse (Row.string reader "fingerprint")))
-                cancellationToken
+            Tap.requireMachineId (nameof machineId) machineId
+
+            Tap.start cancellationToken (fun () ->
+                Sql.readProgram
+                    context
+                    (StoreProgram.tryQueryOne byVersion (key machineId version) (fun reader ->
+                        parse (Row.string reader "fingerprint")))
+                    cancellationToken)

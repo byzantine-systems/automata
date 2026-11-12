@@ -9,6 +9,40 @@ open ByzantineSystems.Automata.Runtime
 open ByzantineSystems.Automata.Runtime.Tests.TestSupport
 open Expecto
 
+type private NonPumpingSynchronizationContext() =
+    inherit SynchronizationContext()
+
+    let gate = obj ()
+    let pending = ResizeArray<SendOrPostCallback * obj>()
+    let mutable released = false
+
+    let queue (callback: SendOrPostCallback) state =
+        ThreadPool.QueueUserWorkItem(WaitCallback(fun _ -> callback.Invoke state))
+        |> ignore
+
+    override _.Post(callback, state) =
+        let runNow =
+            lock gate (fun () ->
+                if released then
+                    true
+                else
+                    pending.Add(callback, state)
+                    false)
+
+        if runNow then
+            queue callback state
+
+    member _.Release() =
+        let callbacks =
+            lock gate (fun () ->
+                released <- true
+                let callbacks = List.ofSeq pending
+                pending.Clear()
+                callbacks)
+
+        for callback, state in callbacks do
+            queue callback state
+
 let private started (stub: StubStore<TestError>) =
     task {
         let built = buildMachine stub (newTime ()) id |> expectMachine
@@ -337,6 +371,75 @@ let submissionTests =
               | Ok(CommandResult.Rejected(CommandFailure.Machine reason)) ->
                   Expect.equal "refused" reason "the durable outcome, read back from the store"
               | other -> failtestf "expected a rejection, got %A" other
+          }
+
+          testTask "send completion does not require pumping the caller context" {
+              let stub = StubStore<TestError>()
+              let submitted = new ManualResetEventSlim(false)
+
+              let submission =
+                  TaskCompletionSource<Result<SubmissionOutcome, StoreError>>(
+                      TaskCreationOptions.RunContinuationsAsynchronously
+                  )
+
+              stub.SubmitOverride <-
+                  Some(fun _ ->
+                      submitted.Set()
+                      submission.Task)
+
+              stub.ResultOutcome <- Ok(Some(CommandResult.Rejected(CommandFailure.Machine "refused")))
+
+              let! built = started stub
+              let context = NonPumpingSynchronizationContext()
+              let mutable outcome = None
+              let mutable failure = None
+
+              let caller =
+                  Thread(
+                      ThreadStart(fun () ->
+                          SynchronizationContext.SetSynchronizationContext context
+
+                          try
+                              outcome <-
+                                  Machine.send
+                                      built
+                                      (entityId "E-1")
+                                      (EventEnvelope.create "context-free" (Start 1))
+                                      CancellationToken.None
+                                  |> fun pending -> Some pending.Result
+                          with error ->
+                              failure <- Some error)
+                  )
+
+              caller.IsBackground <- true
+              caller.Start()
+
+              let mutable reachedDependency = false
+              let mutable completedWithoutPumping = false
+
+              try
+                  reachedDependency <- submitted.Wait(TimeSpan.FromSeconds 2.)
+
+                  if reachedDependency then
+                      Task.Run(fun () -> submission.SetResult(Ok(Accepted(CommandId.ofInt64 3L))))
+                      |> ignore
+
+                      completedWithoutPumping <- caller.Join(TimeSpan.FromSeconds 2.)
+              finally
+                  submission.TrySetCanceled() |> ignore
+                  context.Release()
+
+                  Expect.isTrue (caller.Join(TimeSpan.FromSeconds 2.)) "the caller thread stopped during test cleanup"
+
+              Expect.isTrue reachedDependency "send reached an asynchronously completing dependency"
+
+              Expect.isTrue completedWithoutPumping "send completed without pumping the caller context"
+              Expect.isNone failure "send did not raise"
+
+              Expect.equal
+                  outcome
+                  (Some(Ok(CommandResult.Rejected(CommandFailure.Machine "refused"))))
+                  "send returned the durable result"
           }
 
           testTask "an envelope carries its audit context to the inbox" {

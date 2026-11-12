@@ -43,6 +43,9 @@ Install only the layers your application needs. For pure chart construction and 
 dotnet add package ByzantineSystems.Automata.Core
 ```
 
+>[!Note]
+>As of now, charts backed by PostgreSQL assume you can install at least [pg_cron](https://github.com/citusdata/pg_cron) and [pgmq](https://github.com/pgmq/pgmq) and are running in version 18+.
+
 To execute charts against the PostgreSQL authority:
 
 ```shell

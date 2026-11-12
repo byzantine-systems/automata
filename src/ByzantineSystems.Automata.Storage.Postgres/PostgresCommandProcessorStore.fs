@@ -118,8 +118,12 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     let context = options.Context
 
     let encodeEntityId entityId =
-        options.EntityIdEncode entityId
-        |> ByzantineSystems.Automata.Storage.Internal.EntityKey.ofString
+        let key =
+            options.EntityIdEncode entityId
+            |> ByzantineSystems.Automata.Storage.Internal.EntityKey.ofString
+
+        Tap.requireEntityKey "entityId" key
+        key
 
     let finalizeCommand = StatementKey.create "command" "finalize" |> Sql.prepareProgram
 
@@ -429,118 +433,157 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     interface IStateReader<'EntityId, 'State, 'Event, 'Action> with
 
         member _.TryGetSnapshotAsync(machineId, entityId, cancellationToken) =
-            Sql.readProgram
-                context
-                (StoreProgram.tryQueryOne
-                    currentBelief
-                    [ Params.machineId "machine_id" machineId
-                      Params.entityKey "entity_id" (encodeEntityId entityId) ]
-                    snapshotRow)
-                cancellationToken
+            Tap.requireMachineId (nameof machineId) machineId
+            Tap.requireArg (nameof entityId) entityId
+
+            Tap.start cancellationToken (fun () ->
+                Sql.readProgram
+                    context
+                    (StoreProgram.tryQueryOne
+                        currentBelief
+                        [ Params.machineId "machine_id" machineId
+                          Params.entityKey "entity_id" (encodeEntityId entityId) ]
+                        snapshotRow)
+                    cancellationToken)
 
         member _.HistoryAsync(machineId, entityId, paging, cancellationToken) =
-            // An absent cursor is zero rather than a null, because transition_epoch_positive
-            // forbids a stored epoch of zero. One query shape then serves every page.
-            let after =
-                Page.cursor paging
-                |> Option.map (Epoch.value >> int64)
-                |> Option.defaultValue 0L
+            Tap.requireMachineId (nameof machineId) machineId
+            Tap.requireArg (nameof entityId) entityId
 
-            Sql.readProgram
-                context
-                (StoreProgram.queryRows
-                    historyPage
-                    [ Params.machineId "machine_id" machineId
-                      Params.entityKey "entity_id" (encodeEntityId entityId)
-                      "after", Param.Bigint after
-                      "limit", Param.Int(Page.limit paging) ]
-                    (transitionRow >> toTransition))
-                cancellationToken
+            Tap.start cancellationToken (fun () ->
+                // An absent cursor is zero rather than a null, because transition_epoch_positive
+                // forbids a stored epoch of zero. One query shape then serves every page.
+                let after =
+                    Page.cursor paging
+                    |> Option.map (Epoch.value >> int64)
+                    |> Option.defaultValue 0L
+
+                Sql.readProgram
+                    context
+                    (StoreProgram.queryRows
+                        historyPage
+                        [ Params.machineId "machine_id" machineId
+                          Params.entityKey "entity_id" (encodeEntityId entityId)
+                          "after", Param.Bigint after
+                          "limit", Param.Int(Page.limit paging) ]
+                        (transitionRow >> toTransition))
+                    cancellationToken)
 
     interface ICommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err> with
 
         member _.CommitAsync(commandId, token, expected, draft, cancellationToken) =
-            backgroundTaskResult {
-                let! encoded = encodeDraft draft
-                return! Sql.runProgram context (finalize commandId token (Commit(expected, encoded))) cancellationToken
-            }
+            Tap.requireArg (nameof commandId) commandId
+            Tap.requireArg (nameof token) token
+            Tap.requireArg (nameof draft) draft
+
+            Tap.start cancellationToken (fun () ->
+                backgroundTaskResult {
+                    let! encoded = encodeDraft draft
+
+                    return!
+                        Sql.runProgram context (finalize commandId token (Commit(expected, encoded))) cancellationToken
+                })
 
         member _.RejectAsync(commandId, token, error, cancellationToken) =
-            fail Reject commandId token error cancellationToken
+            Tap.requireArg (nameof commandId) commandId
+            Tap.requireArg (nameof token) token
+            Tap.requireArg (nameof error) error
+
+            Tap.start cancellationToken (fun () -> fail Reject commandId token error cancellationToken)
 
         member _.DeadLetterAsync(commandId, token, error, cancellationToken) =
-            fail DeadLetter commandId token error cancellationToken
+            Tap.requireArg (nameof commandId) commandId
+            Tap.requireArg (nameof token) token
+            Tap.requireArg (nameof error) error
+
+            Tap.start cancellationToken (fun () -> fail DeadLetter commandId token error cancellationToken)
 
         member _.TryGetResultAsync(commandId, cancellationToken) =
-            Sql.readProgram
-                context
-                (StoreProgram.tryQueryOne transitionResult [ Params.commandId "command_id" commandId ] resultRow)
-                cancellationToken
+            Tap.requireArg (nameof commandId) commandId
+
+            Tap.start cancellationToken (fun () ->
+                Sql.readProgram
+                    context
+                    (StoreProgram.tryQueryOne transitionResult [ Params.commandId "command_id" commandId ] resultRow)
+                    cancellationToken)
 
     interface IReplayStore<'EntityId, 'State, 'Event, 'Action> with
 
         member _.SuffixAsync(machineId, entityId, from, limit, cancellationToken) =
-            Sql.readProgram
-                context
-                (store {
-                    let! suffix =
-                        StoreProgram.queryRows
-                            transitionSuffix
-                            [ Params.machineId "machine_id" machineId
-                              Params.entityKey "entity_id" (encodeEntityId entityId)
-                              "from", Param.Timestamp from
-                              "limit", Param.Int limit ]
-                            (transitionRow >> toTransition)
+            Tap.requireMachineId (nameof machineId) machineId
+            Tap.requireArg (nameof entityId) entityId
 
-                    // Retention purges an entity's oldest commands with their transitions, and
-                    // records the greatest effective instant it removed as a watermark. A suffix
-                    // whose start is at or before that watermark may have lost events; one that
-                    // starts strictly after it has not. The suffix is read first, so a concurrent
-                    // purge cannot pair a post-purge suffix with a stale pre-purge watermark.
-                    let! watermark =
-                        StoreProgram.tryQueryOne
-                            transitionWatermark
-                            [ Params.machineId "machine_id" machineId
-                              Params.entityKey "entity_id" (encodeEntityId entityId) ]
-                            (fun reader -> Row.timestamp reader "max_purged_effective_at" |> Ok)
+            Tap.start cancellationToken (fun () ->
+                // Encoded before the program is built, so a null entity id is a usage error
+                // at the call site rather than a failure inside the read: the builder defers
+                // everything it is handed.
+                let key = encodeEntityId entityId
 
-                    let incomplete =
-                        match watermark with
-                        | Some maxPurged -> maxPurged >= from
-                        | None -> false
+                Sql.readProgram
+                    context
+                    (store {
+                        let! suffix =
+                            StoreProgram.queryRows
+                                transitionSuffix
+                                [ Params.machineId "machine_id" machineId
+                                  Params.entityKey "entity_id" key
+                                  "from", Param.Timestamp from
+                                  "limit", Param.Int limit ]
+                                (transitionRow >> toTransition)
 
-                    return
-                        { Transitions = suffix
-                          Incomplete = incomplete }
-                })
-                cancellationToken
+                        // Retention purges an entity's oldest commands with their transitions, and
+                        // records the greatest effective instant it removed as a watermark. A suffix
+                        // whose start is at or before that watermark may have lost events; one that
+                        // starts strictly after it has not. The suffix is read first, so a concurrent
+                        // purge cannot pair a post-purge suffix with a stale pre-purge watermark.
+                        let! watermark =
+                            StoreProgram.tryQueryOne
+                                transitionWatermark
+                                [ Params.machineId "machine_id" machineId; Params.entityKey "entity_id" key ]
+                                (fun reader -> Row.timestamp reader "max_purged_effective_at" |> Ok)
+
+                        let incomplete =
+                            match watermark with
+                            | Some maxPurged -> maxPurged >= from
+                            | None -> false
+
+                        return
+                            { Transitions = suffix
+                              Incomplete = incomplete }
+                    })
+                    cancellationToken)
 
         member _.CommitCorrectionAsync(commandId, token, expected, commit, cancellationToken) =
-            backgroundTaskResult {
-                // Everything is encoded before anything is sent, so a state that will not encode
-                // fails the correction rather than half-writing it.
-                let! encoded = encodeDraft commit.Transition
-                let head, tail = commit.Beliefs
-                let! beliefs = BeliefPayload.encode options.StateCodec (head :: tail)
-                let draft = commit.Transition
+            Tap.requireArg (nameof commandId) commandId
+            Tap.requireArg (nameof token) token
+            Tap.requireArg (nameof commit) commit
 
-                return!
-                    Sql.runProgram
-                        context
-                        (StoreProgram.queryOne
-                            finalizeCorrection
-                            [ Params.commandId "command_id" commandId
-                              Params.commandLease "lease_token" token
-                              "expected_epoch", Param.Bigint(int64 (Epoch.value expected))
-                              "valid_from", Param.Timestamp commit.ValidFrom
-                              "beliefs", Param.Jsonb beliefs
-                              "instance_status", Param.Text(EnumCodec.encode EnumCodec.instanceStatus draft.Status)
-                              "event", Param.Jsonb encoded.EventJson
-                              "from_state", Param.Jsonb encoded.FromJson
-                              "to_state", Param.Jsonb encoded.ToJson
-                              "handled_by", Param.Text(StateId.value draft.HandledBy)
-                              "exited", Param.TextArray(states draft.Exited)
-                              "entered", Param.TextArray(states draft.Entered) ]
-                            (finalizeOutcome expected))
-                        cancellationToken
-            }
+            Tap.start cancellationToken (fun () ->
+                backgroundTaskResult {
+                    // Everything is encoded before anything is sent, so a state that will not encode
+                    // fails the correction rather than half-writing it.
+                    let! encoded = encodeDraft commit.Transition
+                    let head, tail = commit.Beliefs
+                    let! beliefs = BeliefPayload.encode options.StateCodec (head :: tail)
+                    let draft = commit.Transition
+
+                    return!
+                        Sql.runProgram
+                            context
+                            (StoreProgram.queryOne
+                                finalizeCorrection
+                                [ Params.commandId "command_id" commandId
+                                  Params.commandLease "lease_token" token
+                                  "expected_epoch", Param.Bigint(int64 (Epoch.value expected))
+                                  "valid_from", Param.Timestamp commit.ValidFrom
+                                  "beliefs", Param.Jsonb beliefs
+                                  "instance_status", Param.Text(EnumCodec.encode EnumCodec.instanceStatus draft.Status)
+                                  "event", Param.Jsonb encoded.EventJson
+                                  "from_state", Param.Jsonb encoded.FromJson
+                                  "to_state", Param.Jsonb encoded.ToJson
+                                  "handled_by", Param.Text(StateId.value draft.HandledBy)
+                                  "exited", Param.TextArray(states draft.Exited)
+                                  "entered", Param.TextArray(states draft.Entered) ]
+                                (finalizeOutcome expected))
+                            cancellationToken
+                })

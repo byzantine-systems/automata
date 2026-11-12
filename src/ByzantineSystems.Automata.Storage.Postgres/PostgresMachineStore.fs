@@ -173,7 +173,7 @@ type PostgresMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     /// database as it found it; the two writes after it are idempotent, which is what makes
     /// booting every generation of a supervised machine safe.
     let boot machineId ct =
-        taskResult {
+        backgroundTaskResult {
             match! Boot.inspect options.Context ct with
             | [] ->
                 let! _ = ensureQueue ct
@@ -187,7 +187,8 @@ type PostgresMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     /// before any command can commit: a commit enqueues into this queue inside its own
     /// transaction, and a missing queue would fail the commit rather than only the delivery.
     /// </summary>
-    member _.EnsureQueueAsync(ct: CancellationToken) : Task<Result<bool, StoreError>> = ensureQueue ct
+    member _.EnsureQueueAsync(cancellationToken: CancellationToken) : Task<Result<bool, StoreError>> =
+        Tap.start cancellationToken (fun () -> ensureQueue cancellationToken)
 
     interface ICommandInbox<'EntityId, 'Event> with
 
@@ -264,12 +265,20 @@ type PostgresMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     /// The boot check. Delivery names are validated before the options can be constructed.
     interface IStoreBoot with
 
-        member _.BootAsync(machineId, cancellationToken) = boot machineId cancellationToken
+        member _.BootAsync(machineId, cancellationToken) =
+            Tap.requireMachineId (nameof machineId) machineId
+
+            Tap.start cancellationToken (fun () -> boot machineId cancellationToken)
 
     interface IWorkNotifications with
 
         member _.ListenAsync(machineId, onCommands, onActions, cancellationToken) =
-            notifications.ListenAsync(machineId, onCommands, onActions, cancellationToken)
+            Tap.requireMachineId (nameof machineId) machineId
+            Tap.requireArg (nameof onCommands) onCommands
+            Tap.requireArg (nameof onActions) onActions
+
+            Tap.start cancellationToken (fun () ->
+                notifications.ListenAsync(machineId, onCommands, onActions, cancellationToken))
 
     interface IReplayStore<'EntityId, 'State, 'Event, 'Action> with
 
