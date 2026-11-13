@@ -320,13 +320,13 @@ Covers retention, purge and boot — the operator-facing safety net.
 |---|---|
 | **Type** | Safety |
 | **Property** | Purging commands past the retention horizon deletes every FK-dependent row of each purged command, and maintenance keeps succeeding no matter how old the data. |
-| **Invariant** | `Always`: after any purge run with any data age distribution, a subsequent `run_maintenance` succeeds. Deterministic counterpart: C1 regression (90e5ed3); the planned generic catalog guard (every FK into `command` has a purge target) is still missing and is part of C1's finish. |
+| **Invariant** | `Always`: after any purge run with any data age distribution, a subsequent `run_maintenance` succeeds. Deterministic counterpart: C1 regression (90e5ed3); the generic catalog guard (every FK into `command` has a purge target, `SchemaContractTests.fs`) is landed and mutation-validated. |
 | **Antithesis Angle** | Corrections aged past the horizon (E1's exact trigger); purge racing new corrections. |
 | **Why It Matters** | E1 wedged every machine's maintenance forever once any correction aged out. |
 
 **Open Questions:**
 
-- None (guard design already planned in C1 finish).
+- None.
 
 ### retention-watermark-exact — Suffix honesty
 

@@ -1,6 +1,7 @@
 module ByzantineSystems.Automata.Storage.Postgres.Tests.SchemaContractTests
 
 open System
+open System.Text.RegularExpressions
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage.Postgres
 open Expecto
@@ -94,6 +95,42 @@ let tests =
               Expect.isEmpty
                   (nullableColumns ())
                   "absence in this schema is always a value, so that a CHECK cannot pass by being unknown"
+          }
+
+          testTask "purge_commands deletes every table that references fsm.command" {
+              do! reset ()
+
+              // Every table with a foreign key into fsm.command. The keys are NO ACTION, so a
+              // child the purge does not delete would leave a dangling reference and wedge
+              // run_maintenance for every machine once one row ages past the horizon. This is
+              // the generic form of the correction wedge: it fails when the next child table
+              // arrives without a matching delete, not only when the correction one is missing.
+              let children =
+                  rows "SELECT DISTINCT c.relname
+                       FROM pg_constraint con
+                       JOIN pg_class c ON c.oid = con.conrelid
+                       WHERE con.contype = 'f' AND con.confrelid = 'fsm.command'::regclass
+                       ORDER BY c.relname" [] (fun reader -> reader.GetString 0)
+                  |> Set.ofList
+
+              Expect.isNonEmpty children "fsm.command has referents worth guarding"
+
+              // Read back from the catalog rather than the migration file, so a routine that
+              // drifted from what is deployed fails here too.
+              let definition =
+                  scalar<string>
+                      "SELECT pg_get_functiondef('fsm.purge_commands(text,timestamptz,integer)'::regprocedure)"
+
+              let targets =
+                  Regex.Matches(definition, @"DELETE\s+FROM\s+fsm\.([a-z_]+)", RegexOptions.IgnoreCase)
+                  |> Seq.cast<Match>
+                  |> Seq.map (fun matched -> matched.Groups[1].Value)
+                  |> Set.ofSeq
+
+              Expect.equal
+                  (Set.difference children targets |> Set.toList)
+                  []
+                  "every table with a foreign key into fsm.command has a matching DELETE in purge_commands"
           }
 
           testTask "the claim returns exactly the columns the reader expects" {
