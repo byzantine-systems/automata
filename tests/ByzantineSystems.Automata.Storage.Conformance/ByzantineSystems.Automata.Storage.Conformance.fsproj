@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <IsPackable>false</IsPackable>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <Compile Include="ContractProperties.fs" />
+        <Compile Include="StorageTapContracts.fs" />
+        <Compile Include="Conformance.fs" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <PackageReference Include="Expecto" />
+        <PackageReference Include="FsCheck" />
+        <ProjectReference Include="..\..\src\ByzantineSystems.Automata.Core\ByzantineSystems.Automata.Core.fsproj" />
+        <ProjectReference Include="..\..\src\ByzantineSystems.Automata.Storage\ByzantineSystems.Automata.Storage.fsproj" />
+    </ItemGroup>
+
+</Project>

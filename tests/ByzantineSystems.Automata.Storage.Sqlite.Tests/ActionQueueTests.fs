@@ -60,12 +60,7 @@ let private stringStore (fixture: Fixture) =
 let tests =
     testList
         "IActionQueue"
-        [ ContractProperties.poisonBatchProperty
-              "poison actions do not wedge a batch"
-              25
-              (CommandInboxTests.poisonFixture true)
-
-          testTask "explicit Discard records actions without queueing them" {
+        [ testTask "explicit Discard records actions without queueing them" {
               let db = fixture "discard"
 
               let store =

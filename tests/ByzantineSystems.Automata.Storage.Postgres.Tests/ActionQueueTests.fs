@@ -56,12 +56,7 @@ let private deadLetterCount () =
 let tests =
     testList
         "Postgres action queue"
-        [ ContractProperties.poisonBatchProperty
-              "poison actions do not wedge a batch"
-              12
-              (CommandInboxTests.poisonFixture true)
-
-          testTask "a commit routes actions to the boot registration" {
+        [ testTask "a commit routes actions to the boot registration" {
               do! reset ()
 
               exec

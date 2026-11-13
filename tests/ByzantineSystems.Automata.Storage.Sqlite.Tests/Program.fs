@@ -13,13 +13,15 @@ let tests =
           MigrationTests.tests
           SchemaContractTests.tests
           CommandInboxTests.tests
+          ConformanceTests.tests
           FinalizeTests.tests
           ActionQueueTests.tests
           HistoryTests.tests
           ChartRegistryTests.tests
           BootTests.tests
           ProcessorIntegrationTests.tests
-          CrossProcessTests.tests ]
+          CrossProcessTests.tests
+          TapTests.tests ]
 
 /// The binary is also the second process of the cross-process suite: started with the worker
 /// flag, it claims commands instead of running tests.

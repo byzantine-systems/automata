@@ -53,15 +53,7 @@ let private waitForBlockedRegistration () : Task =
 let tests =
     testList
         "Postgres IChartRegistry"
-        [
-
-          ContractProperties.registryProperty "registrations follow an immutable finite map" 20 (fun () ->
-              task {
-                  do! reset ()
-                  return newRegistry ()
-              })
-
-          // The reason fsm.register_chart_version re-reads in a second statement instead of
+        [ // The reason fsm.register_chart_version re-reads in a second statement instead of
           // deciding from one clever CTE. Every process starts at once after a deployment, so
           // losing this race is ordinary rather than exotic, and a loser reporting 'mismatched'
           // for a chart identical to the winner's would fail startup fleet-wide.

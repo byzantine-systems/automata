@@ -6,7 +6,6 @@ open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
 open ByzantineSystems.Automata.Storage.Postgres
-open ByzantineSystems.Automata.Storage.ContractProperties
 open Expecto
 open Npgsql
 open TestContext
@@ -31,182 +30,10 @@ let private claim (inbox: Inbox) batch : Task<Claimed list> =
         return claimed |> expectOk "claim"
     }
 
-// The shared inbox state machine, over this provider: one truncate-and-reseed per generated
-// case, and the database's own clock, so time moves by sleeping. Lease deadlines are stamped
-// by the database, which is why the model is given a deadband around them.
-let private contractEnv () : ContractInboxEnv =
-    let encode, decode = EntityKey.forEntityId<ContractEntity>
-
-    let stores () =
-        { Inbox =
-            PostgresCommandInbox<ContractEntityId, ContractEvent>(
-                { Context = context ()
-                  EventCodec = Serialization.systemTextJson<ContractEvent> ()
-                  EntityIdEncode = encode
-                  EntityIdDecode = decode }
-            )
-            :> ContractInbox
-          Processor =
-            PostgresCommandProcessorStore<ContractEntityId, ContractState, ContractEvent, ContractAction, ContractError>(
-                { Context = context ()
-                  StateCodec = Serialization.systemTextJson<ContractState> ()
-                  EventCodec = Serialization.systemTextJson<ContractEvent> ()
-                  ActionCodec = Serialization.systemTextJson<ContractAction list> ()
-                  ErrorCodec = Serialization.systemTextJson<ContractError> ()
-                  EntityIdEncode = encode
-                  EntityIdDecode = decode }
-            )
-            :> ContractProcessor
-          Now = fun () -> DateTimeOffset.UtcNow
-          Advance = fun span -> Task.Delay(span + TimeSpan.FromMilliseconds 20.0) }
-
-    { Machine = machine
-      Version = version
-      ClaimLease = LeaseDuration.create (TimeSpan.FromMilliseconds 50.0)
-      Backoff = Backoff.create (TimeSpan.FromMilliseconds 5.0) (TimeSpan.FromMilliseconds 40.0)
-      Margin = TimeSpan.FromMilliseconds 25.0
-      Ticks = fun ms -> TimeSpan.FromMilliseconds(float ms)
-      Fresh =
-        fun () ->
-            task {
-                do! reset ()
-                return stores ()
-            } }
-
-let private behaviorClasses =
-    [ "resubmit"
-      "key-reused"
-      "empty-claim"
-      "batch-limited"
-      "blocked-sibling"
-      "delay-not-yet"
-      "delay-elapsed"
-      "expiry-reclaimed"
-      "reject-releases"
-      "deadletter-releases"
-      "retry-deferred"
-      "renew-held"
-      "commit-finalized"
-      "commit-conflict"
-      "commit-already"
-      "commit-stale-fenced"
-      "terminal-stale-commit"
-      "ready-zero-token-fenced"
-      "expired-unreclaimed"
-      "reject-already"
-      "deadletter-already"
-      "stale-reject"
-      "stale-deadletter"
-      "stale-retry"
-      "stale-renew"
-      "lookup-hit"
-      "lookup-miss"
-      "result-pending"
-      "result-committed"
-      "result-rejected"
-      "result-deadlettered"
-      "result-missing" ]
-
-let internal poisonFixture actions count payload =
-    task {
-        do! reset ()
-        let inbox = newInbox ()
-        let processor = newProcessor ()
-        let ids = ResizeArray<CommandId>()
-
-        for index in 1..count do
-            let! submitted =
-                inbox.SubmitAsync(submission (entity $"poison-{index}") $"k{index}" (Start payload), noCancellation)
-
-            ids.Add(submitted |> expectOk "submit" |> commandIdOf)
-
-        if actions then
-            let! held = inbox.ClaimAsync(machine, ClaimBatch.create count, lease, noCancellation)
-
-            for row in held |> expectOk "claim" do
-                let! committed =
-                    processor.CommitAsync(
-                        row.Work.CommandId,
-                        row.Token,
-                        Epoch.initial,
-                        draft row.Work.EntityId Idle (Active payload) startTime,
-                        noCancellation
-                    )
-
-                committed |> expectOk "commit" |> ignore
-
-        return
-            { Ids = List.ofSeq ids
-              Corrupt =
-                fun id ->
-                    task {
-                        let id = CommandId.value id
-
-                        let sql =
-                            if actions then
-                                $"UPDATE pgmq.q_{actionQueue} SET message = jsonb_set(message, '{{action}}', '{{}}'::jsonb) WHERE (message->>'command_id')::bigint = {id}"
-                            else
-                                $"UPDATE fsm.command SET event = '{{}}'::jsonb WHERE command_id = {id}"
-
-                        exec sql |> expectOk "corrupt"
-                    }
-              Claim =
-                fun () ->
-                    task {
-                        if actions then
-                            let! rows =
-                                (newActionQueue ())
-                                    .ClaimAsync(
-                                        machine,
-                                        ClaimBatch.create count,
-                                        LeaseDuration.create (TimeSpan.FromMinutes 1.),
-                                        noCancellation
-                                    )
-
-                            return rows |> Result.map (List.map (fun row -> row.Work.CommandId))
-                        else
-                            let! rows =
-                                inbox.ClaimAsync(
-                                    machine,
-                                    ClaimBatch.create count,
-                                    LeaseDuration.create (TimeSpan.FromMinutes 1.),
-                                    noCancellation
-                                )
-
-                            return rows |> Result.map (List.map (fun row -> row.Work.CommandId))
-                    }
-              IsQuarantined =
-                fun id ->
-                    task {
-                        if actions then
-                            return
-                                scalar<bool>
-                                    $"SELECT EXISTS (SELECT 1 FROM fsm.action_dead_letter WHERE command_id = {CommandId.value id} AND reason LIKE 'undecodable:%%')"
-                        else
-                            let! result = processor.TryGetResultAsync(id, noCancellation)
-
-                            return
-                                match result with
-                                | Ok(Some(CommandResult.DeadLettered(CommandFailure.Machine reason))) ->
-                                    reason.StartsWith "undecodable:"
-                                | _ -> false
-                    } }
-    }
-
 let tests =
     testList
         "Postgres ICommandInbox"
-        [ ContractProperties.inboxProperty "the inbox follows the shared state machine" 12 25 (contractEnv ())
-
-          ContractProperties.finalizeProperty "finalization obeys the shared equations" 3 (contractEnv ())
-
-          ContractProperties.requestIdentityProperty "idempotency keys name immutable requests" 12 (contractEnv ())
-
-          ContractProperties.arrivalOrderProperty "arrival time follows sequence order" 12 (contractEnv ())
-
-          ContractProperties.poisonBatchProperty "poison commands do not wedge a batch" 12 (poisonFixture false)
-
-          testCaseTask "arrival is sampled after a blocked submit takes the entity lock" (fun () ->
+        [ testCaseTask "arrival is sampled after a blocked submit takes the entity lock" (fun () ->
               task {
                   do! reset ()
                   use deadline = new CancellationTokenSource(TimeSpan.FromSeconds 10.)
@@ -276,16 +103,6 @@ let tests =
                       firstArrival
                       "waiting on the lock cannot reverse arrival order"
               })
-
-          ContractProperties.readyTokenProperty
-              "a ready command's sentinel token never authorizes finalization"
-              9
-              (contractEnv ())
-
-          ContractProperties.inboxReachability
-              "the generated inbox traces reach every behavior class"
-              (contractEnv ())
-              behaviorClasses
 
           testTask "sequence numbers are gapless per entity and independent across entities" {
               do! reset ()

@@ -20,12 +20,12 @@ let tests =
                   "integration"
                   [ SqlTests.tests
                     CommandInboxTests.tests
+                    ConformanceTests.tests
                     ChartRegistryTests.tests
                     TemporalTests.tests
                     TemporalReaderTests.tests
                     CorrectionTests.tests
                     TemporalProperties.tests
-                    HistoryTests.tests
                     FinalizeTests.tests
                     ActionQueueTests.tests
                     ProcessorIntegrationTests.tests
@@ -34,7 +34,8 @@ let tests =
                     ReplayFinalizeProperties.tests
                     SchemaContractTests.tests
                     MaintenanceTests.integration
-                    PostgresSupervisionStoreTests.tests ]
+                    PostgresSupervisionStoreTests.tests
+                    TapTests.tests ]
               |> testSequenced
           else
               ptestCase "AUTOMATA_TEST_DB is not set" (fun _ -> ()) ]
