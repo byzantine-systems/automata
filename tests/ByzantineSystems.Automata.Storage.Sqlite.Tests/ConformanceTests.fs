@@ -190,6 +190,7 @@ let private settings: Conformance.Settings =
       ArrivalOrderCases = 25
       PoisonCases = 25
       ReadyTokenCases = 12
+      ClaimExclusivityCases = 25
       RegistryCases = 40
       HistoryCases = 30 }
 

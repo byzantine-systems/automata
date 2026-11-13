@@ -32,6 +32,7 @@ module Conformance =
           ArrivalOrderCases: int
           PoisonCases: int
           ReadyTokenCases: int
+          ClaimExclusivityCases: int
           RegistryCases: int
           HistoryCases: int }
 
@@ -121,6 +122,11 @@ module Conformance =
               ContractProperties.readyTokenProperty
                   "a ready command's sentinel token never authorizes finalization"
                   s.ReadyTokenCases
+                  sut.Inbox
+
+              ContractProperties.claimExclusivityProperty
+                  "concurrent claims never overlap"
+                  s.ClaimExclusivityCases
                   sut.Inbox
 
               ContractProperties.inboxReachability

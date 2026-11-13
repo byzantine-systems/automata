@@ -1186,7 +1186,7 @@ type FakeInbox(env: ContractInboxEnv) =
             |> fun found -> Task.FromResult(Ok found)
 
 /// Raw choices for a simulated trace, three to sixteen steps long.
-let randomInboxChoices (seed: int) : InboxChoice list =
+let private randomInboxChoices (seed: int) : InboxChoice list =
     let rng = Random seed
 
     let next () : InboxChoice =
@@ -1204,13 +1204,13 @@ let randomInboxChoices (seed: int) : InboxChoice list =
     List.init (3 + rng.Next 14) (fun _ -> next ())
 
 /// The behavior classes a trace covers, decided by running it against the reference store.
-let inboxClasses (env: ContractInboxEnv) (choices: InboxChoice list) : string list =
+let private inboxClasses (env: ContractInboxEnv) (choices: InboxChoice list) : string list =
     let fake = FakeInbox env
     let run = runInboxTrace env fake.Stores (List.truncate 14 choices)
     snd (run.GetAwaiter().GetResult())
 
 /// The compiled trace, for reading a shrunk counterexample.
-let renderTrace (choices: InboxChoice list) : string =
+let private renderTrace (choices: InboxChoice list) : string =
     let finishKind =
         function
         | 0 -> "reject"
@@ -1939,6 +1939,76 @@ let inboxReachability name (env: ContractInboxEnv) (expected: string list) =
             (Set.difference expected classes, Set.difference classes expected)
             (Set.empty, Set.empty)
             "every behavior class is reachable from generated traces (missing, unexpected)")
+
+/// Claim exclusivity under concurrency. Several workers race over the same backlog at once; the
+/// serial trace model proves one claim never returns two commands for one entity, and this
+/// property proves the same claim across simultaneous claimers through the public interface:
+/// whatever each worker received, the union of all of them is a set of distinct commands, at
+/// most one per entity.
+let claimExclusivityProperty name maxTests (env: ContractInboxEnv) =
+    testCase name (fun () ->
+        Check.One(
+            Config.QuickThrowOnFailure.WithMaxTest(maxTests),
+            fun (entities: byte, perEntity: byte, workers: byte) ->
+                task {
+                    let entityCount = 2 + int entities % 5
+                    let perEntityCount = 1 + int perEntity % 4
+                    let workerCount = 2 + int workers % 5
+                    let! stores = env.Fresh()
+                    let ct = CancellationToken.None
+
+                    let submissions =
+                        [ for e in 1..entityCount do
+                              for c in 1..perEntityCount ->
+                                  let entity: ContractEntityId = entityId $"claim-e{e}"
+                                  contractSubmission env entity $"claim-e{e}-c{c}" (Ping c) ]
+
+                    let! results =
+                        submissions
+                        |> List.map (fun submission -> stores.Inbox.SubmitAsync(submission, ct))
+                        |> Task.WhenAll
+
+                    for result in results do
+                        match result with
+                        | Ok(Accepted _) -> ()
+                        | other -> failtestf "claim-exclusivity: a fresh submission should be accepted, got %A" other
+
+                    let total = submissions.Length
+
+                    let! batches =
+                        [ for _ in 1..workerCount ->
+                              stores.Inbox.ClaimAsync(env.Machine, ClaimBatch.create total, env.ClaimLease, ct) ]
+                        |> Task.WhenAll
+
+                    let claimed =
+                        batches
+                        |> Array.toList
+                        |> List.map (fun result ->
+                            match result with
+                            | Ok rows -> rows
+                            | Error error -> failtestf "claim-exclusivity: a claim should succeed, got %A" error)
+                        |> List.concat
+
+                    let commandIds = claimed |> List.map (fun row -> row.Work.CommandId)
+
+                    Expect.equal
+                        (commandIds |> List.distinct |> List.length)
+                        (List.length commandIds)
+                        "a command is claimed at most once across all workers"
+
+                    let claimedEntities = claimed |> List.map (fun row -> row.Work.EntityId)
+
+                    Expect.equal
+                        (claimedEntities |> List.distinct |> List.length)
+                        (List.length claimedEntities)
+                        "an entity is claimed at most once across all workers"
+
+                    Expect.equal
+                        (List.length claimed)
+                        entityCount
+                        "every entity's head is claimed exactly once across all workers"
+                }
+        ))
 
 // ---------------------------------------------------------------------------------------------
 // The history equations.
