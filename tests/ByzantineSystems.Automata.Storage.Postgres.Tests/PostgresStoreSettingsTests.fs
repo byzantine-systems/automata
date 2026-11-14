@@ -9,7 +9,17 @@ open Microsoft.Extensions.Options
 let tests =
     testList
         "PostgresStoreSettings"
-        [ test "the defaults resolve to the default schema and the shared listener" {
+        [ test "belief models have stable configuration round trips" {
+              for model in [ BeliefModel.Snapshot; BeliefModel.Bitemporal ] do
+                  Expect.equal (BeliefModel.tryCreate (BeliefModel.value model)) (Ok model) "round trip"
+
+              let settings = PostgresStoreSettings()
+              Expect.equal settings.Beliefs "snapshot" "the default changed deliberately"
+              settings.Beliefs <- "unknown"
+              Expect.isError (PostgresStoreSettings.tryResolve settings) "an unknown model is a configuration refusal"
+          }
+
+          test "the defaults resolve to the default schema and the shared listener" {
               match PostgresStoreSettings.tryResolve (PostgresStoreSettings()) with
               | Ok(schema, listener) ->
                   Expect.equal (SchemaName.value schema) "fsm" "the default schema"

@@ -443,7 +443,7 @@ let tests =
 
               let! outcome =
                   (newReplayStore ())
-                      .CommitCorrectionAsync(
+                      .Committer.CommitCorrectionAsync(
                           held.Work.CommandId,
                           LeaseToken.ofInt64 0L,
                           Epoch.initial,

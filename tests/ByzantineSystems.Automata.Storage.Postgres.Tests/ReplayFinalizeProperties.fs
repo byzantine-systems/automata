@@ -80,7 +80,7 @@ let private finalizeProperty =
 
                     let! outcome =
                         (newReplayStore ())
-                            .CommitCorrectionAsync(
+                            .Committer.CommitCorrectionAsync(
                                 held.Work.CommandId,
                                 presented,
                                 Epoch.initial,

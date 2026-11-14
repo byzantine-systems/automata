@@ -87,9 +87,8 @@ BEGIN
         CASE WHEN v_stored = p_fingerprint THEN
             'matched'
         ELSE
-            'mismatched'
-        END::$schema$.chart_registration,
-        v_stored;
-END;
+            'mismatched' END::$schema$.chart_registration,
+            v_stored;
+        END;
 $$;
 

@@ -256,4 +256,5 @@ let tests =
           Registry = registryFresh
           PoisonCommand = poisonFixture false
           PoisonAction = poisonFixture true
+          Corrections = None
           Settings = settings }

@@ -46,6 +46,7 @@ module Conformance =
           Registry: unit -> Task<IChartRegistry>
           PoisonCommand: int -> int -> Task<PoisonBatchFixture>
           PoisonAction: int -> int -> Task<PoisonBatchFixture>
+          Corrections: CorrectionContract.Environment option
           Settings: Settings }
 
     /// The behavior classes the generated inbox traces are expected to reach. Owned here because
@@ -143,4 +144,8 @@ module Conformance =
                   sut.Inbox
                   behaviorClasses
 
-              ContractProperties.historyProperty "the shared history equations" s.HistoryCases sut.History ]
+              ContractProperties.historyProperty "the shared history equations" s.HistoryCases sut.History
+
+              match sut.Corrections with
+              | Some env -> CorrectionContract.tests env
+              | None -> ptestCase "correction capability is not provided" ignore ]

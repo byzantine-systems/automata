@@ -55,7 +55,7 @@ let private commitAt (name: string) (key: string) (effectiveAt: DateTimeOffset) 
 
 let private suffixIncomplete (name: string) (from: DateTimeOffset) : Task<bool> =
     task {
-        let! result = (newReplayStore ()).SuffixAsync(machine, entity name, from, 100, noCancellation)
+        let! result = (newReplayStore ()).Log.SuffixAsync(machine, entity name, from, 100, noCancellation)
         return (result |> expectOk "suffix").Incomplete
     }
 
@@ -176,7 +176,7 @@ let private regressions =
               Expect.isTrue exactly "the purged transition is effective exactly at the watermark"
           }
 
-          testTask "a purge that leaves no transition still reports what it removed" {
+          testTask "a rejection does not make the snapshot's successful command purgeable" {
               // The newest command is a rejection with no transition, so purging the committed
               // predecessor empties the log. The watermark still says a suffix before it is lost.
               do! reset ()
@@ -206,11 +206,11 @@ let private regressions =
 
               Expect.equal
                   (scalar<int64> $"SELECT count(*) FROM fsm.transition WHERE entity_id = '{name}'")
-                  0L
-                  "no transition survives"
+                  1L
+                  "the snapshot pins its producing command and transition"
 
               let! before = suffixIncomplete name (baseTime.AddHours 9.)
-              Expect.isTrue before "the removed transition is still part of a suffix from before it"
+              Expect.isFalse before "no committed transition was removed"
           } ]
 
 let tests =

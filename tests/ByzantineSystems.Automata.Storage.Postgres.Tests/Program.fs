@@ -23,8 +23,10 @@ let tests =
                   [ SqlTests.tests
                     CommandInboxTests.tests
                     ConformanceTests.tests
+                    ProfileTests.conformance
                     ChartRegistryTests.tests
                     TemporalTests.tests
+                    TemporalBoundaryTests.tests
                     TemporalReaderTests.tests
                     CorrectionTests.tests
                     TemporalProperties.tests
@@ -38,6 +40,7 @@ let tests =
                     MaintenanceTests.integration
                     PostgresSupervisionStoreTests.tests
                     TapTests.tests
+                    ProfileTests.tests
                     TwoSchemaTests.tests ]
               |> testSequenced
           else

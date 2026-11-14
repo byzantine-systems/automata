@@ -21,7 +21,9 @@ let private contracts =
       typeof<IActionQueue<obj, obj>>, set [ "ClaimAsync"; "CompleteAsync"; "RescheduleAsync"; "AbandonAsync" ]
       typeof<ITemporalReader<obj, obj>>, set [ "ValidAtAsync"; "AsOfAsync" ]
       typeof<ICorrectionStore<obj, obj>>, set [ "CorrectAsync" ]
-      typeof<IReplayStore<obj, obj, obj, obj>>, set [ "SuffixAsync"; "CommitCorrectionAsync" ]
+      typeof<ITransitionLog<obj, obj, obj, obj>>, set [ "SuffixAsync" ]
+      typeof<IPriorState<obj, obj>>, set [ "BeforeAsync" ]
+      typeof<ICorrectionCommitter<obj, obj, obj, obj>>, set [ "CommitCorrectionAsync" ]
       typeof<IStoreBoot>, set [ "BootAsync" ]
       typeof<IWorkNotifications>, set [ "ListenAsync" ]
       typeof<IDatabaseMaintenance>,
@@ -53,7 +55,7 @@ let tests =
 
                   Expect.equal actual expected $"{contract.Name} exposes exactly its documented asynchronous members"
 
-              Expect.equal taskMethods.Length 32 "the complete TAP surface is guarded")
+              Expect.equal taskMethods.Length 33 "the complete TAP surface is guarded")
 
           testCase "cancellation tokens are last and named cancellationToken" (fun () ->
               let invalid =

@@ -66,11 +66,13 @@ let private freshOther () : Task =
             Migrator.migrate
                 Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance
                 { ConnectionString = connectionString
-                  Schema = otherSchema }
+                  Schema = otherSchema
+                  Beliefs = BeliefModel.Snapshot }
         with
         | Ok _ -> ()
         | Error(MigrationError.Failed(script, error)) ->
             failtestf "the sibling schema should migrate, failed at %s: %s" script error.Message
+        | Error(MigrationError.ProfileMismatch _ as error) -> failtestf "unexpected profile: %A" error
 
         exec
             $"SELECT {otherName}.ensure_action_queue('{otherQueue}');
@@ -258,11 +260,13 @@ let tests =
                       Migrator.migrate
                           Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance
                           { ConnectionString = connectionString
-                            Schema = temporary }
+                            Schema = temporary
+                            Beliefs = BeliefModel.Bitemporal }
                   with
                   | Ok _ -> ()
                   | Error(MigrationError.Failed(script, error)) ->
                       failtestf "migration under a foreign search_path failed at %s: %s" script error.Message
+                  | Error(MigrationError.ProfileMismatch _ as error) -> failtestf "unexpected profile: %A" error
 
                   Expect.equal
                       (scalar<string>

@@ -120,10 +120,12 @@ let private operations () : (string * (CancellationToken -> Task)) list =
       "queue.ensure", (fun ct -> concreteQueue.EnsureQueueAsync ct :> Task)
       "temporal.validAt", (fun ct -> temporal.ValidAtAsync(TestContext.machine, entity, at, ct) :> Task)
       "temporal.asOf", (fun ct -> temporal.AsOfAsync(TestContext.machine, entity, at, at, ct) :> Task)
-      "corrections.correct", (fun ct -> corrections.CorrectAsync(TestContext.machine, entity, at, [], ct) :> Task)
-      "replay.suffix", (fun ct -> replay.SuffixAsync(TestContext.machine, entity, at, 10, ct) :> Task)
+      "corrections.correct",
+      (fun ct -> corrections.CorrectAsync(TestContext.machine, entity, Epoch.initial, at, [], ct) :> Task)
+      "replay.suffix", (fun ct -> replay.Log.SuffixAsync(TestContext.machine, entity, at, 10, ct) :> Task)
+      "prior.before", (fun ct -> replay.Prior.BeforeAsync(TestContext.machine, entity, at, ct) :> Task)
       "replay.commitCorrection",
-      (fun ct -> replay.CommitCorrectionAsync(one, commandToken, Epoch.initial, commit, ct) :> Task)
+      (fun ct -> replay.Committer.CommitCorrectionAsync(one, commandToken, Epoch.initial, commit, ct) :> Task)
       "registry.register", (fun ct -> registry.RegisterAsync(identity, ct) :> Task)
       "registry.tryGet", (fun ct -> registry.TryGetAsync(TestContext.machine, TestContext.version, ct) :> Task)
       "boot.boot", (fun ct -> (machine :> IStoreBoot).BootAsync(TestContext.machine, ct) :> Task)
@@ -235,6 +237,7 @@ let tests =
                   corrections.CorrectAsync(
                       TestContext.machine,
                       entity,
+                      Epoch.initial,
                       at,
                       Unchecked.defaultof<CorrectedBelief<TestState> list>,
                       CancellationToken.None
@@ -248,6 +251,7 @@ let tests =
                   corrections.CorrectAsync(
                       TestContext.machine,
                       Unchecked.defaultof<Entity>,
+                      Epoch.initial,
                       at,
                       [],
                       CancellationToken.None
@@ -258,7 +262,13 @@ let tests =
               let replay = TestContext.newReplayStore ()
 
               StorageTapContracts.nullThrowsAtCallSite "replay.suffix" (fun () ->
-                  replay.SuffixAsync(TestContext.machine, Unchecked.defaultof<Entity>, at, 10, CancellationToken.None)
+                  replay.Log.SuffixAsync(
+                      TestContext.machine,
+                      Unchecked.defaultof<Entity>,
+                      at,
+                      10,
+                      CancellationToken.None
+                  )
                   |> ignore))
 
           testCase "a null chart identity is refused at the call site" (fun () ->

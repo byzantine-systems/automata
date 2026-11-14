@@ -15,8 +15,11 @@
         <Compile Include="SqlTests.fs" />
         <Compile Include="CommandInboxTests.fs" />
         <Compile Include="ConformanceTests.fs" />
+        <Compile Include="SnapshotCorrectionStore.fs" />
+        <Compile Include="ProfileTests.fs" />
         <Compile Include="ChartRegistryTests.fs" />
         <Compile Include="TemporalTests.fs" />
+        <Compile Include="TemporalBoundaryTests.fs" />
         <Compile Include="TemporalReaderTests.fs" />
         <Compile Include="CorrectionTests.fs" />
         <Compile Include="TemporalProperties.fs" />

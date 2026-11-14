@@ -14,3 +14,4 @@ FROM
     $schema$.schemaversions j
 ORDER BY
     j.scriptname;
+

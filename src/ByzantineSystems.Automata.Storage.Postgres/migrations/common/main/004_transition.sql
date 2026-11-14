@@ -9,24 +9,12 @@
 -- The answer $schema$.finalize_command gives. A checked text domain, like the others.
 CREATE DOMAIN $schema$.finalize_outcome AS text CONSTRAINT finalize_outcome_valid CHECK (VALUE IN ('finalized', 'already_finalized', 'conflict', 'lease_lost'));
 
-CREATE TABLE $schema$.transition (
-    machine_id text NOT NULL,
-    entity_id text NOT NULL,
-    epoch bigint NOT NULL,
-    command_id bigint NOT NULL,
-    chart_version integer NOT NULL,
-    event jsonb NOT NULL,
-    actions jsonb NOT NULL,
-    from_state jsonb NOT NULL,
-    to_state jsonb NOT NULL,
+CREATE TABLE $schema$.transition (machine_id text NOT NULL, entity_id text NOT NULL, epoch bigint NOT NULL, command_id bigint NOT NULL, chart_version integer NOT NULL, event jsonb NOT NULL, actions jsonb NOT NULL, from_state jsonb NOT NULL, to_state jsonb NOT NULL,
     -- Which node in the chain handled the event, and the exit and entry paths
     -- around the least common ancestor. Recorded because resolution is a
     -- bubbling search: knowing the answer without knowing who gave it makes an
     -- unexpected transition impossible to explain after the fact.
-    handled_by text NOT NULL,
-    exited text[] NOT NULL,
-    entered text[] NOT NULL,
-    status $schema$.instance_status NOT NULL,
+    handled_by text NOT NULL, exited text[] NOT NULL, entered text[] NOT NULL, status $schema$.instance_status NOT NULL,
     -- Business time, from the caller. See committed_at for the other one.
     effective_at timestamptz NOT NULL,
     -- Database time, never caller-supplied. The application's clock decides
@@ -39,13 +27,11 @@ CREATE TABLE $schema$.transition (
     -- command per entity is claimable, so at most one worker can be finalizing
     -- an entity at a time. This key is the backstop for that reasoning, not the
     -- mechanism behind it.
-    PRIMARY KEY (machine_id, entity_id, epoch),
-    CONSTRAINT transition_epoch_positive CHECK (epoch > 0),
+    PRIMARY KEY (machine_id, entity_id, epoch), CONSTRAINT transition_epoch_positive CHECK (epoch > 0),
     -- Idempotence as a storage guarantee rather than a property of a routine.
     -- Whatever $schema$.finalize_command does, and whatever a caller retries after a
     -- dropped connection, one command can never produce two transitions.
-    CONSTRAINT transition_unique_command UNIQUE (command_id),
-    CONSTRAINT transition_command_fkey FOREIGN KEY (command_id) REFERENCES $schema$.command (command_id)
+    CONSTRAINT transition_unique_command UNIQUE (command_id), CONSTRAINT transition_command_fkey FOREIGN KEY (command_id) REFERENCES $schema$.command (command_id)
 );
 
 COMMENT ON COLUMN $schema$.transition.effective_at IS 'When the event was effective in the world. Caller-supplied, because a back-dated correction is a legitimate thing to record.';

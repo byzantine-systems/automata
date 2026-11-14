@@ -36,13 +36,7 @@
 -- whose new value cannot be used in the transaction that adds it.
 CREATE DOMAIN $schema$.chart_registration AS text CONSTRAINT chart_registration_valid CHECK (VALUE IN ('registered', 'matched', 'mismatched'));
 
-CREATE TABLE $schema$.machine_chart_version (
-    machine_id text NOT NULL,
-    version integer NOT NULL,
-    fingerprint text NOT NULL,
-    registered_at timestamptz NOT NULL DEFAULT STATEMENT_TIMESTAMP(),
-    CONSTRAINT machine_chart_version_pkey PRIMARY KEY (machine_id, version),
-    CONSTRAINT machine_chart_version_positive CHECK (version > 0),
+CREATE TABLE $schema$.machine_chart_version (machine_id text NOT NULL, version integer NOT NULL, fingerprint text NOT NULL, registered_at timestamptz NOT NULL DEFAULT STATEMENT_TIMESTAMP(), CONSTRAINT machine_chart_version_pkey PRIMARY KEY (machine_id, version), CONSTRAINT machine_chart_version_positive CHECK (version > 0),
     -- 64 lowercase hex digits. Without this, a truncated or upper-cased hash is
     -- accepted and then mismatches against every chart forever, and the
     -- operator reading that mismatch cannot tell it from a chart somebody

@@ -323,7 +323,7 @@ type CommandProcessor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: e
             applyDisposition leased (policy.Classify(MachineError.Store error)) ct
 
         backgroundTask {
-            match Store.tryReplay config.Store with
+            match Store.tryCorrections config.Store with
             | None -> return! deadLetter (CommandFailure.Machine "this store cannot replay corrections")
             | Some replay ->
                 let planned =
@@ -331,11 +331,19 @@ type CommandProcessor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: e
 
                 match! renewWhile leased planned ct with
                 | Ok(plan, expected) ->
-                    match! replay.CommitCorrectionAsync(record.CommandId, leased.Token, expected, plan.Commit, ct) with
+                    match!
+                        replay.Committer.CommitCorrectionAsync(
+                            record.CommandId,
+                            leased.Token,
+                            expected,
+                            plan.Commit,
+                            ct
+                        )
+                    with
                     | Ok outcome -> return! interpretCommit leased plan.Commit.Transition outcome ct
                     | Error error -> return! classify error
                 | Error(CorrectionError.Replay error) -> return! deadLetter (CommandFailure.Replay error)
-                | Error CorrectionError.Unsupported ->
+                | Error(CorrectionError.Rejected _) ->
                     return! deadLetter (CommandFailure.Machine "this store cannot read or replay the past")
                 | Error(CorrectionError.Store error) -> return! classify error
         }

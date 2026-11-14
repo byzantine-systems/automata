@@ -6,6 +6,7 @@
 
     <ItemGroup>
         <Compile Include="ContractProperties.fs" />
+        <Compile Include="CorrectionContract.fs" />
         <Compile Include="StorageTapContracts.fs" />
         <Compile Include="Conformance.fs" />
     </ItemGroup>

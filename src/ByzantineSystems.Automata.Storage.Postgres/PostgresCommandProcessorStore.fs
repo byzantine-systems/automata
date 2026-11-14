@@ -54,8 +54,8 @@ module private ProcessorMapping =
 /// <summary>
 /// The PostgreSQL end of processing a command.
 ///
-/// Every operation is one call to <c>fsm.finalize_command</c>, which is one transaction: the
-/// transition, the belief, the result and the inbox row move together or not at all. Retrying
+/// Every operation is one call to the profile commit routine, which is one transaction: the
+/// transition, the state, the result and the inbox row move together or not at all. Retrying
 /// after an ambiguous failure is safe, because the routine answers a repeated call from the same
 /// lease with what that lease already did.
 /// </summary>
@@ -113,7 +113,7 @@ module private ReplayMapping =
         | _ -> fail ()
 
 type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
-    (options: CommandProcessorOptions<'EntityId, 'State, 'Event, 'Action, 'Err>) =
+    (options: CommandProcessorOptions<'EntityId, 'State, 'Event, 'Action, 'Err>, ?beliefs: BeliefModel) =
 
     let context = options.Context
 
@@ -126,7 +126,11 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
         key
 
     let prepare = Sql.prepareProgram context.Schema
-    let finalizeCommand = StatementKey.create "command" "finalize" |> prepare
+
+    let finalizeCommand =
+        match defaultArg beliefs BeliefModel.Snapshot with
+        | BeliefModel.Snapshot -> StatementKey.create "command" "finalize" |> prepare
+        | BeliefModel.Bitemporal -> StatementKey.create "command" "finalize_temporal" |> prepare
 
     let finalizeCorrection =
         StatementKey.create "command" "finalize_correction" |> prepare
@@ -175,7 +179,7 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
         }
 
     /// <summary>
-    /// One call to <c>fsm.finalize_command</c>. Which half of its parameters is filled follows
+    /// One call to the profile commit routine. Which half of its parameters is filled follows
     /// from how the command ends, so the two shapes cannot be half-filled or mixed: a commit
     /// sends its transition and no error, a failure sends its error and no transition.
     ///
@@ -505,7 +509,7 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                     (StoreProgram.tryQueryOne transitionResult [ Params.commandId "command_id" commandId ] resultRow)
                     cancellationToken)
 
-    interface IReplayStore<'EntityId, 'State, 'Event, 'Action> with
+    interface ITransitionLog<'EntityId, 'State, 'Event, 'Action> with
 
         member _.SuffixAsync(machineId, entityId, from, limit, cancellationToken) =
             Tap.requireMachineId (nameof machineId) machineId
@@ -550,6 +554,8 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                               Incomplete = incomplete }
                     })
                     cancellationToken)
+
+    interface ICorrectionCommitter<'EntityId, 'State, 'Event, 'Action> with
 
         member _.CommitCorrectionAsync(commandId, token, expected, commit, cancellationToken) =
             Tap.requireArg (nameof commandId) commandId

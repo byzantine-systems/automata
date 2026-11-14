@@ -158,7 +158,10 @@ let private correctionProperty name maxTests =
                         replacement
                         |> List.map (fun (at, state, epoch) -> correctedBelief at state epoch)
 
-                    let! outcome = (newCorrections ()).CorrectAsync(machine, entity "e1", cut, beliefs, noCancellation)
+                    let! outcome =
+                        (newCorrections ())
+                            .CorrectAsync(machine, entity "e1", Epoch.initial, cut, beliefs, noCancellation)
+
                     let mutable ok = (outcome |> okOf).IsSome
 
                     if ok then

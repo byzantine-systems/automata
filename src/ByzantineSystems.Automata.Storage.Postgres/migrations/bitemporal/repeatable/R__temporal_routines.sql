@@ -59,7 +59,7 @@
 -- Schema-qualified everywhere, and SET search_path, so a bare name cannot land
 -- wherever the connecting role's search_path happens to point.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION $schema$.temporal_versioning ()
+CREATE OR REPLACE FUNCTION $temporal_schema$.temporal_versioning ()
     RETURNS TRIGGER
     LANGUAGE plpgsql
     SET search_path = pg_catalog, pg_temp
@@ -68,10 +68,13 @@ DECLARE
     at timestamptz := STATEMENT_TIMESTAMP();
 BEGIN
     IF tg_op IN ('UPDATE', 'DELETE') THEN
-        OLD.system_time := TSTZRANGE(LOWER(OLD.system_time), at, '[)');
-        EXECUTE FORMAT('INSERT INTO %I.%I SELECT ($1).*', tg_table_schema, tg_table_name || '_history')
-        USING old;
-    END IF;
+        at := GREATEST (at, LOWER(OLD.system_time));
+        IF at > LOWER(OLD.system_time) THEN
+            OLD.system_time := TSTZRANGE(LOWER(OLD.system_time), at, '[)');
+            EXECUTE FORMAT('INSERT INTO %I.%I SELECT ($1).*', tg_table_schema, tg_table_name || '_history')
+            USING old;
+        END IF;
+        END IF;
         IF tg_op = 'DELETE' THEN
             RETURN old;
         END IF;
@@ -81,9 +84,9 @@ END
 $$;
 
 CREATE OR REPLACE TRIGGER instance_state_versioning_trigger
-    BEFORE INSERT OR UPDATE OR DELETE ON $schema$.instance_state
+    BEFORE INSERT OR UPDATE OR DELETE ON $temporal_schema$.instance_state
     FOR EACH ROW
-    EXECUTE FUNCTION $schema$.temporal_versioning ();
+    EXECUTE FUNCTION $temporal_schema$.temporal_versioning ();
 
 -- ---------------------------------------------------------------------------
 -- $schema$.split_belief: the portion update, hand-rolled.
@@ -103,7 +106,7 @@ CREATE OR REPLACE TRIGGER instance_state_versioning_trigger
 -- Returns the number of rows the update matched, because no routine here
 -- returns void.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION $schema$.split_belief (p_machine_id text, p_entity_id text, p_at timestamptz, p_state jsonb, p_status $schema$.instance_status, p_epoch bigint, p_command_id bigint, p_chart_version integer)
+CREATE OR REPLACE FUNCTION $temporal_schema$.split_belief (p_machine_id text, p_entity_id text, p_at timestamptz, p_state jsonb, p_status $schema$.instance_status, p_epoch bigint, p_command_id bigint, p_chart_version integer)
     RETURNS bigint
     LANGUAGE sql
     VOLATILE PARALLEL UNSAFE
@@ -114,7 +117,7 @@ CREATE OR REPLACE FUNCTION $schema$.split_belief (p_machine_id text, p_entity_id
         -- re-inserted unchanged. Empty when p_at is the live belief's own
         -- start: nothing precedes the new belief, which is the replaced
         -- case.
-        INSERT INTO $schema$.instance_state (machine_id, entity_id, state, status, epoch, command_id, chart_version, valid_during)
+        INSERT INTO $temporal_schema$.instance_state (machine_id, entity_id, state, status, epoch, command_id, chart_version, valid_during)
         SELECT
             machine_id,
             entity_id,
@@ -125,7 +128,7 @@ CREATE OR REPLACE FUNCTION $schema$.split_belief (p_machine_id text, p_entity_id
             chart_version,
             TSTZRANGE(LOWER(valid_during), $3, '[)')
         FROM
-            $schema$.instance_state
+            $temporal_schema$.instance_state
         WHERE
             machine_id = $1
             AND entity_id = $2
@@ -139,7 +142,7 @@ updated AS (
     -- original start should a caller ever arrive with p_at behind it,
     -- though $schema$.close_and_open raises before that can happen.
     UPDATE
-        $schema$.instance_state
+        $temporal_schema$.instance_state
     SET
         state = $4,
         status = $5,
@@ -190,9 +193,9 @@ $$;
 --
 -- VOLATILE and PARALLEL UNSAFE because it writes.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION $schema$.close_and_open (p_machine_id text, p_entity_id text, p_at timestamptz, p_state jsonb, p_status $schema$.instance_status, p_epoch bigint, p_command_id bigint, p_chart_version integer)
+CREATE OR REPLACE FUNCTION $temporal_schema$.close_and_open (p_machine_id text, p_entity_id text, p_at timestamptz, p_state jsonb, p_status $schema$.instance_status, p_epoch bigint, p_command_id bigint, p_chart_version integer)
     RETURNS TABLE (
-        outcome $schema$.belief_outcome,
+        outcome $temporal_schema$.belief_outcome,
         valid_from timestamptz)
     LANGUAGE plpgsql
     VOLATILE PARALLEL UNSAFE
@@ -207,7 +210,7 @@ BEGIN
     INTO
         v_live_from
     FROM
-        $schema$.instance_state s
+        $temporal_schema$.instance_state s
     WHERE
         s.machine_id = p_machine_id
         AND s.entity_id = p_entity_id
@@ -217,24 +220,23 @@ BEGIN
             USING ERRCODE = 'invalid_parameter_value';
     END IF;
     IF v_live_from IS NULL THEN
-        INSERT INTO $schema$.instance_state (machine_id, entity_id, state, status, epoch, command_id, chart_version, valid_during)
+        INSERT INTO $temporal_schema$.instance_state (machine_id, entity_id, state, status, epoch, command_id, chart_version, valid_during)
             VALUES (p_machine_id, p_entity_id, p_state, p_status, p_epoch, p_command_id, p_chart_version, TSTZRANGE(p_at, 'infinity', '[)'));
         RETURN QUERY
         SELECT
-            'opened'::$schema$.belief_outcome,
+            'opened'::$temporal_schema$.belief_outcome,
             p_at;
         RETURN;
     END IF;
     PERFORM
-        $schema$.split_belief (p_machine_id, p_entity_id, p_at, p_state, p_status, p_epoch, p_command_id, p_chart_version);
+        $temporal_schema$.split_belief (p_machine_id, p_entity_id, p_at, p_state, p_status, p_epoch, p_command_id, p_chart_version);
     RETURN QUERY
     SELECT
         CASE WHEN p_at > v_live_from THEN
             'split'
         ELSE
-            'replaced'
-        END::$schema$.belief_outcome,
-        p_at;
-END
+            'replaced' END::$temporal_schema$.belief_outcome,
+            p_at;
+        END
 $$;
 

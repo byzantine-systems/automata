@@ -3,6 +3,7 @@ module ByzantineSystems.Automata.Storage.Postgres.Tests.TestContext
 open System
 open System.Security.Cryptography
 open System.Text
+open System.Text.RegularExpressions
 open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
@@ -62,7 +63,24 @@ let actionQueue =
 
 /// Rewrites default-schema SQL used by tests to the selected validated schema.
 let sql (text: string) =
-    text.Replace("fsm", schemaValue, StringComparison.Ordinal)
+    let temporal =
+        [ "instance_state_history"
+          "instance_state"
+          "current_belief"
+          "belief_cold"
+          "belief"
+          "close_and_open"
+          "split_belief"
+          "temporal_versioning"
+          "correct_beliefs" ]
+
+    (text, temporal)
+    ||> List.fold (fun text name ->
+        Regex.Replace(text, @"\bfsm\." + Regex.Escape(name) + @"\b", $"{schemaValue}_temporal.{name}"))
+    |> fun text ->
+        text
+            .Replace("fsm.", $"{schemaValue}.", StringComparison.Ordinal)
+            .Replace("'fsm'", $"'{schemaValue}'", StringComparison.Ordinal)
 
 let connectionString =
     match Environment.GetEnvironmentVariable "AUTOMATA_TEST_DB" with
@@ -90,7 +108,11 @@ let context () : PostgresContext = contextHolder.Force()
 let migrate () : unit =
     use conn = (dataSource ()).OpenConnection()
 
-    use cmd = new NpgsqlCommand(sql "DROP SCHEMA IF EXISTS fsm CASCADE;", conn)
+    use cmd =
+        new NpgsqlCommand(
+            $"DROP SCHEMA IF EXISTS {schemaValue}_temporal CASCADE; DROP SCHEMA IF EXISTS {schemaValue} CASCADE;",
+            conn
+        )
 
     cmd.ExecuteNonQuery() |> ignore
 
@@ -98,11 +120,13 @@ let migrate () : unit =
         Migrator.migrate
             Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance
             { ConnectionString = connectionString
-              Schema = schema }
+              Schema = schema
+              Beliefs = BeliefModel.Bitemporal }
     with
     | Ok _ -> ()
     | Error(MigrationError.Failed(script, error)) ->
         failwithf "the fixture could not migrate at %s: %s" script error.Message
+    | Error(MigrationError.ProfileMismatch _ as error) -> failtestf "unexpected profile: %A" error
 
     // The action queue is the application's to create, not the migration's: its name is
     // configuration, and one machine's queue is not another's. An application calls this once at
@@ -134,9 +158,9 @@ let reset () : Task =
 
         let resetSql =
             sql
-                $"""TRUNCATE fsm.command, fsm.command_error, fsm.transition, fsm.machine_chart_version,
+                $"""TRUNCATE fsm.entity_state, fsm.command, fsm.command_error, fsm.transition, fsm.machine_chart_version,
                           fsm.supervision_event, fsm.instance_state, fsm.instance_state_history,
-                          fsm.action_dead_letter, fsm.machine_maintenance, fsm.belief_cold_state,
+                          fsm.action_dead_letter, fsm.machine_maintenance,
                           fsm.command_correction, fsm.entity_purge
                           RESTART IDENTITY;
                  -- A materialized view cannot be truncated; refreshed over the emptied history,
@@ -184,16 +208,29 @@ let private processorStore () =
           ActionCodec = Serialization.systemTextJson<TestAction list> ()
           ErrorCodec = Serialization.systemTextJson<TestError> ()
           EntityIdEncode = encode
-          EntityIdDecode = decode }
+          EntityIdDecode = decode },
+        beliefs = BeliefModel.Bitemporal
     )
 
 let newProcessor () : Processor = processorStore () :> Processor
 
 let newReader () : Reader = processorStore () :> Reader
 
-type Replay = IReplayStore<Entity, TestState, TestEvent, TestAction>
+type Replay = CorrectionCapability<Entity, TestState, TestEvent, TestAction>
 
-let newReplayStore () : Replay = processorStore () :> Replay
+let newReplayStore () : Replay =
+    let processor = processorStore ()
+
+    { Log = processor :> ITransitionLog<Entity, TestState, TestEvent, TestAction>
+      Prior =
+        PostgresTemporalStore<Entity, TestState>(
+            { Context = context ()
+              StateCodec = Serialization.systemTextJson<TestState> ()
+              EntityIdEncode = fst (EntityKey.forEntityId<TestEntity>)
+              EntityIdDecode = snd (EntityKey.forEntityId<TestEntity>) }
+        )
+        :> IPriorState<Entity, TestState>
+      Committer = processor :> ICorrectionCommitter<Entity, TestState, TestEvent, TestAction> }
 
 /// A minimal committed transition, for tests that care about what finalize does to the inbox and
 /// the log rather than about the chart that produced it.
@@ -228,30 +265,19 @@ let newActionQueue () : Actions = actionQueueStore () :> Actions
 type Temporal = ITemporalReader<Entity, TestState>
 type Corrections = ICorrectionStore<Entity, TestState>
 
-/// A clock held still, so a test can ask a store what it believed at a frozen now.
-type FrozenTime(at: DateTimeOffset) =
-    inherit TimeProvider()
-    override _.GetUtcNow() = at
-
-let private temporalStore (time: TimeProvider) =
+let private temporalStore () =
     let encode, decode = EntityKey.forEntityId<TestEntity>
 
     PostgresTemporalStore<Entity, TestState>(
         { Context = context ()
-          TimeProvider = time
           StateCodec = Serialization.systemTextJson<TestState> ()
           EntityIdEncode = encode
           EntityIdDecode = decode }
     )
 
-let newTemporalReader () : Temporal =
-    temporalStore TimeProvider.System :> Temporal
+let newTemporalReader () : Temporal = temporalStore () :> Temporal
 
-/// The reader as one chosen clock sees it, for tests of which "now" gets asked.
-let newTemporalReaderAt (time: TimeProvider) : Temporal = temporalStore time :> Temporal
-
-let newCorrections () : Corrections =
-    temporalStore TimeProvider.System :> Corrections
+let newCorrections () : Corrections = temporalStore () :> Corrections
 
 let newRegistry () : IChartRegistry =
     PostgresChartRegistry({ Context = context () }) :> IChartRegistry
@@ -413,7 +439,7 @@ let believe (name: string) (at: DateTimeOffset) (state: TestState) (epoch: int64
 let newMachineStore (retention: RetentionPolicy) =
     let encode, decode = EntityKey.forEntityId<TestEntity>
 
-    PostgresMachineStore<Entity, TestState, TestEvent, TestAction, TestError>(
+    PostgresBitemporalMachineStore<Entity, TestState, TestEvent, TestAction, TestError>(
         { Context = context ()
           ActionDelivery = ActionDelivery.Deliver(ActionQueueName.create actionQueue)
           StateCodec = Serialization.systemTextJson<TestState> ()
@@ -425,6 +451,7 @@ let newMachineStore (retention: RetentionPolicy) =
           Retention = retention
           ReapAfter = LeaseDuration.create (TimeSpan.FromMinutes 5.)
           Listener = ListenerConnection.SameDataSource }
+        |> MachineStoreOptions.bitemporal
     )
 
 let newMaintenance () : IDatabaseMaintenance =

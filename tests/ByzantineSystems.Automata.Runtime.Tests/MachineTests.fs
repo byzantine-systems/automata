@@ -460,10 +460,85 @@ let submissionTests =
           } ]
 
 
+type private LogOnlyStore() =
+    inherit StubStore<TestError>()
+
+    interface ITransitionLog<EntityId<TestEntity>, TestState, TestEvent, TestAction> with
+        member _.SuffixAsync(_, _, _, _, _) =
+            Task.FromResult(Ok { Transitions = []; Incomplete = false })
+
+type private LogAndPriorStore() =
+    inherit LogOnlyStore()
+
+    interface IPriorState<EntityId<TestEntity>, TestState> with
+        member _.BeforeAsync(_, _, _, _) = Task.FromResult(Ok None)
+
+type private SnapshotCorrectionsStore() =
+    inherit LogAndPriorStore()
+
+    interface ICorrectionCommitter<EntityId<TestEntity>, TestState, TestEvent, TestAction> with
+        member _.CommitCorrectionAsync(_, _, _, _, _) =
+            Task.FromResult(Ok FinalizeOutcome.LeaseLost)
+
 let capabilityTests =
     testList
         "optional capabilities"
-        [ test "a store offering only the required four has no temporal capability" {
+        [ Property.property "unsupported correction requests never reach the inbox" (fun (amount: int) ->
+              let stub = StubStore<TestError>()
+              let mutable submitted = false
+
+              stub.SubmitOverride <-
+                  Some(fun _ ->
+                      submitted <- true
+                      Task.FromResult stub.SubmitOutcome)
+
+              let built = buildMachine stub (newTime ()) id |> expectMachine
+
+              let outcome =
+                  Machine.correct
+                      built
+                      (entityId "E-1")
+                      (EventEnvelope.create "key" (Start amount))
+                      startTime
+                      CorrectionPolicy.defaults
+                      CancellationToken.None
+                  |> fun pending -> pending.GetAwaiter().GetResult()
+
+              outcome = Error(MachineError.Rejected MachineRejection.CorrectionsUnsupported)
+              && not submitted)
+
+          test "a correction capability requires all three operations but no temporal reader" {
+              let logOnly = buildMachine (LogOnlyStore()) (newTime ()) id |> expectMachine
+              let noCommitter = buildMachine (LogAndPriorStore()) (newTime ()) id |> expectMachine
+
+              let complete =
+                  buildMachine (SnapshotCorrectionsStore()) (newTime ()) id |> expectMachine
+
+              Expect.isNone (Machine.corrections logOnly) "a log cannot commit corrections"
+              Expect.isNone (Machine.corrections noCommitter) "planning alone is insufficient"
+              Expect.isSome (Machine.corrections complete) "the three operations suffice"
+              Expect.isNone (Machine.temporal complete) "bitemporal storage is not required"
+          }
+
+          testTask "unsupported correction previews are typed refusals" {
+              let built = buildMachine (StubStore<TestError>()) (newTime ()) id |> expectMachine
+
+              let! outcome =
+                  Machine.previewCorrection
+                      built
+                      (entityId "E-1")
+                      (Start 1)
+                      startTime
+                      CorrectionPolicy.defaults
+                      CancellationToken.None
+
+              Expect.equal
+                  outcome
+                  (Error(CorrectionError.Rejected MachineRejection.CorrectionsUnsupported))
+                  "the preview never attempts store reads"
+          }
+
+          test "a store offering only the required four has no temporal capability" {
               // A third-party store that skips a capability is still a complete provider,
               // and the type system says so rather than a runtime error saying it later.
               let built = buildMachine (StubStore<TestError>()) (newTime ()) id |> expectMachine

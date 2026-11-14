@@ -37,6 +37,9 @@ type PostgresStoreSettings() =
     /// <summary>The schema that owns this installation. Validated by <see cref="M:ByzantineSystems.Automata.Storage.Postgres.SchemaName.tryCreate" />.</summary>
     member val Schema = "fsm" with get, set
 
+    /// <summary>snapshot (the default) or bitemporal. Store type and installed profile must match.</summary>
+    member val Beliefs = "snapshot" with get, set
+
     /// <summary>Where the work listener listens.</summary>
     member val Listener = PostgresListenerSettings() with get, set
 
@@ -54,6 +57,10 @@ module PostgresStoreSettings =
 
         if String.IsNullOrWhiteSpace settings.ConnectionStringName then
             failures.Add "ConnectionStringName must be non-empty."
+
+        match BeliefModel.tryCreate settings.Beliefs with
+        | Ok _ -> ()
+        | Error reason -> failures.Add reason
 
         let schema =
             match SchemaName.tryCreate settings.Schema with

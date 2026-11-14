@@ -64,7 +64,7 @@ let private ownStore () =
     let encode, decode = EntityKey.forEntityId<TestEntity>
     let source = DataSource.create connectionString
 
-    PostgresMachineStore<Entity, TestState, TestEvent, TestAction, TestError>(
+    PostgresBitemporalMachineStore<Entity, TestState, TestEvent, TestAction, TestError>(
         { Context =
             PostgresContext.create source TransientPolicy.defaults ignore
             |> PostgresContext.withSchema schema
@@ -78,10 +78,11 @@ let private ownStore () =
           Retention = RetentionPolicy.keepEverything
           ReapAfter = LeaseDuration.create (TimeSpan.FromMinutes 5.)
           Listener = ListenerConnection.SameDataSource }
+        |> MachineStoreOptions.bitemporal
     )
 
 let private buildMachine
-    (machineStore: PostgresMachineStore<Entity, TestState, TestEvent, TestAction, TestError>)
+    (machineStore: PostgresBitemporalMachineStore<Entity, TestState, TestEvent, TestAction, TestError>)
     (time: TimeProvider)
     =
     // Qualified because this suite binds `machine` to its own machine id, which shadows the
@@ -126,7 +127,7 @@ let private drainUntil
             failtest "the processors did not settle within the budget"
     }
 
-let private stateOf (store: PostgresMachineStore<Entity, TestState, TestEvent, TestAction, TestError>) name =
+let private stateOf (store: PostgresBitemporalMachineStore<Entity, TestState, TestEvent, TestAction, TestError>) name =
     task {
         let! snapshot =
             (store :> IStateReader<Entity, TestState, TestEvent, TestAction>)

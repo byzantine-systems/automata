@@ -51,7 +51,7 @@ type PostgresActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'Entity
 
     let queue = [ "queue", Param.Text options.Queue ]
 
-    /// The message body finalize_command wrote. Every field is required: a message missing one
+    /// The message body the commit routine wrote. Every field is required: a message missing one
     /// was not written by this library's finalize, and guessing what it meant would be worse
     /// than refusing it.
     let readMessage (json: string) : Result<ActionRecord<'EntityId, 'Action>, StoreError> =

@@ -8,6 +8,7 @@ open Expecto
 open Microsoft.Extensions.Configuration
 open Microsoft.Extensions.DependencyInjection
 open Microsoft.Extensions.Options
+open Microsoft.Extensions.Hosting
 open Npgsql
 
 /// A connection string that is never connected to: building a pool opens nothing, which is
@@ -43,6 +44,7 @@ let postgresRegistrationTests =
                   let settings = provider.GetRequiredService<IOptions<PostgresStoreSettings>>().Value
 
                   Expect.equal settings.Schema "automata_ci" "the section bound"
+                  Expect.equal (provider.GetRequiredService<BeliefModel>()) BeliefModel.Snapshot "default profile"
 
                   let context = provider.GetRequiredService<PostgresContext>()
 
@@ -62,6 +64,29 @@ let postgresRegistrationTests =
                       (provider.GetRequiredService<ListenerConnection>())
                       ListenerConnection.SameDataSource
                       "the default listener placement")
+          }
+
+          test "an invalid belief profile fails host startup before a data source factory runs" {
+              withConfiguration """{ "Beliefs": "unknown" }""" (fun configuration ->
+                  let builder =
+                      Host.CreateApplicationBuilder(HostApplicationBuilderSettings(DisableDefaults = true))
+
+                  builder.Configuration.AddConfiguration(configuration) |> ignore
+                  builder.Services.AddAutomataPostgres(builder.Configuration) |> ignore
+                  let mutable constructed = false
+
+                  builder.Services.AddSingleton<NpgsqlDataSource>(fun _ ->
+                      constructed <- true
+                      DataSource.create neverConnected)
+                  |> ignore
+
+                  use host = builder.Build()
+
+                  Expect.throwsT<OptionsValidationException>
+                      (fun () -> host.StartAsync().GetAwaiter().GetResult())
+                      "startup validates the model"
+
+                  Expect.isFalse constructed "no pool was constructed")
           }
 
           test "a direct listener resolves its own connection string" {

@@ -336,12 +336,11 @@ CREATE OR REPLACE FUNCTION $schema$.reschedule_command (p_command_id bigint, p_l
                 fenced) THEN
             'updated'
         ELSE
-            'lease_lost'
-        END::$schema$.lease_outcome AS outcome,
-        COALESCE((
-            SELECT
-                f.visible_at
-            FROM fenced f), '-infinity'::timestamptz) AS visible_at;
+            'lease_lost' END::$schema$.lease_outcome AS outcome,
+            COALESCE((
+                SELECT
+                    f.visible_at
+                FROM fenced f), '-infinity'::timestamptz) AS visible_at;
 $$;
 
 -- ---------------------------------------------------------------------------
@@ -356,7 +355,8 @@ CREATE OR REPLACE FUNCTION $schema$.extend_lease (p_command_id bigint, p_lease_t
     RETURNS $schema$.lease_outcome
     LANGUAGE sql
     VOLATILE PARALLEL UNSAFE
-    SET search_path = pg_catalog, $schema$
+    SET search_path = pg_catalog,
+    $schema$
     AS $$
     WITH fenced AS (
         UPDATE
@@ -378,8 +378,7 @@ CREATE OR REPLACE FUNCTION $schema$.extend_lease (p_command_id bigint, p_lease_t
                 fenced) THEN
             'updated'
         ELSE
-            'lease_lost'
-        END::$schema$.lease_outcome;
+            'lease_lost' END::$schema$.lease_outcome;
 $$;
 
 -- ---------------------------------------------------------------------------

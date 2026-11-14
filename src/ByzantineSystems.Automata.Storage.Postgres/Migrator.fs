@@ -2,6 +2,7 @@ namespace ByzantineSystems.Automata.Storage.Postgres
 
 open System
 open System.Reflection
+open System.IO
 open DbUp
 open DbUp.Builder
 open DbUp.Engine
@@ -17,6 +18,8 @@ type MigrationTarget =
         ConnectionString: string
         /// <summary>The schema that owns this Automata installation.</summary>
         Schema: SchemaName
+        /// <summary>The requested PostgreSQL storage profile.</summary>
+        Beliefs: BeliefModel
     }
 
 /// <summary>What one migration run applied.</summary>
@@ -39,6 +42,8 @@ type MigrationError =
     /// failure came before any script, such as a connection that could not be opened.
     /// </summary>
     | Failed of script: string * error: exn
+    /// <summary>Disabling bitemporality requires an explicit reset, never an automatic drop.</summary>
+    | ProfileMismatch of configured: BeliefModel * installed: BeliefModel
 
 /// <summary>DbUp's log, written through an <c>ILogger</c> instead of the console.</summary>
 type private UpgradeLog(logger: ILogger) =
@@ -86,50 +91,6 @@ module Migrator =
             .WithVariablesDisabled()
             .WithPreprocessor(TemplatePreprocessor target.Schema)
 
-    /// <summary>
-    /// Moves a pre-schema-configuration journal into the schema that now owns it.
-    ///
-    /// Before the schema was configurable, DbUp journaled to <c>public.schemaversions</c> while
-    /// creating every object in <c>fsm</c>. To such a database the schema-local journal makes
-    /// every numbered script look pending, and the replay fails on objects that already exist.
-    /// Adoption runs only when the default schema is already installed and the schema-local
-    /// journal is absent, so a deliberate reset — which drops the schema — is followed by a
-    /// fresh migration rather than an adopted journal.
-    /// </summary>
-    let private adoptLegacyJournal (target: MigrationTarget) =
-        if target.Schema <> SchemaName.defaults then
-            Ok()
-        else
-            let schema = SchemaName.value target.Schema
-
-            try
-                use connection = new NpgsqlConnection(target.ConnectionString)
-                connection.Open()
-                use command = connection.CreateCommand()
-
-                command.CommandText <-
-                    $"""DO $$
-                    BEGIN
-                        IF TO_REGNAMESPACE('{schema}') IS NOT NULL
-                           AND TO_REGCLASS('public.schemaversions') IS NOT NULL
-                           AND TO_REGCLASS('{schema}.schemaversions') IS NULL THEN
-                            CREATE TABLE {schema}.schemaversions (
-                                schemaversionsid serial PRIMARY KEY,
-                                scriptname varchar(255) NOT NULL,
-                                applied timestamp NOT NULL
-                            );
-                            INSERT INTO {schema}.schemaversions (scriptname, applied)
-                            SELECT scriptname, applied FROM public.schemaversions;
-                            DROP TABLE public.schemaversions;
-                        END IF;
-                    END
-                    $$;"""
-
-                command.ExecuteNonQuery() |> ignore
-                Ok()
-            with error ->
-                Error(MigrationError.Failed("", error))
-
     let private bootstrap (target: MigrationTarget) =
         let schema = SchemaName.value target.Schema
 
@@ -139,8 +100,7 @@ module Migrator =
             use command = connection.CreateCommand()
 
             command.CommandText <-
-                $"""CREATE EXTENSION IF NOT EXISTS btree_gist WITH SCHEMA public;
-                    CREATE EXTENSION IF NOT EXISTS pgmq;
+                $"""CREATE EXTENSION IF NOT EXISTS pgmq;
                     DO $$
                     BEGIN
                         IF (
@@ -162,6 +122,15 @@ module Migrator =
                     CREATE SCHEMA IF NOT EXISTS {schema};"""
 
             command.ExecuteNonQuery() |> ignore
+
+            match target.Beliefs with
+            | BeliefModel.Snapshot -> ()
+            | BeliefModel.Bitemporal ->
+                command.CommandText <-
+                    $"CREATE EXTENSION IF NOT EXISTS btree_gist WITH SCHEMA public; CREATE SCHEMA IF NOT EXISTS {schema}_temporal;"
+
+                command.ExecuteNonQuery() |> ignore
+
             Ok()
         with error ->
             Error(MigrationError.Failed("", error))
@@ -169,7 +138,10 @@ module Migrator =
     let private main (log: IUpgradeLog) (target: MigrationTarget) =
         DeployChanges.To
             .PostgresqlDatabase(target.ConnectionString, SchemaName.value target.Schema)
-            .WithScriptsEmbeddedInAssembly(assembly, Func<string, bool>(fun name -> name.Contains ".migrations.main."))
+            .WithScriptsEmbeddedInAssembly(
+                assembly,
+                Func<string, bool>(fun name -> name.Contains ".migrations.common.main.")
+            )
             .WithTransactionPerScript()
             .LogTo(log)
         |> configure target
@@ -184,13 +156,60 @@ module Migrator =
             .PostgresqlDatabase(target.ConnectionString, SchemaName.value target.Schema)
             .WithScriptsEmbeddedInAssembly(
                 assembly,
-                Func<string, bool>(fun name -> name.Contains ".migrations.repeatable."),
+                Func<string, bool>(fun name -> name.Contains ".migrations.common.repeatable."),
                 options
             )
             .WithTransactionPerScript()
             .LogTo(log)
         |> configure target
         |> fun (builder: UpgradeEngineBuilder) -> builder.Build().PerformUpgrade()
+        |> outcome
+
+    let private checkProfile (target: MigrationTarget) =
+        try
+            use connection = new NpgsqlConnection(target.ConnectionString)
+            connection.Open()
+            use command = connection.CreateCommand()
+            command.CommandText <- $"SELECT beliefs FROM {SchemaName.value target.Schema}.store_profile"
+
+            match command.ExecuteScalar() :?> string, target.Beliefs with
+            | "bitemporal", BeliefModel.Snapshot ->
+                Error(MigrationError.ProfileMismatch(BeliefModel.Snapshot, BeliefModel.Bitemporal))
+            | _ -> Ok()
+        with error ->
+            Error(MigrationError.Failed("", error))
+
+    let private profile (log: IUpgradeLog) (target: MigrationTarget) =
+        let group, journalSchema, journalTable =
+            match target.Beliefs with
+            | BeliefModel.Snapshot -> "snapshot", SchemaName.value target.Schema, "snapshot_schemaversions"
+            | BeliefModel.Bitemporal -> "bitemporal", $"{SchemaName.value target.Schema}_temporal", "schemaversions"
+
+        let scripts =
+            assembly.GetManifestResourceNames()
+            |> Array.filter (fun name -> name.Contains $".migrations.{group}.")
+            |> Array.map (fun name ->
+                use stream = assembly.GetManifestResourceStream name
+                use reader = new StreamReader(stream)
+
+                let options =
+                    if name.Contains ".main." then
+                        SqlScriptOptions(ScriptType = DbUp.Support.ScriptType.RunOnce, RunGroupOrder = 0)
+                    else
+                        SqlScriptOptions(ScriptType = DbUp.Support.ScriptType.RunAlways, RunGroupOrder = 2)
+
+                SqlScript(name, reader.ReadToEnd(), options))
+
+        DeployChanges.To
+            .PostgresqlDatabase(target.ConnectionString, SchemaName.value target.Schema)
+            .WithScripts(scripts)
+            .JournalToPostgresqlTable(journalSchema, journalTable)
+            .WithVariablesDisabled()
+            .WithPreprocessor(TemplatePreprocessor target.Schema)
+            .WithTransaction()
+            .LogTo(log)
+            .Build()
+            .PerformUpgrade()
         |> outcome
 
     /// <summary>
@@ -202,8 +221,10 @@ module Migrator =
 
         result {
             do! bootstrap target
-            do! adoptLegacyJournal target
             let! numbered = main log target
+            do! checkProfile target
             let! routines = repeatable log target
-            return { Applied = numbered @ routines }
+
+            let! selected = profile log target
+            return { Applied = numbered @ routines @ selected }
         }

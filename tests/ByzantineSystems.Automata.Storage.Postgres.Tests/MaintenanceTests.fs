@@ -237,67 +237,39 @@ let migratorTests =
                   Migrator.migrate
                       Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance
                       { ConnectionString = "Host=unreachable.invalid;Timeout=1"
-                        Schema = SchemaName.defaults }
+                        Schema = SchemaName.defaults
+                        Beliefs = BeliefModel.Snapshot }
               with
               | Error(MigrationError.Failed(script, error)) ->
                   Expect.equal script "" "no script had started"
                   Expect.isNotNull error "and the cause travels with it"
               | Ok report -> failtestf "an unreachable database should not migrate, got %A" report
+              | Error(MigrationError.ProfileMismatch _ as error) -> failtestf "unexpected profile: %A" error
           }
 
-          // The journal was public.schemaversions before the schema was configurable, and every
-          // existing installation still has it there. Without adoption the schema-local journal
-          // replays every numbered script against objects that already exist and fails.
-          testTask "a legacy public journal is adopted, not replayed against" {
+          testTask "reapplying the same profile does not replay numbered migrations" {
               if not TestContext.configured then
                   skiptest "set AUTOMATA_TEST_DB to a migrated PostgreSQL instance"
 
-              if schema <> SchemaName.defaults then
-                  skiptest "the legacy journal only ever journaled the default schema"
-
               do! reset ()
-
-              // Rebuild the pre-schema-configuration shape: the journal in public, nothing in
-              // the schema, and one row of retained data the replay would have to preserve.
-              exec
-                  """CREATE TABLE public.schemaversions (
-                         schemaversionsid serial PRIMARY KEY,
-                         scriptname varchar(255) NOT NULL,
-                         applied timestamp NOT NULL
-                     );
-                     INSERT INTO public.schemaversions (scriptname, applied)
-                     SELECT scriptname, applied FROM fsm.schemaversions;
-                     DROP TABLE fsm.schemaversions;
-                     INSERT INTO fsm.machine_chart_version (machine_id, version, fingerprint)
-                     VALUES ('legacy', 42, repeat('a', 64));"""
-              |> expectOk "arrange the legacy shape"
 
               match
                   Migrator.migrate
                       Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance
                       { ConnectionString = connectionString
-                        Schema = schema }
+                        Schema = schema
+                        Beliefs = BeliefModel.Bitemporal }
               with
               | Ok report ->
                   Expect.isFalse
-                      (report.Applied
-                       |> List.exists (fun script -> script.Contains ".migrations.main."))
+                      (report.Applied |> List.exists (fun script -> script.Contains ".main."))
                       "a numbered script must never replay against an installed schema"
-
-                  Expect.equal
-                      (scalar<int64> "SELECT count(*) FROM fsm.machine_chart_version WHERE machine_id = 'legacy'")
-                      1L
-                      "retained data survives the upgrade"
 
                   Expect.equal
                       (scalar<int64> "SELECT count(*) FROM fsm.schemaversions")
                       10L
-                      "the adopted journal carries every applied script"
-
-                  Expect.isTrue
-                      (scalar<bool> "SELECT to_regclass('public.schemaversions') IS NULL")
-                      "the legacy journal is gone, not left to confuse the next reader"
-              | Error error -> failtestf "an adopted migration should succeed, got %A" error
+                      "the core journal carries every applied numbered script"
+              | Error error -> failtestf "a repeated migration should succeed, got %A" error
           } ]
 
 let bootTests =
@@ -315,7 +287,8 @@ let bootTests =
                   MachineStoreOptions.forEntityId<TestEntity, TestState, TestEvent, TestAction, TestError>
                       (context ())
                       (ActionDelivery.Deliver(ActionQueueName.create actionQueue))
-                  |> PostgresMachineStore
+                  |> MachineStoreOptions.bitemporal
+                  |> PostgresBitemporalMachineStore
 
               let! booted = (store :> IStoreBoot).BootAsync(machine, noCancellation)
               Expect.equal (booted |> expectOk "boot") BootReport.Ready "the defaults are a working store"
@@ -375,8 +348,16 @@ let retentionTests =
 
               let! reports = run 100
 
-              Expect.equal (reportFor reports).PurgedCommands 2L "the committed and the rejected command"
-              Expect.equal (count "SELECT count(*) FROM fsm.transition") 0L "the transition went with its command"
+              Expect.equal
+                  (reportFor reports).PurgedCommands
+                  1L
+                  "only the rejected command; the snapshot pins its successful predecessor"
+
+              Expect.equal
+                  (count "SELECT count(*) FROM fsm.transition")
+                  1L
+                  "the snapshot's successful command and transition survive"
+
               Expect.equal (count "SELECT count(*) FROM fsm.command_error") 0L "and so did the error"
 
               Expect.equal

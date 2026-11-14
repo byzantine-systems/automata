@@ -113,7 +113,8 @@ let tests =
                   MachineStoreOptions.forEntityId<TestEntity, TestState, TestEvent, TestAction, TestError>
                       (context ())
                       ActionDelivery.Discard
-                  |> PostgresMachineStore
+                  |> MachineStoreOptions.bitemporal
+                  |> PostgresBitemporalMachineStore
 
               let! booted = (store :> IStoreBoot).BootAsync(machine, noCancellation)
               Expect.equal (booted |> expectOk "boot") BootReport.Ready "discard is a valid boot policy"

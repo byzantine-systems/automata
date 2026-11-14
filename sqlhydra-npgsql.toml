@@ -24,8 +24,7 @@ include = [
   "fsm/command_correction",
   "fsm/transition",
   "fsm/supervision_event",
-  "fsm/belief",
-  "fsm/current_belief",
+  "fsm/entity_state",
   "fsm/blocked_drift"
 ]
-exclude = [ "fsm/belief_cold" ]
+exclude = []

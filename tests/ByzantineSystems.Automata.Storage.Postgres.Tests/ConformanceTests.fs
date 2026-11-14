@@ -7,6 +7,7 @@ open ByzantineSystems.Automata.Storage
 open ByzantineSystems.Automata.Storage.Postgres
 open ByzantineSystems.Automata.Storage.ContractProperties
 open Expecto
+open Npgsql
 open TestContext
 
 let private entity name : Entity = entityId name
@@ -15,7 +16,7 @@ let private lease = LeaseDuration.create (TimeSpan.FromSeconds 30.0)
 // The shared inbox state machine, over this provider: one truncate-and-reseed per generated
 // case, and the database's own clock, so time moves by sleeping. Lease deadlines are stamped
 // by the database, which is why the model is given a deadband around them.
-let private contractEnv () : ContractInboxEnv =
+let private contractEnv (context: unit -> PostgresContext) reset beliefs : ContractInboxEnv =
     let encode, decode = EntityKey.forEntityId<ContractEntity>
 
     let stores () =
@@ -35,7 +36,8 @@ let private contractEnv () : ContractInboxEnv =
                   ActionCodec = Serialization.systemTextJson<ContractAction list> ()
                   ErrorCodec = Serialization.systemTextJson<ContractError> ()
                   EntityIdEncode = encode
-                  EntityIdDecode = decode }
+                  EntityIdDecode = decode },
+                beliefs = beliefs
             )
             :> ContractProcessor
           Now = fun () -> DateTimeOffset.UtcNow
@@ -56,7 +58,7 @@ let private contractEnv () : ContractInboxEnv =
 
 // The shared history equations, over this provider: one truncate-and-reseed per generated case,
 // and the database's own clock, so commit instants are bounded rather than predicted.
-let private contractHistoryEnv () : ContractHistoryEnv =
+let private contractHistoryEnv (context: unit -> PostgresContext) reset beliefs : ContractHistoryEnv =
     let encode, decode = EntityKey.forEntityId<ContractEntity>
 
     let stores () =
@@ -68,7 +70,8 @@ let private contractHistoryEnv () : ContractHistoryEnv =
                   ActionCodec = Serialization.systemTextJson<ContractAction list> ()
                   ErrorCodec = Serialization.systemTextJson<ContractError> ()
                   EntityIdEncode = encode
-                  EntityIdDecode = decode }
+                  EntityIdDecode = decode },
+                beliefs = beliefs
             )
 
         { Inbox =
@@ -95,7 +98,7 @@ let private contractHistoryEnv () : ContractHistoryEnv =
 
 // The shared action-queue equations, over this provider: one truncate-and-reseed per generated
 // case, and the database's own clock, so a reschedule's backoff elapses by sleeping.
-let private contractActionEnv () : ContractActionEnv =
+let private contractActionEnv (context: unit -> PostgresContext) reset actionQueue beliefs : ContractActionEnv =
     let encode, decode = EntityKey.forEntityId<ContractEntity>
 
     let stores () =
@@ -107,7 +110,8 @@ let private contractActionEnv () : ContractActionEnv =
                   ActionCodec = Serialization.systemTextJson<ContractAction list> ()
                   ErrorCodec = Serialization.systemTextJson<ContractError> ()
                   EntityIdEncode = encode
-                  EntityIdDecode = decode }
+                  EntityIdDecode = decode },
+                beliefs = beliefs
             )
 
         { Inbox =
@@ -144,11 +148,34 @@ let private contractActionEnv () : ContractActionEnv =
                 return stores ()
             } }
 
-let private poisonFixture actions count payload =
+let private poisonFixture (context: unit -> PostgresContext) reset actionQueue beliefs actions count payload =
     task {
         do! reset ()
-        let inbox = newInbox ()
-        let processor = newProcessor ()
+
+        let options =
+            MachineStoreOptions.forEntityId<TestEntity, TestState, TestEvent, TestAction, TestError>
+                (context ())
+                (ActionDelivery.Deliver(ActionQueueName.create actionQueue))
+
+        let store: IMachineStore<Entity, TestState, TestEvent, TestAction, TestError> =
+            match beliefs with
+            | BeliefModel.Snapshot -> PostgresMachineStore(options)
+            | BeliefModel.Bitemporal -> PostgresBitemporalMachineStore(MachineStoreOptions.bitemporal options)
+
+        let inbox = store :> Inbox
+        let processor = store :> Processor
+        let name = SchemaName.value (context ()).Schema
+
+        let exec statement =
+            use connection = (context ()).DataSource.OpenConnection()
+            use command = new NpgsqlCommand(statement, connection)
+            command.ExecuteNonQuery() |> ignore
+
+        let scalar statement =
+            use connection = (context ()).DataSource.OpenConnection()
+            use command = new NpgsqlCommand(statement, connection)
+            command.ExecuteScalar() :?> bool
+
         let ids = ResizeArray<CommandId>()
 
         for index in 1..count do
@@ -183,16 +210,16 @@ let private poisonFixture actions count payload =
                             if actions then
                                 $"UPDATE pgmq.q_{actionQueue} SET message = jsonb_set(message, '{{action}}', '{{}}'::jsonb) WHERE (message->>'command_id')::bigint = {id}"
                             else
-                                $"UPDATE fsm.command SET event = '{{}}'::jsonb WHERE command_id = {id}"
+                                $"UPDATE {name}.command SET event = '{{}}'::jsonb WHERE command_id = {id}"
 
-                        exec sql |> expectOk "corrupt"
+                        exec sql
                     }
               Claim =
                 fun () ->
                     task {
                         if actions then
                             let! rows =
-                                (newActionQueue ())
+                                (store :> Actions)
                                     .ClaimAsync(
                                         machine,
                                         ClaimBatch.create count,
@@ -217,8 +244,8 @@ let private poisonFixture actions count payload =
                     task {
                         if actions then
                             return
-                                scalar<bool>
-                                    $"SELECT EXISTS (SELECT 1 FROM fsm.action_dead_letter WHERE command_id = {CommandId.value id} AND reason LIKE 'undecodable:%%')"
+                                scalar
+                                    $"SELECT EXISTS (SELECT 1 FROM {name}.action_dead_letter WHERE command_id = {CommandId.value id} AND reason LIKE 'undecodable:%%')"
                         else
                             let! result = processor.TryGetResultAsync(id, noCancellation)
 
@@ -230,10 +257,10 @@ let private poisonFixture actions count payload =
                     } }
     }
 
-let private registryFresh () : Task<IChartRegistry> =
+let private registryFresh (context: unit -> PostgresContext) reset () : Task<IChartRegistry> =
     task {
         do! reset ()
-        return newRegistry ()
+        return PostgresChartRegistry({ Context = context () }) :> IChartRegistry
     }
 
 let private settings: Conformance.Settings =
@@ -249,13 +276,41 @@ let private settings: Conformance.Settings =
       RegistryCases = 20
       HistoryCases = 12 }
 
-let tests =
+let forInstallation name context (reset: unit -> Task) actionQueue beliefs corrections =
+    let reset () = task { do! reset () }
+
     Conformance.tests
-        { Name = "PostgreSQL storage conformance"
-          Inbox = contractEnv ()
-          History = contractHistoryEnv ()
-          Action = contractActionEnv ()
-          Registry = registryFresh
-          PoisonCommand = poisonFixture false
-          PoisonAction = poisonFixture true
+        { Name = name
+          Inbox = contractEnv context reset beliefs
+          History = contractHistoryEnv context reset beliefs
+          Action = contractActionEnv context reset actionQueue beliefs
+          Registry = registryFresh context reset
+          PoisonCommand = poisonFixture context reset actionQueue beliefs false
+          PoisonAction = poisonFixture context reset actionQueue beliefs true
+          Corrections =
+            corrections
+            |> Option.map (fun factory ->
+                { CorrectionContract.Environment.Machine = machine
+                  Version = version
+                  Fresh =
+                    fun () ->
+                        task {
+                            do! reset ()
+                            return factory ()
+                        } })
           Settings = settings }
+
+let tests =
+    forInstallation
+        "PostgreSQL bitemporal conformance"
+        context
+        reset
+        actionQueue
+        BeliefModel.Bitemporal
+        (Some(fun () ->
+            MachineStoreOptions.forEntityId<ContractEntity, ContractState, ContractEvent, ContractAction, ContractError>
+                (context ())
+                (ActionDelivery.Deliver(ActionQueueName.create actionQueue))
+            |> MachineStoreOptions.bitemporal
+            |> PostgresBitemporalMachineStore
+            :> CorrectionContract.Store))

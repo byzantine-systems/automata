@@ -48,9 +48,17 @@ type MachineStoreOptions<'EntityId, 'State, 'Event, 'Action, 'Err> =
         Listener: ListenerConnection
     }
 
+/// <summary>Explicit opt-in options for the bitemporal store.</summary>
+type BitemporalMachineStoreOptions<'EntityId, 'State, 'Event, 'Action, 'Err> =
+    internal
+        { Core: MachineStoreOptions<'EntityId, 'State, 'Event, 'Action, 'Err> }
+
 /// <summary>Operations on <see cref="T:ByzantineSystems.Automata.Storage.Postgres.MachineStoreOptions`5" />.</summary>
 [<RequireQualifiedAccess>]
 module MachineStoreOptions =
+
+    /// <summary>Opts a fully configured core store into bitemporal history.</summary>
+    let bitemporal options = { Core = options }
 
     /// <summary>
     /// Every default a host would otherwise write out: JSON codecs for state, events, actions and
@@ -98,7 +106,7 @@ module MachineStoreOptions =
 /// so cannot mean the other one by accident.
 /// </summary>
 type PostgresMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
-    (options: MachineStoreOptions<'EntityId, 'State, 'Event, 'Action, 'Err>) =
+    internal (options: MachineStoreOptions<'EntityId, 'State, 'Event, 'Action, 'Err>, beliefs: BeliefModel) =
 
     let inbox =
         PostgresCommandInbox<'EntityId, 'Event>(
@@ -120,7 +128,8 @@ type PostgresMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
               ActionCodec = Serialization.listOf options.ActionCodec
               ErrorCodec = options.ErrorCodec
               EntityIdEncode = options.EntityIdEncode
-              EntityIdDecode = options.EntityIdDecode }
+              EntityIdDecode = options.EntityIdDecode },
+            beliefs = beliefs
         )
 
     let queueName, actions =
@@ -152,15 +161,6 @@ type PostgresMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
             Some(BootDefect.Misconfigured error.MessageText)
         | _ -> None
 
-    let temporalStore =
-        PostgresTemporalStore<'EntityId, 'State>(
-            { Context = options.Context
-              TimeProvider = TimeProvider.System
-              StateCodec = options.StateCodec
-              EntityIdEncode = options.EntityIdEncode
-              EntityIdDecode = options.EntityIdDecode }
-        )
-
     let notifications =
         PostgresWorkNotifications(options.Context, queueName, options.Listener) :> IWorkNotifications
 
@@ -170,8 +170,6 @@ type PostgresMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
         | None -> ActionQueues.discard ()
 
     let reader = processor :> IStateReader<'EntityId, 'State, 'Event, 'Action>
-    let temporal = temporalStore :> ITemporalReader<'EntityId, 'State>
-    let corrections = temporalStore :> ICorrectionStore<'EntityId, 'State>
 
     let processorStore =
         processor :> ICommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
@@ -181,9 +179,18 @@ type PostgresMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     /// booting every generation of a supervised machine safe.
     let boot machineId ct =
         backgroundTask {
-            match! Boot.inspect options.Context ct with
+            match! Boot.inspectProfile options.Context beliefs ct with
             | Error error -> return Error error
             | Ok [] ->
+                match beliefs, options.Retention.BeliefHistory with
+                | BeliefModel.Snapshot, Retain.For _ ->
+                    System.Diagnostics.Trace.TraceWarning(
+                        "BeliefHistory retention is ignored by a snapshot PostgreSQL store."
+                    )
+                | BeliefModel.Snapshot, Retain.Forever
+                | BeliefModel.Bitemporal, Retain.For _
+                | BeliefModel.Bitemporal, Retain.Forever -> ()
+
                 match! ensureQueue ct with
                 | Error error ->
                     match queueOwnerDefect error with
@@ -195,6 +202,12 @@ type PostgresMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                     | Error error -> return Error error
             | Ok defects -> return Ok(BootReport.Refused defects)
         }
+
+    /// <summary>Creates a snapshot-only PostgreSQL machine store.</summary>
+    new(options) = PostgresMachineStore(options, BeliefModel.Snapshot)
+
+    member internal _.CorrectionCommitter =
+        processor :> ICorrectionCommitter<'EntityId, 'State, 'Event, 'Action>
 
     /// <summary>
     /// Creates this machine's action queue if it does not exist yet. Call once at startup,
@@ -260,22 +273,6 @@ type PostgresMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
         member _.AbandonAsync(action, reason, cancellationToken) =
             actionQueue.AbandonAsync(action, reason, cancellationToken)
 
-    // The two optional capabilities. Declaring them is what makes Store.tryTemporal and
-    // Store.tryCorrections answer Some for this store, and a provider that omits them is still a
-    // complete provider.
-    interface ITemporalReader<'EntityId, 'State> with
-
-        member _.ValidAtAsync(machineId, entityId, validAt, cancellationToken) =
-            temporal.ValidAtAsync(machineId, entityId, validAt, cancellationToken)
-
-        member _.AsOfAsync(machineId, entityId, validAt, knownAt, cancellationToken) =
-            temporal.AsOfAsync(machineId, entityId, validAt, knownAt, cancellationToken)
-
-    interface ICorrectionStore<'EntityId, 'State> with
-
-        member _.CorrectAsync(machineId, entityId, validFrom, beliefs, cancellationToken) =
-            corrections.CorrectAsync(machineId, entityId, validFrom, beliefs, cancellationToken)
-
     /// The boot check. Delivery names are validated before the options can be constructed.
     interface IStoreBoot with
 
@@ -294,14 +291,123 @@ type PostgresMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
             Tap.start cancellationToken (fun () ->
                 notifications.ListenAsync(machineId, onCommands, onActions, cancellationToken))
 
-    interface IReplayStore<'EntityId, 'State, 'Event, 'Action> with
+    interface ITransitionLog<'EntityId, 'State, 'Event, 'Action> with
 
         member _.SuffixAsync(machineId, entityId, from, limit, cancellationToken) =
-            (processor :> IReplayStore<'EntityId, 'State, 'Event, 'Action>)
+            (processor :> ITransitionLog<'EntityId, 'State, 'Event, 'Action>)
                 .SuffixAsync(machineId, entityId, from, limit, cancellationToken)
 
-        member _.CommitCorrectionAsync(commandId, token, expected, commit, cancellationToken) =
-            (processor :> IReplayStore<'EntityId, 'State, 'Event, 'Action>)
-                .CommitCorrectionAsync(commandId, token, expected, commit, cancellationToken)
+    interface IMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
+
+/// <summary>A PostgreSQL machine store with explicitly enabled bitemporal and correction capabilities.</summary>
+type PostgresBitemporalMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
+    (options: BitemporalMachineStoreOptions<'EntityId, 'State, 'Event, 'Action, 'Err>) =
+    let options = options.Core
+    let core = PostgresMachineStore(options, BeliefModel.Bitemporal)
+    let inbox = core :> ICommandInbox<'EntityId, 'Event>
+    let reader = core :> IStateReader<'EntityId, 'State, 'Event, 'Action>
+
+    let processor =
+        core :> ICommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
+
+    let actions = core :> IActionQueue<'EntityId, 'Action>
+
+    let temporal =
+        PostgresTemporalStore<'EntityId, 'State>(
+            { Context = options.Context
+              StateCodec = options.StateCodec
+              EntityIdEncode = options.EntityIdEncode
+              EntityIdDecode = options.EntityIdDecode }
+        )
+
+    /// <summary>Creates the configured queue, without replacing boot's delivery registration.</summary>
+    member _.EnsureQueueAsync(cancellationToken) =
+        core.EnsureQueueAsync(cancellationToken)
+
+    interface ICommandInbox<'EntityId, 'Event> with
+        member _.SubmitAsync(request, cancellationToken) =
+            inbox.SubmitAsync(request, cancellationToken)
+
+        member _.ClaimAsync(machine, batch, lease, cancellationToken) =
+            inbox.ClaimAsync(machine, batch, lease, cancellationToken)
+
+        member _.RescheduleAsync(command, token, backoff, cancellationToken) =
+            inbox.RescheduleAsync(command, token, backoff, cancellationToken)
+
+        member _.ExtendLeaseAsync(command, token, lease, cancellationToken) =
+            inbox.ExtendLeaseAsync(command, token, lease, cancellationToken)
+
+        member _.TryGetAsync(command, cancellationToken) =
+            inbox.TryGetAsync(command, cancellationToken)
+
+        member _.TryFindAsync(machine, entity, key, cancellationToken) =
+            inbox.TryFindAsync(machine, entity, key, cancellationToken)
+
+    interface IStateReader<'EntityId, 'State, 'Event, 'Action> with
+        member _.TryGetSnapshotAsync(machine, entity, cancellationToken) =
+            reader.TryGetSnapshotAsync(machine, entity, cancellationToken)
+
+        member _.HistoryAsync(machine, entity, page, cancellationToken) =
+            reader.HistoryAsync(machine, entity, page, cancellationToken)
+
+    interface ICommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err> with
+        member _.CommitAsync(command, token, expected, draft, cancellationToken) =
+            processor.CommitAsync(command, token, expected, draft, cancellationToken)
+
+        member _.RejectAsync(command, token, error, cancellationToken) =
+            processor.RejectAsync(command, token, error, cancellationToken)
+
+        member _.DeadLetterAsync(command, token, error, cancellationToken) =
+            processor.DeadLetterAsync(command, token, error, cancellationToken)
+
+        member _.TryGetResultAsync(command, cancellationToken) =
+            processor.TryGetResultAsync(command, cancellationToken)
+
+    interface IActionQueue<'EntityId, 'Action> with
+        member _.ClaimAsync(machine, batch, lease, cancellationToken) =
+            actions.ClaimAsync(machine, batch, lease, cancellationToken)
+
+        member _.CompleteAsync(action, cancellationToken) =
+            actions.CompleteAsync(action, cancellationToken)
+
+        member _.RescheduleAsync(action, backoff, cancellationToken) =
+            actions.RescheduleAsync(action, backoff, cancellationToken)
+
+        member _.AbandonAsync(action, reason, cancellationToken) =
+            actions.AbandonAsync(action, reason, cancellationToken)
+
+    interface IStoreBoot with
+        member _.BootAsync(machine, cancellationToken) =
+            (core :> IStoreBoot).BootAsync(machine, cancellationToken)
+
+    interface IWorkNotifications with
+        member _.ListenAsync(machine, commands, actions, cancellationToken) =
+            (core :> IWorkNotifications).ListenAsync(machine, commands, actions, cancellationToken)
+
+    interface ITransitionLog<'EntityId, 'State, 'Event, 'Action> with
+        member _.SuffixAsync(machine, entity, from, limit, cancellationToken) =
+            (core :> ITransitionLog<'EntityId, 'State, 'Event, 'Action>)
+                .SuffixAsync(machine, entity, from, limit, cancellationToken)
+
+    interface IPriorState<'EntityId, 'State> with
+        member _.BeforeAsync(machine, entity, at, cancellationToken) =
+            (temporal :> IPriorState<'EntityId, 'State>).BeforeAsync(machine, entity, at, cancellationToken)
+
+    interface ICorrectionCommitter<'EntityId, 'State, 'Event, 'Action> with
+        member _.CommitCorrectionAsync(command, token, expected, commit, cancellationToken) =
+            core.CorrectionCommitter.CommitCorrectionAsync(command, token, expected, commit, cancellationToken)
+
+    interface ITemporalReader<'EntityId, 'State> with
+        member _.ValidAtAsync(machine, entity, at, cancellationToken) =
+            (temporal :> ITemporalReader<'EntityId, 'State>).ValidAtAsync(machine, entity, at, cancellationToken)
+
+        member _.AsOfAsync(machine, entity, validAt, knownAt, cancellationToken) =
+            (temporal :> ITemporalReader<'EntityId, 'State>)
+                .AsOfAsync(machine, entity, validAt, knownAt, cancellationToken)
+
+    interface ICorrectionStore<'EntityId, 'State> with
+        member _.CorrectAsync(machine, entity, expected, from, beliefs, cancellationToken) =
+            (temporal :> ICorrectionStore<'EntityId, 'State>)
+                .CorrectAsync(machine, entity, expected, from, beliefs, cancellationToken)
 
     interface IMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>

@@ -64,16 +64,25 @@ let private migrateSqlite (logger: ILogger) (path: string) : int =
         logger.LogError("Automata SQLite migration refused the database: {Reason}", reason)
         1
 
-let private migratePostgres (logger: ILogger) (connectionString: string) (schema: SchemaName) : int =
+let private migratePostgres (logger: ILogger) (connectionString: string) (schema: SchemaName) beliefs : int =
     match
         PostgresMigrator.migrate
             logger
             { ConnectionString = connectionString
-              Schema = schema }
+              Schema = schema
+              Beliefs = beliefs }
     with
     | Ok report -> applied logger (List.length report.Applied)
     | Error(PostgresError.Failed(script, error)) ->
         logger.LogError(error, "Automata database migration failed at {Script}", script)
+        1
+    | Error(PostgresError.ProfileMismatch(configured, installed)) ->
+        logger.LogError(
+            "Cannot switch installed {Installed} profile to {Configured}; reset explicitly.",
+            BeliefModel.value installed,
+            BeliefModel.value configured
+        )
+
         1
 
 [<EntryPoint>]
@@ -88,7 +97,26 @@ let main args =
     | Some path, _ -> migrateSqlite logger path
     | None, Some connectionString ->
         match readSchema args with
-        | Ok schema -> migratePostgres logger connectionString schema
+        | Ok schema ->
+            let selected =
+                args
+                |> Array.tryFindIndex ((=) "--beliefs")
+                |> Option.bind (fun index -> args |> Array.tryItem (index + 1))
+                |> Option.orElseWith (fun () ->
+                    args
+                    |> Array.tryPick (fun arg ->
+                        if arg.StartsWith("--beliefs=", StringComparison.Ordinal) then
+                            Some(arg.Substring(10))
+                        else
+                            None))
+                |> Option.orElseWith (fun () -> read "BS_AUTOMATA_BELIEFS")
+                |> Option.defaultValue "snapshot"
+
+            match BeliefModel.tryCreate selected with
+            | Ok beliefs -> migratePostgres logger connectionString schema beliefs
+            | Error error ->
+                logger.LogError("{Error}", error)
+                1
         | Error error ->
             logger.LogError("{Error}", error)
             1

@@ -43,14 +43,25 @@ let tests =
               Expect.isNone (belief |> expectOk "valid at") "the entity had no belief then"
           }
 
-          testTask "ValidAt asks the clock the store was given, not the machine's" {
+          testTask "ValidAt reads the current database opinion despite a skewed application clock" {
               do! reset ()
               believe "e1" (jan 10) (Active 1) 1L
 
-              let frozen = FrozenTime(DateTimeOffset(2020, 1, 1, 0, 0, 0, TimeSpan.Zero))
-              let! belief = (newTemporalReaderAt frozen).ValidAtAsync(machine, entity "e1", jan 12, noCancellation)
+              let reader = newTemporalReader ()
 
-              Expect.isNone (belief |> expectOk "valid at") "a now before anything was known reads nothing"
+              let! old =
+                  reader.AsOfAsync(
+                      machine,
+                      entity "e1",
+                      jan 12,
+                      DateTimeOffset(2020, 1, 1, 0, 0, 0, TimeSpan.Zero),
+                      noCancellation
+                  )
+
+              Expect.isNone (old |> expectOk "past opinion") "explicit historical knowledge predates the belief"
+              let! belief = reader.ValidAtAsync(machine, entity "e1", jan 12, noCancellation)
+
+              Expect.isSome (belief |> expectOk "valid at") "the application clock cannot hide a live belief"
           }
 
           testTask "a live belief reads back with both upper bounds open" {

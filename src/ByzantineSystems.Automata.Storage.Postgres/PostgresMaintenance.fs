@@ -31,7 +31,7 @@ module internal Boot =
     /// </summary>
     let expectedMigrations: string list =
         Assembly.GetExecutingAssembly().GetManifestResourceNames()
-        |> Array.filter (fun name -> name.Contains ".migrations.main.")
+        |> Array.filter (fun name -> name.Contains ".migrations.common.main.")
         |> Array.sort
         |> List.ofArray
 
@@ -124,6 +124,40 @@ module internal Boot =
             })
             ct
 
+    /// <summary>Checks the configured store type against the installed profile before boot writes anything.</summary>
+    let inspectProfile context beliefs ct =
+        backgroundTaskResult {
+            let! catalog = inspect context ct
+
+            let catalog =
+                match beliefs with
+                | BeliefModel.Snapshot -> catalog |> List.filter ((<>) (BootDefect.MissingPrerequisite "btree_gist"))
+                | BeliefModel.Bitemporal -> catalog
+
+            if not catalog.IsEmpty then
+                return catalog
+            else
+                let! installed, temporal =
+                    Sql.readProgram
+                        context
+                        (StoreProgram.queryOne (prepare context.Schema "system" "profile") [] (fun row ->
+                            let complete =
+                                match beliefs with
+                                | BeliefModel.Snapshot -> Row.bool row "snapshot_installed"
+                                | BeliefModel.Bitemporal -> Row.bool row "temporal_installed"
+
+                            Ok(Row.string row "beliefs", complete)))
+                        ct
+
+                return
+                    [ if installed <> BeliefModel.value beliefs then
+                          BootDefect.Misconfigured
+                              $"Configured {BeliefModel.value beliefs} store against {installed} profile."
+                      if installed = BeliefModel.value beliefs && not temporal then
+                          BootDefect.MissingPrerequisite
+                              $"{BeliefModel.value beliefs} profile migrations for {SchemaName.value context.Schema}" ]
+        }
+
     /// <summary>Writes this machine's maintenance registration. An upsert, so safe on every boot.</summary>
     let register
         (context: PostgresContext)
@@ -165,7 +199,6 @@ type PostgresMaintenance(context: PostgresContext) =
     let unscheduleMaintenance = statement "system" "unschedule"
     let beliefColdStale = statement "system" "belief_cold_stale"
     let refreshBeliefCold = statement "system" "refresh_belief_cold"
-    let markBeliefCold = statement "system" "mark_belief_cold"
 
     let schedulingOf (value: string) : Result<Scheduling, StoreError> =
         match value with
@@ -178,7 +211,7 @@ type PostgresMaintenance(context: PostgresContext) =
     /// Refreshes the materialized cold layer of <c>fsm.belief</c> when a day has turned since the
     /// last refresh, and does nothing otherwise, so a pass every minute costs one cheap check.
     ///
-    /// Three statements on one connection rather than one routine, because
+    /// Two statements on one connection rather than one routine, because
     /// <c>REFRESH ... CONCURRENTLY</c> cannot run inside a function or a transaction. Safe to
     /// repeat and safe to race: a second host's refresh waits for the first and finds nothing new.
     /// </summary>
@@ -190,7 +223,6 @@ type PostgresMaintenance(context: PostgresContext) =
 
                 if stale then
                     do! StoreProgram.executeDiscard refreshBeliefCold []
-                    do! StoreProgram.executeDiscard markBeliefCold []
             })
             ct
 

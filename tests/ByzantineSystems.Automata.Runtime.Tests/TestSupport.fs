@@ -223,7 +223,19 @@ type TemporalStubStore<'Err>() =
         member this.AsOfAsync(_, _, _, _, cancellationToken) = Task.FromResult(Ok this.Beliefs)
 
     interface ICorrectionStore<EntityId<TestEntity>, TestState> with
-        member _.CorrectAsync(_, _, _, _, cancellationToken) = Task.FromResult(Ok NothingSuperseded)
+        member _.CorrectAsync(_, _, _, _, _, cancellationToken) = Task.FromResult(Ok NothingSuperseded)
+
+    interface ITransitionLog<EntityId<TestEntity>, TestState, TestEvent, TestAction> with
+        member _.SuffixAsync(_, _, _, _, _) =
+            Task.FromResult(Ok { Transitions = []; Incomplete = false })
+
+    interface IPriorState<EntityId<TestEntity>, TestState> with
+        member this.BeforeAsync(_, _, _, _) =
+            Task.FromResult(Ok(this.Beliefs |> Option.map _.Snapshot))
+
+    interface ICorrectionCommitter<EntityId<TestEntity>, TestState, TestEvent, TestAction> with
+        member _.CommitCorrectionAsync(_, _, _, _, _) =
+            Task.FromResult(Ok FinalizeOutcome.LeaseLost)
 
 /// <summary>A store with a boot check that answers whatever the test scripted.</summary>
 type BootingStubStore<'Err>(report: BootReport) =

@@ -8,6 +8,7 @@ FANTOMAS ?= fantomas
 DB_CONNECTION_STRING ?= Host=127.0.0.1;Port=5432;Database=$(PROJECT_NAME);Username=$(PROJECT_NAME);Password=$(PROJECT_NAME)
 DB_URL ?= postgresql://$(PROJECT_NAME):$(PROJECT_NAME)@127.0.0.1:5432/$(PROJECT_NAME)
 SCHEMA ?= fsm
+BELIEFS ?= snapshot
 
 SOLUTION := bs-automata.slnx
 POSTGRES_PROJECT := src/ByzantineSystems.Automata.Storage.Postgres/ByzantineSystems.Automata.Storage.Postgres.fsproj
@@ -105,7 +106,7 @@ coverage:
 	@echo "HTML coverage report: $(COVERAGE_DIR)/html/index.html"
 
 migrate:
-	BS_AUTOMATA_CONN='$(DB_CONNECTION_STRING)' BS_AUTOMATA_SCHEMA='$(SCHEMA)' $(DOTNET) run --project $(MIGRATE_PROJECT)
+	BS_AUTOMATA_CONN='$(DB_CONNECTION_STRING)' BS_AUTOMATA_SCHEMA='$(SCHEMA)' BS_AUTOMATA_BELIEFS='$(BELIEFS)' $(DOTNET) run --project $(MIGRATE_PROJECT)
 
 # The generated schema types come from the migrated database, so both targets migrate first.
 # Regenerate after any migration that changes a table or view the stores read.

@@ -280,10 +280,19 @@ let private run (logger: ILogger) (_argv: string array) =
                 Migrator.migrate
                     logger
                     { ConnectionString = connectionString
-                      Schema = schema }
+                      Schema = schema
+                      Beliefs = BeliefModel.Snapshot }
             with
             | Error(MigrationError.Failed(script, error)) ->
                 logger.LogError(error, "Migration failed at {Script}", script)
+                return 1
+            | Error(MigrationError.ProfileMismatch(configured, installed)) ->
+                logger.LogError(
+                    "Profile mismatch: configured {Configured}, installed {Installed}.",
+                    configured,
+                    installed
+                )
+
                 return 1
             | Ok _ ->
                 do! runPayment logger connectionString schema

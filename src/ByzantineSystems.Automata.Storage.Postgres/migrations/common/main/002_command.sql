@@ -44,8 +44,8 @@ CREATE DOMAIN $schema$.lease_outcome AS text CONSTRAINT lease_outcome_valid CHEC
 -- unsupplied text, 0 for no lease. Three-valued logic in a claim predicate is a
 -- bug waiting for the one row where somebody writes = instead of
 -- IS NOT DISTINCT FROM.
-CREATE SEQUENCE $schema$.lease_token
-    AS bigint START WITH 1;
+CREATE SEQUENCE $schema$
+.lease_token AS bigint START WITH 1;
 
 CREATE TABLE $schema$.command (
     -- Identity, and only identity. Sequences are not transactional: values are
@@ -53,22 +53,7 @@ CREATE TABLE $schema$.command (
     -- command_id has gaps and those gaps mean nothing. The business numbering
     -- that must be gapless is seq, which is why it is computed rather than
     -- allocated.
-    command_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    machine_id text NOT NULL,
-    entity_id text NOT NULL,
-    seq bigint NOT NULL,
-    idempotency_key text NOT NULL,
-    chart_version integer NOT NULL,
-    event jsonb NOT NULL,
-    request_digest bytea NOT NULL,
-    kind $schema$.command_kind NOT NULL DEFAULT 'event',
-    status $schema$.command_status NOT NULL DEFAULT 'ready',
-    blocked boolean NOT NULL DEFAULT FALSE,
-    visible_at timestamptz NOT NULL DEFAULT NOW(),
-    lease_token bigint NOT NULL DEFAULT 0,
-    read_ct integer NOT NULL DEFAULT 0,
-    attempts integer NOT NULL DEFAULT 0,
-    received_at timestamptz NOT NULL DEFAULT STATEMENT_TIMESTAMP(),
+    command_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, machine_id text NOT NULL, entity_id text NOT NULL, seq bigint NOT NULL, idempotency_key text NOT NULL, chart_version integer NOT NULL, event jsonb NOT NULL, request_digest bytea NOT NULL, kind $schema$.command_kind NOT NULL DEFAULT 'event', status $schema$.command_status NOT NULL DEFAULT 'ready', blocked boolean NOT NULL DEFAULT FALSE, visible_at timestamptz NOT NULL DEFAULT NOW(), lease_token bigint NOT NULL DEFAULT 0, read_ct integer NOT NULL DEFAULT 0, attempts integer NOT NULL DEFAULT 0, received_at timestamptz NOT NULL DEFAULT STATEMENT_TIMESTAMP(),
     -- Audit context. Every column here belongs to the application, never to the
     -- library: it is recorded and returned, and nothing in the claim path reads
     -- it.
@@ -78,11 +63,7 @@ CREATE TABLE $schema$.command (
     -- and blank worth carrying three-valued logic for. tenant becomes the
     -- row-level-security discriminator in a later step, and that policy already
     -- reads an unset tenant GUC as '' rather than as NULL, so the two agree.
-    tenant text NOT NULL DEFAULT '',
-    principal text NOT NULL DEFAULT '',
-    source text NOT NULL DEFAULT '',
-    correlation_id text NOT NULL DEFAULT '',
-    causation_id text NOT NULL DEFAULT '',
+    tenant text NOT NULL DEFAULT '', principal text NOT NULL DEFAULT '', source text NOT NULL DEFAULT '', correlation_id text NOT NULL DEFAULT '', causation_id text NOT NULL DEFAULT '',
     -- A resubmitted idempotency key must find the original command rather than
     -- create a second one.
     --
@@ -96,10 +77,7 @@ CREATE TABLE $schema$.command (
     -- Gapless per entity. Also the index that makes "what is the next sequence
     -- number" a single backward index scan rather than a scan of the entity's
     -- accumulated history.
-    CONSTRAINT command_unique_seq UNIQUE (machine_id, entity_id, seq),
-    CONSTRAINT command_seq_positive CHECK (seq > 0),
-    CONSTRAINT command_counters_non_negative CHECK (read_ct >= 0 AND attempts >= 0),
-    CONSTRAINT command_lease_token_non_negative CHECK (lease_token >= 0),
+    CONSTRAINT command_unique_seq UNIQUE (machine_id, entity_id, seq), CONSTRAINT command_seq_positive CHECK (seq > 0), CONSTRAINT command_counters_non_negative CHECK (read_ct >= 0 AND attempts >= 0), CONSTRAINT command_lease_token_non_negative CHECK (lease_token >= 0),
     -- A leased or terminal row carries the token that claimed it; a ready row
     -- carries the 0 sentinel. Keeping the token after a terminal write is what
     -- will later let finalize_command answer "was this result written by *my*
@@ -209,14 +187,11 @@ WHERE
 --
 -- The primary key is the command, so a command owns at most one error.
 -- ---------------------------------------------------------------------------
-CREATE TABLE $schema$.command_error (
-    command_id bigint PRIMARY KEY,
-    error jsonb NOT NULL,
+CREATE TABLE $schema$.command_error (command_id bigint PRIMARY KEY, error jsonb NOT NULL,
     -- When we gave up: the failure path's counterpart to
     -- $schema$.transition.committed_at, which a rejected command never writes. Same
     -- clock as that column, since they answer the same question.
-    recorded_at timestamptz NOT NULL DEFAULT STATEMENT_TIMESTAMP(),
-    CONSTRAINT command_error_command_fkey FOREIGN KEY (command_id) REFERENCES $schema$.command (command_id)
+    recorded_at timestamptz NOT NULL DEFAULT STATEMENT_TIMESTAMP(), CONSTRAINT command_error_command_fkey FOREIGN KEY (command_id) REFERENCES $schema$.command (command_id)
 );
 
 -- ---------------------------------------------------------------------------

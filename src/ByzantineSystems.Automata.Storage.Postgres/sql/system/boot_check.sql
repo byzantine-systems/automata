@@ -42,3 +42,4 @@ SELECT
             pg_extension e
         WHERE
             e.extname = 'pgmq') AS has_pgmq;
+

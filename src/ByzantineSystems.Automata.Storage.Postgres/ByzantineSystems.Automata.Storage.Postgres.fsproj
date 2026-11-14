@@ -3,12 +3,13 @@
     <PropertyGroup>
         <GenerateDocumentationFile>true</GenerateDocumentationFile>
         <IsPackable>true</IsPackable>
-        <Description>PostgreSQL store for ByzantineSystems.Automata. Requires PostgreSQL 19 with btree_gist and pgmq.</Description>
+        <Description>PostgreSQL store for ByzantineSystems.Automata with snapshot storage and opt-in bitemporal history. Uses pgmq; bitemporal mode also requires btree_gist.</Description>
         <PackageTags>fsharp;statechart;postgresql;pgmq;bitemporal;sqlhydra</PackageTags>
     </PropertyGroup>
 
     <ItemGroup>
         <Compile Include="SchemaName.fs" />
+        <Compile Include="BeliefModel.fs" />
         <Compile Include="PostgresStoreSettings.fs" />
         <!-- Db.fs precedes DataSource.fs: the data source's resilience is built from the
              driver-failure classifier that lives with the rest of the adapter boundary. -->
@@ -37,8 +38,7 @@
     </ItemGroup>
 
     <ItemGroup>
-        <EmbeddedResource Include="migrations/main/*.sql" />
-        <EmbeddedResource Include="migrations/repeatable/*.sql" />
+        <EmbeddedResource Include="migrations/**/*.sql" />
         <!-- Queries, keyed by SqlResources as sql/<domain>/<operation>.sql. -->
         <EmbeddedResource Include="sql/**/*.sql" />
     </ItemGroup>

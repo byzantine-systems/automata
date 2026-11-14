@@ -15,17 +15,11 @@ type CorrectionError<'Err> =
     /// <summary>The history does not replay. Nothing is written.</summary>
     | Replay of ReplayError
     /// <summary>The store cannot read the past or replay into it.</summary>
-    | Unsupported
+    | Rejected of MachineRejection
 
 /// <summary>Reading what a correction replays from, then planning it. Shared by commit and preview.</summary>
 [<RequireQualifiedAccess>]
 module internal Correction =
-
-    /// PostgreSQL keeps microseconds, so this is the instant just before T at the resolution the
-    /// beliefs are stored in. The belief in force then is the one the missed event follows; a
-    /// belief starting exactly at T came from an event at T, which is replayed rather than
-    /// assumed.
-    let private justBefore (at: DateTimeOffset) = at.AddTicks -10L
 
     let plan
         (config: RuntimeConfig<'EntityId, 'State, 'Event, 'Action, 'Err>)
@@ -36,16 +30,18 @@ module internal Correction =
         (correction: CommandId)
         (ct: CancellationToken)
         : Task<Result<ReplayPlan<'EntityId, 'State, 'Event, 'Action> * Epoch, CorrectionError<'Err>>> =
-        match Store.tryTemporal config.Store, Store.tryReplay config.Store with
-        | Some temporal, Some replay ->
+        match ct.IsCancellationRequested, Store.tryCorrections config.Store with
+        | true, _ ->
+            Task.FromCanceled<Result<ReplayPlan<'EntityId, 'State, 'Event, 'Action> * Epoch, CorrectionError<'Err>>> ct
+        | false, Some capability ->
             let reader = config.Store :> IStateReader<'EntityId, 'State, 'Event, 'Action>
 
             backgroundTaskResult {
                 let! live = reader.TryGetSnapshotAsync(config.MachineId, entityId, ct)
-                let! before = temporal.ValidAtAsync(config.MachineId, entityId, justBefore at, ct)
+                let! before = capability.Prior.BeforeAsync(config.MachineId, entityId, at, ct)
                 // One more than the budget, which is how an over-long suffix is told apart from
                 // one exactly at the limit.
-                let! suffix = replay.SuffixAsync(config.MachineId, entityId, at, policy.ReplayLimit + 1, ct)
+                let! suffix = capability.Log.SuffixAsync(config.MachineId, entityId, at, policy.ReplayLimit + 1, ct)
 
                 return live, before, suffix
             }
@@ -59,7 +55,7 @@ module internal Correction =
                 let input =
                     { MachineId = config.MachineId
                       EntityId = entityId
-                      Start = before |> Option.map _.Snapshot.State |> Option.defaultValue config.InitialState
+                      Start = before |> Option.map _.State |> Option.defaultValue config.InitialState
                       Live = liveState
                       Missed = missed
                       At = at
@@ -75,4 +71,4 @@ module internal Correction =
                     |> Result.map (fun plan -> plan, epoch)
                     |> Result.mapError CorrectionError.Replay
                     |> Task.FromResult)
-        | _ -> TaskResult.error CorrectionError.Unsupported
+        | false, None -> TaskResult.error (CorrectionError.Rejected MachineRejection.CorrectionsUnsupported)

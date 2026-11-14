@@ -13,7 +13,7 @@ SELECT
     known_from,
     known_to
 FROM
-    $schema$.belief
+    $temporal_schema$.belief
 WHERE
     machine_id = @machine_id
     AND entity_id = @entity_id

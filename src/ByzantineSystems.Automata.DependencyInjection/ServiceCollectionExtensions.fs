@@ -186,6 +186,13 @@ type ServiceCollectionExtensions =
 
         services
             .AddSingleton<IValidateOptions<PostgresStoreSettings>, PostgresStoreSettingsValidator>()
+            .AddSingleton<BeliefModel>(fun provider ->
+                let settings = PostgresRegistration.settingsOf provider
+
+                match BeliefModel.tryCreate settings.Beliefs with
+                | Ok model -> model
+                | Error reason ->
+                    raise (OptionsValidationException(Options.DefaultName, typeof<PostgresStoreSettings>, [ reason ])))
             .AddSingleton<NpgsqlDataSource>(fun provider ->
                 // The pool, once per application: the registered context and every store share
                 // it, which is the sharing the resilience pipeline is sized for. The

@@ -354,8 +354,8 @@ module Machine =
     /// the chart version that first decided it, and rewrites the entity's beliefs from that
     /// instant. It waits its turn behind the entity's queued commands like any other command.
     ///
-    /// Needs a store that can read and replay the past; on one that cannot, the correction is
-    /// dead-lettered with the reason. No historical action is re-emitted.
+    /// Needs a complete correction capability; on one that cannot, the request is refused
+    /// before submission. No historical action is re-emitted.
     /// </summary>
     let correct
         (machine: Machine<'EntityId, 'State, 'Event, 'Action, 'Err>)
@@ -365,7 +365,12 @@ module Machine =
         (policy: CorrectionPolicy)
         (ct: CancellationToken)
         : Task<Result<SubmissionOutcome, MachineError<'Err>>> =
-        submit (CommandKind.Correction(at, policy)) machine entityId envelope ct
+        if ct.IsCancellationRequested then
+            Task.FromCanceled<Result<SubmissionOutcome, MachineError<'Err>>> ct
+        else
+            match Store.tryCorrections machine.RuntimeConfig.Store with
+            | None -> TaskResult.error (MachineError.Rejected MachineRejection.CorrectionsUnsupported)
+            | Some _ -> submit (CommandKind.Correction(at, policy)) machine entityId envelope ct
 
     /// <summary>
     /// What a correction would do, without doing it: the same reads and the same replay a worker
@@ -513,7 +518,7 @@ module Machine =
     /// <code lang="fsharp">
     /// match Machine.temporal machine with
     /// | Some reader -> reader.AsOfAsync(Machine.machineId machine, orderId, validAt, knownAt, ct)
-    /// | None -> failwith "this store does not keep history"
+    /// | None -> () // This store does not offer temporal reads.
     /// </code>
     /// </example>
     let temporal
@@ -529,7 +534,7 @@ module Machine =
     /// </summary>
     let corrections
         (machine: Machine<'EntityId, 'State, 'Event, 'Action, 'Err>)
-        : ICorrectionStore<'EntityId, 'State> option =
+        : CorrectionCapability<'EntityId, 'State, 'Event, 'Action> option =
         Store.tryCorrections machine.RuntimeConfig.Store
 
     /// <summary>The logical machine name the chart, inbox and store are keyed by.</summary>

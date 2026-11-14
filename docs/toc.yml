@@ -6,3 +6,5 @@
   href: fragments.md
 - name: Schema evolution
   href: schema-evolution.md
+- name: Custom corrections
+  href: corrections.md

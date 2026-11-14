@@ -11,68 +11,6 @@ module Version =
 
 module fsm =
 
-    type belief =
-        { [<ProviderDbType("Text")>]
-          machine_id: Option<string>
-          [<ProviderDbType("Text")>]
-          entity_id: Option<string>
-          [<ProviderDbType("Jsonb")>]
-          state: Option<string>
-          [<ProviderDbType("Text")>]
-          status: Option<string>
-          [<ProviderDbType("Bigint")>]
-          epoch: Option<int64>
-          [<ProviderDbType("Bigint")>]
-          command_id: Option<int64>
-          [<ProviderDbType("Integer")>]
-          chart_version: Option<int>
-          [<ProviderDbType("TimestampTz")>]
-          valid_from: Option<System.DateTime>
-          [<ProviderDbType("TimestampTz")>]
-          valid_to: Option<System.DateTime>
-          [<ProviderDbType("TimestampTz")>]
-          known_from: Option<System.DateTime>
-          [<ProviderDbType("TimestampTz")>]
-          known_to: Option<System.DateTime> }
-
-        interface IWriteColumns with
-            member this.WriteColumns =
-                [ { WriteColumn.Name = "machine_id"
-                    Value = box this.machine_id
-                    ProviderDbType = Some "Text" }
-                  { WriteColumn.Name = "entity_id"
-                    Value = box this.entity_id
-                    ProviderDbType = Some "Text" }
-                  { WriteColumn.Name = "state"
-                    Value = box this.state
-                    ProviderDbType = Some "Jsonb" }
-                  { WriteColumn.Name = "status"
-                    Value = box this.status
-                    ProviderDbType = Some "Text" }
-                  { WriteColumn.Name = "epoch"
-                    Value = box this.epoch
-                    ProviderDbType = Some "Bigint" }
-                  { WriteColumn.Name = "command_id"
-                    Value = box this.command_id
-                    ProviderDbType = Some "Bigint" }
-                  { WriteColumn.Name = "chart_version"
-                    Value = box this.chart_version
-                    ProviderDbType = Some "Integer" }
-                  { WriteColumn.Name = "valid_from"
-                    Value = box this.valid_from
-                    ProviderDbType = Some "TimestampTz" }
-                  { WriteColumn.Name = "valid_to"
-                    Value = box this.valid_to
-                    ProviderDbType = Some "TimestampTz" }
-                  { WriteColumn.Name = "known_from"
-                    Value = box this.known_from
-                    ProviderDbType = Some "TimestampTz" }
-                  { WriteColumn.Name = "known_to"
-                    Value = box this.known_to
-                    ProviderDbType = Some "TimestampTz" } ]
-
-    let belief = table<belief>
-
     type blocked_drift =
         { [<ProviderDbType("Bigint")>]
           command_id: Option<int64>
@@ -398,25 +336,25 @@ module fsm =
 
     let command_error = table<command_error>
 
-    type current_belief =
+    type entity_state =
         { [<ProviderDbType("Text")>]
-          machine_id: Option<string>
+          machine_id: string
           [<ProviderDbType("Text")>]
-          entity_id: Option<string>
+          entity_id: string
           [<ProviderDbType("Jsonb")>]
-          state: Option<string>
+          state: string
           [<ProviderDbType("Text")>]
-          status: Option<string>
+          status: string
           [<ProviderDbType("Bigint")>]
-          epoch: Option<int64>
+          epoch: int64
           [<ProviderDbType("Bigint")>]
-          command_id: Option<int64>
+          command_id: int64
           [<ProviderDbType("Integer")>]
-          chart_version: Option<int>
+          chart_version: int
           [<ProviderDbType("TimestampTz")>]
-          valid_from: Option<System.DateTime>
+          effective_at: System.DateTime
           [<ProviderDbType("TimestampTz")>]
-          known_from: Option<System.DateTime> }
+          committed_at: System.DateTime }
 
         interface IWriteColumns with
             member this.WriteColumns =
@@ -441,14 +379,14 @@ module fsm =
                   { WriteColumn.Name = "chart_version"
                     Value = box this.chart_version
                     ProviderDbType = Some "Integer" }
-                  { WriteColumn.Name = "valid_from"
-                    Value = box this.valid_from
+                  { WriteColumn.Name = "effective_at"
+                    Value = box this.effective_at
                     ProviderDbType = Some "TimestampTz" }
-                  { WriteColumn.Name = "known_from"
-                    Value = box this.known_from
+                  { WriteColumn.Name = "committed_at"
+                    Value = box this.committed_at
                     ProviderDbType = Some "TimestampTz" } ]
 
-    let current_belief = table<current_belief>
+    let entity_state = table<entity_state>
 
     type supervision_event =
         { [<ProviderDbType("Bigint")>]

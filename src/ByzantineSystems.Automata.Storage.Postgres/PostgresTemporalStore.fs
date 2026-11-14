@@ -19,9 +19,6 @@ open Npgsql
 type TemporalOptions<'EntityId, 'State> =
     {
         Context: PostgresContext
-        /// <summary>The clock "what do we believe now" is asked from, so a host owns it and a test
-        /// can hold it still.</summary>
-        TimeProvider: TimeProvider
         StateCodec: Codec<'State>
         EntityIdEncode: 'EntityId -> string
         /// <summary>Decoding returns a result, so a corrupt row is a typed failure rather than an exception.</summary>
@@ -50,6 +47,8 @@ type PostgresTemporalStore<'EntityId, 'State>(options: TemporalOptions<'EntityId
 
     let prepare = Sql.prepareProgram context.Schema
     let beliefAsOf = StatementKey.create "belief" "as_of" |> prepare
+    let beliefBefore = StatementKey.create "belief" "before" |> prepare
+    let beliefValidAt = StatementKey.create "belief" "valid_at" |> prepare
     let correctBeliefs = StatementKey.create "belief" "correct" |> prepare
 
     /// Rebuilds one belief from a row of fsm.belief. The view cannot carry NOT NULL, so every
@@ -110,8 +109,8 @@ type PostgresTemporalStore<'EntityId, 'State>(options: TemporalOptions<'EntityId
         }
 
     /// <summary>
-    /// One as-of read, from fsm.belief. <c>ValidAtAsync</c> is this with <c>knownAt</c> set to now
-    /// rather than a second query: two queries that have to agree are two queries that can drift.
+    /// One as-of read from the optional temporal schema. ValidAtAsync instead selects the
+    /// currently held opinion directly, so no application clock participates in that question.
     ///
     /// Both windows are half-open by constraint, so <c>from &lt;= t &lt; to</c> on the view's
     /// bounds is exactly the containment the ranges state. The view serves live beliefs, recent
@@ -130,17 +129,34 @@ type PostgresTemporalStore<'EntityId, 'State>(options: TemporalOptions<'EntityId
                 beliefRow)
             ct
 
+    let currentOpinion statement machineId entityId validAt ct =
+        Sql.readProgram
+            context
+            (StoreProgram.tryQueryOne
+                statement
+                [ Params.machineId "machine_id" machineId
+                  Params.entityKey "entity_id" (encodeEntityId entityId)
+                  "valid_at", Param.Timestamp validAt ]
+                beliefRow)
+            ct
+
+    interface IPriorState<'EntityId, 'State> with
+        member _.BeforeAsync(machineId, entityId, at, cancellationToken) =
+            Tap.requireMachineId (nameof machineId) machineId
+            Tap.requireArg (nameof entityId) entityId
+
+            Tap.start cancellationToken (fun () ->
+                currentOpinion beliefBefore machineId entityId at cancellationToken
+                |> TaskResult.map (Option.map _.Snapshot))
+
     interface ITemporalReader<'EntityId, 'State> with
 
         member _.ValidAtAsync(machineId, entityId, validAt, cancellationToken) =
             Tap.requireMachineId (nameof machineId) machineId
             Tap.requireArg (nameof entityId) entityId
 
-            // The clock is read inside the started work and nowhere else in this type. "What do
-            // we think now" is the one temporal question whose second coordinate is the present;
-            // a caller wanting any other one calls AsOf and says so.
             Tap.start cancellationToken (fun () ->
-                asOf machineId entityId validAt (options.TimeProvider.GetUtcNow()) cancellationToken)
+                currentOpinion beliefValidAt machineId entityId validAt cancellationToken)
 
         member _.AsOfAsync(machineId, entityId, validAt, knownAt, cancellationToken) =
             Tap.requireMachineId (nameof machineId) machineId
@@ -150,7 +166,7 @@ type PostgresTemporalStore<'EntityId, 'State>(options: TemporalOptions<'EntityId
 
     interface ICorrectionStore<'EntityId, 'State> with
 
-        member _.CorrectAsync(machineId, entityId, validFrom, beliefs, cancellationToken) =
+        member _.CorrectAsync(machineId, entityId, expected, validFrom, beliefs, cancellationToken) =
             Tap.requireMachineId (nameof machineId) machineId
             Tap.requireArg (nameof entityId) entityId
             Tap.requireArg (nameof beliefs) beliefs
@@ -169,13 +185,17 @@ type PostgresTemporalStore<'EntityId, 'State>(options: TemporalOptions<'EntityId
                                 correctBeliefs
                                 [ Params.machineId "machine_id" machineId
                                   Params.entityKey "entity_id" key
+                                  "expected_epoch", Param.Bigint(int64 (Epoch.value expected))
                                   "valid_from", Param.Timestamp validFrom
                                   "beliefs", Param.Jsonb payload ]
-                                (fun reader -> Row.int32 reader "superseded" |> Ok))
+                                (fun reader ->
+                                    if Row.bool reader "conflict" then
+                                        Ok(CorrectionOutcome.Conflict(Db.epochOf (Row.int64 reader "actual_epoch")))
+                                    else
+                                        match Row.int32 reader "superseded" with
+                                        | 0 -> Ok NothingSuperseded
+                                        | count -> Ok(Corrected count)))
                             cancellationToken
 
-                    return
-                        match superseded with
-                        | 0 -> NothingSuperseded
-                        | superseded -> Corrected superseded
+                    return superseded
                 })

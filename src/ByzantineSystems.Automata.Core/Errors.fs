@@ -68,6 +68,8 @@ module StoreError =
 /// than throwing lifecycle exceptions or asking callers to parse a reason string.
 /// </summary>
 type MachineRejection =
+    /// <summary>The configured store does not support correction planning and atomic correction commits.</summary>
+    | CorrectionsUnsupported
     /// <summary>The machine must be started before it accepts sends or state reads.</summary>
     | NotStarted
 

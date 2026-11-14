@@ -77,21 +77,17 @@ BEGIN
         pgmq.create (p_queue);
     v_created := TRUE;
 END IF;
-
     SELECT
         OBJ_DESCRIPTION(TO_REGCLASS(FORMAT('pgmq.%I', 'q_' || p_queue)), 'pg_class')
-    INTO v_owner;
-
+    INTO
+        v_owner;
     IF v_owner IS NOT NULL AND v_owner <> v_expected_owner THEN
         RAISE EXCEPTION 'queue % belongs to %, not $schema$', p_queue, v_owner
-            USING ERRCODE = 'unique_violation',
-                  CONSTRAINT = 'automata_action_queue_owner';
+            USING ERRCODE = 'unique_violation', CONSTRAINT = 'automata_action_queue_owner';
     END IF;
-
     -- An existing uncommented queue predates schema ownership. Claiming it preserves its
     -- messages while making every later cross-schema use fail closed.
     EXECUTE FORMAT('COMMENT ON TABLE pgmq.%I IS %L', 'q_' || p_queue, v_expected_owner);
-
     RETURN v_created;
 END
 $$;
@@ -256,3 +252,4 @@ BEGIN
     RETURN 'updated';
 END
 $$;
+

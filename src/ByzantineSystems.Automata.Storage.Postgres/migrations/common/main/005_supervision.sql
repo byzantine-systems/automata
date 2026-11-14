@@ -7,14 +7,7 @@
 -- services and the supervision example both depend on it, so it outlives the
 -- v1 store that was replaced around it.
 -- ---------------------------------------------------------------------------
-CREATE TABLE $schema$.supervision_event (
-    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    supervisor text NOT NULL,
-    child_id text NOT NULL,
-    kind text NOT NULL,
-    strategy text NOT NULL,
-    reason jsonb NOT NULL DEFAULT '{}',
-    at timestamptz NOT NULL
+CREATE TABLE $schema$.supervision_event (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, supervisor text NOT NULL, child_id text NOT NULL, kind text NOT NULL, strategy text NOT NULL, reason jsonb NOT NULL DEFAULT '{}', at timestamptz NOT NULL
 );
 
 -- Newest first is the only way this table is ever read.

@@ -135,9 +135,17 @@ let tests =
                   |> Set.ofSeq
 
               Expect.equal
-                  (Set.difference children targets |> Set.toList)
+                  (Set.difference (Set.remove "entity_state" children) targets |> Set.toList)
                   []
                   "every table with a foreign key into fsm.command has a matching DELETE in purge_commands"
+
+              Expect.isTrue
+                  (Regex.IsMatch(
+                      definition,
+                      $@"NOT\s+EXISTS\s*\(\s*SELECT\s+1\s+FROM\s+{Regex.Escape schemaValue}\.entity_state\s+s\s+WHERE\s+s.command_id\s*=\s*c.command_id",
+                      RegexOptions.IgnoreCase
+                  ))
+                  "snapshot commands are excluded, never deleted with their snapshot"
           }
 
           testTask "the claim returns exactly the columns the reader expects" {
@@ -266,7 +274,7 @@ let tests =
                   cmd.Parameters.AddWithValue("entity_id", "e1234") |> ignore
                   cmd.ExecuteScalar() |> string
 
-              Expect.stringContains plan "instance_state_live_idx" "the current-state read must use the partial index"
+              Expect.stringContains plan "entity_state_pkey" "the snapshot read uses its primary key"
 
               Expect.isFalse
                   (plan.Contains "Seq Scan")
