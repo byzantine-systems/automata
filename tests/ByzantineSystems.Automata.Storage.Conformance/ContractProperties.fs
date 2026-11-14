@@ -205,11 +205,13 @@ let private advanceOf (raw: byte) = advanceTable[int raw % 8]
 let private finishKindOf (raw: byte) = int raw % 4
 
 let private failureOf (raw: byte) : CommandFailure<ContractError> =
-    match int raw / 4 % 4 with
+    match int raw / 4 % 6 with
     | 0 -> CommandFailure.Domain(Refused "the trace refused it")
     | 1 -> CommandFailure.Machine "the trace could not process it"
     | 2 -> CommandFailure.Replay(ReplayError.Diverged(Epoch.ofUInt64 3UL, "the trace diverged"))
-    | _ -> CommandFailure.Replay ReplayError.HistoryPurged
+    | 3 -> CommandFailure.Replay ReplayError.HistoryPurged
+    | 4 -> CommandFailure.Replay(ReplayError.UnknownChartVersion(ChartVersion.create (1 + int raw)))
+    | _ -> CommandFailure.Replay(ReplayError.BudgetExceeded(int raw))
 
 let private contractSubmission (machine: MachineId) (version: ChartVersion) entity key event =
     { MachineId = machine
@@ -1613,13 +1615,17 @@ let finalizeProperty name maxTests (env: ContractInboxEnv) =
                         let firstEpoch = Epoch.next Epoch.initial
                         let secondPayload = byte ((int payload + 1) % 256)
 
-                        let secondDraft =
+                        let nextDraft =
                             contractDraft
                                 env.Machine
                                 second.Work.EntityId
                                 second.Work.Event
                                 secondPayload
                                 firstDraft.ToState
+
+                        let secondDraft =
+                            { nextDraft with
+                                EffectiveAt = firstDraft.EffectiveAt.AddSeconds 1. }
 
                         let! secondOutcome =
                             stores.Processor.CommitAsync(
@@ -1708,7 +1714,10 @@ let finalizeProperty name maxTests (env: ContractInboxEnv) =
                     [ true, CommandFailure.Domain(Refused $"domain-{payload}")
                       false, CommandFailure.Machine $"machine-{payload}"
                       true, CommandFailure.Replay(ReplayError.Diverged(Epoch.ofUInt64 3UL, $"diverged-{payload}"))
-                      false, CommandFailure.Replay ReplayError.HistoryPurged ]
+                      false, CommandFailure.Replay ReplayError.HistoryPurged
+                      true,
+                      CommandFailure.Replay(ReplayError.UnknownChartVersion(ChartVersion.create (1 + int payload)))
+                      false, CommandFailure.Replay(ReplayError.BudgetExceeded(int payload)) ]
 
                 let mutable valid = true
 
@@ -1864,7 +1873,18 @@ let finalizeProperty name maxTests (env: ContractInboxEnv) =
                     let! expired = expiredLaw payload
                     let! reclaimed = reclaimedLaw payload
                     let! crossed = crossResolutionLaw payload
-                    return committed && conflicted && failed && stale && expired && reclaimed && crossed
+
+                    for label, holds in
+                        [ "commit", committed
+                          "conflict", conflicted
+                          "failure", failed
+                          "stale", stale
+                          "expired", expired
+                          "reclaimed", reclaimed
+                          "cross-resolution", crossed ] do
+                        Expect.isTrue holds $"finalization law {label}, payload {payload}"
+
+                    return true
                 }
         ))
 

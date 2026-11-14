@@ -76,8 +76,7 @@ BEGIN
             END IF;
         END IF;
     ELSE
-        INSERT INTO $schema$.command_error (command_id, error)
-            VALUES (p_command_id, p_error);
+        RAISE EXCEPTION 'failures use fail_command' USING ERRCODE = 'invalid_parameter_value';
     END IF;
     PERFORM
         $schema$.close_command (p_command_id, p_status);
@@ -92,4 +91,3 @@ BEGIN
         p_status;
 END
 $$;
-

@@ -30,6 +30,7 @@
         <Compile Include="EnumCodec.fs" />
         <Compile Include="CommandInboxProgram.fs" />
         <Compile Include="ClaimRecovery.fs" />
+        <Compile Include="Failure.fs" />
         <!-- How a leased command ends, shared by the bundled providers' finalize paths. -->
         <Compile Include="Finalize.fs" />
     </ItemGroup>

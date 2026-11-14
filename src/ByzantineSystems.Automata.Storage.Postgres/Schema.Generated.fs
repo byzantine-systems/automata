@@ -317,8 +317,8 @@ module fsm =
     type command_error =
         { [<ProviderDbType("Bigint")>]
           command_id: int64
-          [<ProviderDbType("Jsonb")>]
-          error: string
+          [<ProviderDbType("Text")>]
+          kind: string
           [<ProviderDbType("TimestampTz")>]
           recorded_at: System.DateTime }
 
@@ -327,9 +327,9 @@ module fsm =
                 [ { WriteColumn.Name = "command_id"
                     Value = box this.command_id
                     ProviderDbType = Some "Bigint" }
-                  { WriteColumn.Name = "error"
-                    Value = box this.error
-                    ProviderDbType = Some "Jsonb" }
+                  { WriteColumn.Name = "kind"
+                    Value = box this.kind
+                    ProviderDbType = Some "Text" }
                   { WriteColumn.Name = "recorded_at"
                     Value = box this.recorded_at
                     ProviderDbType = Some "TimestampTz" } ]

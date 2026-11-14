@@ -16,6 +16,7 @@ let private expected =
       "command", "by_id"
       "command", "find_by_key"
       "command", "finalize"
+      "command", "finalize_failure"
       "command", "finalize_temporal"
       "command", "reschedule"
       "command", "extend_lease"

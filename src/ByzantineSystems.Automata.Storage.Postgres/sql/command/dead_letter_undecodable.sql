@@ -2,5 +2,4 @@
 SELECT
     f.outcome
 FROM
-    $schema$.finish_command (p_command_id => @command_id, p_lease_token => @lease_token, p_expected_epoch => 0, p_status => 'dead_letter', p_error => JSONB_BUILD_OBJECT('machine', @reason::text)) f;
-
+    $schema$.fail_command (@command_id, @lease_token, 'dead_letter', 'machine', 'null'::jsonb, @reason, '', 0, 0::bigint, 0) f;

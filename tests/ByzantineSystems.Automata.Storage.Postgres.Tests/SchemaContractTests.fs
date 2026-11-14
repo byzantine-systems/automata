@@ -56,7 +56,17 @@ let private transitionColumns =
       "effective_at"
       "committed_at" ]
 
-let private resultColumns = [ "command_status" ] @ transitionColumns @ [ "error" ]
+let private resultColumns =
+    [ "command_status" ]
+    @ transitionColumns
+    @ [ "failure_kind"
+        "domain_error"
+        "machine_reason"
+        "replay_kind"
+        "failure_version"
+        "failure_epoch"
+        "replay_reason"
+        "failure_budget" ]
 
 let private resource domain operation =
     SqlResources.get domain operation |> SqlTemplate.substitute schema
@@ -109,10 +119,13 @@ let tests =
               // the generic form of the correction wedge: it fails when the next child table
               // arrives without a matching delete, not only when the correction one is missing.
               let children =
-                  rows "SELECT DISTINCT c.relname
+                  rows "WITH RECURSIVE deps(oid) AS (
+                         SELECT 'fsm.command'::regclass::oid UNION
+                         SELECT con.conrelid FROM pg_constraint con JOIN deps d ON con.confrelid = d.oid WHERE con.contype = 'f')
+                        SELECT DISTINCT c.relname
                        FROM pg_constraint con
                        JOIN pg_class c ON c.oid = con.conrelid
-                       WHERE con.contype = 'f' AND con.confrelid = 'fsm.command'::regclass
+                        WHERE con.contype = 'f' AND con.confrelid IN (SELECT oid FROM deps)
                        ORDER BY c.relname" [] (fun reader -> reader.GetString 0)
                   |> Set.ofList
 

@@ -158,7 +158,7 @@ let reset () : Task =
 
         let resetSql =
             sql
-                $"""TRUNCATE fsm.entity_state, fsm.command, fsm.command_error, fsm.transition, fsm.machine_chart_version,
+                $"""TRUNCATE fsm.entity_state, fsm.command, fsm.command_error, fsm.command_error_domain, fsm.command_error_machine, fsm.command_error_replay, fsm.transition, fsm.machine_chart_version,
                           fsm.supervision_event, fsm.instance_state, fsm.instance_state_history,
                           fsm.action_dead_letter, fsm.machine_maintenance,
                           fsm.command_correction, fsm.entity_purge

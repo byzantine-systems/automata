@@ -13,6 +13,7 @@
         <Compile Include="TapShapeTests.fs" />
         <Compile Include="StoreProgramTests.fs" />
         <Compile Include="EnumCodecTests.fs" />
+        <Compile Include="FailureTests.fs" />
         <Compile Include="Program.fs" />
     </ItemGroup>
 

@@ -17,10 +17,10 @@ type internal Resolution<'EntityId, 'State, 'Event, 'Action> =
     | Commit of expected: Epoch * draft: EncodedDraft<'EntityId, 'State, 'Event, 'Action>
 
     /// <summary>The chart refused the event. The encoded failure is recorded and no state moves.</summary>
-    | Reject of error: string
+    | Reject of error: EncodedFailure
 
     /// <summary>The machine gave up on the command. The encoded failure is recorded and no state moves.</summary>
-    | DeadLetter of error: string
+    | DeadLetter of error: EncodedFailure
 
 /// <summary>Operations on <see cref="T:ByzantineSystems.Automata.Storage.Internal.Resolution`4" />.</summary>
 [<RequireQualifiedAccess>]

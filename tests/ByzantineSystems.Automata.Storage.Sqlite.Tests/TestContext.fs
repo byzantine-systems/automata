@@ -104,6 +104,9 @@ let reset () : unit =
         (shared ())
         "DELETE FROM fsm_action_dead_letter;
          DELETE FROM fsm_action;
+         DELETE FROM fsm_command_error_domain;
+         DELETE FROM fsm_command_error_machine;
+         DELETE FROM fsm_command_error_replay;
          DELETE FROM fsm_command_error;
          DELETE FROM fsm_command_correction;
          DELETE FROM fsm_entity_snapshot;

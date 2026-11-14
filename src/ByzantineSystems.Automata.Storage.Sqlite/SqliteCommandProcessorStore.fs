@@ -33,59 +33,6 @@ type CommandProcessorOptions<'EntityId, 'State, 'Event, 'Action, 'Err> =
         EntityIdDecode: string -> Result<'EntityId, string>
     }
 
-/// <summary>
-/// A replay error as the error column stores it: a kind, and the fields that kind has. Written by
-/// this library alone, so every field is required on the way back.
-/// </summary>
-[<RequireQualifiedAccess>]
-module internal ReplayMapping =
-
-    let toJson (error: ReplayError) : string =
-        let node = System.Text.Json.Nodes.JsonObject()
-
-        match error with
-        | ReplayError.UnknownChartVersion version ->
-            node["kind"] <- "unknown_chart_version"
-            node["version"] <- ChartVersion.value version
-        | ReplayError.Diverged(epoch, reason) ->
-            node["kind"] <- "diverged"
-            node["epoch"] <- int64 (Epoch.value epoch)
-            node["reason"] <- reason
-        | ReplayError.BudgetExceeded limit ->
-            node["kind"] <- "budget_exceeded"
-            node["limit"] <- limit
-        | ReplayError.HistoryPurged -> node["kind"] <- "history_purged"
-
-        node.ToJsonString()
-
-    let ofJson (element: JsonElement) : Result<ReplayError, StoreError> =
-        let fail () =
-            Error(Db.decodeFailure (nameof ReplayError) "an unreadable replay error")
-
-        let field (name: string) (read: JsonElement -> 'T) =
-            match element.TryGetProperty name with
-            | true, value -> Ok(read value)
-            | _ -> fail ()
-
-        match element.TryGetProperty "kind" with
-        | true, kind ->
-            match kind.GetString() with
-            | "unknown_chart_version" ->
-                field "version" _.GetInt32()
-                |> Result.bind (fun version ->
-                    ChartVersion.tryCreate version
-                    |> Result.mapError (Db.decodeFailure "ChartVersion"))
-                |> Result.map ReplayError.UnknownChartVersion
-            | "diverged" ->
-                Result.map2
-                    (fun epoch reason -> ReplayError.Diverged(Db.epochOf epoch, reason))
-                    (field "epoch" _.GetInt64())
-                    (field "reason" _.GetString())
-            | "budget_exceeded" -> field "limit" _.GetInt32() |> Result.map ReplayError.BudgetExceeded
-            | "history_purged" -> Ok ReplayError.HistoryPurged
-            | _ -> fail ()
-        | _ -> fail ()
-
 /// <summary>What finalizing reads about a command before deciding anything.</summary>
 type internal FinalizeTarget =
     { Machine: MachineId
@@ -219,39 +166,8 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     /// cases have to be told apart on the way back out. A domain error is the application's own
     /// value, encoded by its codec; a machine reason and a replay error are this library's.
     /// </summary>
-    let encodeFailure (failure: CommandFailure<'Err>) : Result<string, StoreError> =
-        match failure with
-        | CommandFailure.Domain error ->
-            options.ErrorCodec.Encode error
-            |> Result.mapError Db.toStoreError
-            |> Result.map (fun encoded -> $"""{{"domain":%s{encoded}}}""")
-        | CommandFailure.Machine reason -> Ok $"""{{"machine":%s{JsonSerializer.Serialize reason}}}"""
-        | CommandFailure.Replay error -> Ok $"""{{"replay":%s{ReplayMapping.toJson error}}}"""
-
-    let readFailure (json: string) : Result<CommandFailure<'Err>, StoreError> =
-        match Db.parseJson (nameof CommandFailure) json with
-        | Error error -> Error error
-        | Ok parsed ->
-            use document = parsed
-            let root = document.RootElement
-
-            match root.TryGetProperty "domain" with
-            | true, domain ->
-                domain.GetRawText()
-                |> options.ErrorCodec.Decode
-                |> Result.mapError Db.toStoreError
-                |> Result.map CommandFailure.Domain
-            | _ ->
-                match root.TryGetProperty "machine", root.TryGetProperty "replay" with
-                | (true, machine), _ when machine.ValueKind = JsonValueKind.String ->
-                    Ok(CommandFailure.Machine(machine.GetString()))
-                | _, (true, replay) -> ReplayMapping.ofJson replay |> Result.map CommandFailure.Replay
-                | _ ->
-                    Error(
-                        Db.decodeFailure
-                            (nameof CommandFailure)
-                            "a command error carried no domain, machine or replay tag"
-                    )
+    let encodeFailure failure =
+        FailureEncoding.encode options.ErrorCodec failure
 
     /// The exited and entered paths, stored as JSON arrays of state ids.
     let encodePath (states: StateId list) : string =
@@ -373,18 +289,26 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
             else
                 Some(transitionRow reader)
 
-        let error =
-            let marker = reader.GetOrdinal "error"
-
-            if reader.IsDBNull marker then
-                None
-            else
-                Some(Row.string reader "error")
-
         let failure () =
-            match error with
-            | Some error -> readFailure error
-            | None -> Error(Db.decodeFailure (nameof CommandResult) "a failed command has no recorded error")
+            let optional column =
+                if reader.IsDBNull(reader.GetOrdinal column) then
+                    None
+                else
+                    Some(Row.string reader column)
+
+            FailureEncoding.decode
+                options.ErrorCodec
+                { Kind = optional "failure_kind"
+                  Domain = optional "domain_error"
+                  Machine = optional "machine_reason"
+                  Replay =
+                    optional "replay_kind"
+                    |> Option.map (fun kind ->
+                        kind,
+                        int (Row.int64 reader "failure_version"),
+                        Row.int64 reader "failure_epoch",
+                        Row.string reader "replay_reason",
+                        int (Row.int64 reader "failure_budget")) }
 
         EnumCodec.read Row.string EnumCodec.commandStatus "command_status" reader
         |> Result.bind (fun status ->
@@ -484,12 +408,20 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     let recordError
         (now: int64)
         (commandId: CommandId)
-        (error: string)
+        (error: EncodedFailure)
         : StoreProgram<WriteAccess, (string * Param) list, SqliteDataReader, unit> =
+        let fields = FailureEncoding.fields error
+
         StoreProgram.executeDiscard
             insertError
             [ Params.commandId "@command_id" commandId
-              "@error", Param.Text error
+              "@kind", Param.Text fields.Kind
+              "@domain", Param.Text fields.Domain
+              "@reason", Param.Text fields.Reason
+              "@replay_kind", Param.Text fields.ReplayKind
+              "@version", Param.Integer(int64 fields.Version)
+              "@failure_epoch", Param.Integer fields.Epoch
+              "@budget", Param.Integer(int64 fields.Budget)
               "@now", Param.Integer now ]
 
     /// <summary>
@@ -587,7 +519,7 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     /// A rejection or a dead letter. The failure is encoded before the write begins, so the
     /// transaction only writes.
     /// </summary>
-    let fail (resolve: string -> Resolution<'EntityId, 'State, 'Event, 'Action>) commandId token failure ct =
+    let fail (resolve: EncodedFailure -> Resolution<'EntityId, 'State, 'Event, 'Action>) commandId token failure ct =
         backgroundTaskResult {
             let! encoded = encodeFailure failure
             return! finalize commandId token (resolve encoded) ct

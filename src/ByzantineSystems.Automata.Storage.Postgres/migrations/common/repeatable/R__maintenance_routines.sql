@@ -197,7 +197,10 @@ INSERT INTO $schema$.entity_purge (machine_id, entity_id, max_purged_effective_a
     ON CONFLICT (machine_id,
         entity_id)
         DO UPDATE SET
-            max_purged_effective_at = GREATEST ($schema$.entity_purge.max_purged_effective_at, EXCLUDED.max_purged_effective_at)), errors AS (
+            max_purged_effective_at = GREATEST ($schema$.entity_purge.max_purged_effective_at, EXCLUDED.max_purged_effective_at)), domain_errors AS (
+            DELETE FROM $schema$.command_error_domain e USING doomed d WHERE e.command_id = d.command_id), machine_errors AS (
+            DELETE FROM $schema$.command_error_machine e USING doomed d WHERE e.command_id = d.command_id), replay_errors AS (
+            DELETE FROM $schema$.command_error_replay e USING doomed d WHERE e.command_id = d.command_id), errors AS (
             DELETE FROM $schema$.command_error e
             USING doomed d
             WHERE e.command_id = d.command_id), undelivered AS (
@@ -649,4 +652,3 @@ END IF;
     RETURN v_removed;
 END
 $$;
-

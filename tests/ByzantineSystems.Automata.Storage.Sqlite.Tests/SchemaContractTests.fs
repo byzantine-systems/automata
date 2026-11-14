@@ -20,7 +20,39 @@ let private refuses (expected: int) (what: string) (action: unit -> unit) =
 let private invariantTests =
     testList
         "invariants"
-        [ fixture "an entity has at most one unblocked open command"
+        [ fixture "failure children are exclusive and replay fields are checked"
+          <| fun db ->
+              insertCommand db []
+
+              refuses Code.constraintCheck "unknown kind" (fun () ->
+                  exec db "INSERT INTO fsm_command_error SELECT command_id, 'unknown', 0 FROM fsm_command" [])
+
+              exec db "INSERT INTO fsm_command_error SELECT command_id, 'replay', 0 FROM fsm_command" []
+
+              refuses Code.constraintForeignKey "wrong child kind" (fun () ->
+                  exec
+                      db
+                      "INSERT INTO fsm_command_error_machine(command_id, reason) SELECT command_id, '' FROM fsm_command"
+                      [])
+
+              refuses Code.constraintCheck "irrelevant replay fields" (fun () ->
+                  exec
+                      db
+                      "INSERT INTO fsm_command_error_replay(command_id, replay_kind, version) SELECT command_id, 'history_purged', 1 FROM fsm_command"
+                      [])
+
+              exec
+                  db
+                  "INSERT INTO fsm_command_error_replay(command_id, replay_kind) SELECT command_id, 'history_purged' FROM fsm_command"
+                  []
+
+              refuses 1555 "second child" (fun () ->
+                  exec
+                      db
+                      "INSERT INTO fsm_command_error_replay(command_id, replay_kind) SELECT command_id, 'history_purged' FROM fsm_command"
+                      [])
+
+          fixture "an entity has at most one unblocked open command"
           <| fun db ->
               insertCommand db []
 

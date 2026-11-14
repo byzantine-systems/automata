@@ -453,8 +453,13 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
                                                     StoreProgram.executeDiscard
                                                         insertError
                                                         [ "@command_id", Param.Integer row.command_id
-                                                          "@error",
-                                                          Param.Text(JsonSerializer.Serialize {| machine = reason |})
+                                                          "@kind", Param.Text "machine"
+                                                          "@domain", Param.Text "null"
+                                                          "@reason", Param.Text reason
+                                                          "@replay_kind", Param.Text ""
+                                                          "@version", Param.Integer 0L
+                                                          "@failure_epoch", Param.Integer 0L
+                                                          "@budget", Param.Integer 0L
                                                           "@now", Param.Integer now ]
 
                                                 do!
