@@ -143,6 +143,9 @@ type ContractInboxEnv =
         Fresh: unit -> Task<ContractStores>
     }
 
+/// The reader of an entity's belief and its history, for the contract domain.
+type ContractReader = IStateReader<ContractEntityId, ContractState, ContractEvent, ContractAction>
+
 /// The queue that delivers what a commit asked for, for the contract action domain.
 type ContractActionQueue = IActionQueue<ContractEntityId, ContractAction>
 
@@ -150,6 +153,7 @@ type ContractActionQueue = IActionQueue<ContractEntityId, ContractAction>
 type ContractActionStores =
     { Inbox: ContractInbox
       Processor: ContractProcessor
+      Reader: ContractReader
       Queue: ContractActionQueue
       Now: unit -> DateTimeOffset
       Advance: TimeSpan -> Task }
@@ -2281,6 +2285,108 @@ let actionQueueProperty name maxTests (env: ContractActionEnv) =
                 }
         ))
 
+/// Fencing and epoch conservation: a finalize that is refused (wrong expected epoch) or fenced
+/// (stale lease) writes nothing at all. The command result, the snapshot, the history and the
+/// action queue are observed before and after, and the correct commit then changes all three, so
+/// the oracle is proven able to see a write.
+let conservationProperty name maxTests (env: ContractActionEnv) =
+    testCase name (fun () ->
+        Check.One(
+            Config.QuickThrowOnFailure.WithMaxTest(maxTests),
+            fun (payload: byte) ->
+                task {
+                    let! stores = env.Fresh()
+                    let ct = CancellationToken.None
+                    let entity: ContractEntityId = entityId "conservation"
+
+                    let submission =
+                        contractSubmission env.Machine env.Version entity "k" (Ping(int payload))
+
+                    let ok label result =
+                        match result with
+                        | Ok value -> value
+                        | Error error -> failtestf "conservation: %s failed: %A" label error
+
+                    let! accepted = stores.Inbox.SubmitAsync(submission, ct)
+
+                    let commandId =
+                        accepted
+                        |> ok "submit"
+                        |> function
+                            | Accepted id -> id
+                            | _ -> failtest "expected Accepted"
+
+                    let! held = stores.Inbox.ClaimAsync(env.Machine, ClaimBatch.create 1, env.ClaimLease, ct)
+
+                    let command =
+                        held
+                        |> ok "claim"
+                        |> function
+                            | [ single ] -> single
+                            | other -> failtestf "expected one command, got %d" (List.length other)
+
+                    let draft = contractDraft env.Machine entity (Ping(int payload)) payload Idle
+
+                    let snapshotEpoch () =
+                        task {
+                            let! snapshot = stores.Reader.TryGetSnapshotAsync(env.Machine, entity, ct)
+                            return snapshot |> ok "snapshot" |> Option.map _.Epoch
+                        }
+
+                    let historyLength () =
+                        task {
+                            let! history = stores.Reader.HistoryAsync(env.Machine, entity, Page.create 10, ct)
+                            return history |> ok "history" |> List.length
+                        }
+
+                    let queueDepth () =
+                        task {
+                            let! queue =
+                                stores.Queue.ClaimAsync(env.Machine, ClaimBatch.create 10, env.ActionLease, ct)
+
+                            return queue |> ok "claim" |> List.length
+                        }
+
+                    let! snapshotBefore = snapshotEpoch ()
+                    let! historyBefore = historyLength ()
+                    let! queueBefore = queueDepth ()
+
+                    let! conflict =
+                        stores.Processor.CommitAsync(commandId, command.Token, Epoch.next Epoch.initial, draft, ct)
+
+                    Expect.equal
+                        (conflict |> ok "conflict")
+                        (FinalizeOutcome.Conflict(Epoch.next Epoch.initial, Epoch.initial))
+                        "the wrong expected epoch is refused"
+
+                    let! stale =
+                        stores.Processor.CommitAsync(commandId, LeaseToken.ofInt64 999999L, Epoch.initial, draft, ct)
+
+                    Expect.equal (stale |> ok "stale") FinalizeOutcome.LeaseLost "the stale token is fenced"
+
+                    let! snapshotAfter = snapshotEpoch ()
+                    let! historyAfter = historyLength ()
+                    let! queueAfter = queueDepth ()
+
+                    Expect.equal snapshotAfter snapshotBefore "the snapshot is untouched"
+                    Expect.equal historyAfter historyBefore "the history is untouched"
+                    Expect.equal queueAfter queueBefore "the queue is untouched"
+
+                    let! landed = stores.Processor.CommitAsync(commandId, command.Token, Epoch.initial, draft, ct)
+
+                    Expect.equal (landed |> ok "commit") (Finalized(Epoch.next Epoch.initial)) "the holder commits"
+
+                    let! snapshotFinal = snapshotEpoch ()
+                    Expect.equal snapshotFinal (Some(Epoch.next Epoch.initial)) "the snapshot advanced"
+
+                    let! historyFinal = historyLength ()
+                    Expect.equal historyFinal 1 "one transition was appended"
+
+                    let! queueFinal = queueDepth ()
+                    Expect.equal queueFinal 1 "one action was queued"
+                }
+        ))
+
 // ---------------------------------------------------------------------------------------------
 // The history equations.
 //
@@ -2290,8 +2396,6 @@ let actionQueueProperty name maxTests (env: ContractActionEnv) =
 // status, a page is the log filtered by an exclusive epoch cursor and truncated by the limit,
 // and a page pinned to a cursor does not move as the log grows behind it.
 // ---------------------------------------------------------------------------------------------
-
-type ContractReader = IStateReader<ContractEntityId, ContractState, ContractEvent, ContractAction>
 
 /// The stores one provider supplies per generated history case, plus its view of now.
 type ContractHistoryStores =

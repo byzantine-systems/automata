@@ -136,6 +136,8 @@ module Conformance =
                   s.ActionCases
                   sut.Action
 
+              ContractProperties.conservationProperty "fenced writes change nothing at all" s.ActionCases sut.Action
+
               ContractProperties.inboxReachability
                   "the generated inbox traces reach every behavior class"
                   sut.Inbox

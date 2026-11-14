@@ -99,15 +99,7 @@ let private contractActionEnv () : ContractActionEnv =
     let encode, decode = EntityKey.forEntityId<ContractEntity>
 
     let stores () =
-        { Inbox =
-            PostgresCommandInbox<ContractEntityId, ContractEvent>(
-                { Context = context ()
-                  EventCodec = Serialization.systemTextJson<ContractEvent> ()
-                  EntityIdEncode = encode
-                  EntityIdDecode = decode }
-            )
-            :> ContractInbox
-          Processor =
+        let processor =
             PostgresCommandProcessorStore<ContractEntityId, ContractState, ContractEvent, ContractAction, ContractError>(
                 { Context = context ()
                   StateCodec = Serialization.systemTextJson<ContractState> ()
@@ -117,7 +109,17 @@ let private contractActionEnv () : ContractActionEnv =
                   EntityIdEncode = encode
                   EntityIdDecode = decode }
             )
-            :> ContractProcessor
+
+        { Inbox =
+            PostgresCommandInbox<ContractEntityId, ContractEvent>(
+                { Context = context ()
+                  EventCodec = Serialization.systemTextJson<ContractEvent> ()
+                  EntityIdEncode = encode
+                  EntityIdDecode = decode }
+            )
+            :> ContractInbox
+          Processor = processor :> ContractProcessor
+          Reader = processor :> ContractReader
           Queue =
             PostgresActionQueue<ContractEntityId, ContractAction>(
                 { Context = context ()

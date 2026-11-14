@@ -101,15 +101,7 @@ let private contractActionEnv () : ContractActionEnv =
     let stores () =
         let db = fixture "contract-action"
 
-        { Inbox =
-            SqliteCommandInbox<ContractEntityId, ContractEvent>(
-                { Context = db.Context
-                  EventCodec = Serialization.systemTextJson<ContractEvent> ()
-                  EntityIdEncode = encode
-                  EntityIdDecode = decode }
-            )
-            :> ContractInbox
-          Processor =
+        let processor =
             SqliteCommandProcessorStore<ContractEntityId, ContractState, ContractEvent, ContractAction, ContractError>(
                 { Context = db.Context
                   ActionDelivery = ActionDelivery.Deliver(ActionQueueName.create "sqlite_actions")
@@ -120,7 +112,17 @@ let private contractActionEnv () : ContractActionEnv =
                   EntityIdEncode = encode
                   EntityIdDecode = decode }
             )
-            :> ContractProcessor
+
+        { Inbox =
+            SqliteCommandInbox<ContractEntityId, ContractEvent>(
+                { Context = db.Context
+                  EventCodec = Serialization.systemTextJson<ContractEvent> ()
+                  EntityIdEncode = encode
+                  EntityIdDecode = decode }
+            )
+            :> ContractInbox
+          Processor = processor :> ContractProcessor
+          Reader = processor :> ContractReader
           Queue =
             SqliteActionQueue<ContractEntityId, ContractAction>(
                 { Context = db.Context
