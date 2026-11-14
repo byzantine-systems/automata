@@ -3,10 +3,9 @@ namespace ByzantineSystems.Automata.Storage.Internal
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
 
-/// <summary>A committed draft with its four payloads already encoded, so the transaction only writes.</summary>
+/// <summary>A committed draft with its state and action payloads encoded before writing.</summary>
 type internal EncodedDraft<'EntityId, 'State, 'Event, 'Action> =
     { Source: TransitionDraft<'EntityId, 'State, 'Event, 'Action>
-      EventJson: string
       ActionsJson: string
       FromJson: string
       ToJson: string }

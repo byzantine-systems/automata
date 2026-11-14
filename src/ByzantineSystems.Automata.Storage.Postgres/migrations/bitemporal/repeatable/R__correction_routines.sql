@@ -127,7 +127,7 @@ $$;
 
 CREATE OR REPLACE FUNCTION $temporal_schema$.commit_correction (p_command_id bigint, p_lease_token bigint, p_expected_epoch bigint, p_valid_from timestamptz,
     p_states jsonb[], p_statuses text[], p_valid_froms timestamptz[], p_epochs bigint[], p_command_ids bigint[], p_chart_versions integer[],
-    p_instance_status $schema$.instance_status, p_event jsonb, p_from_state jsonb, p_to_state jsonb, p_handled_by text, p_exited text[], p_entered text[])
+    p_instance_status $schema$.instance_status, p_from_state jsonb, p_to_state jsonb, p_handled_by text, p_exited text[], p_entered text[])
     RETURNS TABLE (
         outcome $schema$.finalize_outcome,
         epoch bigint,
@@ -183,7 +183,7 @@ END IF;
         RAISE EXCEPTION 'a correction commit requires at least one belief' USING ERRCODE = 'invalid_parameter_value';
     END IF;
     PERFORM
-        $schema$.append_transition (standing.machine_id, standing.entity_id, p_expected_epoch + 1, p_command_id, standing.chart_version, p_event, '[]', p_from_state, p_to_state, p_handled_by, p_exited, p_entered, p_instance_status, p_valid_from);
+        $schema$.append_transition (standing.machine_id, standing.entity_id, p_expected_epoch + 1, p_command_id, standing.chart_version, '[]', p_from_state, p_to_state, p_handled_by, p_exited, p_entered, p_instance_status, p_valid_from);
     PERFORM
         $temporal_schema$.rewrite_beliefs (standing.machine_id, standing.entity_id, p_valid_from, p_states, p_statuses, p_valid_froms, p_epochs, p_command_ids, p_chart_versions);
     PERFORM

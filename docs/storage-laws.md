@@ -48,3 +48,12 @@ identity go to `action_quarantine`, keyed by queue and message ID with raw evide
 archiving share the raw fence and transaction. Action-archive retention purges quarantine with
 the same bounded batch budget. Provider properties mix poison positions with healthy work and
 check durable quarantine, fencing and retention; shared conformance checks ordinary poison work.
+
+## Command-owned events
+
+The submitted command owns the event. Finalization does not re-encode or replace it from the
+draft. History, results and replay suffixes join the command by its primary key. Both databases
+reject event updates; PostgreSQL's narrow event guard is brought forward from Phase H because
+joined history depends on it. The shared event-ownership property deliberately supplies a
+different draft event and checks both result and history. Retention keeps the command and its
+transition together. Correction transitions use their own correction command's missed event.

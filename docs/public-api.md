@@ -125,3 +125,9 @@ SQLite uses the same explicit delivery argument. `Deliver` queues actions in the
 `Migrator.migrate logger target` takes `{ ConnectionString; Schema; Beliefs }` and returns `Result<MigrationReport, MigrationError>`. `SchemaName` is the validated SQL injection boundary (default `fsm`). The tool accepts `--schema` / `BS_AUTOMATA_SCHEMA` and `--beliefs snapshot|bitemporal` / `BS_AUTOMATA_BELIEFS`; snapshot is the default. Enabling bitemporality later seeds the current snapshots. Disabling it returns `MigrationError.ProfileMismatch`, never an automatic drop. Phase E uses a clean reset of pre-E databases; no data-preserving upgrade is supplied.
 
 For a Generic Host, `AddAutomataPostgres services configuration` binds `PostgresStoreSettings` from `Automata:Postgres` (`ConnectionStringName`, `Schema`, `Beliefs`, `Listener`) and validates on startup before creating a pool. It registers the shared `NpgsqlDataSource`, `PostgresContext`, typed `BeliefModel`, and `ListenerConnection`. Callers choose the matching typed store at the composition root; boot checks the database profile. Generated `…Storage.Postgres.Schema` types remain unsupported. See [schema evolution](schema-evolution.md) for layout and reset/opt-in recipes.
+# Phase G storage ownership
+
+`TransitionDraft.Event` describes the decision, but a SQL store's persisted event is authoritative
+from the submitted command. Finalization no longer invokes `EventCodec.Encode` or stores a second
+event copy. A mismatched low-level draft cannot rewrite the submitted request. History, result
+and replay interfaces continue returning the event through their existing types.

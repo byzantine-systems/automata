@@ -141,7 +141,7 @@ let tests =
                       exec
                           db.Db
                           "INSERT INTO fsm_transition
-                           SELECT machine_id, entity_id, epoch + 1, command_id, chart_version, event, actions,
+                           SELECT machine_id, entity_id, epoch + 1, command_id, chart_version, actions,
                                   from_state, to_state, handled_by, exited, entered, status, effective_at, committed_at
                            FROM fsm_transition;"
                           [])

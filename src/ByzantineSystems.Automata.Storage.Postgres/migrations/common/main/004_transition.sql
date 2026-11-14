@@ -9,7 +9,7 @@
 -- The answer $schema$.finalize_command gives. A checked text domain, like the others.
 CREATE DOMAIN $schema$.finalize_outcome AS text CONSTRAINT finalize_outcome_valid CHECK (VALUE IN ('finalized', 'already_finalized', 'conflict', 'lease_lost'));
 
-CREATE TABLE $schema$.transition (machine_id text NOT NULL, entity_id text NOT NULL, epoch bigint NOT NULL, command_id bigint NOT NULL, chart_version integer NOT NULL, event jsonb NOT NULL, actions jsonb NOT NULL, from_state jsonb NOT NULL, to_state jsonb NOT NULL,
+CREATE TABLE $schema$.transition (machine_id text NOT NULL, entity_id text NOT NULL, epoch bigint NOT NULL, command_id bigint NOT NULL, chart_version integer NOT NULL, actions jsonb NOT NULL, from_state jsonb NOT NULL, to_state jsonb NOT NULL,
     -- Which node in the chain handled the event, and the exit and entry paths
     -- around the least common ancestor. Recorded because resolution is a
     -- bubbling search: knowing the answer without knowing who gave it makes an

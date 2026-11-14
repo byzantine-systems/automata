@@ -306,7 +306,6 @@ module main =
           epoch: int64
           command_id: int64
           chart_version: int64
-          event: string
           actions: string
           from_state: string
           to_state: string
@@ -333,9 +332,6 @@ module main =
                     ProviderDbType = None }
                   { WriteColumn.Name = "chart_version"
                     Value = box this.chart_version
-                    ProviderDbType = None }
-                  { WriteColumn.Name = "event"
-                    Value = box this.event
                     ProviderDbType = None }
                   { WriteColumn.Name = "actions"
                     Value = box this.actions

@@ -1,5 +1,5 @@
 -- Atomic command completion. Expected fencing outcomes return before any write.
-CREATE OR REPLACE FUNCTION $schema$.finish_command (p_command_id bigint, p_lease_token bigint, p_expected_epoch bigint, p_status $schema$.command_status, p_error jsonb DEFAULT NULL, p_state jsonb DEFAULT NULL, p_instance_status $schema$.instance_status DEFAULT NULL, p_effective_at timestamptz DEFAULT NULL, p_event jsonb DEFAULT NULL, p_actions jsonb DEFAULT NULL, p_from_state jsonb DEFAULT NULL, p_to_state jsonb DEFAULT NULL, p_handled_by text DEFAULT NULL, p_exited text[] DEFAULT NULL, p_entered text[] DEFAULT NULL)
+CREATE OR REPLACE FUNCTION $schema$.finish_command (p_command_id bigint, p_lease_token bigint, p_expected_epoch bigint, p_status $schema$.command_status, p_error jsonb DEFAULT NULL, p_state jsonb DEFAULT NULL, p_instance_status $schema$.instance_status DEFAULT NULL, p_effective_at timestamptz DEFAULT NULL, p_actions jsonb DEFAULT NULL, p_from_state jsonb DEFAULT NULL, p_to_state jsonb DEFAULT NULL, p_handled_by text DEFAULT NULL, p_exited text[] DEFAULT NULL, p_entered text[] DEFAULT NULL)
     RETURNS TABLE (
         outcome $schema$.finalize_outcome,
         epoch bigint,
@@ -17,7 +17,7 @@ BEGIN
         RAISE EXCEPTION 'not a terminal status: %', p_status
             USING ERRCODE = 'invalid_parameter_value';
     END IF;
-    IF p_status = 'succeeded' AND (p_state IS NULL OR p_event IS NULL OR p_effective_at IS NULL) THEN
+    IF p_status = 'succeeded' AND (p_state IS NULL OR p_effective_at IS NULL) THEN
         RAISE EXCEPTION 'a succeeded command requires its transition'
             USING ERRCODE = 'invalid_parameter_value';
     END IF;
@@ -49,7 +49,7 @@ BEGIN
             RETURN;
         END IF;
         PERFORM
-            $schema$.append_transition (standing.machine_id, standing.entity_id, p_expected_epoch + 1, p_command_id, standing.chart_version, p_event, p_actions, p_from_state, p_to_state, p_handled_by, p_exited, p_entered, p_instance_status, p_effective_at);
+            $schema$.append_transition (standing.machine_id, standing.entity_id, p_expected_epoch + 1, p_command_id, standing.chart_version, p_actions, p_from_state, p_to_state, p_handled_by, p_exited, p_entered, p_instance_status, p_effective_at);
         PERFORM
             $schema$.set_entity_state (standing.machine_id, standing.entity_id, p_state, p_instance_status, p_expected_epoch + 1, p_command_id, standing.chart_version, p_effective_at);
         IF p_actions IS NOT NULL AND JSONB_ARRAY_LENGTH(p_actions) > 0 THEN

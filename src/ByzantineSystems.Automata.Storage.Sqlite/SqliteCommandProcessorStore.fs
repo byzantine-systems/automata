@@ -144,22 +144,19 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
         (draft: TransitionDraft<'EntityId, 'State, 'Event, 'Action>)
         : Result<EncodedDraft<'EntityId, 'State, 'Event, 'Action>, StoreError> =
         match
-            options.EventCodec.Encode draft.Event,
             options.ActionCodec.Encode draft.Actions,
             options.StateCodec.Encode draft.FromState,
             options.StateCodec.Encode draft.ToState
         with
-        | Ok event, Ok actions, Ok fromState, Ok toState ->
+        | Ok actions, Ok fromState, Ok toState ->
             Ok
                 { Source = draft
-                  EventJson = event
                   ActionsJson = actions
                   FromJson = fromState
                   ToJson = toState }
-        | Error error, _, _, _
-        | _, Error error, _, _
-        | _, _, Error error, _
-        | _, _, _, Error error -> Error(Db.toStoreError error)
+        | Error error, _, _
+        | _, Error error, _
+        | _, _, Error error -> Error(Db.toStoreError error)
 
     /// <summary>
     /// The failure column is a tagged envelope rather than the bare domain error, because the
@@ -191,25 +188,27 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     /// into a compile error in this reader rather than a value it silently leaves out. Shared
     /// by the history page and the result read, so one row shape has one reader.
     /// </summary>
-    let transitionRow (reader: SqliteDataReader) : main.fsm_transition =
-        { machine_id = Row.string reader "machine_id"
-          entity_id = Row.string reader "entity_id"
-          epoch = Row.int64 reader "epoch"
-          command_id = Row.int64 reader "command_id"
-          chart_version = Row.int64 reader "chart_version"
-          event = Row.string reader "event"
-          actions = Row.string reader "actions"
-          from_state = Row.string reader "from_state"
-          to_state = Row.string reader "to_state"
-          handled_by = Row.string reader "handled_by"
-          exited = Row.string reader "exited"
-          entered = Row.string reader "entered"
-          status = Row.string reader "status"
-          effective_at = Row.int64 reader "effective_at"
-          committed_at = Row.int64 reader "committed_at" }
+    let transitionRow (reader: SqliteDataReader) : main.fsm_transition * string =
+        let row: main.fsm_transition =
+            { machine_id = Row.string reader "machine_id"
+              entity_id = Row.string reader "entity_id"
+              epoch = Row.int64 reader "epoch"
+              command_id = Row.int64 reader "command_id"
+              chart_version = Row.int64 reader "chart_version"
+              actions = Row.string reader "actions"
+              from_state = Row.string reader "from_state"
+              to_state = Row.string reader "to_state"
+              handled_by = Row.string reader "handled_by"
+              exited = Row.string reader "exited"
+              entered = Row.string reader "entered"
+              status = Row.string reader "status"
+              effective_at = Row.int64 reader "effective_at"
+              committed_at = Row.int64 reader "committed_at" }
+
+        row, Row.string reader "event"
 
     let toTransition
-        (row: main.fsm_transition)
+        ((row, eventJson): main.fsm_transition * string)
         : Result<CommittedTransition<'EntityId, 'State, 'Event, 'Action>, StoreError> =
         let decode (codec: Codec<'T>) (json: string) =
             codec.Decode json |> Result.mapError Db.toStoreError
@@ -220,7 +219,7 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                 |> options.EntityIdDecode
                 |> Result.mapError (Db.decodeFailure "EntityId")
 
-            let! event = decode options.EventCodec row.event
+            let! event = decode options.EventCodec eventJson
             let! actions = decode options.ActionCodec row.actions
             let! fromState = decode options.StateCodec row.from_state
             let! toState = decode options.StateCodec row.to_state
@@ -381,8 +380,7 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                 StoreProgram.executeDiscard
                     insertTransition
                     (written
-                     @ [ "@event", Param.Text encoded.EventJson
-                         "@actions", Param.Text encoded.ActionsJson
+                     @ [ "@actions", Param.Text encoded.ActionsJson
                          "@from_state", Param.Text encoded.FromJson
                          "@to_state", Param.Text encoded.ToJson
                          "@handled_by", Param.Text(StateId.value draft.HandledBy)

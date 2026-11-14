@@ -30,7 +30,8 @@ the caller's cancellation token throughout. It uses these common schema-qualifie
    current `epoch`, stored `status`, `machine_id`, `entity_id`, and `chart_version`.
 2. If already finalized or lease-lost, return that verdict without writing. If the live epoch
    differs from the expected epoch, return `FinalizeOutcome.Conflict(expected, actual)`.
-3. `append_transition(...)` writes the correction's own transition with **no actions**.
+3. `append_transition(...)` writes the correction's own transition with **no actions**. It no
+   longer accepts an event payload: history reads the immutable event of this correction command.
 4. `set_entity_state(...)` writes its final replayed state at `expected + 1`, attributed to
    this correction command, regardless of how the custom implementation represents history.
 5. Write any application-owned historical facts in the same transaction.

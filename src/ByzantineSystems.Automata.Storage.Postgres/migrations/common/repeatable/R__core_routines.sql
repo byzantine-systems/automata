@@ -108,14 +108,14 @@ CREATE OR REPLACE FUNCTION $schema$.set_entity_state (p_machine text, p_entity t
             epoch;
 $$;
 
-CREATE OR REPLACE FUNCTION $schema$.append_transition (p_machine text, p_entity text, p_epoch bigint, p_command bigint, p_version integer, p_event jsonb, p_actions jsonb, p_from jsonb, p_to jsonb, p_handled text, p_exited text[], p_entered text[], p_status $schema$.instance_status, p_at timestamptz)
+CREATE OR REPLACE FUNCTION $schema$.append_transition (p_machine text, p_entity text, p_epoch bigint, p_command bigint, p_version integer, p_actions jsonb, p_from jsonb, p_to jsonb, p_handled text, p_exited text[], p_entered text[], p_status $schema$.instance_status, p_at timestamptz)
     RETURNS bigint
     LANGUAGE sql
     VOLATILE PARALLEL UNSAFE
     SET search_path = pg_catalog, pg_temp
     AS $$
-    INSERT INTO $schema$.transition (machine_id, entity_id, epoch, command_id, chart_version, event, actions, from_state, to_state, handled_by, exited, entered, status, effective_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+    INSERT INTO $schema$.transition (machine_id, entity_id, epoch, command_id, chart_version, actions, from_state, to_state, handled_by, exited, entered, status, effective_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
     RETURNING
         epoch;
 $$;
@@ -166,4 +166,3 @@ BEGIN
     RETURN TRUE;
 END
 $$;
-

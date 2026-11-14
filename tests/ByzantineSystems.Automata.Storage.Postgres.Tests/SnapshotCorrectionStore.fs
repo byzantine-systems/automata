@@ -66,7 +66,6 @@ type SnapshotCorrectionStore<'EntityId, 'State, 'Event, 'Action, 'Err>
             Tap.start cancellationToken (fun () ->
                 backgroundTaskResult {
                     let draft = correction.Transition
-                    let! event = options.EventCodec.Encode draft.Event |> Result.mapError Db.toStoreError
                     let! fromState = options.StateCodec.Encode draft.FromState |> Result.mapError Db.toStoreError
                     let! toState = options.StateCodec.Encode draft.ToState |> Result.mapError Db.toStoreError
                     use! connection = options.Context.DataSource.OpenConnectionAsync(cancellationToken)
@@ -117,7 +116,7 @@ type SnapshotCorrectionStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                     | "finalized" ->
                         use write =
                             new NpgsqlCommand(
-                                $"SELECT {name}.append_transition(@machine,@entity,@epoch,@id,@version,@event::jsonb,'[]'::jsonb,
+                                $"SELECT {name}.append_transition(@machine,@entity,@epoch,@id,@version,'[]'::jsonb,
                               @from::jsonb,@to::jsonb,@handled,@exited,@entered,@status::{name}.instance_status,@at);
                           SELECT {name}.set_entity_state(@machine,@entity,@to::jsonb,@status::{name}.instance_status,@epoch,@id,@version,@at);
                           SELECT {name}.close_command(@id,'succeeded');",
@@ -131,7 +130,6 @@ type SnapshotCorrectionStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                               "epoch", box (int64 (Epoch.value (Epoch.next actual)))
                               "id", box (CommandId.value commandId)
                               "version", box version
-                              "event", box event
                               "from", box fromState
                               "to", box toState
                               "handled", box (StateId.value draft.HandledBy)

@@ -333,7 +333,7 @@ let tests =
                       use commit =
                           new NpgsqlCommand(
                               $"SELECT * FROM {owner}.commit_command(@id,@token,@expected,'succeeded',NULL,'{{}}'::jsonb,'running',@at,
-                              '{{}}'::jsonb,'[]'::jsonb,'{{}}'::jsonb,'{{}}'::jsonb,'root','{{}}'::text[],'{{}}'::text[])",
+                              '[]'::jsonb,'{{}}'::jsonb,'{{}}'::jsonb,'root','{{}}'::text[],'{{}}'::text[])",
                               connection,
                               transaction
                           )

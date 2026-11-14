@@ -210,7 +210,9 @@ let private poisonFixture (context: unit -> PostgresContext) reset actionQueue b
                             if actions then
                                 $"UPDATE pgmq.q_{actionQueue} SET message = jsonb_set(message, '{{action}}', '{{}}'::jsonb) WHERE (message->>'command_id')::bigint = {id}"
                             else
-                                $"UPDATE {name}.command SET event = '{{}}'::jsonb WHERE command_id = {id}"
+                                $"ALTER TABLE {name}.command DISABLE TRIGGER command_event_is_immutable;
+                                  UPDATE {name}.command SET event = '{{}}'::jsonb WHERE command_id = {id};
+                                  ALTER TABLE {name}.command ENABLE TRIGGER command_event_is_immutable;"
 
                         exec sql
                     }

@@ -138,7 +138,7 @@ let private stateOf (store: PostgresBitemporalMachineStore<Entity, TestState, Te
 
 let private transitionEpochs name =
     rows
-        "SELECT epoch, event FROM fsm.transition WHERE entity_id = @entity ORDER BY epoch"
+        "SELECT t.epoch, c.event FROM fsm.transition t JOIN fsm.command c ON c.command_id = t.command_id WHERE t.entity_id = @entity ORDER BY t.epoch"
         [ "entity", box name ]
         (fun reader -> reader.GetInt64 0, reader.GetString 1)
 

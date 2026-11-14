@@ -101,22 +101,19 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
         (draft: TransitionDraft<'EntityId, 'State, 'Event, 'Action>)
         : Result<EncodedDraft<'EntityId, 'State, 'Event, 'Action>, StoreError> =
         match
-            options.EventCodec.Encode draft.Event,
             options.ActionCodec.Encode draft.Actions,
             options.StateCodec.Encode draft.FromState,
             options.StateCodec.Encode draft.ToState
         with
-        | Ok event, Ok actions, Ok fromState, Ok toState ->
+        | Ok actions, Ok fromState, Ok toState ->
             Ok
                 { Source = draft
-                  EventJson = event
                   ActionsJson = actions
                   FromJson = fromState
                   ToJson = toState }
-        | Error error, _, _, _
-        | _, Error error, _, _
-        | _, _, Error error, _
-        | _, _, _, Error error -> Error(Db.toStoreError error)
+        | Error error, _, _
+        | _, Error error, _
+        | _, _, Error error -> Error(Db.toStoreError error)
 
     let states (ids: StateId list) : string list = ids |> List.map StateId.value
 
@@ -151,7 +148,6 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                   "state", Param.JsonbOrNull(Some encoded.ToJson)
                   "instance_status", Param.TextOrNull(Some(EnumCodec.encode EnumCodec.instanceStatus draft.Status))
                   "effective_at", Param.TimestampOrNull(Some draft.EffectiveAt)
-                  "event", Param.JsonbOrNull(Some encoded.EventJson)
                   "actions", Param.JsonbOrNull(Some encoded.ActionsJson)
                   "from_state", Param.JsonbOrNull(Some encoded.FromJson)
                   "to_state", Param.JsonbOrNull(Some encoded.ToJson)
@@ -219,27 +215,29 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     /// by the history page, the result read and the replay suffix, so one row shape has one
     /// reader.
     /// </summary>
-    let transitionRow (reader: NpgsqlDataReader) : fsm.transition =
-        { machine_id = Row.string reader "machine_id"
-          entity_id = Row.string reader "entity_id"
-          epoch = Row.int64 reader "epoch"
-          command_id = Row.int64 reader "command_id"
-          chart_version = Row.int32 reader "chart_version"
-          event = Row.string reader "event"
-          actions = Row.string reader "actions"
-          from_state = Row.string reader "from_state"
-          to_state = Row.string reader "to_state"
-          handled_by = Row.string reader "handled_by"
-          exited = reader.GetFieldValue<string[]>(reader.GetOrdinal "exited")
-          entered = reader.GetFieldValue<string[]>(reader.GetOrdinal "entered")
-          status = Row.string reader "status"
-          effective_at = reader.GetDateTime(reader.GetOrdinal "effective_at")
-          committed_at = reader.GetDateTime(reader.GetOrdinal "committed_at") }
+    let transitionRow (reader: NpgsqlDataReader) : fsm.transition * string =
+        let row: fsm.transition =
+            { machine_id = Row.string reader "machine_id"
+              entity_id = Row.string reader "entity_id"
+              epoch = Row.int64 reader "epoch"
+              command_id = Row.int64 reader "command_id"
+              chart_version = Row.int32 reader "chart_version"
+              actions = Row.string reader "actions"
+              from_state = Row.string reader "from_state"
+              to_state = Row.string reader "to_state"
+              handled_by = Row.string reader "handled_by"
+              exited = reader.GetFieldValue<string[]>(reader.GetOrdinal "exited")
+              entered = reader.GetFieldValue<string[]>(reader.GetOrdinal "entered")
+              status = Row.string reader "status"
+              effective_at = reader.GetDateTime(reader.GetOrdinal "effective_at")
+              committed_at = reader.GetDateTime(reader.GetOrdinal "committed_at") }
+
+        row, Row.string reader "event"
 
     /// Rebuilds a committed transition from its row. Seven decodes can fail independently, and
     /// none of them is expected: each means the row is not what this code was compiled for.
     let toTransition
-        (row: fsm.transition)
+        ((row, eventJson): fsm.transition * string)
         : Result<CommittedTransition<'EntityId, 'State, 'Event, 'Action>, StoreError> =
         let decode (codec: Codec<'T>) (json: string) =
             codec.Decode json |> Result.mapError Db.toStoreError
@@ -256,7 +254,7 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                 |> options.EntityIdDecode
                 |> Result.mapError (Db.decodeFailure "EntityId")
 
-            let! event = decode options.EventCodec row.event
+            let! event = decode options.EventCodec eventJson
             let! actions = decode options.ActionCodec row.actions
             let! fromState = decode options.StateCodec row.from_state
             let! toState = decode options.StateCodec row.to_state
@@ -516,7 +514,6 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                                    "valid_from", Param.Timestamp commit.ValidFrom
                                    "instance_status",
                                    Param.Text(EnumCodec.encode EnumCodec.instanceStatus draft.Status)
-                                   "event", Param.Jsonb encoded.EventJson
                                    "from_state", Param.Jsonb encoded.FromJson
                                    "to_state", Param.Jsonb encoded.ToJson
                                    "handled_by", Param.Text(StateId.value draft.HandledBy)

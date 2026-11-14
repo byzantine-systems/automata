@@ -107,10 +107,10 @@ let private triggerTests =
 
               exec
                   db
-                  "INSERT INTO fsm_transition (machine_id, entity_id, epoch, command_id, chart_version, event, actions,
+                  "INSERT INTO fsm_transition (machine_id, entity_id, epoch, command_id, chart_version, actions,
                                                from_state, to_state, handled_by, exited, entered, status,
                                                effective_at, committed_at)
-                   VALUES (@machine, 'entity-1', 1, @id, 1, '{}', '[]', '{}', '{}', 'root', '[]', '[]', 'running', 0, 0);"
+                   VALUES (@machine, 'entity-1', 1, @id, 1, '[]', '{}', '{}', 'root', '[]', '[]', 'running', 0, 0);"
                   [ "@machine", box machine; "@id", box id ]
 
               refuses Code.constraintTrigger "editing history" (fun () ->
@@ -165,7 +165,8 @@ let private planTests =
           <| fun db ->
               let steps = plan db (SqlResources.get "command" "history_page")
 
-              Expect.exists steps (fun step -> step.StartsWith "SEARCH fsm_transition") "a seek, not a scan"
+              Expect.exists steps (fun step -> step.StartsWith "SEARCH t " && step.Contains "fsm_transition") "the log alias seeks its index"
+              Expect.exists steps (fun step -> step.StartsWith "SEARCH c " && step.Contains "PRIMARY KEY") "the command join uses its primary key"
               noSort steps
 
           fixture "deleting a command finds its snapshot by index"

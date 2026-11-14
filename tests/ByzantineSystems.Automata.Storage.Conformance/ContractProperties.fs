@@ -804,14 +804,12 @@ let private runInboxTrace
 
                             if finished tracked then
                                 return! loop rest
-                            else if
-                                // Reschedule resets the row's lease token to the nobody-holds
-                                // sentinel, so a "stale" token of zero collides with it when the
-                                // claim's token was the first ever issued. To the store that token
-                                // is not stale at all, so this step is skipped rather than
-                                // asserted either way.
-                                token - 1L = tracked.RowToken
-                            then
+                            // Reschedule resets the row's lease token to the nobody-holds
+                            // sentinel, so a "stale" token of zero collides with it when the
+                            // claim's token was the first ever issued. To the store that token
+                            // is not stale at all, so this step is skipped rather than
+                            // asserted either way.
+                            else if token - 1L = tracked.RowToken then
                                 return! loop rest
                             else
                                 let stale = LeaseToken.ofInt64 (token - 1L)
@@ -2440,6 +2438,55 @@ type ContractHistoryEnv =
     }
 
 type private ContractTransition = CommittedTransition<ContractEntityId, ContractState, ContractEvent, ContractAction>
+
+/// A draft cannot replace the immutable event owned by its associated command.
+let eventOwnershipProperty name maxTests (env: ContractHistoryEnv) =
+    testCase name (fun () ->
+        Check.One(
+            Config.QuickThrowOnFailure.WithMaxTest(maxTests),
+            fun (payload: byte) ->
+                task {
+                    let! stores = env.Fresh()
+                    let ct = CancellationToken.None
+                    let entity: ContractEntityId = entityId "event-owner"
+                    let event = Ping(int payload)
+
+                    let! submitted =
+                        stores.Inbox.SubmitAsync(contractSubmission env.Machine env.Version entity "owned" event, ct)
+
+                    Expect.isOk submitted "submit"
+
+                    let! claimed =
+                        stores.Inbox.ClaimAsync(
+                            env.Machine,
+                            ClaimBatch.create 1,
+                            LeaseDuration.create (TimeSpan.FromMinutes 1.),
+                            ct
+                        )
+
+                    let held =
+                        match claimed with
+                        | Ok [ value ] -> value
+                        | other -> failtestf "claim: %A" other
+
+                    let draft = contractDraft env.Machine entity Pong payload Idle
+
+                    let! committed =
+                        stores.Processor.CommitAsync(held.Work.CommandId, held.Token, Epoch.initial, draft, ct)
+
+                    Expect.equal committed (Ok(Finalized(Epoch.next Epoch.initial))) "commit"
+                    let! result = stores.Processor.TryGetResultAsync(held.Work.CommandId, ct)
+                    let! history = stores.Reader.HistoryAsync(env.Machine, entity, Page.create 10, ct)
+
+                    match result, history with
+                    | Ok(Some(CommandResult.Committed result)), Ok [ history ] ->
+                        Expect.equal result.Draft.Event event "result uses the submitted event"
+                        Expect.equal history.Draft.Event event "history uses the submitted event"
+                        return true
+                    | other -> return failtestf "observations: %A" other
+                }
+                |> fun running -> running.GetAwaiter().GetResult()
+        ))
 
 type private AppendSeed =
     { Entity: byte

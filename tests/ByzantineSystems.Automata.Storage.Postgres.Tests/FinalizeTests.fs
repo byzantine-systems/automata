@@ -58,6 +58,19 @@ let tests =
         "Postgres finalize"
         [
 
+          testTask "submitted events remain immutable while command lifecycle can advance" {
+              do! reset ()
+              let! held = leased (newInbox ()) "immutable" "immutable"
+              let id = CommandId.value held.Work.CommandId
+
+              Expect.isError
+                  (exec $"UPDATE fsm.command SET event = '{{}}' WHERE command_id = {id}")
+                  "history cannot be rewritten through its command"
+
+              let! result = commit (newProcessor ()) held Epoch.initial (Active 1)
+              Expect.equal result (Finalized(Epoch.next Epoch.initial)) "lifecycle writes remain possible"
+          }
+
           testTask "committing appends the transition, advances the belief and closes the command" {
               do! reset ()
               let inbox = newInbox ()
@@ -125,10 +138,10 @@ let tests =
               // a property of the schema rather than of the code above it.
               match
                   exec
-                      "INSERT INTO fsm.transition (machine_id, entity_id, epoch, command_id, chart_version, event,
+                      "INSERT INTO fsm.transition (machine_id, entity_id, epoch, command_id, chart_version,
                                                    actions, from_state, to_state, handled_by, exited, entered,
                                                    status, effective_at)
-                       SELECT machine_id, entity_id, epoch + 1, command_id, chart_version, event, actions,
+                       SELECT machine_id, entity_id, epoch + 1, command_id, chart_version, actions,
                               from_state, to_state, handled_by, exited, entered, status, effective_at
                        FROM fsm.transition"
               with

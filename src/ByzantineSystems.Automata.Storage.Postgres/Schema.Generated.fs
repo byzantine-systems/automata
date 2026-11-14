@@ -485,8 +485,6 @@ module fsm =
           [<ProviderDbType("Integer")>]
           chart_version: int
           [<ProviderDbType("Jsonb")>]
-          event: string
-          [<ProviderDbType("Jsonb")>]
           actions: string
           [<ProviderDbType("Jsonb")>]
           from_state: string
@@ -522,9 +520,6 @@ module fsm =
                   { WriteColumn.Name = "chart_version"
                     Value = box this.chart_version
                     ProviderDbType = Some "Integer" }
-                  { WriteColumn.Name = "event"
-                    Value = box this.event
-                    ProviderDbType = Some "Jsonb" }
                   { WriteColumn.Name = "actions"
                     Value = box this.actions
                     ProviderDbType = Some "Jsonb" }

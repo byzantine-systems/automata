@@ -145,6 +145,10 @@ module Conformance =
                   behaviorClasses
 
               ContractProperties.historyProperty "the shared history equations" s.HistoryCases sut.History
+              ContractProperties.eventOwnershipProperty
+                  "the submitted command owns the transition event"
+                  s.HistoryCases
+                  sut.History
 
               match sut.Corrections with
               | Some env -> CorrectionContract.tests env

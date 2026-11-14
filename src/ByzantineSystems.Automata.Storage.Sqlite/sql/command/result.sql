@@ -9,7 +9,7 @@ SELECT
     t.epoch,
     t.command_id,
     t.chart_version,
-    t.event,
+    c.event,
     t.actions,
     t.from_state,
     t.to_state,
