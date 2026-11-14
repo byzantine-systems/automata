@@ -26,3 +26,12 @@ Reasons are PostgreSQL text, including empty strings, quotes, newlines and repre
 (U+0000 is not a PostgreSQL text value). Kinds and strategies use the existing `EnumCodec`
 spellings and checked domains. `PostgresSupervisionStoreTests` generates reasons across every
 constructor pair and checks bounded newest-first reads with insertion order breaking time ties.
+
+## Belief batches
+
+Each encoded belief row is projected into six explicitly typed arrays. Projection preserves
+row order and field association. SQL rejects null arrays, SQL-null elements, unequal lengths,
+non-ascending times and invalid fields before rewriting. JSON `null` remains a valid payload.
+Operator correction accepts an empty replacement (erase the suffix); correction commits require
+a non-empty batch. Temporal properties compare replacement against an independent half-open
+interval model, and invalid-array tests observe both live beliefs and archived system history.

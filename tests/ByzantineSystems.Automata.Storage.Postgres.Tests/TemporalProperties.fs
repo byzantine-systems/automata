@@ -4,6 +4,7 @@ open System
 open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
+open ByzantineSystems.Automata.Storage.Postgres
 open Expecto
 open FsCheck
 open TestContext
@@ -183,6 +184,87 @@ let private correctionProperty name maxTests =
 let tests =
     testList
         "Postgres temporal properties"
-        [ timelineProperty "a contiguous timeline answers ValidAt half-open and round-trips" 40
+        [ testCase "belief projection preserves every row and column" (fun () ->
+              Check.One(
+                  Config.QuickThrowOnFailure,
+                  fun (values: byte list) ->
+                      let rows: BeliefBatch.EncodedBelief list =
+                          values
+                          |> List.mapi (fun index value ->
+                              { State = string value
+                                Status = if index % 2 = 0 then "running" else "suspended"
+                                ValidFrom = baseTime.AddMinutes(float index)
+                                Epoch = int64 index + 1L
+                                CommandId = int64 value + 1L
+                                ChartVersion = 1 + index })
+
+                      match BeliefBatch.parameters rows with
+                      | [ _, Param.JsonbArray states
+                          _, Param.TextArray statuses
+                          _, Param.TimestampArray times
+                          _, Param.BigintArray epochs
+                          _, Param.BigintArray commands
+                          _, Param.IntArray versions ] ->
+                          List.length states = rows.Length
+                          && (rows
+                              |> List.indexed
+                              |> List.forall (fun (i, row) ->
+                                  let actual = states[i], statuses[i], times[i], epochs[i], commands[i], versions[i]
+
+                                  let expected =
+                                      row.State, row.Status, row.ValidFrom, row.Epoch, row.CommandId, row.ChartVersion
+
+                                  actual = expected))
+                      | _ -> false
+              ))
+
+          testTask "malformed belief arrays are rejected without changing either timeline" {
+              do! reset ()
+              believe "e1" baseTime (Active 1) 1L
+
+              let before =
+                  scalar<string> "SELECT jsonb_agg(to_jsonb(s))::text FROM fsm.instance_state s"
+
+              let historyBefore = scalar<int64> "SELECT count(*) FROM fsm.instance_state_history"
+
+              let valid =
+                  [ "ARRAY['{}'::jsonb]"
+                    "ARRAY['running']::text[]"
+                    "ARRAY['2026-01-01T00:00:00Z'::timestamptz]"
+                    "ARRAY[1::bigint]"
+                    "ARRAY[1::bigint]"
+                    "ARRAY[1]" ]
+
+              let types = [ "jsonb"; "text"; "timestamptz"; "bigint"; "bigint"; "integer" ]
+
+              for index, elementType in List.indexed types do
+                  for bad in
+                      [ $"ARRAY[]::{elementType}[]"
+                        $"ARRAY[NULL]::{elementType}[]"
+                        $"NULL::{elementType}[]" ] do
+                      let args =
+                          valid
+                          |> List.mapi (fun i value -> if i = index then bad else value)
+                          |> String.concat ","
+
+                      let statement =
+                          $"SELECT fsm_temporal.rewrite_beliefs('pg-tests','e1','2026-01-01T00:00:00Z',{args})"
+
+                      Expect.isError
+                          (exec (statement.Replace("fsm_temporal.", $"{schemaValue}_temporal.")))
+                          "invalid array rejected"
+
+                      Expect.equal
+                          (scalar<string> "SELECT jsonb_agg(to_jsonb(s))::text FROM fsm.instance_state s")
+                          before
+                          "live timeline unchanged"
+
+                      Expect.equal
+                          (scalar<int64> "SELECT count(*) FROM fsm.instance_state_history")
+                          historyBefore
+                          "system history unchanged"
+          }
+
+          timelineProperty "a contiguous timeline answers ValidAt half-open and round-trips" 40
 
           correctionProperty "a correction rewrites exactly from its cut" 40 ]

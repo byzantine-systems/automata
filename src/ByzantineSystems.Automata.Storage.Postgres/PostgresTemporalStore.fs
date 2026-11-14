@@ -176,18 +176,18 @@ type PostgresTemporalStore<'EntityId, 'State>(options: TemporalOptions<'EntityId
 
                 backgroundTaskResult {
                     // The whole timeline is encoded before anything is sent.
-                    let! payload = BeliefPayload.encode options.StateCodec beliefs
+                    let! payload = BeliefBatch.encode options.StateCodec beliefs
 
                     let! superseded =
                         Sql.runProgram
                             context
                             (StoreProgram.queryOne
                                 correctBeliefs
-                                [ Params.machineId "machine_id" machineId
-                                  Params.entityKey "entity_id" key
-                                  "expected_epoch", Param.Bigint(int64 (Epoch.value expected))
-                                  "valid_from", Param.Timestamp validFrom
-                                  "beliefs", Param.Jsonb payload ]
+                                ([ Params.machineId "machine_id" machineId
+                                   Params.entityKey "entity_id" key
+                                   "expected_epoch", Param.Bigint(int64 (Epoch.value expected))
+                                   "valid_from", Param.Timestamp validFrom ]
+                                 @ BeliefBatch.parameters payload)
                                 (fun reader ->
                                     if Row.bool reader "conflict" then
                                         Ok(CorrectionOutcome.Conflict(Db.epochOf (Row.int64 reader "actual_epoch")))

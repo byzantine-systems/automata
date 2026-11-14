@@ -502,7 +502,7 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                     // fails the correction rather than half-writing it.
                     let! encoded = encodeDraft commit.Transition
                     let head, tail = commit.Beliefs
-                    let! beliefs = BeliefPayload.encode options.StateCodec (head :: tail)
+                    let! beliefs = BeliefBatch.encode options.StateCodec (head :: tail)
                     let draft = commit.Transition
 
                     return!
@@ -510,18 +510,19 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                             context
                             (StoreProgram.queryOne
                                 finalizeCorrection
-                                [ Params.commandId "command_id" commandId
-                                  Params.commandLease "lease_token" token
-                                  "expected_epoch", Param.Bigint(int64 (Epoch.value expected))
-                                  "valid_from", Param.Timestamp commit.ValidFrom
-                                  "beliefs", Param.Jsonb beliefs
-                                  "instance_status", Param.Text(EnumCodec.encode EnumCodec.instanceStatus draft.Status)
-                                  "event", Param.Jsonb encoded.EventJson
-                                  "from_state", Param.Jsonb encoded.FromJson
-                                  "to_state", Param.Jsonb encoded.ToJson
-                                  "handled_by", Param.Text(StateId.value draft.HandledBy)
-                                  "exited", Param.TextArray(states draft.Exited)
-                                  "entered", Param.TextArray(states draft.Entered) ]
+                                ([ Params.commandId "command_id" commandId
+                                   Params.commandLease "lease_token" token
+                                   "expected_epoch", Param.Bigint(int64 (Epoch.value expected))
+                                   "valid_from", Param.Timestamp commit.ValidFrom
+                                   "instance_status",
+                                   Param.Text(EnumCodec.encode EnumCodec.instanceStatus draft.Status)
+                                   "event", Param.Jsonb encoded.EventJson
+                                   "from_state", Param.Jsonb encoded.FromJson
+                                   "to_state", Param.Jsonb encoded.ToJson
+                                   "handled_by", Param.Text(StateId.value draft.HandledBy)
+                                   "exited", Param.TextArray(states draft.Exited)
+                                   "entered", Param.TextArray(states draft.Entered) ]
+                                 @ BeliefBatch.parameters beliefs)
                                 (finalizeOutcome expected))
                             cancellationToken
                 })

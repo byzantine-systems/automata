@@ -1,5 +1,16 @@
 # Custom corrections over core PostgreSQL
 
+## Bundled temporal transport
+
+The bundled temporal routines take six parallel typed arrays: `jsonb[]` states, `text[]`
+statuses, `timestamptz[]` valid starts, `bigint[]` epochs and command IDs, and `integer[]` chart
+versions. Build them from one ordered collection of belief rows. Empty arrays erase a suffix
+for operator `CorrectAsync`; a replayed correction commit requires at least one belief.
+SQL rejects mismatched lengths, SQL-null arrays/elements and invalid ordering atomically.
+Application state payloads still use `Codec<'State>` and may encode JSON `null`.
+
+## Correction capabilities
+
 Corrections need three operations, not a particular history representation:
 
 - `ITransitionLog.SuffixAsync` supplies the ordered committed suffix and its purge completeness.
