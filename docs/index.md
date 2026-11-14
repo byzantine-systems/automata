@@ -8,9 +8,9 @@
 
 - **The chart is pure.** `Chart.resolve` takes a state and an event and returns the next state and the actions to run, or a typed error. Nothing in it touches a clock, a database or a thread.
 - **The inbox orders the work.** `Machine.enqueue` records an event in `fsm.command` and returns. At most one command per entity is claimable at a time, so claiming one excludes that entity on every host, while unrelated entities make progress concurrently.
-- **A commit is one transaction.** The processor claims a command, resolves it against the chart, and finalizes it: the transition is appended, the belief advanced, the actions queued on pgmq and the command closed, all or nothing.
+- **A commit is one transaction.** The processor claims a command, resolves it against the chart, and finalizes it: the transition is appended, the entity snapshot advanced, the actions queued on pgmq and the command closed, all or nothing.
 - **Actions are delivered at least once**, by a dispatcher that fences every acknowledgement against the delivery that claimed it.
-- **Beliefs have two time axes.** What was true and when it was believed are recorded separately, so the past can be read as it was believed at any moment, and corrected without erasing the opinion it replaces.
+- **Bitemporal history is opt-in.** With `PostgresBitemporalMachineStore`, beliefs record what was true and when it was believed separately, so the past can be read as it was believed at any moment, and corrected without erasing the opinion it replaces. The default snapshot store keeps only the current state and the transition log.
 - **Maintenance is part of the library.** A boot check refuses to start against a schema that cannot serve, and retention, lease reaping, drift reports and cross-process wake-ups run on pg_cron or in the host.
 
 ## Start here
@@ -27,4 +27,4 @@ Runnable demonstrations live under `examples/`:
 - `Supervision`: the supervisor on its own, restarting a child that crashes. `make run-example-supervision`.
 - `readme.fsx`: the README's chart, resolved in a script with nothing but `Core`.
 
-The projects target .NET 10 and PostgreSQL 19, with the `btree_gist` and `pgmq` extensions. `pg_cron` is optional.
+The projects target .NET 10 and PostgreSQL 19. `pgmq` is required; opt-in bitemporal history additionally needs `btree_gist`, and `pg_cron` is optional.

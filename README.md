@@ -27,9 +27,9 @@ stateDiagram-v2
 - **Typed and validated charts**: hierarchical and terminal states, guarded transitions, entry and exit actions, event bubbling, and accumulated construction errors.
 - **Deterministic core**: `Chart.resolve` is a pure function, so transition behavior can be tested without databases, clocks, or dependency injection.
 - **Entity-level ordering, across processes**: at most one command per entity is claimable, so claiming it excludes that entity on every host, not only in one; unrelated entities still make progress concurrently. Idempotency keys and a gapless epoch protect committed transitions.
-- **Composable durability**: storage contracts cover the command inbox, the current snapshot, the atomic end of processing a command, and action delivery. A commit appends the transition, advances the belief and queues its actions in one transaction.
+- **Composable durability**: storage contracts cover the command inbox, the current snapshot, the atomic end of processing a command, and action delivery. A commit appends the transition, advances the entity snapshot and queues its actions in one transaction.
 - **Operational resilience**: a Polly pipeline handles short-lived driver failures inside the store, the inbox handles longer delays with a database-computed backoff, and supervision policies manage machine restarts and escalation. Work that keeps dying without an outcome is dead-lettered rather than retried forever.
-- **Two time axes**: every belief records when it was true and when it was held, so you can ask what was true at 14:02 and what the system thought at 14:05, and correct the past without erasing it.
+- **Opt-in bitemporal history**: with `PostgresBitemporalMachineStore`, every belief records when it was true and when it was held, so you can ask what was true at 14:02 and what the system thought at 14:05, and correct the past without erasing it. The default snapshot store keeps only the current state and the transition log.
 - **Maintenance included**: a blocking boot check, retention, lease reaping, drift reports and cross-process wake-ups, run by pg_cron when the database allows it and by the host when it does not.
 - **Composable charts**: chart fragments are ordinary values; splice several with `yield!`, and reuse one twice with `Fragment.prefix`.
 
@@ -44,7 +44,7 @@ dotnet add package ByzantineSystems.Automata.Core
 ```
 
 >[!Note]
->As of now, charts backed by PostgreSQL assume you can install at least [pg_cron](https://github.com/citusdata/pg_cron) and [pgmq](https://github.com/pgmq/pgmq) and are running in version 18+.
+>Charts backed by PostgreSQL need [pgmq](https://github.com/pgmq/pgmq) and PostgreSQL 19+. [pg_cron](https://github.com/citusdata/pg_cron) is optional, and opt-in bitemporal history additionally requires [btree_gist](https://www.postgresql.org/docs/current/btree-gist.html).
 
 To execute charts against the PostgreSQL authority:
 
@@ -201,7 +201,7 @@ The toolkit is published as focused building blocks. Start with `Core` for pure 
 | `ByzantineSystems.Automata.Core` | Typed identifiers, transition rules, validated hierarchical charts, and pure event resolution |
 | `ByzantineSystems.Automata.Resilience` | Polly retry, timeout, and circuit-breaker policy for a store's own I/O, plus Erlang-style supervision |
 | `ByzantineSystems.Automata.Storage` | The command inbox, state reader, command processor store, and action queue contracts, plus the optional capabilities: temporal reads, corrections, boot checks, work notifications and database maintenance |
-| `ByzantineSystems.Automata.Storage.Postgres` | The PostgreSQL authority: inbox, bitemporal beliefs and corrections, transition log, pgmq action delivery, maintenance routines, JSON codecs, and embedded DbUp migrations |
+| `ByzantineSystems.Automata.Storage.Postgres` | The PostgreSQL authority: inbox, snapshot storage with opt-in bitemporal beliefs and corrections, transition log, pgmq action delivery, maintenance routines, JSON codecs, and embedded DbUp migrations |
 | `ByzantineSystems.Automata.Runtime` | The command processor, the `enqueue`/`send`/`commandResult` surface, action dispatch, observers, and machine lifecycle |
 | `ByzantineSystems.Automata.DependencyInjection` | Hosted `BackgroundService` supervision with scoped action handlers and audit persistence, and `MaintenanceService` |
 
@@ -237,5 +237,5 @@ If you have a local PostgreSQL server running:
 
 - `make test-integration` runs PostgreSQL tests when `AUTOMATA_TEST_DB` is configured.
 - `make coverage` runs every test project and generates merged Cobertura and HTML reports.
-- `make migrate` applies migrations using `BS_AUTOMATA_CONN`.
-- `make db-reset` resets the local disposable schema.
+- `make migrate` applies migrations using `BS_AUTOMATA_CONN`; `BS_AUTOMATA_SCHEMA` (default `fsm`) and `BS_AUTOMATA_BELIEFS` (`snapshot` or `bitemporal`, default `snapshot`) select the installation.
+- `make db-reset` drops and re-migrates the local disposable schema; pass `BELIEFS=bitemporal` to install the temporal module. `make schema-generate`/`make schema-check` target the snapshot default.
