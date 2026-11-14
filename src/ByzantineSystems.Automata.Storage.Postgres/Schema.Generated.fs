@@ -399,7 +399,7 @@ module fsm =
           kind: string
           [<ProviderDbType("Text")>]
           strategy: string
-          [<ProviderDbType("Jsonb")>]
+          [<ProviderDbType("Text")>]
           reason: string
           [<ProviderDbType("TimestampTz")>]
           at: System.DateTime }
@@ -430,7 +430,7 @@ module fsm =
                     ProviderDbType = Some "Text" }
                   { WriteColumn.Name = "reason"
                     Value = box this.reason
-                    ProviderDbType = Some "Jsonb" }
+                    ProviderDbType = Some "Text" }
                   { WriteColumn.Name = "at"
                     Value = box this.at
                     ProviderDbType = Some "TimestampTz" } ]
@@ -445,7 +445,7 @@ module fsm =
           kind: string
           [<ProviderDbType("Text")>]
           strategy: string
-          [<ProviderDbType("Jsonb")>]
+          [<ProviderDbType("Text")>]
           reason: string
           [<ProviderDbType("TimestampTz")>]
           at: System.DateTime }
@@ -466,7 +466,7 @@ module fsm =
                     ProviderDbType = Some "Text" }
                   { WriteColumn.Name = "reason"
                     Value = box this.reason
-                    ProviderDbType = Some "Jsonb" }
+                    ProviderDbType = Some "Text" }
                   { WriteColumn.Name = "at"
                     Value = box this.at
                     ProviderDbType = Some "TimestampTz" } ]

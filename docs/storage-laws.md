@@ -19,3 +19,10 @@ children; readers reject incomplete headers. Global lifecycle completeness belon
 `FailureTests` exercises all six leaf constructors on every generated case. Shared finalize
 properties exercise each case against both providers. Schema tests check invalid child shapes;
 the PostgreSQL purge contract walks transitive foreign keys as well as direct command children.
+
+## Supervision audit
+
+Reasons are PostgreSQL text, including empty strings, quotes, newlines and representable Unicode
+(U+0000 is not a PostgreSQL text value). Kinds and strategies use the existing `EnumCodec`
+spellings and checked domains. `PostgresSupervisionStoreTests` generates reasons across every
+constructor pair and checks bounded newest-first reads with insertion order breaking time ties.

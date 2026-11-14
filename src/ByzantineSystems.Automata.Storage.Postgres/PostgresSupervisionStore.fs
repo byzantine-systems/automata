@@ -1,7 +1,6 @@
 namespace ByzantineSystems.Automata.Storage.Postgres
 
 open System
-open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
@@ -9,14 +8,6 @@ open ByzantineSystems.Automata.Storage
 open ByzantineSystems.Automata.Storage.Internal
 open FsToolkit.ErrorHandling
 open Npgsql
-
-[<RequireQualifiedAccess>]
-module private SupervisionMapping =
-
-    let private reasonCodec = Serialization.systemTextJson<string> ()
-
-    let reasonFromJson (json: string) =
-        reasonCodec.Decode json |> Result.mapError Db.toStoreError
 
 /// <summary>PostgreSQL append-only supervision audit writer backed by a pooled data source.</summary>
 type PostgresSupervisionStore(context: PostgresContext) =
@@ -38,7 +29,7 @@ type PostgresSupervisionStore(context: PostgresContext) =
                           "child_id", Param.Text(SupervisedChildId.value entry.ChildId)
                           "kind", Param.Text(EnumCodec.encode EnumCodec.supervisionKind entry.Kind)
                           "strategy", Param.Text(EnumCodec.encode EnumCodec.supervisionStrategy entry.Strategy)
-                          "reason", Param.Jsonb(JsonSerializer.Serialize entry.Reason)
+                          "reason", Param.Text entry.Reason
                           "at", Param.Timestamp entry.At ])
                     cancellationToken)
 
@@ -59,7 +50,7 @@ module PostgresSupervisionQueries =
             result {
                 let! kind = EnumCodec.read Row.string EnumCodec.supervisionKind "kind" reader
                 let! strategy = EnumCodec.read Row.string EnumCodec.supervisionStrategy "strategy" reader
-                let! reason = SupervisionMapping.reasonFromJson (Row.string reader "reason")
+                let reason = Row.string reader "reason"
 
                 let! supervisor =
                     Row.string reader "supervisor"
