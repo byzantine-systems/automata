@@ -57,3 +57,10 @@ reject event updates; PostgreSQL's narrow event guard is brought forward from Ph
 joined history depends on it. The shared event-ownership property deliberately supplies a
 different draft event and checks both result and history. Retention keeps the command and its
 transition together. Correction transitions use their own correction command's missed event.
+
+## Destination state
+
+An ordinary commit supplies its destination once to PostgreSQL. Transition, snapshot and the
+optional temporal timeline consume the same payload. Shared conformance compares the committed
+destination and epoch with the snapshot; temporal tests observe the timeline and existing
+rollback tests fail the temporal write after transition insertion to check atomicity.

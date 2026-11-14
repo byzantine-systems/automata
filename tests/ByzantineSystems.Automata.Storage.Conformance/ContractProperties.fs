@@ -2477,11 +2477,21 @@ let eventOwnershipProperty name maxTests (env: ContractHistoryEnv) =
                     Expect.equal committed (Ok(Finalized(Epoch.next Epoch.initial))) "commit"
                     let! result = stores.Processor.TryGetResultAsync(held.Work.CommandId, ct)
                     let! history = stores.Reader.HistoryAsync(env.Machine, entity, Page.create 10, ct)
+                    let! snapshot = stores.Reader.TryGetSnapshotAsync(env.Machine, entity, ct)
 
                     match result, history with
                     | Ok(Some(CommandResult.Committed result)), Ok [ history ] ->
                         Expect.equal result.Draft.Event event "result uses the submitted event"
                         Expect.equal history.Draft.Event event "history uses the submitted event"
+
+                        Expect.equal
+                            (snapshot
+                             |> Result.map (
+                                 Option.map (fun (value: Snapshot<ContractState>) -> value.State, value.Epoch)
+                             ))
+                            (Ok(Some(result.Draft.ToState, result.Epoch)))
+                            "snapshot and transition share exactly one destination"
+
                         return true
                     | other -> return failtestf "observations: %A" other
                 }

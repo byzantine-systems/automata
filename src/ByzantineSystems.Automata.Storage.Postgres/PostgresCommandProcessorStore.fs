@@ -145,7 +145,6 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                 let draft = encoded.Source
 
                 [ "error", Param.JsonbOrNull None
-                  "state", Param.JsonbOrNull(Some encoded.ToJson)
                   "instance_status", Param.TextOrNull(Some(EnumCodec.encode EnumCodec.instanceStatus draft.Status))
                   "effective_at", Param.TimestampOrNull(Some draft.EffectiveAt)
                   "actions", Param.JsonbOrNull(Some encoded.ActionsJson)
