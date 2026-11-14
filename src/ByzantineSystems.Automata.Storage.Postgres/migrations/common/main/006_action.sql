@@ -27,6 +27,16 @@ CREATE TABLE $schema$.action_dead_letter (machine_id text NOT NULL, entity_id te
 -- question this table is asked and the one a dead-letter rate alert runs.
 CREATE INDEX action_dead_letter_machine_idx ON $schema$.action_dead_letter (machine_id, recorded_at DESC);
 
+-- Corrupt transport envelopes may have no business identity. Preserve their raw evidence
+-- under the queue identity instead of inventing a command reference. Action-archive retention
+-- purges these rows in bounded batches alongside pgmq archives.
+CREATE TABLE $schema$.action_quarantine (
+    queue text NOT NULL, msg_id bigint NOT NULL, message jsonb NOT NULL,
+    reason text NOT NULL, deliveries integer NOT NULL CHECK (deliveries > 0),
+    recorded_at timestamptz NOT NULL DEFAULT STATEMENT_TIMESTAMP(), PRIMARY KEY (queue, msg_id)
+);
+CREATE INDEX action_quarantine_retention_idx ON $schema$.action_quarantine (queue, recorded_at, msg_id);
+
 -- TODO: no autovacuum settings, as in 002_command.sql. This table should stay
 -- small, because a healthy deployment writes to it rarely. A benchmark would
 -- need to show the opposite before tuning it.

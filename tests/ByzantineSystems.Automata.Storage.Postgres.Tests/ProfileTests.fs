@@ -64,7 +64,7 @@ let private resetSnapshot () : Task =
 
         execute
             $"TRUNCATE {name}.entity_state, {name}.command, {name}.command_error, {name}.command_error_domain, {name}.command_error_machine, {name}.command_error_replay, {name}.transition,
-            {name}.machine_chart_version, {name}.supervision_event, {name}.action_dead_letter,
+            {name}.machine_chart_version, {name}.supervision_event, {name}.action_dead_letter, {name}.action_quarantine,
             {name}.machine_maintenance, {name}.command_correction, {name}.entity_purge RESTART IDENTITY;
             SELECT pgmq.purge_queue('{queue}'); DELETE FROM pgmq.a_{queue}"
 

@@ -8,6 +8,7 @@ open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
 open ByzantineSystems.Automata.Storage.Internal
 open FsToolkit.ErrorHandling
+open Npgsql
 
 /// <summary>
 /// What the action queue needs to bridge one machine's actions to a pgmq queue.
@@ -54,66 +55,38 @@ type PostgresActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'Entity
     /// The message body the commit routine wrote. Every field is required: a message missing one
     /// was not written by this library's finalize, and guessing what it meant would be worse
     /// than refusing it.
-    let readMessage (json: string) : Result<ActionRecord<'EntityId, 'Action>, StoreError> =
-        match Db.parseJson (nameof ActionRecord) json with
-        | Error error -> Error error
-        | Ok parsed ->
-            use document = parsed
-            let root = document.RootElement
+    let readActionRow (reader: NpgsqlDataReader) : Result<ActionRecord<'EntityId, 'Action>, StoreError> =
+        let required column read =
+            let index = reader.GetOrdinal column
+            Db.required "ActionRecord" column (if reader.IsDBNull index then None else Some(read index))
 
-            let field (name: string) : Result<JsonElement, StoreError> =
-                if root.ValueKind <> JsonValueKind.Object then
-                    Error(Db.decodeFailure (nameof ActionRecord) "an action message was not an object")
-                else
-                    match root.TryGetProperty name with
-                    | true, value -> Ok value
-                    | _ -> Error(Db.decodeFailure (nameof ActionRecord) $"an action message carried no {name}")
+        result {
+            let! machineText = required "machine_id" reader.GetString
 
-            let text (name: string) : Result<string, StoreError> =
-                field name
-                |> Result.bind (fun value ->
-                    match value.ValueKind with
-                    | JsonValueKind.String -> Ok(value.GetString())
-                    | _ -> Error(Db.decodeFailure (nameof ActionRecord) $"{name} was not a string"))
+            let! machine =
+                MachineId.tryCreate machineText
+                |> Result.mapError (Db.decodeFailure "MachineId")
 
-            let number (name: string) : Result<int64, StoreError> =
-                field name
-                |> Result.bind (fun value ->
-                    match value.ValueKind with
-                    | JsonValueKind.Number ->
-                        match value.TryGetInt64() with
-                        | true, number -> Ok number
-                        | _ -> Error(Db.decodeFailure (nameof ActionRecord) $"{name} was outside int64 range")
-                    | _ -> Error(Db.decodeFailure (nameof ActionRecord) $"{name} was not a number"))
+            let! entityText = required "entity_id" reader.GetString
 
-            result {
-                let! machineId =
-                    text "machine_id"
-                    |> Result.bind (MachineId.tryCreate >> Result.mapError (Db.decodeFailure "MachineId"))
+            let! entity =
+                options.EntityIdDecode entityText
+                |> Result.mapError (Db.decodeFailure "EntityId")
 
-                let! entityId =
-                    text "entity_id"
-                    |> Result.bind (options.EntityIdDecode >> Result.mapError (Db.decodeFailure "EntityId"))
+            let! command = required "command_id" reader.GetInt64
+            let! epoch = required "epoch" reader.GetInt64
+            let! ordinal = required "ordinal" reader.GetInt32
+            let! payload = required "action" reader.GetString
+            let! action = options.ActionCodec.Decode payload |> Result.mapError Db.toStoreError
 
-                let! commandId = number "command_id"
-                let! epoch = number "epoch"
-                let! ordinal = number "ordinal"
-
-                let! action =
-                    field "action"
-                    |> Result.bind (fun value ->
-                        value.GetRawText()
-                        |> options.ActionCodec.Decode
-                        |> Result.mapError Db.toStoreError)
-
-                return
-                    { MachineId = machineId
-                      EntityId = entityId
-                      CommandId = CommandId.ofInt64 commandId
-                      Epoch = Epoch.ofUInt64 (uint64 epoch)
-                      Ordinal = int ordinal
-                      Action = action }
-            }
+            return
+                { MachineId = machine
+                  EntityId = entity
+                  CommandId = CommandId.ofInt64 command
+                  Epoch = Epoch.ofUInt64 (uint64 epoch)
+                  Ordinal = ordinal
+                  Action = action }
+        }
 
     /// <summary>
     /// The two halves of a pgmq claim, both carried on the lease.
@@ -164,7 +137,7 @@ type PostgresActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'Entity
                          "lease", Param.Interval(LeaseDuration.value lease) ])
                     (fun reader ->
                         Ok(
-                            Row.string reader "message",
+                            readActionRow reader,
                             Row.int64 reader "msg_id",
                             Row.int32 reader "read_ct",
                             Row.timestamp reader "vt"
@@ -176,8 +149,8 @@ type PostgresActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'Entity
 
                     return!
                         ClaimRecovery.collect
-                            (fun (message, messageId, deliveries, visibleUntil) ->
-                                readMessage message
+                            (fun (decoded, messageId, deliveries, visibleUntil) ->
+                                decoded
                                 |> Result.map (fun record ->
                                     { Work = record
                                       // The message's id identifies the claim; the delivery count fences

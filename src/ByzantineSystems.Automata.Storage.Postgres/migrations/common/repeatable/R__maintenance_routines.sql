@@ -264,19 +264,26 @@ CREATE OR REPLACE FUNCTION $schema$.purge_action_archive (p_queue text, p_before
     AS $$
 DECLARE
     v_purged bigint;
+    v_quarantined bigint;
 BEGIN
     IF p_queue = '' THEN
         RETURN 0;
     END IF;
     PERFORM
         $schema$.assert_queue_name (p_queue);
+    WITH doomed AS (
+        SELECT q.queue, q.msg_id FROM $schema$.action_quarantine q
+        WHERE q.queue = p_queue AND q.recorded_at < p_before
+        ORDER BY q.recorded_at, q.msg_id LIMIT p_batch FOR UPDATE SKIP LOCKED
+    ) DELETE FROM $schema$.action_quarantine q USING doomed d WHERE q.queue = d.queue AND q.msg_id = d.msg_id;
+    GET DIAGNOSTICS v_quarantined = ROW_COUNT;
     IF TO_REGCLASS(FORMAT('pgmq.%I', 'a_' || p_queue)) IS NULL THEN
-        RETURN 0;
+        RETURN v_quarantined;
     END IF;
     EXECUTE FORMAT('WITH doomed AS MATERIALIZED (SELECT a.msg_id FROM pgmq.%1$I a WHERE a.archived_at < $1 ORDER BY a.msg_id LIMIT $2) DELETE FROM pgmq.%1$I a USING doomed d WHERE a.msg_id = d.msg_id', 'a_' || p_queue)
-    USING p_before, p_batch;
+    USING p_before, GREATEST(0, p_batch - v_quarantined);
     GET DIAGNOSTICS v_purged = ROW_COUNT;
-    RETURN v_purged;
+    RETURN v_purged + v_quarantined;
 END
 $$;
 

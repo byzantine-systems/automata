@@ -107,12 +107,21 @@ $$;
 --
 -- VOLATILE and PARALLEL UNSAFE: reading a message leases it.
 -- ---------------------------------------------------------------------------
+-- A transport integer is allowed to fail without aborting the already claimed batch.
+CREATE OR REPLACE FUNCTION $schema$.action_integer(p_value jsonb)
+RETURNS bigint LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE SET search_path = pg_catalog, pg_temp AS $$
+BEGIN
+    IF jsonb_typeof(p_value) IS DISTINCT FROM 'number' OR p_value::text !~ '^-?[0-9]+$' THEN RETURN NULL; END IF;
+    RETURN p_value::text::bigint;
+EXCEPTION WHEN numeric_value_out_of_range OR invalid_text_representation THEN RETURN NULL;
+END $$;
+
 CREATE OR REPLACE FUNCTION $schema$.claim_actions (p_queue text, p_batch integer, p_lease interval)
     RETURNS TABLE (
         msg_id bigint,
         read_ct integer,
         vt timestamptz,
-        message jsonb)
+        machine_id text, entity_id text, command_id bigint, epoch bigint, ordinal integer, action jsonb)
     LANGUAGE plpgsql
     VOLATILE PARALLEL UNSAFE
     SET search_path = pg_catalog,
@@ -126,7 +135,12 @@ BEGIN
         r.msg_id,
         r.read_ct,
         r.vt,
-        r.message
+        CASE WHEN jsonb_typeof(r.message->'machine_id') = 'string' THEN r.message->>'machine_id' END,
+        CASE WHEN jsonb_typeof(r.message->'entity_id') = 'string' THEN r.message->>'entity_id' END,
+        CASE WHEN $schema$.action_integer(r.message->'command_id') > 0 THEN $schema$.action_integer(r.message->'command_id') END,
+        CASE WHEN $schema$.action_integer(r.message->'epoch') > 0 THEN $schema$.action_integer(r.message->'epoch') END,
+        CASE WHEN $schema$.action_integer(r.message->'ordinal') BETWEEN 0 AND 2147483647 THEN $schema$.action_integer(r.message->'ordinal')::integer END,
+        r.message->'action'
     FROM
         -- Explicit casts: pgmq.read is overloaded and resolution happens at
         -- prepare time, so an untyped argument picks the wrong one.
@@ -231,6 +245,9 @@ CREATE OR REPLACE FUNCTION $schema$.abandon_action (p_queue text, p_msg_id bigin
 DECLARE
     v_read_ct integer;
     v_message jsonb;
+    v_command bigint;
+    v_epoch bigint;
+    v_ordinal bigint;
 BEGIN
     PERFORM
         $schema$.assert_queue_name (p_queue);
@@ -240,16 +257,27 @@ BEGIN
     IF v_read_ct IS NULL OR v_read_ct <> p_read_ct THEN
         RETURN 'lease_lost';
     END IF;
+    v_command := $schema$.action_integer(v_message->'command_id');
+    v_epoch := $schema$.action_integer(v_message->'epoch');
+    v_ordinal := $schema$.action_integer(v_message->'ordinal');
+    IF jsonb_typeof(v_message->'machine_id') = 'string' AND jsonb_typeof(v_message->'entity_id') = 'string'
+       AND v_epoch > 0 AND v_ordinal BETWEEN 0 AND 2147483647 AND v_message->'action' IS NOT NULL
+       AND EXISTS (SELECT 1 FROM $schema$.command c WHERE c.command_id = v_command
+           AND c.machine_id = v_message->>'machine_id' AND c.entity_id = v_message->>'entity_id') THEN
     INSERT INTO $schema$.action_dead_letter (machine_id, entity_id, command_id, epoch, ordinal, action, reason, deliveries)
     VALUES
         ((v_message ->> 'machine_id'),
             (v_message ->> 'entity_id'),
-            (v_message ->> 'command_id')::bigint, (v_message ->> 'epoch')::bigint, (v_message ->> 'ordinal')::integer, (v_message -> 'action'), p_reason, v_read_ct)
+             v_command, v_epoch, v_ordinal::integer, (v_message -> 'action'), p_reason, v_read_ct)
     ON CONFLICT (command_id, ordinal)
         DO NOTHING;
+    ELSE
+        INSERT INTO $schema$.action_quarantine(queue, msg_id, message, reason, deliveries)
+            VALUES (p_queue, p_msg_id, v_message, p_reason, v_read_ct)
+            ON CONFLICT (queue, msg_id) DO NOTHING;
+    END IF;
     PERFORM
         pgmq.archive (p_queue::text, p_msg_id::bigint);
     RETURN 'updated';
 END
 $$;
-

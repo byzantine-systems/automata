@@ -35,3 +35,16 @@ non-ascending times and invalid fields before rewriting. JSON `null` remains a v
 Operator correction accepts an empty replacement (erase the suffix); correction commits require
 a non-empty batch. Temporal properties compare replacement against an independent half-open
 interval model, and invalid-array tests observe both live beliefs and archived system history.
+
+## Action claims
+
+Queue message identity, delivery count and expiry survive payload decoding failures. Typed
+projection never lets malformed envelope numbers abort a batch. Per-row errors are kept inside
+the claimed row until `ClaimRecovery` partitions work from poison; the outer query only fails on
+infrastructure errors. Healthy work is conserved even when quarantine fails.
+
+Decodable envelopes use business action dead letters. Corrupt envelopes without usable business
+identity go to `action_quarantine`, keyed by queue and message ID with raw evidence. Recording and
+archiving share the raw fence and transaction. Action-archive retention purges quarantine with
+the same bounded batch budget. Provider properties mix poison positions with healthy work and
+check durable quarantine, fencing and retention; shared conformance checks ordinary poison work.

@@ -6,6 +6,7 @@ open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
 open ByzantineSystems.Automata.Storage.Postgres
 open Expecto
+open FsCheck
 open TestContext
 
 let private entity name : Entity = entityId name
@@ -57,7 +58,69 @@ let private deadLetterCount () =
 let tests =
     testList
         "Postgres action queue"
-        [ testTask "a commit routes actions to the boot registration" {
+        [ testCase "structurally corrupt envelopes cannot strand healthy actions" (fun () ->
+              Check.One(
+                  Config.QuickThrowOnFailure.WithMaxTest(8),
+                  fun (choice: byte) ->
+                      task {
+                          do! reset ()
+
+                          let poison =
+                              [ "{}"
+                                "[]"
+                                "null"
+                                "{\"command_id\":9999999999999999999999999999}"
+                                "{\"command_id\":1.5}"
+                                "{\"ordinal\":-1}" ]
+
+                          let send payload =
+                              exec $"SELECT pgmq.send('{actionQueue}', '{payload}'::jsonb)"
+                              |> expectOk "send corrupt envelope"
+                              |> ignore
+
+                          let count = 1 + int choice % poison.Length
+
+                          for payload in List.take count poison do
+                              send payload
+
+                          let! held = leased (newInbox ()) "healthy" "healthy"
+                          let! _ = commit (newProcessor ()) held
+
+                          for payload in List.skip count poison do
+                              send payload
+
+                          let! work = claimActions (newActionQueue ())
+                          Expect.equal work.Length 1 "healthy action is still delivered"
+
+                          Expect.equal
+                              (scalar<int64> "SELECT count(*) FROM fsm.action_quarantine")
+                              (int64 poison.Length)
+                              "every corrupt envelope is durable"
+
+                          Expect.equal (queueDepth ()) 1L "only leased healthy work remains"
+
+                          let stale =
+                              scalar<string>
+                                  $"SELECT fsm.abandon_action('{actionQueue}', (SELECT min(msg_id) FROM fsm.action_quarantine), 0, 'stale')::text"
+
+                          Expect.equal stale "lease_lost" "an archived poison cannot be quarantined again"
+
+                          let purged =
+                              scalar<int64> $"SELECT fsm.purge_action_archive('{actionQueue}', 'infinity', 2)"
+
+                          Expect.equal purged 2L "quarantine and archive share the batch budget"
+
+                          Expect.equal
+                              (scalar<int64> "SELECT count(*) FROM fsm.action_quarantine")
+                              (int64 poison.Length - 2L)
+                              "quarantine has a retention path"
+
+                          return true
+                      }
+                      |> fun running -> running.GetAwaiter().GetResult()
+              ))
+
+          testTask "a commit routes actions to the boot registration" {
               do! reset ()
 
               exec
