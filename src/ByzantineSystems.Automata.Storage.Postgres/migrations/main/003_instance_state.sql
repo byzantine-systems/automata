@@ -1,5 +1,5 @@
 -- ---------------------------------------------------------------------------
--- fsm.instance_state: what an entity's state was, and when we believed it.
+-- $schema$.instance_state: what an entity's state was, and when we believed it.
 --
 -- Two independent time axes, kept apart:
 --
@@ -10,36 +10,36 @@
 -- asking about both at once. Valid time alone cannot answer it, because a
 -- back-dated correction changes what was true without changing what we thought
 -- at the time, and a table that records only the current answer cannot tell the
--- two apart. Superseded beliefs move to fsm.instance_state_history rather than
+-- two apart. Superseded beliefs move to $schema$.instance_state_history rather than
 -- being overwritten, so the earlier opinion survives its own correction.
 --
--- system_time is maintained entirely by the fsm.temporal_versioning trigger.
+-- system_time is maintained entirely by the $schema$.temporal_versioning trigger.
 -- Nothing else should write it.
 -- ---------------------------------------------------------------------------
 -- What a valid-time mutation did. A checked text domain, for the reason
--- fsm.command_status is one: adding an outcome must not be an ALTER TYPE whose
+-- $schema$.command_status is one: adding an outcome must not be an ALTER TYPE whose
 -- new value cannot be used in the transaction that adds it.
-CREATE DOMAIN fsm.belief_outcome AS text CONSTRAINT belief_outcome_valid CHECK (VALUE IN ('opened', 'split', 'replaced'));
+CREATE DOMAIN $schema$.belief_outcome AS text CONSTRAINT belief_outcome_valid CHECK (VALUE IN ('opened', 'split', 'replaced'));
 
 -- An entity's lifecycle, as of a belief. Declared here rather than beside
--- fsm.transition because this is the first table to use it.
-CREATE DOMAIN fsm.instance_status AS text CONSTRAINT instance_status_valid CHECK (VALUE IN ('running', 'suspended', 'terminated'));
+-- $schema$.transition because this is the first table to use it.
+CREATE DOMAIN $schema$.instance_status AS text CONSTRAINT instance_status_valid CHECK (VALUE IN ('running', 'suspended', 'terminated'));
 
-CREATE TABLE fsm.instance_state (
+CREATE TABLE $schema$.instance_state (
     machine_id text NOT NULL,
     entity_id text NOT NULL,
     state jsonb NOT NULL,
-    status fsm.instance_status NOT NULL,
+    status $schema$.instance_status NOT NULL,
     -- Which transition produced this belief, and under which chart.
     --
-    -- epoch is denormalised from fsm.transition. Unlike blocked in
-    -- fsm.command it has no independent writer to drift against: the belief and
+    -- epoch is denormalised from $schema$.transition. Unlike blocked in
+    -- $schema$.command it has no independent writer to drift against: the belief and
     -- its transition are written by the same two statements of the same routine.
     -- Carrying it here is what makes reading an entity's current state a single
     -- lookup on instance_state_live_idx rather than a join against a log that
     -- grows forever.
     --
-    -- No foreign key to fsm.transition. A correction writes a belief that no
+    -- No foreign key to $schema$.transition. A correction writes a belief that no
     -- single transition produced, and that arrives in a later step.
     epoch bigint NOT NULL,
     command_id bigint NOT NULL,
@@ -73,7 +73,7 @@ CREATE TABLE fsm.instance_state (
     -- fire. The temporal key rejects an empty valid_during too, but CHECKs run
     -- first.
     --
-    -- They matter most on fsm.instance_state_history, which has neither the
+    -- They matter most on $schema$.instance_state_history, which has neither the
     -- temporal key nor the trigger. On this table the trigger overwrites
     -- system_time on every write, so a caller cannot reach the constraint with a
     -- bad value; on the twin, the constraint is all there is.
@@ -81,9 +81,9 @@ CREATE TABLE fsm.instance_state (
     CONSTRAINT instance_state_system_half_open CHECK (LOWER_INC(system_time) AND NOT UPPER_INC(system_time))
 );
 
-COMMENT ON COLUMN fsm.instance_state.valid_during IS 'Business time: when this state was true in the world. Half-open, and open-ended for the current belief. Supplied by the caller, because a back-dated correction is a legitimate thing to write and the system clock cannot know about it.';
+COMMENT ON COLUMN $schema$.instance_state.valid_during IS 'Business time: when this state was true in the world. Half-open, and open-ended for the current belief. Supplied by the caller, because a back-dated correction is a legitimate thing to write and the system clock cannot know about it.';
 
-COMMENT ON COLUMN fsm.instance_state.system_time IS 'Belief time: when this database held this opinion. Maintained only by fsm.temporal_versioning, stamped with statement_timestamp() so that one statement is one change of belief. The upper bound is the literal infinity, never NULL.';
+COMMENT ON COLUMN $schema$.instance_state.system_time IS 'Belief time: when this database held this opinion. Maintained only by $schema$.temporal_versioning, stamped with statement_timestamp() so that one statement is one change of belief. The upper bound is the literal infinity, never NULL.';
 
 -- The fetch path. "What is this entity's state now" is the question the runtime
 -- asks most, and upper(valid_during) = 'infinity' is how a row says it is the
@@ -97,14 +97,14 @@ COMMENT ON COLUMN fsm.instance_state.system_time IS 'Belief time: when this data
 --
 -- upper() on a range is IMMUTABLE and the comparison is against a literal, so
 -- this is a legal partial-index predicate. now() would not be.
-CREATE UNIQUE INDEX instance_state_live_idx ON fsm.instance_state (machine_id, entity_id)
+CREATE UNIQUE INDEX instance_state_live_idx ON $schema$.instance_state (machine_id, entity_id)
 WHERE
     UPPER(valid_during) = 'infinity';
 
 -- ---------------------------------------------------------------------------
 -- The history twin.
 --
--- Named by convention: fsm.temporal_versioning finds it as <table>_history, so
+-- Named by convention: $schema$.temporal_versioning finds it as <table>_history, so
 -- one trigger function serves every temporal table this schema grows.
 --
 -- LIKE ... INCLUDING DEFAULTS INCLUDING CONSTRAINTS copies the columns, their
@@ -119,14 +119,14 @@ WHERE
 --     way. There is no generated column here today, and stating the reason is
 --     what stops one being added without noticing.
 -- ---------------------------------------------------------------------------
-CREATE TABLE fsm.instance_state_history (
-    LIKE fsm.instance_state INCLUDING DEFAULTS INCLUDING CONSTRAINTS
+CREATE TABLE $schema$.instance_state_history (
+    LIKE $schema$.instance_state INCLUDING DEFAULTS INCLUDING CONSTRAINTS
 );
 
 -- Time travel: what did we believe about this entity as of some instant. A GiST
 -- index because the system_time predicate is a containment test, and the two
 -- text columns ride along through btree_gist.
-CREATE INDEX instance_state_history_as_of_idx ON fsm.instance_state_history USING gist (machine_id, entity_id, system_time);
+CREATE INDEX instance_state_history_as_of_idx ON $schema$.instance_state_history USING gist (machine_id, entity_id, system_time);
 
 -- ---------------------------------------------------------------------------
 -- Storage

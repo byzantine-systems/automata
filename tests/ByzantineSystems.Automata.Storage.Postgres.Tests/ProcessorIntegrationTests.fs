@@ -65,7 +65,9 @@ let private ownStore () =
     let source = DataSource.create connectionString
 
     PostgresMachineStore<Entity, TestState, TestEvent, TestAction, TestError>(
-        { Context = PostgresContext.create source TransientPolicy.defaults ignore
+        { Context =
+            PostgresContext.create source TransientPolicy.defaults ignore
+            |> PostgresContext.withSchema schema
           ActionDelivery = ActionDelivery.Deliver(ActionQueueName.create actionQueue)
           StateCodec = Serialization.systemTextJson<TestState> ()
           EventCodec = Serialization.systemTextJson<TestEvent> ()

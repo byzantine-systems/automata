@@ -11,7 +11,7 @@ SELECT
     valid_from,
     known_from
 FROM
-    fsm.current_belief
+    $schema$.current_belief
 WHERE
     machine_id = @machine_id
     AND entity_id = @entity_id;

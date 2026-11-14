@@ -8,7 +8,7 @@
 -- returns a value rather than void, and is not overloaded.
 -- ---------------------------------------------------------------------------
 -- ---------------------------------------------------------------------------
--- fsm.register_chart_version: claim a version for a fingerprint, or report what
+-- $schema$.register_chart_version: claim a version for a fingerprint, or report what
 -- the stored one says.
 --
 -- Called once per process startup per machine, and by every process at once
@@ -31,14 +31,14 @@
 -- know.
 --
 -- There is no routine for deleting a registration. Forgetting one is how this
--- check gets disarmed by habit, and the foreign key from fsm.command refuses it
+-- check gets disarmed by habit, and the foreign key from $schema$.command refuses it
 -- anyway once a single command has referenced the version.
 --
 -- VOLATILE and PARALLEL UNSAFE because it writes.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fsm.register_chart_version (p_machine_id text, p_version integer, p_fingerprint text)
+CREATE OR REPLACE FUNCTION $schema$.register_chart_version (p_machine_id text, p_version integer, p_fingerprint text)
     RETURNS TABLE (
-        registration fsm.chart_registration,
+        registration $schema$.chart_registration,
         stored_fingerprint text)
     LANGUAGE plpgsql
     VOLATILE PARALLEL UNSAFE
@@ -54,12 +54,12 @@ BEGIN
     INTO
         v_stored
     FROM
-        fsm.machine_chart_version c
+        $schema$.machine_chart_version c
     WHERE
         c.machine_id = p_machine_id
         AND c.version = p_version;
     IF v_stored IS NULL THEN
-        INSERT INTO fsm.machine_chart_version (machine_id, version, fingerprint)
+        INSERT INTO $schema$.machine_chart_version (machine_id, version, fingerprint)
             VALUES (p_machine_id, p_version, p_fingerprint)
         ON CONFLICT ON CONSTRAINT machine_chart_version_pkey
             DO NOTHING;
@@ -67,7 +67,7 @@ BEGIN
         IF v_inserted = 1 THEN
             RETURN QUERY
             SELECT
-                'registered'::fsm.chart_registration,
+                'registered'::$schema$.chart_registration,
                 p_fingerprint;
             RETURN;
         END IF;
@@ -77,7 +77,7 @@ BEGIN
         INTO
             v_stored
         FROM
-            fsm.machine_chart_version c
+            $schema$.machine_chart_version c
         WHERE
             c.machine_id = p_machine_id
             AND c.version = p_version;
@@ -88,7 +88,7 @@ BEGIN
             'matched'
         ELSE
             'mismatched'
-        END::fsm.chart_registration,
+        END::$schema$.chart_registration,
         v_stored;
 END;
 $$;

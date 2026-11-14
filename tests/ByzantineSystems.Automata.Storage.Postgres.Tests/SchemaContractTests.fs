@@ -58,6 +58,9 @@ let private transitionColumns =
 
 let private resultColumns = [ "command_status" ] @ transitionColumns @ [ "error" ]
 
+let private resource domain operation =
+    SqlResources.get domain operation |> SqlTemplate.substitute schema
+
 /// Builds the plan probe from the routine's own body, read back out of the catalog. Copying the
 /// statement into the test instead would let the two drift, which is exactly the failure this
 /// test exists to catch.
@@ -67,7 +70,7 @@ let private explainClaim () : string =
     let body =
         use read =
             new NpgsqlCommand(
-                "SELECT prosrc FROM pg_proc WHERE oid = 'fsm.claim_commands(text,integer,interval)'::regprocedure",
+                sql "SELECT prosrc FROM pg_proc WHERE oid = 'fsm.claim_commands(text,integer,interval)'::regprocedure",
                 conn
             )
 
@@ -122,7 +125,11 @@ let tests =
                       "SELECT pg_get_functiondef('fsm.purge_commands(text,timestamptz,integer)'::regprocedure)"
 
               let targets =
-                  Regex.Matches(definition, @"DELETE\s+FROM\s+fsm\.([a-z_]+)", RegexOptions.IgnoreCase)
+                  Regex.Matches(
+                      definition,
+                      $@"DELETE\s+FROM\s+{Regex.Escape schemaValue}\.([a-z_]+)",
+                      RegexOptions.IgnoreCase
+                  )
                   |> Seq.cast<Match>
                   |> Seq.map (fun matched -> matched.Groups[1].Value)
                   |> Set.ofSeq
@@ -138,7 +145,7 @@ let tests =
 
               let columns =
                   columnsOf
-                      (SqlResources.get "command" "claim")
+                      (resource "command" "claim")
                       [ "machine_id", box "none"
                         "batch", box 1
                         "lease", box (TimeSpan.FromSeconds 30.0) ]
@@ -149,11 +156,11 @@ let tests =
           testTask "command lookups return the shared record shape" {
               do! reset ()
 
-              let byId = columnsOf (SqlResources.get "command" "by_id") [ "command_id", box 0L ]
+              let byId = columnsOf (resource "command" "by_id") [ "command_id", box 0L ]
 
               let byKey =
                   columnsOf
-                      (SqlResources.get "command" "find_by_key")
+                      (resource "command" "find_by_key")
                       [ "machine_id", box "none"
                         "entity_id", box "none"
                         "idempotency_key", box "none" ]
@@ -166,7 +173,7 @@ let tests =
               do! reset ()
 
               let columns =
-                  columnsOf (SqlResources.get "chart" "by_version") [ "machine_id", box "none"; "version", box 1 ]
+                  columnsOf (resource "chart" "by_version") [ "machine_id", box "none"; "version", box 1 ]
 
               Expect.equal columns [ "fingerprint" ] "the registry reads this column by name"
           }
@@ -175,7 +182,7 @@ let tests =
               do! reset ()
 
               let belief =
-                  columnsOf (SqlResources.get "belief" "current") [ "machine_id", box "none"; "entity_id", box "none" ]
+                  columnsOf (resource "belief" "current") [ "machine_id", box "none"; "entity_id", box "none" ]
 
               let beliefColumns =
                   [ "machine_id"
@@ -192,7 +199,7 @@ let tests =
 
               let page =
                   columnsOf
-                      (SqlResources.get "transition" "history_page")
+                      (resource "transition" "history_page")
                       [ "machine_id", box "none"
                         "entity_id", box "none"
                         "after", box 0L
@@ -200,14 +207,13 @@ let tests =
 
               Expect.equal page transitionColumns "the history reader maps these columns by name"
 
-              let result =
-                  columnsOf (SqlResources.get "transition" "result") [ "command_id", box 0L ]
+              let result = columnsOf (resource "transition" "result") [ "command_id", box 0L ]
 
               Expect.equal result resultColumns "the result reader maps these columns by name"
 
               let suffix =
                   columnsOf
-                      (SqlResources.get "transition" "suffix")
+                      (resource "transition" "suffix")
                       [ "machine_id", box "none"
                         "entity_id", box "none"
                         "from", box (DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero))
@@ -217,7 +223,7 @@ let tests =
 
               let watermark =
                   columnsOf
-                      (SqlResources.get "transition" "purge_watermark")
+                      (resource "transition" "purge_watermark")
                       [ "machine_id", box "none"; "entity_id", box "none" ]
 
               Expect.equal watermark [ "max_purged_effective_at" ] "the watermark probe reads one column"
@@ -254,10 +260,7 @@ let tests =
                   use conn = (dataSource ()).OpenConnection()
 
                   use cmd =
-                      new NpgsqlCommand(
-                          "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + SqlResources.get "belief" "current",
-                          conn
-                      )
+                      new NpgsqlCommand("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + resource "belief" "current", conn)
 
                   cmd.Parameters.AddWithValue("machine_id", "plan-probe") |> ignore
                   cmd.Parameters.AddWithValue("entity_id", "e1234") |> ignore

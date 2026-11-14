@@ -1,5 +1,8 @@
 module ByzantineSystems.Automata.Storage.Postgres.Tests.SqlResourceTests
 
+open System
+open System.IO
+open System.Text.RegularExpressions
 open ByzantineSystems.Automata.Storage.Postgres
 open Expecto
 
@@ -98,4 +101,42 @@ let tests =
                       "the message should name the file that was expected"
 
                   Expect.stringContains error.Message "command/submit" "the message should list the known keys"
+          }
+
+          test "embedded SQL uses only the two schema template variables" {
+              let assembly = typeof<SchemaName>.Assembly
+              let variable = Regex(@"\$[A-Za-z_][A-Za-z0-9_]*\$", RegexOptions.CultureInvariant)
+              let known = set [ "$schema$"; "$temporal_schema$" ]
+
+              let unknown =
+                  assembly.GetManifestResourceNames()
+                  |> Array.filter (fun name -> name.EndsWith(".sql", StringComparison.Ordinal))
+                  |> Array.collect (fun name ->
+                      use stream = assembly.GetManifestResourceStream name
+                      use reader = new StreamReader(stream)
+
+                      variable.Matches(reader.ReadToEnd())
+                      |> Seq.cast<Match>
+                      |> Seq.map (fun found -> name, found.Value)
+                      |> Array.ofSeq)
+                  |> Array.filter (snd >> known.Contains >> not)
+
+              Expect.isEmpty
+                  unknown
+                  "a named dollar token is a template variable, not a PostgreSQL dollar quote; add it deliberately"
+          }
+
+          test "statement text is specialized per schema" {
+              let alternate =
+                  SchemaName.tryCreate "automata_ci"
+                  |> Result.defaultWith (fun error -> failwithf "%A" error)
+
+              let defaultText =
+                  Statement.load SchemaName.defaults "command" "submit" |> Statement.text
+
+              let alternateText = Statement.load alternate "command" "submit" |> Statement.text
+
+              Expect.isFalse (defaultText = alternateText) "two schemas cannot share prepared statement text"
+              Expect.stringContains defaultText "fsm.submit_command" "the default statement"
+              Expect.stringContains alternateText "automata_ci.submit_command" "the alternate statement"
           } ]

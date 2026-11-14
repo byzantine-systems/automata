@@ -6,6 +6,7 @@ open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
 open FsToolkit.ErrorHandling
+open Npgsql
 
 /// <summary>
 /// Everything one machine's PostgreSQL store needs, in one place.
@@ -145,6 +146,12 @@ type PostgresMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
         | None when ct.IsCancellationRequested -> Task.FromCanceled<Result<bool, StoreError>> ct
         | None -> Task.FromResult(Ok false)
 
+    let queueOwnerDefect =
+        function
+        | StoreError.Unexpected(:? PostgresException as error) when error.ConstraintName = "automata_action_queue_owner" ->
+            Some(BootDefect.Misconfigured error.MessageText)
+        | _ -> None
+
     let temporalStore =
         PostgresTemporalStore<'EntityId, 'State>(
             { Context = options.Context
@@ -173,13 +180,20 @@ type PostgresMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     /// database as it found it; the two writes after it are idempotent, which is what makes
     /// booting every generation of a supervised machine safe.
     let boot machineId ct =
-        backgroundTaskResult {
+        backgroundTask {
             match! Boot.inspect options.Context ct with
-            | [] ->
-                let! _ = ensureQueue ct
-                do! Boot.register options.Context machineId queueName options.Retention options.ReapAfter ct
-                return BootReport.Ready
-            | defects -> return BootReport.Refused defects
+            | Error error -> return Error error
+            | Ok [] ->
+                match! ensureQueue ct with
+                | Error error ->
+                    match queueOwnerDefect error with
+                    | Some defect -> return Ok(BootReport.Refused [ defect ])
+                    | None -> return Error error
+                | Ok _ ->
+                    match! Boot.register options.Context machineId queueName options.Retention options.ReapAfter ct with
+                    | Ok() -> return Ok BootReport.Ready
+                    | Error error -> return Error error
+            | Ok defects -> return Ok(BootReport.Refused defects)
         }
 
     /// <summary>

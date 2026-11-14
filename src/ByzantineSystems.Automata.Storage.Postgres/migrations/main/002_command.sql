@@ -1,5 +1,5 @@
 -- ---------------------------------------------------------------------------
--- fsm.command: the durable command inbox, and the unit of ordering.
+-- $schema$.command: the durable command inbox, and the unit of ordering.
 --
 -- Process-local actors give strict per-entity ordering inside one process and
 -- nothing across processes. Two pods running the same machine each serialise
@@ -18,19 +18,19 @@
 --
 -- 'ready' and 'leased' are the non-terminal states, in which a command still
 -- owns its entity. The other three are terminal and release it, 'dead_letter'
--- included; fsm.ack_command explains why a poisonous command must not wedge an
+-- included; $schema$.ack_command explains why a poisonous command must not wedge an
 -- entity forever.
-CREATE DOMAIN fsm.command_status AS text CONSTRAINT command_status_valid CHECK (VALUE IN ('ready', 'leased', 'succeeded', 'rejected', 'dead_letter'));
+CREATE DOMAIN $schema$.command_status AS text CONSTRAINT command_status_valid CHECK (VALUE IN ('ready', 'leased', 'succeeded', 'rejected', 'dead_letter'));
 
 -- What a command asks for: an ordinary event, or a correction that inserts a
 -- missed event in the past and replays what followed. A correction's own
--- details live in fsm.command_correction.
-CREATE DOMAIN fsm.command_kind AS text CONSTRAINT command_kind_valid CHECK (VALUE IN ('event', 'correction'));
+-- details live in $schema$.command_correction.
+CREATE DOMAIN $schema$.command_kind AS text CONSTRAINT command_kind_valid CHECK (VALUE IN ('event', 'correction'));
 
 -- The result of every fenced write. A domain rather than a bare text column, so
 -- that a typo in a routine is a constraint violation rather than a value the
 -- caller silently fails to match.
-CREATE DOMAIN fsm.lease_outcome AS text CONSTRAINT lease_outcome_valid CHECK (VALUE IN ('updated', 'lease_lost'));
+CREATE DOMAIN $schema$.lease_outcome AS text CONSTRAINT lease_outcome_valid CHECK (VALUE IN ('updated', 'lease_lost'));
 
 -- Fencing tokens, monotone by construction. A stale worker's token is not
 -- merely different from the current one, it is strictly lower, which makes "did
@@ -44,10 +44,10 @@ CREATE DOMAIN fsm.lease_outcome AS text CONSTRAINT lease_outcome_valid CHECK (VA
 -- unsupplied text, 0 for no lease. Three-valued logic in a claim predicate is a
 -- bug waiting for the one row where somebody writes = instead of
 -- IS NOT DISTINCT FROM.
-CREATE SEQUENCE fsm.lease_token
+CREATE SEQUENCE $schema$.lease_token
     AS bigint START WITH 1;
 
-CREATE TABLE fsm.command (
+CREATE TABLE $schema$.command (
     -- Identity, and only identity. Sequences are not transactional: values are
     -- allocated outside the transaction and a rollback does not return them, so
     -- command_id has gaps and those gaps mean nothing. The business numbering
@@ -61,8 +61,8 @@ CREATE TABLE fsm.command (
     chart_version integer NOT NULL,
     event jsonb NOT NULL,
     request_digest bytea NOT NULL,
-    kind fsm.command_kind NOT NULL DEFAULT 'event',
-    status fsm.command_status NOT NULL DEFAULT 'ready',
+    kind $schema$.command_kind NOT NULL DEFAULT 'event',
+    status $schema$.command_status NOT NULL DEFAULT 'ready',
     blocked boolean NOT NULL DEFAULT FALSE,
     visible_at timestamptz NOT NULL DEFAULT NOW(),
     lease_token bigint NOT NULL DEFAULT 0,
@@ -87,7 +87,7 @@ CREATE TABLE fsm.command (
     -- create a second one.
     --
     -- This constraint and command_unique_seq below are the integrity boundary.
-    -- fsm.submit_command takes a per-entity advisory lock so that concurrent
+    -- $schema$.submit_command takes a per-entity advisory lock so that concurrent
     -- submissions queue instead of colliding, but an advisory lock only binds
     -- writers who take it. These two constraints bind every writer, including one
     -- that bypasses the routine, so a bug there is a failed insert rather than a
@@ -131,24 +131,24 @@ CREATE TABLE fsm.command (
     -- appended and then kept. An index for it would put a fourth write on every
     -- insert into the busiest table in the schema to serve an operation the
     -- constraint forbids.
-    CONSTRAINT command_chart_version_fkey FOREIGN KEY (machine_id, chart_version) REFERENCES fsm.machine_chart_version (machine_id, version)
+    CONSTRAINT command_chart_version_fkey FOREIGN KEY (machine_id, chart_version) REFERENCES $schema$.machine_chart_version (machine_id, version)
 );
 
-COMMENT ON COLUMN fsm.command.seq IS 'Gapless per-entity submission counter, computed under the advisory lock taken by fsm.submit_command and enforced by command_unique_seq. Not an identity column: identity values are allocated outside the transaction and would leave gaps on rollback.';
+COMMENT ON COLUMN $schema$.command.seq IS 'Gapless per-entity submission counter, computed under the advisory lock taken by $schema$.submit_command and enforced by command_unique_seq. Not an identity column: identity values are allocated outside the transaction and would leave gaps on rollback.';
 
-COMMENT ON COLUMN fsm.command.chart_version IS 'The chart version this command was resolved under, pinned at submission so that replay decides it the same way twice. Held to a version some chart declared by command_chart_version_fkey.';
+COMMENT ON COLUMN $schema$.command.chart_version IS 'The chart version this command was resolved under, pinned at submission so that replay decides it the same way twice. Held to a version some chart declared by command_chart_version_fkey.';
 
-COMMENT ON COLUMN fsm.command.blocked IS 'TRUE when an earlier non-terminal sibling exists for this entity. Derived, denormalised, and deliberately so: the alternative is an anti-join in the claim path. Measured on a comparable queue at 200k jobs with 50k blocked at the head, a live anti-join in checkout took 237 ms over 253k buffers, an anti-join against a materialised set took 42 ms over 102k buffers, and this column inside the index took 0.14 ms over 9 buffers. It ships with the discipline that buys: a non-clamped CHECK, a drift query that runs by default, and a repair that does not.';
+COMMENT ON COLUMN $schema$.command.blocked IS 'TRUE when an earlier non-terminal sibling exists for this entity. Derived, denormalised, and deliberately so: the alternative is an anti-join in the claim path. Measured on a comparable queue at 200k jobs with 50k blocked at the head, a live anti-join in checkout took 237 ms over 253k buffers, an anti-join against a materialised set took 42 ms over 102k buffers, and this column inside the index took 0.14 ms over 9 buffers. It ships with the discipline that buys: a non-clamped CHECK, a drift query that runs by default, and a repair that does not.';
 
-COMMENT ON COLUMN fsm.command.visible_at IS 'Two readings, one column, one index. For a ready row it is the earliest instant the command may be claimed; for a leased row it is the lease deadline. An expired lease therefore becomes claimable again on its own, and the job that reaps them is an optimisation rather than a correctness requirement.';
+COMMENT ON COLUMN $schema$.command.visible_at IS 'Two readings, one column, one index. For a ready row it is the earliest instant the command may be claimed; for a leased row it is the lease deadline. An expired lease therefore becomes claimable again on its own, and the job that reaps them is an optimisation rather than a correctness requirement.';
 
-COMMENT ON COLUMN fsm.command.lease_token IS 'Fences a worker that stalled past its lease: completing, rescheduling or extending requires the token the claim handed out, so a worker whose command was reclaimed cannot corrupt it. 0 means not leased, and fsm.lease_token starts at 1, so the sentinel can never collide with a live token.';
+COMMENT ON COLUMN $schema$.command.lease_token IS 'Fences a worker that stalled past its lease: completing, rescheduling or extending requires the token the claim handed out, so a worker whose command was reclaimed cannot corrupt it. 0 means not leased, and $schema$.lease_token starts at 1, so the sentinel can never collide with a live token.';
 
-COMMENT ON COLUMN fsm.command.read_ct IS 'Deliveries. Incremented by every claim, including redelivery after a lease expires.';
+COMMENT ON COLUMN $schema$.command.read_ct IS 'Deliveries. Incremented by every claim, including redelivery after a lease expires.';
 
-COMMENT ON COLUMN fsm.command.attempts IS 'Processing attempts. Incremented by fsm.reschedule_command only, so it counts failures the application actually reported rather than deliveries.';
+COMMENT ON COLUMN $schema$.command.attempts IS 'Processing attempts. Incremented by $schema$.reschedule_command only, so it counts failures the application actually reported rather than deliveries.';
 
-COMMENT ON COLUMN fsm.command.received_at IS 'When the submission reached the database. Distinct from the business time at which an event was effective, and from the instant its transition commits. Without all three you cannot separate "when did the user act" from "when did we process it".';
+COMMENT ON COLUMN $schema$.command.received_at IS 'When the submission reached the database. Distinct from the business time at which an event was effective, and from the instant its transition commits. Without all three you cannot separate "when did the user act" from "when did we process it".';
 
 -- ---------------------------------------------------------------------------
 -- Indexes
@@ -161,11 +161,11 @@ COMMENT ON COLUMN fsm.command.received_at IS 'When the submission reached the da
 -- answered by the index itself: no sort node above the Limit, and ties broken
 -- deterministically by submission order rather than by physical row order.
 --
--- This predicate is repeated verbatim in fsm.claim_commands and in
--- fsm.command_metrics. If you change one, change all three. A claim whose WHERE
+-- This predicate is repeated verbatim in $schema$.claim_commands and in
+-- $schema$.command_metrics. If you change one, change all three. A claim whose WHERE
 -- clause has drifted from its index still returns correct rows, it just stops
 -- using the index, and nothing fails to tell you so.
-CREATE INDEX command_claim_idx ON fsm.command (machine_id, visible_at, command_id)
+CREATE INDEX command_claim_idx ON $schema$.command (machine_id, visible_at, command_id)
 WHERE
     status IN ('ready', 'leased') AND NOT blocked;
 
@@ -179,44 +179,44 @@ WHERE
 -- be a foreign-key target and ON CONFLICT cannot infer it without restating the
 -- predicate. Neither matters here: nothing references a command by entity, and
 -- every write goes through a routine.
-CREATE UNIQUE INDEX command_entity_head_idx ON fsm.command (machine_id, entity_id)
+CREATE UNIQUE INDEX command_entity_head_idx ON $schema$.command (machine_id, entity_id)
 WHERE
     status IN ('ready', 'leased') AND NOT blocked;
 
 -- Answers "does this entity already have an open command" for
--- fsm.submit_command. A superset of the head index, which cannot serve the
+-- $schema$.submit_command. A superset of the head index, which cannot serve the
 -- question because its predicate excludes exactly the blocked rows being looked
 -- for. Both stay small: they index open commands only, never the accumulated
 -- history.
-CREATE INDEX command_entity_open_idx ON fsm.command (machine_id, entity_id)
+CREATE INDEX command_entity_open_idx ON $schema$.command (machine_id, entity_id)
 WHERE
     status IN ('ready', 'leased');
 
 -- ---------------------------------------------------------------------------
--- fsm.command_error: why a command was rejected or dead-lettered.
+-- $schema$.command_error: why a command was rejected or dead-lettered.
 --
--- A separate table rather than a column on fsm.command, for three reasons that
--- all point the same way. The claim path scans fsm.command and never reads an
+-- A separate table rather than a column on $schema$.command, for three reasons that
+-- all point the same way. The claim path scans $schema$.command and never reads an
 -- error, so carrying one inline widens every row that path touches to no
 -- purpose. Most commands succeed, so the column would be empty on nearly every
 -- row. And a succeeded command's result already lives elsewhere, in
--- fsm.transition, so keeping a failed command's result inline would make
+-- $schema$.transition, so keeping a failed command's result inline would make
 -- "what happened to this command" two different shapes.
 --
--- What makes finalize idempotent stays on fsm.command regardless: status says a
+-- What makes finalize idempotent stays on $schema$.command regardless: status says a
 -- result exists and lease_token says who wrote it. This table holds the
 -- payload, never the fence.
 --
 -- The primary key is the command, so a command owns at most one error.
 -- ---------------------------------------------------------------------------
-CREATE TABLE fsm.command_error (
+CREATE TABLE $schema$.command_error (
     command_id bigint PRIMARY KEY,
     error jsonb NOT NULL,
     -- When we gave up: the failure path's counterpart to
-    -- fsm.transition.committed_at, which a rejected command never writes. Same
+    -- $schema$.transition.committed_at, which a rejected command never writes. Same
     -- clock as that column, since they answer the same question.
     recorded_at timestamptz NOT NULL DEFAULT STATEMENT_TIMESTAMP(),
-    CONSTRAINT command_error_command_fkey FOREIGN KEY (command_id) REFERENCES fsm.command (command_id)
+    CONSTRAINT command_error_command_fkey FOREIGN KEY (command_id) REFERENCES $schema$.command (command_id)
 );
 
 -- ---------------------------------------------------------------------------

@@ -15,6 +15,7 @@ let private entity name : Entity = entityId name
 let private lease = TimeSpan.FromSeconds 30.0
 let private hour = TimeSpan.FromHours 1.0
 let private effectiveAt = DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero)
+let private commandChannel, actionChannel = Listener.channels schema
 
 let private keepCommandsFor span =
     { RetentionPolicy.keepEverything with
@@ -129,7 +130,7 @@ let private explainNotify () : string =
 
     let body =
         use read =
-            new NpgsqlCommand("SELECT prosrc FROM pg_proc WHERE oid = 'fsm.notify_pending()'::regprocedure", conn)
+            new NpgsqlCommand(sql "SELECT prosrc FROM pg_proc WHERE oid = 'fsm.notify_pending()'::regprocedure", conn)
 
         read.ExecuteScalar() :?> string
 
@@ -178,7 +179,7 @@ let pureTests =
                     HasPgmq = false }
 
               Expect.equal
-                  (Boot.defects nothing None [ "a" ])
+                  (Boot.defects SchemaName.defaults nothing None [ "a" ])
                   [ BootDefect.MissingPrerequisite "btree_gist"
                     BootDefect.MissingPrerequisite "pgmq"
                     BootDefect.SchemaMissing ]
@@ -194,9 +195,28 @@ let pureTests =
                     HasPgmq = true }
 
               Expect.equal
-                  (Boot.defects noRoutines (Some [ "a" ]) [ "a" ])
+                  (Boot.defects SchemaName.defaults noRoutines (Some [ "a" ]) [ "a" ])
                   [ BootDefect.MissingPrerequisite "fsm routines (the repeatable migrations)" ]
                   "numbered migrations alone are not a working schema"
+          }
+
+          test "a missing journal names the configured schema, not the legacy public one" {
+              let noJournal =
+                  { HasSchema = true
+                    HasJournal = false
+                    HasRoutines = true
+                    HasBtreeGist = true
+                    HasPgmq = true }
+
+              let schema =
+                  match SchemaName.tryCreate "automata_ci" with
+                  | Ok schema -> schema
+                  | Error error -> failtestf "automata_ci must validate: %A" error
+
+              Expect.equal
+                  (Boot.defects schema noJournal None [ "a" ])
+                  [ BootDefect.MissingPrerequisite "migration journal automata_ci.schemaversions" ]
+                  "the operator is told which schema's journal to look for"
           }
 
           test "keeping forever is written as an infinite interval" {
@@ -216,12 +236,68 @@ let migratorTests =
               match
                   Migrator.migrate
                       Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance
-                      "Host=unreachable.invalid;Timeout=1"
+                      { ConnectionString = "Host=unreachable.invalid;Timeout=1"
+                        Schema = SchemaName.defaults }
               with
               | Error(MigrationError.Failed(script, error)) ->
                   Expect.equal script "" "no script had started"
                   Expect.isNotNull error "and the cause travels with it"
               | Ok report -> failtestf "an unreachable database should not migrate, got %A" report
+          }
+
+          // The journal was public.schemaversions before the schema was configurable, and every
+          // existing installation still has it there. Without adoption the schema-local journal
+          // replays every numbered script against objects that already exist and fails.
+          testTask "a legacy public journal is adopted, not replayed against" {
+              if not TestContext.configured then
+                  skiptest "set AUTOMATA_TEST_DB to a migrated PostgreSQL instance"
+
+              if schema <> SchemaName.defaults then
+                  skiptest "the legacy journal only ever journaled the default schema"
+
+              do! reset ()
+
+              // Rebuild the pre-schema-configuration shape: the journal in public, nothing in
+              // the schema, and one row of retained data the replay would have to preserve.
+              exec
+                  """CREATE TABLE public.schemaversions (
+                         schemaversionsid serial PRIMARY KEY,
+                         scriptname varchar(255) NOT NULL,
+                         applied timestamp NOT NULL
+                     );
+                     INSERT INTO public.schemaversions (scriptname, applied)
+                     SELECT scriptname, applied FROM fsm.schemaversions;
+                     DROP TABLE fsm.schemaversions;
+                     INSERT INTO fsm.machine_chart_version (machine_id, version, fingerprint)
+                     VALUES ('legacy', 42, repeat('a', 64));"""
+              |> expectOk "arrange the legacy shape"
+
+              match
+                  Migrator.migrate
+                      Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance
+                      { ConnectionString = connectionString
+                        Schema = schema }
+              with
+              | Ok report ->
+                  Expect.isFalse
+                      (report.Applied
+                       |> List.exists (fun script -> script.Contains ".migrations.main."))
+                      "a numbered script must never replay against an installed schema"
+
+                  Expect.equal
+                      (scalar<int64> "SELECT count(*) FROM fsm.machine_chart_version WHERE machine_id = 'legacy'")
+                      1L
+                      "retained data survives the upgrade"
+
+                  Expect.equal
+                      (scalar<int64> "SELECT count(*) FROM fsm.schemaversions")
+                      10L
+                      "the adopted journal carries every applied script"
+
+                  Expect.isTrue
+                      (scalar<bool> "SELECT to_regclass('public.schemaversions') IS NULL")
+                      "the legacy journal is gone, not left to confuse the next reader"
+              | Error error -> failtestf "an adopted migration should succeed, got %A" error
           } ]
 
 let bootTests =
@@ -606,7 +682,10 @@ let singleFlightTests =
               use transaction = holder.BeginTransaction()
 
               use take =
-                  new NpgsqlCommand("SELECT pg_advisory_xact_lock(hashtextextended('fsm.run_maintenance', 0))", holder)
+                  new NpgsqlCommand(
+                      sql "SELECT pg_advisory_xact_lock(hashtextextended('fsm.run_maintenance', 0))",
+                      holder
+                  )
 
               take.ExecuteScalar() |> ignore
 
@@ -625,7 +704,7 @@ let notifyTests =
               do! reset ()
               do! boot RetentionPolicy.keepEverything
               let! _ = submit "e1" "k1"
-              let! conn, heard = listenOn "fsm_command"
+              let! conn, heard = listenOn commandChannel
               use _ = conn
 
               let! tick = notify ()
@@ -635,7 +714,7 @@ let notifyTests =
 
               Expect.contains
                   (List.ofSeq heard)
-                  ("fsm_command", MachineId.value machine)
+                  (commandChannel, MachineId.value machine)
                   "the payload is the machine id, never data"
           }
 
@@ -648,7 +727,7 @@ let notifyTests =
                       VisibleAt = Some(DateTimeOffset.UtcNow.AddHours 1.) }
 
               let! _ = (newInbox ()).SubmitAsync(later, noCancellation)
-              let! conn, heard = listenOn "fsm_command"
+              let! conn, heard = listenOn commandChannel
               use _ = conn
 
               let! _ = notify ()
@@ -663,13 +742,13 @@ let notifyTests =
               let! _ = submit "e1" "k1"
               let! first = claimed "k1"
               let! _ = commit first Epoch.initial
-              let! conn, heard = listenOn "fsm_action"
+              let! conn, heard = listenOn actionChannel
               use _ = conn
 
               let! _ = notify ()
               do! settle conn (TimeSpan.FromSeconds 2.)
 
-              Expect.contains (List.ofSeq heard) ("fsm_action", actionQueue) "the payload is the queue name"
+              Expect.contains (List.ofSeq heard) (actionChannel, actionQueue) "the payload is the queue name"
           }
 
           testTask "a tick reports how full the notification queue is" {
@@ -766,6 +845,7 @@ let cronTests =
               let maintenance =
                   PostgresMaintenance(
                       PostgresContext.create source ByzantineSystems.Automata.Resilience.TransientPolicy.defaults ignore
+                      |> PostgresContext.withSchema schema
                   )
                   :> IDatabaseMaintenance
 
@@ -773,7 +853,10 @@ let cronTests =
                   use conn = source.OpenConnection()
 
                   use cmd =
-                      new NpgsqlCommand("SELECT count(*) FROM cron.job WHERE jobname LIKE 'automata-%'", conn)
+                      new NpgsqlCommand(
+                          $"SELECT count(*) FROM cron.job WHERE jobname LIKE 'automata-{schemaValue}-%%'",
+                          conn
+                      )
 
                   cmd.ExecuteScalar() :?> int64
 

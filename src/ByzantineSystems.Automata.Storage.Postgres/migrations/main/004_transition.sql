@@ -1,15 +1,15 @@
 -- ---------------------------------------------------------------------------
--- fsm.transition: the append-only record of what each command decided.
+-- $schema$.transition: the append-only record of what each command decided.
 --
 -- One row per finalized command that produced a state change. The belief table
 -- says what an entity's state is; this says how it got there, which command was
 -- responsible, and under which chart version the decision was made. Replay and
 -- audit both read this, and neither can work from the belief alone.
 -- ---------------------------------------------------------------------------
--- The answer fsm.finalize_command gives. A checked text domain, like the others.
-CREATE DOMAIN fsm.finalize_outcome AS text CONSTRAINT finalize_outcome_valid CHECK (VALUE IN ('finalized', 'already_finalized', 'conflict', 'lease_lost'));
+-- The answer $schema$.finalize_command gives. A checked text domain, like the others.
+CREATE DOMAIN $schema$.finalize_outcome AS text CONSTRAINT finalize_outcome_valid CHECK (VALUE IN ('finalized', 'already_finalized', 'conflict', 'lease_lost'));
 
-CREATE TABLE fsm.transition (
+CREATE TABLE $schema$.transition (
     machine_id text NOT NULL,
     entity_id text NOT NULL,
     epoch bigint NOT NULL,
@@ -26,7 +26,7 @@ CREATE TABLE fsm.transition (
     handled_by text NOT NULL,
     exited text[] NOT NULL,
     entered text[] NOT NULL,
-    status fsm.instance_status NOT NULL,
+    status $schema$.instance_status NOT NULL,
     -- Business time, from the caller. See committed_at for the other one.
     effective_at timestamptz NOT NULL,
     -- Database time, never caller-supplied. The application's clock decides
@@ -42,18 +42,18 @@ CREATE TABLE fsm.transition (
     PRIMARY KEY (machine_id, entity_id, epoch),
     CONSTRAINT transition_epoch_positive CHECK (epoch > 0),
     -- Idempotence as a storage guarantee rather than a property of a routine.
-    -- Whatever fsm.finalize_command does, and whatever a caller retries after a
+    -- Whatever $schema$.finalize_command does, and whatever a caller retries after a
     -- dropped connection, one command can never produce two transitions.
     CONSTRAINT transition_unique_command UNIQUE (command_id),
-    CONSTRAINT transition_command_fkey FOREIGN KEY (command_id) REFERENCES fsm.command (command_id)
+    CONSTRAINT transition_command_fkey FOREIGN KEY (command_id) REFERENCES $schema$.command (command_id)
 );
 
-COMMENT ON COLUMN fsm.transition.effective_at IS 'When the event was effective in the world. Caller-supplied, because a back-dated correction is a legitimate thing to record.';
+COMMENT ON COLUMN $schema$.transition.effective_at IS 'When the event was effective in the world. Caller-supplied, because a back-dated correction is a legitimate thing to record.';
 
-COMMENT ON COLUMN fsm.transition.committed_at IS 'When this database wrote the transition. Never caller-supplied: one clock decides durable order.';
+COMMENT ON COLUMN $schema$.transition.committed_at IS 'When this database wrote the transition. Never caller-supplied: one clock decides durable order.';
 
 -- The audit read: one entity's history, oldest first.
-CREATE INDEX transition_history_idx ON fsm.transition (machine_id, entity_id, epoch);
+CREATE INDEX transition_history_idx ON $schema$.transition (machine_id, entity_id, epoch);
 
 -- ---------------------------------------------------------------------------
 -- Storage

@@ -3,12 +3,12 @@
 --
 -- Every routine here is called the same way whoever calls it. pg_cron, when it
 -- is installed, and the application's MaintenanceService, when it is not, both
--- call fsm.notify_pending and fsm.run_maintenance and nothing else, so a
+-- call $schema$.notify_pending and $schema$.run_maintenance and nothing else, so a
 -- deployment without pg_cron behaves identically, only on the application's
 -- schedule. That is the whole reason maintenance is SQL rather than F#.
 --
 -- Nothing here repairs derived state. Drift is counted and reported; the repair
--- is fsm.repair_blocked, and something has to decide to call it.
+-- is $schema$.repair_blocked, and something has to decide to call it.
 --
 -- Each routine declares its volatility, parallel safety and search_path, and
 -- returns a value, for the reasons given at the top of R__command_routines.sql.
@@ -17,12 +17,12 @@
 -- there are exactly two such reasons:
 --
 --   * pgmq names a table after each queue, so reaching one takes EXECUTE on a
---     formatted identifier, which only plpgsql has. fsm.has_visible_actions
---     and fsm.purge_action_archive are that and nothing more.
+--     formatted identifier, which only plpgsql has. $schema$.has_visible_actions
+--     and $schema$.purge_action_archive are that and nothing more.
 --   * A SQL body is parsed as a whole, so it cannot name cron.* in a database
 --     where pg_cron is not installed, even behind a guard. plpgsql resolves a
 --     statement only when it reaches it, which is what lets
---     fsm.schedule_maintenance and fsm.unschedule_maintenance check for the
+--     $schema$.schedule_maintenance and $schema$.unschedule_maintenance check for the
 --     extension first.
 --
 -- Everything else is one statement the planner sees whole and a test can
@@ -31,19 +31,19 @@
 -- rather than per row of some larger query.
 -- ---------------------------------------------------------------------------
 -- ---------------------------------------------------------------------------
--- fsm.register_maintenance: a machine announcing itself on boot.
+-- $schema$.register_maintenance: a machine announcing itself on boot.
 --
 -- An upsert, so booting again is how a changed policy takes effect, and a
 -- restored database whose registry is stale heals on the next start. Returns
 -- whether the row was new.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fsm.register_maintenance (p_machine_id text, p_action_queue text, p_keep_commands interval, p_keep_belief_history interval, p_keep_action_archive interval, p_reap_after interval)
+CREATE OR REPLACE FUNCTION $schema$.register_maintenance (p_machine_id text, p_action_queue text, p_keep_commands interval, p_keep_belief_history interval, p_keep_action_archive interval, p_reap_after interval)
     RETURNS boolean
     LANGUAGE sql
     VOLATILE PARALLEL UNSAFE
-    SET search_path = pg_catalog, fsm
+    SET search_path = pg_catalog, $schema$
     AS $$
-    INSERT INTO fsm.machine_maintenance AS m (machine_id, action_queue, keep_commands, keep_belief_history, keep_action_archive, reap_after)
+    INSERT INTO $schema$.machine_maintenance AS m (machine_id, action_queue, keep_commands, keep_belief_history, keep_action_archive, reap_after)
         VALUES ($1, $2, $3, $4, $5, $6)
     ON CONFLICT (machine_id)
         DO UPDATE SET
@@ -57,7 +57,7 @@ CREATE OR REPLACE FUNCTION fsm.register_maintenance (p_machine_id text, p_action
 $$;
 
 -- ---------------------------------------------------------------------------
--- fsm.reap_leases: hand long-expired leases back to ready.
+-- $schema$.reap_leases: hand long-expired leases back to ready.
 --
 -- Not needed for progress, and worth being honest about that. An expired lease
 -- is already claimable, because the claim tests visible_at and not status.
@@ -66,7 +66,7 @@ $$;
 -- Poison is not handled here; the processor refuses a command claimed more
 -- often than it may be attempted, which is where a crash loop is visible.
 --
--- The grace period is deliberate. fsm.extend_lease accepts a lease that
+-- The grace period is deliberate. $schema$.extend_lease accepts a lease that
 -- expired and was not reclaimed, and reaping at the instant of expiry would
 -- break that. A worker still holding the old token after a reap is fenced
 -- exactly as it would be after a reclaim: its token no longer matches.
@@ -75,15 +75,15 @@ $$;
 -- written anyway so the predicate is command_claim_idx's and the range on
 -- visible_at is an index scan.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fsm.reap_leases (p_machine_id text, p_reap_after interval)
+CREATE OR REPLACE FUNCTION $schema$.reap_leases (p_machine_id text, p_reap_after interval)
     RETURNS bigint
     LANGUAGE sql
     VOLATILE PARALLEL UNSAFE
-    SET search_path = pg_catalog, fsm
+    SET search_path = pg_catalog, $schema$
     AS $$
     WITH reaped AS (
         UPDATE
-            fsm.command c
+            $schema$.command c
         SET
             status = 'ready',
             lease_token = 0
@@ -103,7 +103,7 @@ CREATE OR REPLACE FUNCTION fsm.reap_leases (p_machine_id text, p_reap_after inte
 $$;
 
 -- ---------------------------------------------------------------------------
--- fsm.purge_commands: retention for a command's whole record.
+-- $schema$.purge_commands: retention for a command's whole record.
 --
 -- A command, its correction metadata, its transition, its error and its
 -- undelivered actions are deleted together, because together they are one
@@ -112,7 +112,7 @@ $$;
 -- statement rather than per row, so deleting parent and children in sibling
 -- CTEs of one statement satisfies them.
 --
--- Purging a transition advances fsm.entity_purge, the watermark replay reads to
+-- Purging a transition advances $schema$.entity_purge, the watermark replay reads to
 -- decide whether a suffix is complete. Only transitions matter: a rejected or
 -- dead-lettered command never changed the timeline, so it contributes nothing.
 --
@@ -134,11 +134,11 @@ $$;
 -- continues where this one stopped. SKIP LOCKED so a purge never waits on a
 -- command something else is looking at.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fsm.purge_commands (p_machine_id text, p_before timestamptz, p_batch integer)
+CREATE OR REPLACE FUNCTION $schema$.purge_commands (p_machine_id text, p_before timestamptz, p_batch integer)
     RETURNS bigint
     LANGUAGE sql
     VOLATILE PARALLEL UNSAFE
-    SET search_path = pg_catalog, fsm
+    SET search_path = pg_catalog, $schema$
     AS $$
     WITH doomed AS MATERIALIZED (
         SELECT
@@ -146,7 +146,7 @@ CREATE OR REPLACE FUNCTION fsm.purge_commands (p_machine_id text, p_before times
             c.machine_id,
             c.entity_id
         FROM
-            fsm.command c
+            $schema$.command c
         WHERE
             c.machine_id = $1
             AND c.status IN (
@@ -157,7 +157,7 @@ CREATE OR REPLACE FUNCTION fsm.purge_commands (p_machine_id text, p_before times
                 SELECT
                     1
                 FROM
-                    fsm.command later
+                    $schema$.command later
                 WHERE
                     later.machine_id = c.machine_id
                     AND later.entity_id = c.entity_id
@@ -170,13 +170,13 @@ CREATE OR REPLACE FUNCTION fsm.purge_commands (p_machine_id text, p_before times
                 SKIP LOCKED
 ),
         corrections AS (
-            DELETE FROM fsm.command_correction cc USING doomed d
+            DELETE FROM $schema$.command_correction cc USING doomed d
 WHERE cc.command_id = d.command_id), transitions AS (
-    DELETE FROM fsm.transition t USING doomed d
+    DELETE FROM $schema$.transition t USING doomed d
 WHERE t.command_id = d.command_id
 RETURNING
     d.machine_id, d.entity_id, t.effective_at), watermark AS (
-INSERT INTO fsm.entity_purge (machine_id, entity_id, max_purged_effective_at)
+INSERT INTO $schema$.entity_purge (machine_id, entity_id, max_purged_effective_at)
     SELECT
         machine_id,
         entity_id,
@@ -189,15 +189,15 @@ INSERT INTO fsm.entity_purge (machine_id, entity_id, max_purged_effective_at)
     ON CONFLICT (machine_id,
         entity_id)
         DO UPDATE SET
-            max_purged_effective_at = GREATEST (fsm.entity_purge.max_purged_effective_at, EXCLUDED.max_purged_effective_at)), errors AS (
-            DELETE FROM fsm.command_error e
+            max_purged_effective_at = GREATEST ($schema$.entity_purge.max_purged_effective_at, EXCLUDED.max_purged_effective_at)), errors AS (
+            DELETE FROM $schema$.command_error e
             USING doomed d
             WHERE e.command_id = d.command_id), undelivered AS (
                     DELETE
-                        FROM fsm.action_dead_letter a USING doomed d
+                        FROM $schema$.action_dead_letter a USING doomed d
             WHERE a.command_id = d.command_id), purged AS (
         DELETE
-            FROM fsm.command c USING doomed d
+            FROM $schema$.command c USING doomed d
 WHERE c.command_id = d.command_id
 RETURNING
     1)
@@ -206,7 +206,7 @@ RETURNING
 $$;
 
 -- ---------------------------------------------------------------------------
--- fsm.purge_belief_history: retention for superseded beliefs.
+-- $schema$.purge_belief_history: retention for superseded beliefs.
 --
 -- Deletes by upper(system_time), which is when the database stopped holding the
 -- belief. The live table is never touched, so what is believed now is never
@@ -215,17 +215,17 @@ $$;
 -- had never been held, which is exactly what retention means and worth saying
 -- where somebody configures it.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fsm.purge_belief_history (p_machine_id text, p_before timestamptz, p_batch integer)
+CREATE OR REPLACE FUNCTION $schema$.purge_belief_history (p_machine_id text, p_before timestamptz, p_batch integer)
     RETURNS bigint
     LANGUAGE sql
     VOLATILE PARALLEL UNSAFE
-    SET search_path = pg_catalog, fsm
+    SET search_path = pg_catalog, $schema$
     AS $$
     WITH doomed AS MATERIALIZED (
         SELECT
             h.ctid
         FROM
-            fsm.instance_state_history h
+            $schema$.instance_state_history h
         WHERE
             h.machine_id = $1
             AND UPPER(
@@ -234,7 +234,7 @@ CREATE OR REPLACE FUNCTION fsm.purge_belief_history (p_machine_id text, p_before
         LIMIT $3
 ),
 purged AS (
-    DELETE FROM fsm.instance_state_history h USING doomed d
+    DELETE FROM $schema$.instance_state_history h USING doomed d
 WHERE h.ctid = d.ctid
 RETURNING
     1
@@ -246,9 +246,9 @@ FROM
 $$;
 
 -- ---------------------------------------------------------------------------
--- fsm.purge_action_archive: retention for delivered actions.
+-- $schema$.purge_action_archive: retention for delivered actions.
 --
--- pgmq archives every message fsm.complete_action and fsm.abandon_action
+-- pgmq archives every message $schema$.complete_action and $schema$.abandon_action
 -- acknowledge, and nothing reads the archive back. It is operational rather
 -- than business data, so this deletes it by archived_at without any of the
 -- care the command purge takes.
@@ -257,7 +257,7 @@ $$;
 -- here, where the interpolation happens. A registered queue whose table is gone
 -- purges nothing rather than failing the whole maintenance run.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fsm.purge_action_archive (p_queue text, p_before timestamptz, p_batch integer)
+CREATE OR REPLACE FUNCTION $schema$.purge_action_archive (p_queue text, p_before timestamptz, p_batch integer)
     RETURNS bigint
     LANGUAGE plpgsql
     VOLATILE PARALLEL UNSAFE
@@ -270,7 +270,7 @@ BEGIN
         RETURN 0;
     END IF;
     PERFORM
-        fsm.assert_queue_name (p_queue);
+        $schema$.assert_queue_name (p_queue);
     IF TO_REGCLASS(FORMAT('pgmq.%I', 'a_' || p_queue)) IS NULL THEN
         RETURN 0;
     END IF;
@@ -282,13 +282,13 @@ END
 $$;
 
 -- ---------------------------------------------------------------------------
--- fsm.has_visible_actions: does this queue hold a message a worker could read.
+-- $schema$.has_visible_actions: does this queue hold a message a worker could read.
 --
 -- pgmq's own visibility test, against its (vt) index. plpgsql only because the
 -- table is named after the queue. A registered queue whose table is gone has
 -- nothing visible, rather than failing the tick for every other machine.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fsm.has_visible_actions (p_queue text)
+CREATE OR REPLACE FUNCTION $schema$.has_visible_actions (p_queue text)
     RETURNS boolean
     LANGUAGE plpgsql
     STABLE PARALLEL SAFE
@@ -301,7 +301,7 @@ BEGIN
         RETURN FALSE;
     END IF;
     PERFORM
-        fsm.assert_queue_name (p_queue);
+        $schema$.assert_queue_name (p_queue);
     IF TO_REGCLASS(FORMAT('pgmq.%I', 'q_' || p_queue)) IS NOT NULL THEN
         EXECUTE FORMAT('SELECT EXISTS (SELECT 1 FROM pgmq.%I q WHERE q.vt <= clock_timestamp())', 'q_' || p_queue) INTO v_visible;
     END IF;
@@ -310,7 +310,7 @@ END
 $$;
 
 -- ---------------------------------------------------------------------------
--- fsm.notify_pending: one tick of wake-ups, never one per write.
+-- $schema$.notify_pending: one tick of wake-ups, never one per write.
 --
 -- Called from a tick and never from a trigger. Every transaction with a pending
 -- NOTIFY takes the global notification-queue lock at commit, which serialises
@@ -318,15 +318,15 @@ $$;
 -- caps write throughput at whatever that lock allows. One statement per tick
 -- takes it once.
 --
--- The command probe is fsm.claim_commands' WHERE clause verbatim, which makes
+-- The command probe is $schema$.claim_commands' WHERE clause verbatim, which makes
 -- four places stating the claim predicate: command_claim_idx,
--- fsm.claim_commands, fsm.command_metrics and this. If you change one, change
+-- $schema$.claim_commands, $schema$.command_metrics and this. If you change one, change
 -- all four. A drifted copy here breaks nothing loudly: it wakes workers for
 -- commands they cannot claim, or fails to wake them for ones they can, and a
 -- machine holding only blocked commands wakes every listener every tick.
 -- SchemaContractTests asserts it still uses the index.
 --
--- Channels are fsm_command and fsm_action, and payloads are the machine id or
+-- Channels are namespaced per schema, and payloads are the machine id or
 -- the queue name, never data. NOTIFY bypasses row-level security, so anything
 -- in a payload is visible to every listener on the channel, and listeners have
 -- to re-read the source of truth regardless.
@@ -336,25 +336,25 @@ $$;
 -- notification costs the polling interval and nothing else. Returns how many
 -- were sent.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fsm.notify_pending ()
+CREATE OR REPLACE FUNCTION $schema$.notify_pending ()
     RETURNS integer
     LANGUAGE sql
     VOLATILE PARALLEL UNSAFE
-    SET search_path = pg_catalog, fsm
+    SET search_path = pg_catalog, $schema$
     AS $$
     WITH commands AS MATERIALIZED (
         SELECT
             PG_NOTIFY(
-                'fsm_command', m.machine_id
+                '$schema$_command', m.machine_id
 )
         FROM
-            fsm.machine_maintenance m
+            $schema$.machine_maintenance m
         WHERE
             EXISTS (
                 SELECT
                     1
                 FROM
-                    fsm.command c
+                    $schema$.command c
                 WHERE
                     c.machine_id = m.machine_id
                     AND c.status IN (
@@ -368,12 +368,12 @@ CREATE OR REPLACE FUNCTION fsm.notify_pending ()
         actions AS MATERIALIZED (
             SELECT
                 PG_NOTIFY(
-                    'fsm_action', m.action_queue
+                    '$schema$_action', m.action_queue
 )
             FROM
-                fsm.machine_maintenance m
+                $schema$.machine_maintenance m
             WHERE
-                fsm.has_visible_actions (
+                $schema$.has_visible_actions (
                     m.action_queue
 ))
     SELECT
@@ -389,7 +389,7 @@ CREATE OR REPLACE FUNCTION fsm.notify_pending ()
 $$;
 
 -- ---------------------------------------------------------------------------
--- fsm.run_maintenance: one maintenance pass over every registered machine.
+-- $schema$.run_maintenance: one maintenance pass over every registered machine.
 --
 -- Single-flight. The advisory lock is tried rather than awaited, so when
 -- another host or pg_cron is already running a pass this returns no rows at
@@ -411,7 +411,7 @@ $$;
 --
 -- One row per registered machine.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fsm.run_maintenance (p_batch integer)
+CREATE OR REPLACE FUNCTION $schema$.run_maintenance (p_batch integer)
     RETURNS TABLE (
         machine_id text,
         reaped bigint,
@@ -422,22 +422,22 @@ CREATE OR REPLACE FUNCTION fsm.run_maintenance (p_batch integer)
     LANGUAGE sql
     VOLATILE PARALLEL UNSAFE
     SET search_path = pg_catalog,
-    fsm
+    $schema$
     AS $$
     WITH turn AS MATERIALIZED (
         SELECT
             PG_TRY_ADVISORY_XACT_LOCK(
                 HASHTEXTEXTENDED(
-                    'fsm.run_maintenance', 0
+                    '$schema$.run_maintenance', 0
 )
 ) AS held
 )
 SELECT
     m.machine_id,
-    fsm.reap_leases (m.machine_id, m.reap_after),
-    fsm.purge_commands (m.machine_id, NOW() - m.keep_commands, $1),
-    fsm.purge_belief_history (m.machine_id, NOW() - m.keep_belief_history, $1),
-    fsm.purge_action_archive (m.action_queue, NOW() - m.keep_action_archive, $1),
+    $schema$.reap_leases (m.machine_id, m.reap_after),
+    $schema$.purge_commands (m.machine_id, NOW() - m.keep_commands, $1),
+    $schema$.purge_belief_history (m.machine_id, NOW() - m.keep_belief_history, $1),
+    $schema$.purge_action_archive (m.action_queue, NOW() - m.keep_action_archive, $1),
     (
         SELECT
             COUNT(*)
@@ -446,7 +446,7 @@ SELECT
                 c.blocked,
                 c.seq > MIN(c.seq) OVER (PARTITION BY c.entity_id) AS expected_blocked
             FROM
-                fsm.command c
+                $schema$.command c
             WHERE
                 c.machine_id = m.machine_id
                 AND c.status IN ('ready', 'leased')) o
@@ -454,7 +454,7 @@ SELECT
             o.blocked IS DISTINCT FROM o.expected_blocked)
 FROM
     turn,
-    fsm.machine_maintenance m
+    $schema$.machine_maintenance m
 WHERE
     turn.held
 ORDER BY
@@ -462,51 +462,51 @@ ORDER BY
 $$;
 
 -- ---------------------------------------------------------------------------
--- fsm.belief_cold_cutoff: the cutoff a refresh made now would use. The same
--- expression as fsm.belief_cold's own, so the two cannot disagree about which
+-- $schema$.belief_cold_cutoff: the cutoff a refresh made now would use. The same
+-- expression as $schema$.belief_cold's own, so the two cannot disagree about which
 -- day the cold layer should cover.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fsm.belief_cold_cutoff ()
+CREATE OR REPLACE FUNCTION $schema$.belief_cold_cutoff ()
     RETURNS timestamptz
     LANGUAGE sql
     STABLE PARALLEL SAFE
-    SET search_path = pg_catalog, fsm
+    SET search_path = pg_catalog, $schema$
     AS $$
     SELECT
         DATE_TRUNC('day', NOW()) - interval '1 day';
 $$;
 
 -- ---------------------------------------------------------------------------
--- fsm.belief_cold_is_stale: whether the cold layer is a day behind.
+-- $schema$.belief_cold_is_stale: whether the cold layer is a day behind.
 --
 -- Never refreshed counts as stale. The refresh itself is the caller's to
 -- issue, as its own statement, because REFRESH ... CONCURRENTLY cannot run
 -- inside a function.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fsm.belief_cold_is_stale ()
+CREATE OR REPLACE FUNCTION $schema$.belief_cold_is_stale ()
     RETURNS boolean
     LANGUAGE sql
     STABLE PARALLEL SAFE
-    SET search_path = pg_catalog, fsm
+    SET search_path = pg_catalog, $schema$
     AS $$
     SELECT
         COALESCE((
             SELECT
                 s.refreshed_for
-            FROM fsm.belief_cold_state s), '-infinity') < fsm.belief_cold_cutoff ();
+            FROM $schema$.belief_cold_state s), '-infinity') < $schema$.belief_cold_cutoff ();
 $$;
 
 -- ---------------------------------------------------------------------------
--- fsm.mark_belief_cold_refreshed: records the cutoff a refresh just used.
+-- $schema$.mark_belief_cold_refreshed: records the cutoff a refresh just used.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fsm.mark_belief_cold_refreshed ()
+CREATE OR REPLACE FUNCTION $schema$.mark_belief_cold_refreshed ()
     RETURNS timestamptz
     LANGUAGE sql
     VOLATILE PARALLEL UNSAFE
-    SET search_path = pg_catalog, fsm
+    SET search_path = pg_catalog, $schema$
     AS $$
-    INSERT INTO fsm.belief_cold_state AS s (singleton, refreshed_for)
-        VALUES (TRUE, fsm.belief_cold_cutoff ())
+    INSERT INTO $schema$.belief_cold_state AS s (singleton, refreshed_for)
+        VALUES (TRUE, $schema$.belief_cold_cutoff ())
     ON CONFLICT (singleton)
         DO UPDATE SET
             refreshed_for = EXCLUDED.refreshed_for
@@ -515,18 +515,18 @@ CREATE OR REPLACE FUNCTION fsm.mark_belief_cold_refreshed ()
 $$;
 
 -- ---------------------------------------------------------------------------
--- fsm.cron_schedule_of: an interval, as pg_cron would write it.
+-- $schema$.cron_schedule_of: an interval, as pg_cron would write it.
 --
 -- pg_cron takes either '<n> seconds', for 1 to 59 seconds, or a cron
 -- expression. Anything else answers the empty string rather than a rounded
 -- schedule, because a tick that silently runs at a different rate than
 -- configured is worse than one that fails to schedule; the caller refuses it.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fsm.cron_schedule_of (p_every interval)
+CREATE OR REPLACE FUNCTION $schema$.cron_schedule_of (p_every interval)
     RETURNS text
     LANGUAGE sql
     IMMUTABLE PARALLEL SAFE
-    SET search_path = pg_catalog, fsm
+    SET search_path = pg_catalog, $schema$
     AS $$
     SELECT
         CASE WHEN e.s >= 1
@@ -549,7 +549,7 @@ CREATE OR REPLACE FUNCTION fsm.cron_schedule_of (p_every interval)
 $$;
 
 -- ---------------------------------------------------------------------------
--- fsm.schedule_maintenance: put the two ticks into pg_cron, if it is here.
+-- $schema$.schedule_maintenance: put the two ticks into pg_cron, if it is here.
 --
 -- Called on every boot rather than by a migration. The intervals are the
 -- application's configuration, which a migration cannot know, and asserting
@@ -565,22 +565,22 @@ $$;
 -- use it, and 'scheduled' otherwise. The first two are not failures: pg_cron is
 -- optional and the application's MaintenanceService does the same work.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fsm.schedule_maintenance (p_notify_every interval, p_run_every interval, p_batch integer)
+CREATE OR REPLACE FUNCTION $schema$.schedule_maintenance (p_notify_every interval, p_run_every interval, p_batch integer)
     RETURNS text
     LANGUAGE plpgsql
     VOLATILE PARALLEL UNSAFE
     SET search_path = pg_catalog, pg_temp
     AS $$
 DECLARE
-    v_notify text := fsm.cron_schedule_of (p_notify_every);
-    v_run text := fsm.cron_schedule_of (p_run_every);
+    v_notify text := $schema$.cron_schedule_of (p_notify_every);
+    v_run text := $schema$.cron_schedule_of (p_run_every);
 BEGIN
     IF v_notify = '' OR v_run = '' THEN
-        RAISE EXCEPTION 'fsm.schedule_maintenance: pg_cron cannot run every % or every %; use whole seconds under a minute, whole minutes dividing an hour, or one hour', p_notify_every, p_run_every
+        RAISE EXCEPTION '$schema$.schedule_maintenance: pg_cron cannot run every % or every %; use whole seconds under a minute, whole minutes dividing an hour, or one hour', p_notify_every, p_run_every
             USING ERRCODE = 'invalid_parameter_value';
     END IF;
     IF p_batch IS NULL OR p_batch < 1 THEN
-        RAISE EXCEPTION 'fsm.schedule_maintenance: the batch must be positive, not %', p_batch
+        RAISE EXCEPTION '$schema$.schedule_maintenance: the batch must be positive, not %', p_batch
             USING ERRCODE = 'invalid_parameter_value';
     END IF;
     IF NOT EXISTS (
@@ -594,14 +594,14 @@ BEGIN
 END IF;
     BEGIN
         PERFORM
-            cron.schedule ('automata-notify', v_notify, 'SELECT fsm.notify_pending()');
+            cron.schedule ('automata-$schema$-notify', v_notify, 'SELECT $schema$.notify_pending()');
         PERFORM
-            cron.schedule ('automata-maintenance', v_run, FORMAT('SELECT count(*) FROM fsm.run_maintenance(%s)', p_batch));
+            cron.schedule ('automata-$schema$-maintenance', v_run, FORMAT('SELECT count(*) FROM $schema$.run_maintenance(%s)', p_batch));
         -- Its own job, because REFRESH ... CONCURRENTLY refuses to run inside
         -- a transaction block, and a multi-statement command is one. Half an
         -- hour past midnight, after the cutoff has moved.
         PERFORM
-            cron.schedule ('automata-belief-cold', '30 0 * * *', 'REFRESH MATERIALIZED VIEW CONCURRENTLY fsm.belief_cold');
+            cron.schedule ('automata-$schema$-belief-cold', '30 0 * * *', 'REFRESH MATERIALIZED VIEW CONCURRENTLY $schema$.belief_cold');
     EXCEPTION
         WHEN insufficient_privilege THEN
             RETURN 'not_permitted';
@@ -611,17 +611,17 @@ END
 $$;
 
 -- ---------------------------------------------------------------------------
--- fsm.unschedule_maintenance: take every maintenance job out of pg_cron, by
+-- $schema$.unschedule_maintenance: take every maintenance job out of pg_cron, by
 -- name.
 --
--- cron.job rows live outside this schema, so DROP SCHEMA fsm CASCADE leaves
+-- cron.job rows live outside this schema, so DROP SCHEMA ... CASCADE leaves
 -- them behind, calling functions that no longer exist every second. Anything
 -- tearing the schema down calls this first; make db-reset does.
 --
 -- Returns how many jobs were removed, and 0 without pg_cron or without the
 -- right to use it.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fsm.unschedule_maintenance ()
+CREATE OR REPLACE FUNCTION $schema$.unschedule_maintenance ()
     RETURNS integer
     LANGUAGE plpgsql
     VOLATILE PARALLEL UNSAFE
@@ -648,7 +648,7 @@ END IF;
         FROM
             cron.job j
         WHERE
-            j.jobname IN ('automata-notify', 'automata-maintenance', 'automata-belief-cold');
+            j.jobname IN ('automata-$schema$-notify', 'automata-$schema$-maintenance', 'automata-$schema$-belief-cold');
         GET DIAGNOSTICS v_removed = ROW_COUNT;
     EXCEPTION
         WHEN insufficient_privilege THEN
@@ -657,4 +657,3 @@ END IF;
     RETURN v_removed;
 END
 $$;
-

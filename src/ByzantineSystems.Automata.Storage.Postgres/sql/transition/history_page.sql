@@ -18,7 +18,7 @@ SELECT
     effective_at,
     committed_at
 FROM
-    fsm.transition
+    $schema$.transition
 WHERE
     machine_id = @machine_id
     AND entity_id = @entity_id

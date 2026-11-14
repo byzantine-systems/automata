@@ -13,5 +13,5 @@ SELECT
     a.vt,
     a.message
 FROM
-    fsm.claim_actions (@queue, @batch, @lease) a;
+    $schema$.claim_actions (@queue, @batch, @lease) a;
 

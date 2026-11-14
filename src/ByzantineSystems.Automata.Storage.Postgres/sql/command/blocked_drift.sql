@@ -7,7 +7,7 @@ SELECT
     blocked,
     expected_blocked
 FROM
-    fsm.blocked_drift
+    $schema$.blocked_drift
 ORDER BY
     machine_id,
     entity_id,

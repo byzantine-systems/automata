@@ -21,7 +21,8 @@ module private SupervisionMapping =
 /// <summary>PostgreSQL append-only supervision audit writer backed by a pooled data source.</summary>
 type PostgresSupervisionStore(context: PostgresContext) =
 
-    let record = StatementKey.create "supervision" "record" |> Sql.prepareProgram
+    let record =
+        StatementKey.create "supervision" "record" |> Sql.prepareProgram context.Schema
 
     interface ISupervisionEventStore with
 
@@ -45,15 +46,15 @@ type PostgresSupervisionStore(context: PostgresContext) =
 [<RequireQualifiedAccess>]
 module PostgresSupervisionQueries =
 
-    let private recent =
-        StatementKey.create "supervision" "recent" |> Sql.prepareProgram
-
     /// <summary>Lists up to 1000 of the newest audit facts first.</summary>
     let listRecent
         (context: PostgresContext)
         (limit: ClaimBatch)
         (ct: CancellationToken)
         : Task<Result<SupervisionRecord list, StoreError>> =
+        let recent =
+            StatementKey.create "supervision" "recent" |> Sql.prepareProgram context.Schema
+
         let toRecord (reader: NpgsqlDataReader) : Result<SupervisionRecord, StoreError> =
             result {
                 let! kind = EnumCodec.read Row.string EnumCodec.supervisionKind "kind" reader

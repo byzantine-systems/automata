@@ -44,7 +44,8 @@ let tests =
 
                   use acquire =
                       new NpgsqlCommand(
-                          "SELECT pg_advisory_xact_lock(hashtextextended(format('fsm.command/%s/%s', @machine::text, 'arrival-race'), 0))",
+                          sql
+                              "SELECT pg_advisory_xact_lock(hashtextextended(format('fsm.command/%s/%s', @machine::text, 'arrival-race'), 0))",
                           holder,
                           transaction
                       )
@@ -52,10 +53,10 @@ let tests =
                   acquire.Parameters.AddWithValue("machine", MachineId.value machine) |> ignore
                   let! _ = acquire.ExecuteNonQueryAsync ct
 
-                  let sql =
-                      "SELECT * FROM fsm.submit_command(@machine, 'arrival-race', @key, 1, '{}'::jsonb)"
+                  let submitSql =
+                      sql "SELECT * FROM fsm.submit_command(@machine, 'arrival-race', @key, 1, '{}'::jsonb)"
 
-                  use waiting = new NpgsqlCommand(sql, blocked)
+                  use waiting = new NpgsqlCommand(submitSql, blocked)
                   waiting.Parameters.AddWithValue("machine", MachineId.value machine) |> ignore
                   waiting.Parameters.AddWithValue("key", "second") |> ignore
                   let waitingResult = waiting.ExecuteNonQueryAsync ct
@@ -78,7 +79,7 @@ let tests =
                           do! Task.Delay(5, ct)
 
                   // B's statement clock is now older than this first insertion's arrival.
-                  use first = new NpgsqlCommand(sql, holder, transaction)
+                  use first = new NpgsqlCommand(submitSql, holder, transaction)
                   first.Parameters.AddWithValue("machine", MachineId.value machine) |> ignore
                   first.Parameters.AddWithValue("key", "first") |> ignore
                   let! _ = first.ExecuteNonQueryAsync ct
@@ -87,7 +88,8 @@ let tests =
 
                   use result =
                       new NpgsqlCommand(
-                          "SELECT received_at FROM fsm.command WHERE machine_id = @machine AND entity_id = 'arrival-race' ORDER BY seq",
+                          sql
+                              "SELECT received_at FROM fsm.command WHERE machine_id = @machine AND entity_id = 'arrival-race' ORDER BY seq",
                           holder
                       )
 

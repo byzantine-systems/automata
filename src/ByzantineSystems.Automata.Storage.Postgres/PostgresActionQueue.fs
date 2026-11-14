@@ -40,14 +40,14 @@ type PostgresActionQueue<'EntityId, 'Action>(options: ActionQueueOptions<'Entity
 
     let context = options.Context
 
-    let ensureQueue = StatementKey.create "action" "ensure_queue" |> Sql.prepareProgram
-    let claimActions = StatementKey.create "action" "claim" |> Sql.prepareProgram
-    let completeAction = StatementKey.create "action" "complete" |> Sql.prepareProgram
+    let prepare = Sql.prepareProgram context.Schema
+    let ensureQueue = StatementKey.create "action" "ensure_queue" |> prepare
+    let claimActions = StatementKey.create "action" "claim" |> prepare
+    let completeAction = StatementKey.create "action" "complete" |> prepare
 
-    let rescheduleAction =
-        StatementKey.create "action" "reschedule" |> Sql.prepareProgram
+    let rescheduleAction = StatementKey.create "action" "reschedule" |> prepare
 
-    let abandonAction = StatementKey.create "action" "abandon" |> Sql.prepareProgram
+    let abandonAction = StatementKey.create "action" "abandon" |> prepare
 
     let queue = [ "queue", Param.Text options.Queue ]
 

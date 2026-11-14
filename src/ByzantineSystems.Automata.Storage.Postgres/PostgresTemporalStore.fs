@@ -48,8 +48,9 @@ type PostgresTemporalStore<'EntityId, 'State>(options: TemporalOptions<'EntityId
         Tap.requireEntityKey "entityId" key
         key
 
-    let beliefAsOf = StatementKey.create "belief" "as_of" |> Sql.prepareProgram
-    let correctBeliefs = StatementKey.create "belief" "correct" |> Sql.prepareProgram
+    let prepare = Sql.prepareProgram context.Schema
+    let beliefAsOf = StatementKey.create "belief" "as_of" |> prepare
+    let correctBeliefs = StatementKey.create "belief" "correct" |> prepare
 
     /// Rebuilds one belief from a row of fsm.belief. The view cannot carry NOT NULL, so every
     /// column is required here rather than assumed; a row that will not decode fails on its first

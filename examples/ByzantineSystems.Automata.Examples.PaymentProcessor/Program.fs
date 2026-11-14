@@ -164,6 +164,11 @@ let private readConnectionString () : string option =
     |> List.map Environment.GetEnvironmentVariable
     |> List.tryFind (String.IsNullOrWhiteSpace >> not)
 
+let private readSchema () =
+    match Environment.GetEnvironmentVariable "BS_AUTOMATA_SCHEMA" |> Option.ofObj with
+    | None -> Ok SchemaName.defaults
+    | Some value -> SchemaName.tryCreate value
+
 /// <summary>
 /// Runs one payment through the durable path.
 ///
@@ -172,12 +177,15 @@ let private readConnectionString () : string option =
 /// processor in the background, which is what a host's worker would do, so the two halves are
 /// visible side by side.
 /// </summary>
-let private runPayment (logger: ILogger) (connectionString: string) : Task =
+let private runPayment (logger: ILogger) (connectionString: string) (schema: SchemaName) : Task =
     task {
         // One pooled data source for the run, disposed with this scope: nothing else here owns
         // a pool.
         use source = DataSource.create connectionString
-        let context = PostgresContext.create source TransientPolicy.defaults ignore
+
+        let context =
+            PostgresContext.create source TransientPolicy.defaults ignore
+            |> PostgresContext.withSchema schema
 
         // Every default spelled out in one function: JSON codecs, EntityId keys, nothing deleted,
         // leases reaped five minutes after they expire. Override any of them with { ... with }.
@@ -256,21 +264,29 @@ let private runPayment (logger: ILogger) (connectionString: string) : Task =
 
 let private run (logger: ILogger) (_argv: string array) =
     task {
-        match readConnectionString () with
-        | None ->
+        match readConnectionString (), readSchema () with
+        | None, _ ->
             // The durable authority is the point of this library, so the example needs one. It
             // says so rather than failing somewhere inside Npgsql.
             logger.LogError
                 "Set BS_AUTOMATA_CONN to a PostgreSQL connection string, then run `make migrate` before this example."
 
             return 1
-        | Some connectionString ->
-            match Migrator.migrate logger connectionString with
+        | _, Error error ->
+            logger.LogError("Invalid BS_AUTOMATA_SCHEMA: {Error}", error)
+            return 1
+        | Some connectionString, Ok schema ->
+            match
+                Migrator.migrate
+                    logger
+                    { ConnectionString = connectionString
+                      Schema = schema }
+            with
             | Error(MigrationError.Failed(script, error)) ->
                 logger.LogError(error, "Migration failed at {Script}", script)
                 return 1
             | Ok _ ->
-                do! runPayment logger connectionString
+                do! runPayment logger connectionString schema
                 return 0
     }
 

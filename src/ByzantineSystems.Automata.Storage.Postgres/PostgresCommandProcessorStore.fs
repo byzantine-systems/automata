@@ -125,24 +125,22 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
         Tap.requireEntityKey "entityId" key
         key
 
-    let finalizeCommand = StatementKey.create "command" "finalize" |> Sql.prepareProgram
+    let prepare = Sql.prepareProgram context.Schema
+    let finalizeCommand = StatementKey.create "command" "finalize" |> prepare
 
     let finalizeCorrection =
-        StatementKey.create "command" "finalize_correction" |> Sql.prepareProgram
+        StatementKey.create "command" "finalize_correction" |> prepare
 
-    let currentBelief = StatementKey.create "belief" "current" |> Sql.prepareProgram
+    let currentBelief = StatementKey.create "belief" "current" |> prepare
 
-    let historyPage =
-        StatementKey.create "transition" "history_page" |> Sql.prepareProgram
+    let historyPage = StatementKey.create "transition" "history_page" |> prepare
 
-    let transitionResult =
-        StatementKey.create "transition" "result" |> Sql.prepareProgram
+    let transitionResult = StatementKey.create "transition" "result" |> prepare
 
-    let transitionSuffix =
-        StatementKey.create "transition" "suffix" |> Sql.prepareProgram
+    let transitionSuffix = StatementKey.create "transition" "suffix" |> prepare
 
     let transitionWatermark =
-        StatementKey.create "transition" "purge_watermark" |> Sql.prepareProgram
+        StatementKey.create "transition" "purge_watermark" |> prepare
 
     /// What a commit sends beyond the command's identity: the draft and its four encoded
     /// payloads, encoded before anything is sent.

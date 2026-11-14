@@ -2,6 +2,30 @@ namespace ByzantineSystems.Automata.Storage.Postgres
 
 open System.IO
 open System.Reflection
+open System.Text.RegularExpressions
+
+/// <summary>Substitution for the named variables shared by migrations and embedded statements.</summary>
+[<RequireQualifiedAccess>]
+module internal SqlTemplate =
+
+    let private namedVariable =
+        Regex(@"\$[A-Za-z_][A-Za-z0-9_]*\$", RegexOptions.CultureInvariant)
+
+    /// <summary>
+    /// Replaces the supported schema variables and rejects every other named dollar token.
+    /// Positional parameters and anonymous dollar quotes are left untouched.
+    /// </summary>
+    let substitute (schema: SchemaName) (sql: string) : string =
+        let schema = SchemaName.value schema
+
+        namedVariable.Replace(
+            sql,
+            MatchEvaluator(fun token ->
+                match token.Value with
+                | "$schema$" -> schema
+                | "$temporal_schema$" -> $"%s{schema}_temporal"
+                | unknown -> invalidOp $"Unknown SQL template variable %s{unknown}.")
+        )
 
 /// <summary>
 /// Every statement this assembly sends, loaded once from the embedded <c>sql/</c> tree.

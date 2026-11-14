@@ -17,7 +17,7 @@
 -- comparison cannot be overtaken between checking and acting.
 -- ---------------------------------------------------------------------------
 -- ---------------------------------------------------------------------------
--- fsm.assert_queue_name: the allowlist, enforced where the interpolation is.
+-- $schema$.assert_queue_name: the allowlist, enforced where the interpolation is.
 --
 -- A queue name reaches dynamic SQL as an identifier rather than a parameter,
 -- because pgmq's tables are named after the queue. The F# side checks the same
@@ -30,7 +30,7 @@
 --
 -- IMMUTABLE and PARALLEL SAFE: it reads nothing.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fsm.assert_queue_name (p_queue text)
+CREATE OR REPLACE FUNCTION $schema$.assert_queue_name (p_queue text)
     RETURNS boolean
     LANGUAGE plpgsql
     IMMUTABLE PARALLEL SAFE
@@ -38,7 +38,7 @@ CREATE OR REPLACE FUNCTION fsm.assert_queue_name (p_queue text)
     AS $$
 BEGIN
     IF p_queue IS NULL OR LENGTH(p_queue) > 47 OR p_queue !~ '^[a-z_][a-z0-9_]*$' THEN
-        RAISE EXCEPTION 'fsm: % is not an acceptable queue name', p_queue
+        RAISE EXCEPTION '$schema$: % is not an acceptable queue name', p_queue
             USING ERRCODE = 'invalid_parameter_value';
     END IF;
     RETURN TRUE;
@@ -46,14 +46,14 @@ END
 $$;
 
 -- ---------------------------------------------------------------------------
--- fsm.ensure_action_queue: create the queue if this is its first sighting.
+-- $schema$.ensure_action_queue: create the queue if this is its first sighting.
 --
 -- pgmq.create is not idempotent, so the registry is consulted first rather than
 -- catching duplicate_table, which would also swallow a genuine collision.
 --
 -- VOLATILE and PARALLEL UNSAFE because it creates tables.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fsm.ensure_action_queue (p_queue text)
+CREATE OR REPLACE FUNCTION $schema$.ensure_action_queue (p_queue text)
     RETURNS boolean
     LANGUAGE plpgsql
     VOLATILE PARALLEL UNSAFE
@@ -61,9 +61,11 @@ CREATE OR REPLACE FUNCTION fsm.ensure_action_queue (p_queue text)
     AS $$
 DECLARE
     v_created boolean := FALSE;
+    v_owner text;
+    v_expected_owner constant text := 'automata:$schema$';
 BEGIN
     PERFORM
-        fsm.assert_queue_name (p_queue);
+        $schema$.assert_queue_name (p_queue);
     IF NOT EXISTS (
         SELECT
             1
@@ -75,12 +77,27 @@ BEGIN
         pgmq.create (p_queue);
     v_created := TRUE;
 END IF;
+
+    SELECT
+        OBJ_DESCRIPTION(TO_REGCLASS(FORMAT('pgmq.%I', 'q_' || p_queue)), 'pg_class')
+    INTO v_owner;
+
+    IF v_owner IS NOT NULL AND v_owner <> v_expected_owner THEN
+        RAISE EXCEPTION 'queue % belongs to %, not $schema$', p_queue, v_owner
+            USING ERRCODE = 'unique_violation',
+                  CONSTRAINT = 'automata_action_queue_owner';
+    END IF;
+
+    -- An existing uncommented queue predates schema ownership. Claiming it preserves its
+    -- messages while making every later cross-schema use fail closed.
+    EXECUTE FORMAT('COMMENT ON TABLE pgmq.%I IS %L', 'q_' || p_queue, v_expected_owner);
+
     RETURN v_created;
 END
 $$;
 
 -- ---------------------------------------------------------------------------
--- fsm.claim_actions: lease a batch for delivery.
+-- $schema$.claim_actions: lease a batch for delivery.
 --
 -- A thin pass-through, because pgmq.read is already the right shape: ORDER BY
 -- msg_id, WHERE vt <= clock_timestamp(), FOR UPDATE SKIP LOCKED against a (vt)
@@ -94,7 +111,7 @@ $$;
 --
 -- VOLATILE and PARALLEL UNSAFE: reading a message leases it.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fsm.claim_actions (p_queue text, p_batch integer, p_lease interval)
+CREATE OR REPLACE FUNCTION $schema$.claim_actions (p_queue text, p_batch integer, p_lease interval)
     RETURNS TABLE (
         msg_id bigint,
         read_ct integer,
@@ -107,7 +124,7 @@ CREATE OR REPLACE FUNCTION fsm.claim_actions (p_queue text, p_batch integer, p_l
     AS $$
 BEGIN
     PERFORM
-        fsm.assert_queue_name (p_queue);
+        $schema$.assert_queue_name (p_queue);
     RETURN QUERY
     SELECT
         r.msg_id,
@@ -122,7 +139,7 @@ END
 $$;
 
 -- ---------------------------------------------------------------------------
--- fsm.complete_action: archive a delivered message, fenced.
+-- $schema$.complete_action: archive a delivered message, fenced.
 --
 -- The SELECT ... FOR UPDATE is what makes this safe rather than merely checked.
 -- It holds the row for the rest of the transaction, so no other worker can read
@@ -131,8 +148,8 @@ $$;
 --
 -- VOLATILE and PARALLEL UNSAFE because it writes.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fsm.complete_action (p_queue text, p_msg_id bigint, p_read_ct integer)
-    RETURNS fsm.lease_outcome
+CREATE OR REPLACE FUNCTION $schema$.complete_action (p_queue text, p_msg_id bigint, p_read_ct integer)
+    RETURNS $schema$.lease_outcome
     LANGUAGE plpgsql
     VOLATILE PARALLEL UNSAFE
     SET search_path = pg_catalog, pg_temp
@@ -141,7 +158,7 @@ DECLARE
     v_read_ct integer;
 BEGIN
     PERFORM
-        fsm.assert_queue_name (p_queue);
+        $schema$.assert_queue_name (p_queue);
     EXECUTE FORMAT('SELECT read_ct FROM pgmq.%I WHERE msg_id = $1 FOR UPDATE', 'q_' || p_queue) INTO v_read_ct
     USING p_msg_id;
     -- Absent means somebody already archived it; a different count means
@@ -156,7 +173,7 @@ END
 $$;
 
 -- ---------------------------------------------------------------------------
--- fsm.reschedule_action: push a failed delivery out, fenced.
+-- $schema$.reschedule_action: push a failed delivery out, fenced.
 --
 -- The delay is computed by the same capped-exponential-with-jitter routine the
 -- inbox uses, so a queue full of failures spreads rather than retrying in
@@ -164,9 +181,9 @@ $$;
 --
 -- VOLATILE and PARALLEL UNSAFE because it writes.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fsm.reschedule_action (p_queue text, p_msg_id bigint, p_read_ct integer, p_base_ms integer, p_cap_ms integer)
+CREATE OR REPLACE FUNCTION $schema$.reschedule_action (p_queue text, p_msg_id bigint, p_read_ct integer, p_base_ms integer, p_cap_ms integer)
     RETURNS TABLE (
-        outcome fsm.lease_outcome,
+        outcome $schema$.lease_outcome,
         visible_at timestamptz)
     LANGUAGE plpgsql
     VOLATILE PARALLEL UNSAFE
@@ -178,29 +195,29 @@ DECLARE
     v_delay interval;
 BEGIN
     PERFORM
-        fsm.assert_queue_name (p_queue);
+        $schema$.assert_queue_name (p_queue);
     EXECUTE FORMAT('SELECT read_ct FROM pgmq.%I WHERE msg_id = $1 FOR UPDATE', 'q_' || p_queue) INTO v_read_ct
     USING p_msg_id;
     IF v_read_ct IS NULL OR v_read_ct <> p_read_ct THEN
         RETURN QUERY
         SELECT
-            'lease_lost'::fsm.lease_outcome,
+            'lease_lost'::$schema$.lease_outcome,
             '-infinity'::timestamptz;
         RETURN;
     END IF;
     -- read_ct counts deliveries, so it is the attempt number the backoff wants.
-    v_delay := fsm.retry_backoff (v_read_ct, p_base_ms, p_cap_ms);
+    v_delay := $schema$.retry_backoff (v_read_ct, p_base_ms, p_cap_ms);
     PERFORM
         pgmq.set_vt (p_queue::text, p_msg_id::bigint, EXTRACT(epoch FROM v_delay)::integer);
     RETURN QUERY
     SELECT
-        'updated'::fsm.lease_outcome,
+        'updated'::$schema$.lease_outcome,
         CLOCK_TIMESTAMP() + v_delay;
 END
 $$;
 
 -- ---------------------------------------------------------------------------
--- fsm.abandon_action: record the effect that never happened, then archive.
+-- $schema$.abandon_action: record the effect that never happened, then archive.
 --
 -- Fenced like the others, and the record is written before the archive so a
 -- failure between them leaves the message in the queue rather than leaving the
@@ -209,8 +226,8 @@ $$;
 --
 -- VOLATILE and PARALLEL UNSAFE because it writes.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fsm.abandon_action (p_queue text, p_msg_id bigint, p_read_ct integer, p_reason text)
-    RETURNS fsm.lease_outcome
+CREATE OR REPLACE FUNCTION $schema$.abandon_action (p_queue text, p_msg_id bigint, p_read_ct integer, p_reason text)
+    RETURNS $schema$.lease_outcome
     LANGUAGE plpgsql
     VOLATILE PARALLEL UNSAFE
     SET search_path = pg_catalog, pg_temp
@@ -220,14 +237,14 @@ DECLARE
     v_message jsonb;
 BEGIN
     PERFORM
-        fsm.assert_queue_name (p_queue);
+        $schema$.assert_queue_name (p_queue);
     EXECUTE FORMAT('SELECT read_ct, message FROM pgmq.%I WHERE msg_id = $1 FOR UPDATE', 'q_' || p_queue) INTO v_read_ct,
     v_message
     USING p_msg_id;
     IF v_read_ct IS NULL OR v_read_ct <> p_read_ct THEN
         RETURN 'lease_lost';
     END IF;
-    INSERT INTO fsm.action_dead_letter (machine_id, entity_id, command_id, epoch, ordinal, action, reason, deliveries)
+    INSERT INTO $schema$.action_dead_letter (machine_id, entity_id, command_id, epoch, ordinal, action, reason, deliveries)
     VALUES
         ((v_message ->> 'machine_id'),
             (v_message ->> 'entity_id'),
@@ -239,4 +256,3 @@ BEGIN
     RETURN 'updated';
 END
 $$;
-

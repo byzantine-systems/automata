@@ -1,8 +1,8 @@
 -- ---------------------------------------------------------------------------
--- fsm.correct_beliefs: rewrite a belief timeline from one instant onward.
+-- $schema$.correct_beliefs: rewrite a belief timeline from one instant onward.
 --
 -- This is the only routine permitted to write behind the live belief.
--- fsm.close_and_open refuses that case and keeps refusing it: a forward commit
+-- $schema$.close_and_open refuses that case and keeps refusing it: a forward commit
 -- landing before the current belief is a bug, not a change of mind, and a
 -- routine that quietly accepted both could not tell them apart. A correction
 -- says so explicitly by calling this instead.
@@ -14,7 +14,7 @@
 -- all, because those questions have no settled answers yet and this one does.
 --
 -- Superseded beliefs are archived rather than overwritten, and that falls out of
--- the trigger rather than being arranged here: fsm.temporal_versioning closes
+-- the trigger rather than being arranged here: $schema$.temporal_versioning closes
 -- OLD.system_time and copies the row into the history twin on UPDATE *and* on
 -- DELETE. So a belief this routine removes is still answerable through an as-of
 -- read at a known_at before the correction, which is the entire point. A
@@ -27,7 +27,7 @@
 --
 -- VOLATILE and PARALLEL UNSAFE because it writes.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fsm.correct_beliefs (p_machine_id text, p_entity_id text, p_valid_from timestamptz, p_beliefs jsonb)
+CREATE OR REPLACE FUNCTION $schema$.correct_beliefs (p_machine_id text, p_entity_id text, p_valid_from timestamptz, p_beliefs jsonb)
     RETURNS integer
     LANGUAGE plpgsql
     VOLATILE PARALLEL UNSAFE
@@ -41,7 +41,7 @@ DECLARE
     v_next timestamptz;
 BEGIN
     IF JSONB_TYPEOF(p_beliefs) <> 'array' THEN
-        RAISE EXCEPTION 'fsm.correct_beliefs: the beliefs must be a json array, not %', JSONB_TYPEOF(p_beliefs)
+        RAISE EXCEPTION '$schema$.correct_beliefs: the beliefs must be a json array, not %', JSONB_TYPEOF(p_beliefs)
             USING ERRCODE = 'invalid_parameter_value';
     END IF;
     -- Ordering is checked before anything is written. A timeline that is not
@@ -60,11 +60,11 @@ BEGIN
             -- query can answer; either is refused before anything is written.
             IF v_previous = '-infinity'::timestamptz THEN
                 IF (v_belief ->> 'valid_from')::timestamptz <> p_valid_from THEN
-                    RAISE EXCEPTION 'fsm.correct_beliefs: the first belief at % must start exactly at the corrected instant %', (v_belief ->> 'valid_from')::timestamptz, p_valid_from USING ERRCODE = 'invalid_parameter_value';
+                    RAISE EXCEPTION '$schema$.correct_beliefs: the first belief at % must start exactly at the corrected instant %', (v_belief ->> 'valid_from')::timestamptz, p_valid_from USING ERRCODE = 'invalid_parameter_value';
         END IF;
 ELSE
     IF (v_belief ->> 'valid_from')::timestamptz <= v_previous THEN
-        RAISE EXCEPTION 'fsm.correct_beliefs: the beliefs are not in ascending valid-time order at %', (v_belief ->> 'valid_from')::timestamptz
+        RAISE EXCEPTION '$schema$.correct_beliefs: the beliefs are not in ascending valid-time order at %', (v_belief ->> 'valid_from')::timestamptz
             USING ERRCODE = 'invalid_parameter_value';
     END IF;
 END IF;
@@ -79,7 +79,7 @@ END LOOP;
     -- is deleted with the rest; truncating it would produce an empty range, which
     -- instance_state_valid_half_open refuses.
     UPDATE
-        fsm.instance_state s
+        $schema$.instance_state s
     SET
         valid_during = TSTZRANGE(LOWER(s.valid_during), p_valid_from, '[)')
     WHERE
@@ -88,7 +88,7 @@ END LOOP;
         AND LOWER(s.valid_during) < p_valid_from
         AND UPPER(s.valid_during) > p_valid_from;
     GET DIAGNOSTICS v_truncated = ROW_COUNT;
-    DELETE FROM fsm.instance_state s
+    DELETE FROM $schema$.instance_state s
     WHERE s.machine_id = p_machine_id
         AND s.entity_id = p_entity_id
         AND LOWER(s.valid_during) >= p_valid_from;
@@ -106,27 +106,27 @@ END LOOP;
         JSONB_ARRAY_ELEMENTS(p_beliefs)
     WITH ORDINALITY AS t (value, ordinal)
     LOOP
-        INSERT INTO fsm.instance_state (machine_id, entity_id, state, status, epoch, command_id, chart_version, valid_during)
+        INSERT INTO $schema$.instance_state (machine_id, entity_id, state, status, epoch, command_id, chart_version, valid_during)
         VALUES
             (p_machine_id, p_entity_id, (v_belief -> 'state'),
-                (v_belief ->> 'status')::fsm.instance_status, (v_belief ->> 'epoch')::bigint, (v_belief ->> 'command_id')::bigint, (v_belief ->> 'chart_version')::integer, TSTZRANGE((v_belief ->> 'valid_from')::timestamptz, COALESCE(v_next, 'infinity'::timestamptz), '[)'));
+                (v_belief ->> 'status')::$schema$.instance_status, (v_belief ->> 'epoch')::bigint, (v_belief ->> 'command_id')::bigint, (v_belief ->> 'chart_version')::integer, TSTZRANGE((v_belief ->> 'valid_from')::timestamptz, COALESCE(v_next, 'infinity'::timestamptz), '[)'));
     END LOOP;
     RETURN v_truncated + v_deleted;
 END
 $$;
 
 -- ---------------------------------------------------------------------------
--- fsm.submit_correction: a correction enters the inbox like any command.
+-- $schema$.submit_correction: a correction enters the inbox like any command.
 --
--- Through fsm.submit_command, so idempotency, the gapless sequence and the
+-- Through $schema$.submit_command, so idempotency, the gapless sequence and the
 -- head invariant are exactly an ordinary command's: a correction waits behind
 -- work already queued for its entity, and nothing queued after it runs first.
 -- The shared insert records the correction kind and digest immediately. Only a
 -- newly accepted command receives details; changed requests under a key are refused.
 -- ---------------------------------------------------------------------------
-DROP FUNCTION IF EXISTS fsm.submit_correction (text, text, text, integer, jsonb, timestamptz, fsm.divergence, integer, text, text, text, text, text);
+DROP FUNCTION IF EXISTS $schema$.submit_correction (text, text, text, integer, jsonb, timestamptz, $schema$.divergence, integer, text, text, text, text, text);
 
-CREATE OR REPLACE FUNCTION fsm.submit_correction (p_machine_id text, p_entity_id text, p_idempotency_key text, p_chart_version integer, p_event jsonb, p_effective_at timestamptz, p_on_divergence fsm.divergence, p_replay_limit integer, p_tenant text DEFAULT '', p_principal text DEFAULT '', p_source text DEFAULT '', p_correlation_id text DEFAULT '', p_causation_id text DEFAULT '')
+CREATE OR REPLACE FUNCTION $schema$.submit_correction (p_machine_id text, p_entity_id text, p_idempotency_key text, p_chart_version integer, p_event jsonb, p_effective_at timestamptz, p_on_divergence $schema$.divergence, p_replay_limit integer, p_tenant text DEFAULT '', p_principal text DEFAULT '', p_source text DEFAULT '', p_correlation_id text DEFAULT '', p_causation_id text DEFAULT '')
     RETURNS TABLE (
         command_id bigint,
         seq bigint,
@@ -158,9 +158,9 @@ BEGIN
         v_key_reused,
         v_predecessor
     FROM
-        fsm.submit_command (p_machine_id, p_entity_id, p_idempotency_key, p_chart_version, p_event, NULL, NULL, p_tenant, p_principal, p_source, p_correlation_id, p_causation_id, 'correction', JSONB_BUILD_ARRAY(EXTRACT(EPOCH FROM p_effective_at), p_on_divergence, p_replay_limit)) s;
+        $schema$.submit_command (p_machine_id, p_entity_id, p_idempotency_key, p_chart_version, p_event, NULL, NULL, p_tenant, p_principal, p_source, p_correlation_id, p_causation_id, 'correction', JSONB_BUILD_ARRAY(EXTRACT(EPOCH FROM p_effective_at), p_on_divergence, p_replay_limit)) s;
     IF v_accepted THEN
-        INSERT INTO fsm.command_correction (command_id, effective_at, on_divergence, replay_limit)
+        INSERT INTO $schema$.command_correction (command_id, effective_at, on_divergence, replay_limit)
             VALUES (v_command_id, p_effective_at, p_on_divergence, p_replay_limit);
     END IF;
     RETURN QUERY
@@ -174,29 +174,29 @@ END
 $$;
 
 -- ---------------------------------------------------------------------------
--- fsm.finalize_correction: commit a replayed correction, all or nothing.
+-- $schema$.finalize_correction: commit a replayed correction, all or nothing.
 --
--- The same fence and epoch check as fsm.finalize_command, then the three
+-- The same fence and epoch check as $schema$.finalize_command, then the three
 -- writes a correction is: its own transition, with no actions, because no
 -- historical action is re-emitted; the rewritten belief timeline, through
--- fsm.correct_beliefs, which archives what it replaces; and the closed command,
+-- $schema$.correct_beliefs, which archives what it replaces; and the closed command,
 -- with the entity's next command promoted.
 --
 -- The replay ran outside this transaction. That is sound because the command
 -- was the entity's head while it ran, so nothing else for the entity could
 -- commit, and the epoch check here is the backstop that proves it.
 --
--- The last belief carries the new epoch. fsm.finalize_command reads the live
+-- The last belief carries the new epoch. $schema$.finalize_command reads the live
 -- belief's epoch as the entity's, so any other attribution would leave the next
 -- ordinary command expecting an epoch that is already taken.
 -- ---------------------------------------------------------------------------
-DROP FUNCTION IF EXISTS fsm.finalize_correction (bigint, bigint, bigint, timestamptz, jsonb, fsm.instance_status, jsonb, jsonb, jsonb, text, text[], text[]);
+DROP FUNCTION IF EXISTS $schema$.finalize_correction (bigint, bigint, bigint, timestamptz, jsonb, $schema$.instance_status, jsonb, jsonb, jsonb, text, text[], text[]);
 
-CREATE OR REPLACE FUNCTION fsm.finalize_correction (p_command_id bigint, p_lease_token bigint, p_expected_epoch bigint, p_valid_from timestamptz, p_beliefs jsonb, p_instance_status fsm.instance_status, p_event jsonb, p_from_state jsonb, p_to_state jsonb, p_handled_by text, p_exited text[], p_entered text[])
+CREATE OR REPLACE FUNCTION $schema$.finalize_correction (p_command_id bigint, p_lease_token bigint, p_expected_epoch bigint, p_valid_from timestamptz, p_beliefs jsonb, p_instance_status $schema$.instance_status, p_event jsonb, p_from_state jsonb, p_to_state jsonb, p_handled_by text, p_exited text[], p_entered text[])
     RETURNS TABLE (
-        outcome fsm.finalize_outcome,
+        outcome $schema$.finalize_outcome,
         epoch bigint,
-        status fsm.command_status)
+        status $schema$.command_status)
     LANGUAGE plpgsql
     VOLATILE PARALLEL UNSAFE
     SET search_path = pg_catalog,
@@ -205,8 +205,8 @@ CREATE OR REPLACE FUNCTION fsm.finalize_correction (p_command_id bigint, p_lease
 DECLARE
     v_machine_id text;
     v_entity_id text;
-    v_status fsm.command_status;
-    v_kind fsm.command_kind;
+    v_status $schema$.command_status;
+    v_kind $schema$.command_kind;
     v_token bigint;
     v_chart_version integer;
     v_current_epoch bigint;
@@ -226,33 +226,33 @@ BEGIN
         v_token,
         v_chart_version
     FROM
-        fsm.command c
+        $schema$.command c
     WHERE
         c.command_id = p_command_id
     FOR UPDATE;
     IF NOT FOUND THEN
-        RAISE EXCEPTION 'fsm.finalize_correction: no command %', p_command_id
+        RAISE EXCEPTION '$schema$.finalize_correction: no command %', p_command_id
             USING ERRCODE = 'invalid_parameter_value';
     END IF;
     IF v_kind <> 'correction' THEN
-        RAISE EXCEPTION 'fsm.finalize_correction: command % is not a correction', p_command_id
+        RAISE EXCEPTION '$schema$.finalize_correction: command % is not a correction', p_command_id
             USING ERRCODE = 'invalid_parameter_value';
     END IF;
     IF v_status IN ('succeeded', 'rejected', 'dead_letter') THEN
         IF v_token = p_lease_token THEN
             RETURN QUERY
             SELECT
-                'already_finalized'::fsm.finalize_outcome,
+                'already_finalized'::$schema$.finalize_outcome,
                 COALESCE((
                     SELECT
                         t.epoch
-                    FROM fsm.transition t
+                    FROM $schema$.transition t
                     WHERE
                         t.command_id = p_command_id), p_expected_epoch), v_status;
         ELSE
             RETURN QUERY
             SELECT
-                'lease_lost'::fsm.finalize_outcome,
+                'lease_lost'::$schema$.finalize_outcome,
                 p_expected_epoch,
                 v_status;
         END IF;
@@ -261,7 +261,7 @@ BEGIN
     IF v_status <> 'leased' OR v_token <> p_lease_token THEN
         RETURN QUERY
         SELECT
-            'lease_lost'::fsm.finalize_outcome,
+            'lease_lost'::$schema$.finalize_outcome,
             p_expected_epoch,
             v_status;
         RETURN;
@@ -271,7 +271,7 @@ BEGIN
     INTO
         v_current_epoch
     FROM
-        fsm.instance_state s
+        $schema$.instance_state s
     WHERE
         s.machine_id = v_machine_id
         AND s.entity_id = v_entity_id
@@ -280,23 +280,23 @@ BEGIN
     IF v_current_epoch <> p_expected_epoch THEN
         RETURN QUERY
         SELECT
-            'conflict'::fsm.finalize_outcome,
+            'conflict'::$schema$.finalize_outcome,
             v_current_epoch,
             v_status;
         RETURN;
     END IF;
-    INSERT INTO fsm.transition (machine_id, entity_id, epoch, command_id, chart_version, event, actions, from_state, to_state, handled_by, exited, entered, status, effective_at)
+    INSERT INTO $schema$.transition (machine_id, entity_id, epoch, command_id, chart_version, event, actions, from_state, to_state, handled_by, exited, entered, status, effective_at)
         VALUES (v_machine_id, v_entity_id, p_expected_epoch + 1, p_command_id, v_chart_version, p_event, '[]'::jsonb, p_from_state, p_to_state, p_handled_by, p_exited, p_entered, p_instance_status, p_valid_from);
     PERFORM
-        fsm.correct_beliefs (v_machine_id, v_entity_id, p_valid_from, p_beliefs);
+        $schema$.correct_beliefs (v_machine_id, v_entity_id, p_valid_from, p_beliefs);
     UPDATE
-        fsm.command c
+        $schema$.command c
     SET
         status = 'succeeded'
     WHERE
         c.command_id = p_command_id;
     UPDATE
-        fsm.command c
+        $schema$.command c
     SET
         blocked = FALSE
     WHERE
@@ -304,7 +304,7 @@ BEGIN
             SELECT
                 n.command_id
             FROM
-                fsm.command n
+                $schema$.command n
             WHERE
                 n.machine_id = v_machine_id
                 AND n.entity_id = v_entity_id
@@ -314,9 +314,9 @@ BEGIN
             LIMIT 1);
     RETURN QUERY
     SELECT
-        'finalized'::fsm.finalize_outcome,
+        'finalized'::$schema$.finalize_outcome,
         p_expected_epoch + 1,
-        'succeeded'::fsm.command_status;
+        'succeeded'::$schema$.command_status;
 END
 $$;
 

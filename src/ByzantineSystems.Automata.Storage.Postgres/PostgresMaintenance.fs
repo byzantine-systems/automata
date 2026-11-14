@@ -53,7 +53,14 @@ module internal Boot =
     /// exist, which is the answer <see cref="T:ByzantineSystems.Automata.Storage.Postgres.CatalogCheck" />
     /// gave before anyone tried to read it.
     /// </summary>
-    let defects (check: CatalogCheck) (applied: string list option) (expected: string list) : BootDefect list =
+    let defects
+        (schema: SchemaName)
+        (check: CatalogCheck)
+        (applied: string list option)
+        (expected: string list)
+        : BootDefect list =
+        let name = SchemaName.value schema
+
         [ if not check.HasBtreeGist then
               BootDefect.MissingPrerequisite "btree_gist"
           if not check.HasPgmq then
@@ -62,13 +69,13 @@ module internal Boot =
               BootDefect.SchemaMissing
           else
               match applied with
-              | None -> BootDefect.MissingPrerequisite "migration journal public.schemaversions"
+              | None -> BootDefect.MissingPrerequisite $"migration journal {name}.schemaversions"
               | Some applied -> yield! compare expected applied
 
               // A schema whose numbered migrations all ran but whose routines are missing is one
               // whose repeatable scripts never did, and nothing it could be asked would work.
               if not check.HasRoutines then
-                  BootDefect.MissingPrerequisite "fsm routines (the repeatable migrations)" ]
+                  BootDefect.MissingPrerequisite $"{name} routines (the repeatable migrations)" ]
 
     /// <summary>
     /// How long to keep something, as PostgreSQL reads an interval. Text rather than a
@@ -82,17 +89,12 @@ module internal Boot =
             String.Format(CultureInfo.InvariantCulture, "{0} microseconds", span.Ticks / 10L)
         | Retain.For span -> invalidArg (nameof retain) $"A retention period must be positive, not {span}."
 
-    let private bootCheck =
-        StatementKey.create "system" "boot_check" |> Sql.prepareProgram
-
-    let private journalOf = StatementKey.create "system" "journal" |> Sql.prepareProgram
-
-    let private registerMaintenance =
-        StatementKey.create "system" "register_maintenance" |> Sql.prepareProgram
+    let private prepare schema domain operation =
+        StatementKey.create domain operation |> Sql.prepareProgram schema
 
     /// <summary>Reads the catalog check. Never fails for a missing object; see boot_check.sql.</summary>
-    let check: StoreProgram<ReadAccess, (string * Param) list, NpgsqlDataReader, CatalogCheck> =
-        StoreProgram.queryOne bootCheck [] (fun reader ->
+    let check (schema: SchemaName) : StoreProgram<ReadAccess, (string * Param) list, NpgsqlDataReader, CatalogCheck> =
+        StoreProgram.queryOne (prepare schema "system" "boot_check") [] (fun reader ->
             Ok
                 { HasSchema = Row.bool reader "has_schema"
                   HasJournal = Row.bool reader "has_journal"
@@ -102,10 +104,11 @@ module internal Boot =
 
     /// <summary>The applied migrations, read only once the check has said the journal exists.</summary>
     let journal
+        (schema: SchemaName)
         (check: CatalogCheck)
         : StoreProgram<ReadAccess, (string * Param) list, NpgsqlDataReader, string list option> =
         if check.HasJournal then
-            StoreProgram.queryRows journalOf [] (fun row -> Row.string row "scriptname" |> Ok)
+            StoreProgram.queryRows (prepare schema "system" "journal") [] (fun row -> Row.string row "scriptname" |> Ok)
             |> StoreProgram.map Some
         else
             StoreProgram.ok None
@@ -115,9 +118,9 @@ module internal Boot =
         Sql.readProgram
             context
             (store {
-                let! check = check
-                let! applied = journal check
-                return defects check applied expectedMigrations
+                let! check = check context.Schema
+                let! applied = journal context.Schema check
+                return defects context.Schema check applied expectedMigrations
             })
             ct
 
@@ -133,7 +136,7 @@ module internal Boot =
         Sql.runProgram
             context
             (StoreProgram.executeDiscard
-                registerMaintenance
+                (prepare context.Schema "system" "register_maintenance")
                 [ "machine_id", Param.Text(MachineId.value machineId)
                   "action_queue", Param.Text queue
                   "keep_commands", Param.Text(interval retention.Commands)
@@ -152,7 +155,7 @@ module internal Boot =
 type PostgresMaintenance(context: PostgresContext) =
 
     let statement domain operation =
-        StatementKey.create domain operation |> Sql.prepareProgram
+        StatementKey.create domain operation |> Sql.prepareProgram context.Schema
 
     let notifyPending = statement "system" "notify_pending"
     let runMaintenance = statement "system" "run_maintenance"

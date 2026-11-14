@@ -13,6 +13,7 @@ type private Claimed = LeasedCommand<Entity, TestEvent>
 let private lease = LeaseDuration.create (TimeSpan.FromSeconds 30.0)
 let private actionLease = LeaseDuration.create (TimeSpan.FromSeconds 30.0)
 let private effectiveAt = DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero)
+let private registeredQueue = $"{actionQueue}_registered"
 
 let private leased (inbox: Inbox) (name: string) (key: string) : Task<Claimed> =
     task {
@@ -60,7 +61,7 @@ let tests =
               do! reset ()
 
               exec
-                  "SELECT fsm.ensure_action_queue('registered_action_target'); SELECT pgmq.purge_queue('registered_action_target'); INSERT INTO fsm.machine_maintenance(machine_id, action_queue) VALUES ('pg-tests', 'registered_action_target') ON CONFLICT(machine_id) DO UPDATE SET action_queue = EXCLUDED.action_queue"
+                  $"SELECT fsm.ensure_action_queue('{registeredQueue}'); SELECT pgmq.purge_queue('{registeredQueue}'); INSERT INTO fsm.machine_maintenance(machine_id, action_queue) VALUES ('pg-tests', '{registeredQueue}') ON CONFLICT(machine_id) DO UPDATE SET action_queue = EXCLUDED.action_queue"
               |> expectOk "register A"
 
               let! held = leased (newInbox ()) "routing" "key"
@@ -69,7 +70,7 @@ let tests =
               let! _ = commit processor held
 
               Expect.equal
-                  (scalar<int64> "SELECT count(*) FROM pgmq.q_registered_action_target")
+                  (scalar<int64> $"SELECT count(*) FROM pgmq.q_{registeredQueue}")
                   1L
                   "registration A is authoritative"
 

@@ -1,25 +1,25 @@
 -- ---------------------------------------------------------------------------
--- fsm.command_correction: what a correction command corrects.
+-- $schema$.command_correction: what a correction command corrects.
 --
 -- The missed event itself is the command's event; this holds the rest. A row
 -- exists exactly for the commands whose kind is 'correction', written in the
--- same transaction as the command by fsm.submit_correction.
+-- same transaction as the command by $schema$.submit_correction.
 -- ---------------------------------------------------------------------------
-CREATE DOMAIN fsm.divergence AS text CONSTRAINT divergence_valid CHECK (VALUE IN ('fail', 'truncate'));
+CREATE DOMAIN $schema$.divergence AS text CONSTRAINT divergence_valid CHECK (VALUE IN ('fail', 'truncate'));
 
-CREATE TABLE fsm.command_correction (
+CREATE TABLE $schema$.command_correction (
     command_id bigint PRIMARY KEY,
     -- When the missed event should have happened: the instant the belief
     -- timeline is rewritten from.
     effective_at timestamptz NOT NULL,
-    on_divergence fsm.divergence NOT NULL,
+    on_divergence $schema$.divergence NOT NULL,
     replay_limit integer NOT NULL,
     CONSTRAINT command_correction_replay_limit_positive CHECK (replay_limit > 0),
-    CONSTRAINT command_correction_command_fkey FOREIGN KEY (command_id) REFERENCES fsm.command (command_id)
+    CONSTRAINT command_correction_command_fkey FOREIGN KEY (command_id) REFERENCES $schema$.command (command_id)
 );
 
 -- ---------------------------------------------------------------------------
--- fsm.entity_purge: the furthest back a replay can still see.
+-- $schema$.entity_purge: the furthest back a replay can still see.
 --
 -- Retention removes an entity's oldest commands together with their transitions,
 -- and a transition is the only thing replay reads. The greatest effective instant
@@ -30,7 +30,7 @@ CREATE TABLE fsm.command_correction (
 -- no foreign key. The '-infinity' default keeps absence a value rather than a
 -- null, but a row only exists once something was actually purged.
 -- ---------------------------------------------------------------------------
-CREATE TABLE fsm.entity_purge (
+CREATE TABLE $schema$.entity_purge (
     machine_id text NOT NULL,
     entity_id text NOT NULL,
     max_purged_effective_at timestamptz NOT NULL DEFAULT '-infinity',

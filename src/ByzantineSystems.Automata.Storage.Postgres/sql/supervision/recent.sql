@@ -7,7 +7,7 @@ SELECT
     reason,
     at
 FROM
-    fsm.supervision_event
+    $schema$.supervision_event
 ORDER BY
     at DESC,
     id DESC

@@ -3,9 +3,15 @@
 `ByzantineSystems.Automata.Storage.Postgres` embeds its SQL and applies it through `Migrator.migrate`. The schema requires PostgreSQL 19 and two extensions.
 
 - **`btree_gist`**, for the temporal keys. It is trusted, so a role with `CREATE` on the database can install it without superuser.
-- **`pgmq`**, for action delivery. It is **not** trusted and needs a superuser, which makes `000_bootstrap.sql` a genuine DBA step rather than one only in principle.
+- **`pgmq`**, for action delivery. It is **not** trusted and needs a superuser.
+
+The migrator installs both at bootstrap, `btree_gist` with an explicit `SCHEMA public` so a `search_path` pointed at an Automata schema cannot pull an extension into a droppable schema and have `db-reset` remove it for everyone. `pgmq` keeps the schema its extension control file declares. Bootstrap is idempotent and runs as part of `Migrator.migrate`, not as a separate step a DBA must remember.
 
 The command inbox on its own still needs no extension. A deployment that only submits and claims commands runs on a host where nobody may install anything.
+
+## The schema is a setting
+
+Everything installs into a validated `SchemaName` (default `fsm`) rather than a literal. Every `$schema$` in the migration and `sql/` trees substitutes the same validated name, and database-global names — NOTIFY channels, advisory-lock keys, pg_cron job names, and the migration journal — are namespaced by it, so two Automata installations can share one database. A database migrated before the schema was configurable has its journal in `public.schemaversions`; `Migrator.migrate` moves it into the chosen schema once rather than replaying the numbered scripts against objects that already exist.
 
 ## Where SQL lives
 

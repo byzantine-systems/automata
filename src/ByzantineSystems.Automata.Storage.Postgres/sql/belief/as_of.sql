@@ -13,7 +13,7 @@ SELECT
     known_from,
     known_to
 FROM
-    fsm.belief
+    $schema$.belief
 WHERE
     machine_id = @machine_id
     AND entity_id = @entity_id

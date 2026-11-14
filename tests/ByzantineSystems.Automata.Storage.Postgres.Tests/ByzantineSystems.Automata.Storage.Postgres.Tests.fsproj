@@ -9,6 +9,8 @@
 
     <ItemGroup>
         <Compile Include="TestContext.fs" />
+        <Compile Include="SchemaNameTests.fs" />
+        <Compile Include="PostgresStoreSettingsTests.fs" />
         <Compile Include="SqlResourceTests.fs" />
         <Compile Include="SqlTests.fs" />
         <Compile Include="CommandInboxTests.fs" />
@@ -29,6 +31,7 @@
         <Compile Include="PostgresSupervisionStoreTests.fs" />
         <Compile Include="TapTests.fs" />
         <Compile Include="ListenerTests.fs" />
+        <Compile Include="TwoSchemaTests.fs" />
         <Compile Include="Program.fs" />
     </ItemGroup>
 

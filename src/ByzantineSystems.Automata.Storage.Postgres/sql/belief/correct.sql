@@ -5,5 +5,5 @@
 -- caller writing them row by row could be interrupted between two of them and
 -- leave a timeline with a hole in it that every as-of query would answer from.
 SELECT
-    fsm.correct_beliefs (@machine_id, @entity_id, @valid_from, @beliefs::jsonb) AS superseded;
+    $schema$.correct_beliefs (@machine_id, @entity_id, @valid_from, @beliefs::jsonb) AS superseded;
 

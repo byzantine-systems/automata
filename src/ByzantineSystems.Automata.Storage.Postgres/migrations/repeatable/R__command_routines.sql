@@ -1,7 +1,7 @@
 -- ---------------------------------------------------------------------------
 -- Command inbox routines.
 --
--- Every mutation of fsm.command goes through one of these. The application
+-- Every mutation of $schema$.command goes through one of these. The application
 -- never writes the table directly, which is what lets the blocked invariant,
 -- the gapless sequence and the lease fence be reasoned about in one place.
 --
@@ -13,7 +13,7 @@
 -- the operation genuinely needs more than one statement, LANGUAGE sql
 -- everywhere else.
 --
---   * fsm.submit_command is plpgsql because it needs ordered statements.
+--   * $schema$.submit_command is plpgsql because it needs ordered statements.
 --     Sibling data-modifying parts of a single SQL statement share one
 --     snapshot, run in no defined order, and cannot see each other's effects,
 --     and it depends on seeing the previous statement's effect.
@@ -24,7 +24,7 @@
 --
 -- All of these are SECURITY INVOKER, the default. They hold no privilege of
 -- their own, so the default EXECUTE grant to PUBLIC confers nothing: a caller
--- still needs its own rights on fsm.command, and row-level security, when it
+-- still needs its own rights on $schema$.command, and row-level security, when it
 -- arrives, still applies. Routines are the mutation surface for the sake of
 -- invariants, not as a privilege boundary.
 --
@@ -41,7 +41,7 @@
 -- select the wrong candidate.
 -- ---------------------------------------------------------------------------
 -- ---------------------------------------------------------------------------
--- fsm.retry_backoff: capped exponential backoff with full jitter.
+-- $schema$.retry_backoff: capped exponential backoff with full jitter.
 --
 -- Computed by bit-shift rather than pow(), so the ceiling has no float rounding
 -- near it, with the exponent clamped at 30 to stay well inside bigint.
@@ -54,18 +54,18 @@
 -- VOLATILE PARALLEL RESTRICTED because random() is. Marking it otherwise would
 -- let the planner fold a single draw across rows and undo the jitter.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fsm.retry_backoff (p_attempt integer, p_base_ms integer, p_cap_ms integer)
+CREATE OR REPLACE FUNCTION $schema$.retry_backoff (p_attempt integer, p_base_ms integer, p_cap_ms integer)
     RETURNS interval
     LANGUAGE sql
     STRICT VOLATILE PARALLEL RESTRICTED
-    SET search_path = pg_catalog, fsm
+    SET search_path = pg_catalog, $schema$
     AS $$
     SELECT
         MAKE_INTERVAL(secs => (RANDOM() * least (greatest ($3, 1)::bigint, greatest ($2, 1)::bigint << least (greatest ($1, 1) - 1, 30))) / 1000.0);
 $$;
 
 -- ---------------------------------------------------------------------------
--- fsm.submit_command: the durable front door.
+-- $schema$.submit_command: the durable front door.
 --
 -- Returns the command and whether it was newly accepted. A repeated
 -- idempotency key returns the original command id with accepted = false, so a
@@ -90,11 +90,11 @@ $$;
 -- entity and never global, and a hash collision between two unrelated entities
 -- costs serialisation rather than correctness.
 -- ---------------------------------------------------------------------------
-DROP FUNCTION IF EXISTS fsm.submit_command (text, text, text, integer, jsonb, timestamptz, timestamptz, text, text, text, text, text);
+DROP FUNCTION IF EXISTS $schema$.submit_command (text, text, text, integer, jsonb, timestamptz, timestamptz, text, text, text, text, text);
 
-DROP FUNCTION IF EXISTS fsm.submit_command (text, text, text, integer, jsonb, timestamptz, timestamptz, text, text, text, text, text, fsm.command_kind, jsonb);
+DROP FUNCTION IF EXISTS $schema$.submit_command (text, text, text, integer, jsonb, timestamptz, timestamptz, text, text, text, text, text, $schema$.command_kind, jsonb);
 
-CREATE OR REPLACE FUNCTION fsm.submit_command (p_machine_id text, p_entity_id text, p_idempotency_key text, p_chart_version integer, p_event jsonb, p_visible_at timestamptz DEFAULT NULL, p_received_at timestamptz DEFAULT NULL, p_tenant text DEFAULT '', p_principal text DEFAULT '', p_source text DEFAULT '', p_correlation_id text DEFAULT '', p_causation_id text DEFAULT '', p_kind fsm.command_kind DEFAULT 'event', p_correction jsonb DEFAULT '{}')
+CREATE OR REPLACE FUNCTION $schema$.submit_command (p_machine_id text, p_entity_id text, p_idempotency_key text, p_chart_version integer, p_event jsonb, p_visible_at timestamptz DEFAULT NULL, p_received_at timestamptz DEFAULT NULL, p_tenant text DEFAULT '', p_principal text DEFAULT '', p_source text DEFAULT '', p_correlation_id text DEFAULT '', p_causation_id text DEFAULT '', p_kind $schema$.command_kind DEFAULT 'event', p_correction jsonb DEFAULT '{}')
     RETURNS TABLE (
         command_id bigint,
         seq bigint,
@@ -104,7 +104,7 @@ CREATE OR REPLACE FUNCTION fsm.submit_command (p_machine_id text, p_entity_id te
     LANGUAGE plpgsql
     VOLATILE PARALLEL UNSAFE
     SET search_path = pg_catalog,
-    fsm
+    $schema$
     AS $$
 DECLARE
     v_command_id bigint;
@@ -116,7 +116,7 @@ DECLARE
     v_received_at timestamptz;
 BEGIN
     PERFORM
-        PG_ADVISORY_XACT_LOCK(HASHTEXTEXTENDED(FORMAT('fsm.command/%s/%s', p_machine_id, p_entity_id), 0));
+        PG_ADVISORY_XACT_LOCK(HASHTEXTEXTENDED(FORMAT('$schema$.command/%s/%s', p_machine_id, p_entity_id), 0));
     v_digest := SHA256 (CONVERT_TO(JSONB_BUILD_ARRAY(p_kind, p_chart_version, p_event, p_correction)::text, 'UTF8'));
     -- The incumbent, if this key was already submitted. Under the lock this read
     -- is race-free, and command_unique_idem remains the backstop.
@@ -134,7 +134,7 @@ BEGIN
         v_seq,
         v_existing_digest
     FROM
-        fsm.command c
+        $schema$.command c
     WHERE
         c.machine_id = p_machine_id
         AND c.entity_id = p_entity_id
@@ -158,7 +158,7 @@ BEGIN
         v_seq,
         v_predecessor
     FROM
-        fsm.command c
+        $schema$.command c
     WHERE
         c.machine_id = p_machine_id
         AND c.entity_id = p_entity_id
@@ -186,15 +186,15 @@ BEGIN
         SELECT
             1
         FROM
-            fsm.command c
+            $schema$.command c
         WHERE
             c.machine_id = p_machine_id
             AND c.entity_id = p_entity_id
             AND c.status IN ('ready', 'leased'));
-    INSERT INTO fsm.command (machine_id, entity_id, seq, idempotency_key, chart_version, event, kind, request_digest, blocked, visible_at, received_at, tenant, principal, source, correlation_id, causation_id)
+    INSERT INTO $schema$.command (machine_id, entity_id, seq, idempotency_key, chart_version, event, kind, request_digest, blocked, visible_at, received_at, tenant, principal, source, correlation_id, causation_id)
         VALUES (p_machine_id, p_entity_id, v_seq, p_idempotency_key, p_chart_version, p_event, p_kind, v_digest, v_blocked, COALESCE(p_visible_at, NOW()), v_received_at, COALESCE(p_tenant, ''), coalesce(p_principal, ''), COALESCE(p_source, ''), coalesce(p_correlation_id, ''), COALESCE(p_causation_id, ''))
     RETURNING
-        fsm.command.command_id
+        $schema$.command.command_id
     INTO
         v_command_id;
     RETURN QUERY
@@ -208,11 +208,11 @@ END;
 $$;
 
 -- ---------------------------------------------------------------------------
--- fsm.claim_commands: lease the next runnable commands for a machine.
+-- $schema$.claim_commands: lease the next runnable commands for a machine.
 --
 -- THE CANDIDATE SET MUST BE A MATERIALISED CTE. Written the obvious way, as
 --
---     UPDATE fsm.command SET ... WHERE command_id IN (SELECT ... LIMIT $2)
+--     UPDATE $schema$.command SET ... WHERE command_id IN (SELECT ... LIMIT $2)
 --
 -- the planner puts the candidate subquery on the inner side of a nested-loop
 -- semi join and rescans it once per outer row. Each rescan sees the rows this
@@ -225,7 +225,7 @@ $$;
 -- once. MATERIALIZED is therefore redundant, and written anyway for the reader.
 --
 -- The WHERE clause is command_claim_idx's predicate plus the visibility test.
--- If you change one, change the index, this, and fsm.command_metrics together.
+-- If you change one, change the index, this, and $schema$.command_metrics together.
 -- Drift does not break correctness, it silently stops using the index.
 --
 -- Per-entity mutual exclusion is not enforced here and does not need to be.
@@ -244,17 +244,17 @@ $$;
 -- deliberately ends here: the lease, not a held row lock, is what protects the
 -- command while the application processes it outside any transaction.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fsm.claim_commands (p_machine_id text, p_batch integer, p_lease interval)
-    RETURNS SETOF fsm.command
+CREATE OR REPLACE FUNCTION $schema$.claim_commands (p_machine_id text, p_batch integer, p_lease interval)
+    RETURNS SETOF $schema$.command
     LANGUAGE sql
     VOLATILE PARALLEL UNSAFE
-    SET search_path = pg_catalog, fsm
+    SET search_path = pg_catalog, $schema$
     AS $$
     WITH candidate AS MATERIALIZED (
         SELECT
             c.command_id
         FROM
-            fsm.command c
+            $schema$.command c
         WHERE
             c.machine_id = $1
             AND c.status IN (
@@ -270,11 +270,11 @@ CREATE OR REPLACE FUNCTION fsm.claim_commands (p_machine_id text, p_batch intege
         FOR UPDATE
             SKIP LOCKED)
 UPDATE
-    fsm.command c
+    $schema$.command c
 SET
     status = 'leased',
     visible_at = NOW() + $3,
-    lease_token = NEXTVAL('fsm.lease_token'),
+    lease_token = NEXTVAL('$schema$.lease_token'),
     read_ct = c.read_ct + 1
 FROM
     candidate
@@ -285,7 +285,7 @@ RETURNING
 $$;
 
 -- ---------------------------------------------------------------------------
--- fsm.reschedule_command: hand a failed command back for a later attempt.
+-- $schema$.reschedule_command: hand a failed command back for a later attempt.
 --
 -- The command keeps its place. It stays non-terminal, stays the entity's head,
 -- and nothing else for that entity runs before it. This is what replaces a
@@ -298,14 +298,14 @@ $$;
 -- Returns '-infinity' as the new visibility when the lease was lost, because
 -- nothing in this schema is nullable and absence always has a value.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fsm.reschedule_command (p_command_id bigint, p_lease_token bigint, p_base_ms integer, p_cap_ms integer)
+CREATE OR REPLACE FUNCTION $schema$.reschedule_command (p_command_id bigint, p_lease_token bigint, p_base_ms integer, p_cap_ms integer)
     RETURNS TABLE (
-        outcome fsm.lease_outcome,
+        outcome $schema$.lease_outcome,
         visible_at timestamptz)
     LANGUAGE sql
     VOLATILE PARALLEL UNSAFE
     SET search_path = pg_catalog,
-    fsm
+    $schema$
     AS $$
     -- c.attempts on the right-hand side is the pre-update value, so the backoff
     -- is computed for the attempt that has just failed.
@@ -315,12 +315,12 @@ CREATE OR REPLACE FUNCTION fsm.reschedule_command (p_command_id bigint, p_lease_
     -- Zero rows back means the fence rejected the caller.
     WITH fenced AS (
         UPDATE
-            fsm.command c
+            $schema$.command c
         SET
             status = 'ready',
             lease_token = 0,
             attempts = c.attempts + 1,
-            visible_at = NOW() + fsm.retry_backoff (c.attempts + 1, $3, $4)
+            visible_at = NOW() + $schema$.retry_backoff (c.attempts + 1, $3, $4)
         WHERE
             c.command_id = $1
             AND c.lease_token = $2
@@ -337,7 +337,7 @@ CREATE OR REPLACE FUNCTION fsm.reschedule_command (p_command_id bigint, p_lease_
             'updated'
         ELSE
             'lease_lost'
-        END::fsm.lease_outcome AS outcome,
+        END::$schema$.lease_outcome AS outcome,
         COALESCE((
             SELECT
                 f.visible_at
@@ -345,22 +345,22 @@ CREATE OR REPLACE FUNCTION fsm.reschedule_command (p_command_id bigint, p_lease_
 $$;
 
 -- ---------------------------------------------------------------------------
--- fsm.extend_lease: keep a long-running command claimed.
+-- $schema$.extend_lease: keep a long-running command claimed.
 --
 -- Deliberately does not check whether the lease has already expired. If it has
 -- and nobody reclaimed the command, extending is exactly the right outcome; if
 -- somebody did reclaim it, the token no longer matches and the answer is
 -- 'lease_lost'. The token, not the clock, decides ownership.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fsm.extend_lease (p_command_id bigint, p_lease_token bigint, p_lease interval)
-    RETURNS fsm.lease_outcome
+CREATE OR REPLACE FUNCTION $schema$.extend_lease (p_command_id bigint, p_lease_token bigint, p_lease interval)
+    RETURNS $schema$.lease_outcome
     LANGUAGE sql
     VOLATILE PARALLEL UNSAFE
-    SET search_path = pg_catalog, fsm
+    SET search_path = pg_catalog, $schema$
     AS $$
     WITH fenced AS (
         UPDATE
-            fsm.command c
+            $schema$.command c
         SET
             visible_at = NOW() + $3
         WHERE
@@ -379,11 +379,11 @@ CREATE OR REPLACE FUNCTION fsm.extend_lease (p_command_id bigint, p_lease_token 
             'updated'
         ELSE
             'lease_lost'
-        END::fsm.lease_outcome;
+        END::$schema$.lease_outcome;
 $$;
 
 -- ---------------------------------------------------------------------------
--- fsm.repair_blocked: opt-in reconciliation of the derived blocked column.
+-- $schema$.repair_blocked: opt-in reconciliation of the derived blocked column.
 --
 -- Detection runs by default on the maintenance tick, from
 -- sql/command/blocked_drift.sql. Repair does not, and must be invoked
@@ -401,14 +401,14 @@ $$;
 -- command_blocked_is_ready rather than writing it. That combination is
 -- impossible by construction, so failing is the correct outcome.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fsm.repair_blocked ()
+CREATE OR REPLACE FUNCTION $schema$.repair_blocked ()
     RETURNS TABLE (
         command_id bigint,
         blocked boolean)
     LANGUAGE sql
     VOLATILE PARALLEL UNSAFE
     SET search_path = pg_catalog,
-    fsm
+    $schema$
     AS $$
     WITH expected AS (
         SELECT
@@ -417,11 +417,11 @@ CREATE OR REPLACE FUNCTION fsm.repair_blocked ()
             c.seq > MIN(c.seq) OVER (PARTITION BY c.machine_id,
                 c.entity_id) AS expected_blocked
         FROM
-            fsm.command c
+            $schema$.command c
         WHERE
             c.status IN ('ready', 'leased'))
     UPDATE
-        fsm.command c
+        $schema$.command c
     SET
         blocked = e.expected_blocked
     FROM
@@ -435,7 +435,7 @@ CREATE OR REPLACE FUNCTION fsm.repair_blocked ()
 $$;
 
 -- ---------------------------------------------------------------------------
--- fsm.command_metrics: "is this machine healthy", in one row per machine.
+-- $schema$.command_metrics: "is this machine healthy", in one row per machine.
 --
 -- Grain: one row per machine_id that has at least one command. A machine with
 -- no rows at all does not appear, which is the honest answer to "how is it
@@ -445,7 +445,7 @@ $$;
 -- blocked commands looks idle by every other measure while holding work that
 -- may never run.
 --
--- The runnable filter is fsm.claim_commands' WHERE clause verbatim, so the
+-- The runnable filter is $schema$.claim_commands' WHERE clause verbatim, so the
 -- number reported and the number claimable cannot drift apart. An expired lease
 -- counts as runnable because it is claimable; in_flight counts only leases that
 -- are still live.
@@ -459,7 +459,7 @@ $$;
 -- a hot path. Its cost grows with retained history, which is what retention is
 -- for.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fsm.command_metrics ()
+CREATE OR REPLACE FUNCTION $schema$.command_metrics ()
     RETURNS TABLE (
         machine_id text,
         runnable bigint,
@@ -474,7 +474,7 @@ CREATE OR REPLACE FUNCTION fsm.command_metrics ()
     LANGUAGE sql
     STABLE PARALLEL SAFE
     SET search_path = pg_catalog,
-    fsm
+    $schema$
     AS $$
     SELECT
         c.machine_id AS machine_id,
@@ -496,8 +496,7 @@ CREATE OR REPLACE FUNCTION fsm.command_metrics ()
         AND c.visible_at <= NOW()), interval '0') AS oldest_runnable_age,
         COALESCE(MAX(NOW() - c.received_at) FILTER (WHERE c.status IN ('ready', 'leased')), interval '0') AS oldest_unacked_age
     FROM
-        fsm.command c
+        $schema$.command c
     GROUP BY
         c.machine_id;
 $$;
-

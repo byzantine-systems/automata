@@ -8,7 +8,7 @@
 -- what "range @> t" meant, with no boundary case between them.
 -- ---------------------------------------------------------------------------
 -- ---------------------------------------------------------------------------
--- fsm.belief_cold: superseded beliefs old enough to never change again.
+-- $schema$.belief_cold: superseded beliefs old enough to never change again.
 --
 -- A history row is written once, when its belief is superseded, and only ever
 -- deleted afterwards, by retention. Rows older than the cutoff are therefore
@@ -33,7 +33,7 @@
 -- job when pg_cron runs maintenance, and by the application's maintenance pass
 -- otherwise.
 -- ---------------------------------------------------------------------------
-CREATE MATERIALIZED VIEW fsm.belief_cold AS
+CREATE MATERIALIZED VIEW $schema$.belief_cold AS
 SELECT
     h.machine_id,
     h.entity_id,
@@ -46,7 +46,7 @@ SELECT
     h.system_time,
     c.cutoff
 FROM
-    fsm.instance_state_history h
+    $schema$.instance_state_history h
     CROSS JOIN (
         SELECT
             DATE_TRUNC('day', NOW()) - interval '1 day' AS cutoff) c
@@ -55,24 +55,24 @@ WHERE
 
 -- What REFRESH ... CONCURRENTLY diffs by. One entity never holds two versions
 -- with the same valid window over the same belief window.
-CREATE UNIQUE INDEX belief_cold_key ON fsm.belief_cold (machine_id, entity_id, valid_during, system_time);
+CREATE UNIQUE INDEX belief_cold_key ON $schema$.belief_cold (machine_id, entity_id, valid_during, system_time);
 
 -- max(cutoff) is read on every belief query, so it has to be an index probe
 -- rather than a scan of everything this view holds.
-CREATE INDEX belief_cold_cutoff_idx ON fsm.belief_cold (cutoff);
+CREATE INDEX belief_cold_cutoff_idx ON $schema$.belief_cold (cutoff);
 
 -- Which cutoff the last refresh used, so the maintenance pass refreshes once a
 -- day rather than on every tick. A hint and nothing more: a stale value costs
 -- a refresh that finds nothing new, never a wrong read, because readers take
--- the boundary from fsm.belief_cold itself.
-CREATE TABLE fsm.belief_cold_state (
+-- the boundary from $schema$.belief_cold itself.
+CREATE TABLE $schema$.belief_cold_state (
     singleton boolean PRIMARY KEY DEFAULT TRUE,
     refreshed_for timestamptz NOT NULL,
     CONSTRAINT belief_cold_state_singleton CHECK (singleton)
 );
 
 -- ---------------------------------------------------------------------------
--- fsm.belief: every belief ever held, on both time axes.
+-- $schema$.belief: every belief ever held, on both time axes.
 --
 -- Three branches, which never overlap:
 --
@@ -84,13 +84,13 @@ CREATE TABLE fsm.belief_cold_state (
 -- cold layer is empty, so the two history branches meet exactly whatever the
 -- refresh has or has not done yet.
 --
--- Retention is applied here as well as by fsm.purge_belief_history. A purge is
+-- Retention is applied here as well as by $schema$.purge_belief_history. A purge is
 -- batched and the cold layer refreshes once a day, so without this a belief
 -- past its retention would stay visible until both caught up. Filtering by the
 -- machine's keep_belief_history makes it invisible at the same instant for
 -- every reader. A machine with no registration keeps everything.
 -- ---------------------------------------------------------------------------
-CREATE VIEW fsm.belief AS
+CREATE VIEW $schema$.belief AS
 SELECT
     b.machine_id,
     b.entity_id,
@@ -115,7 +115,7 @@ FROM (
         s.valid_during,
         s.system_time
     FROM
-        fsm.instance_state s
+        $schema$.instance_state s
     UNION ALL
     SELECT
         h.machine_id,
@@ -128,17 +128,17 @@ FROM (
         h.valid_during,
         h.system_time
     FROM
-        fsm.instance_state_history h
+        $schema$.instance_state_history h
     WHERE
         UPPER(h.system_time) >= (
             SELECT
                 COALESCE(MAX(c.cutoff), '-infinity')
             FROM
-                fsm.belief_cold c)
+                $schema$.belief_cold c)
             AND UPPER(h.system_time) >= NOW() - COALESCE((
                 SELECT
                     m.keep_belief_history
-                FROM fsm.machine_maintenance m
+                FROM $schema$.machine_maintenance m
             WHERE
                 m.machine_id = h.machine_id), 'infinity')
         UNION ALL
@@ -153,22 +153,22 @@ FROM (
             c.valid_during,
             c.system_time
         FROM
-            fsm.belief_cold c
+            $schema$.belief_cold c
         WHERE
             UPPER(c.system_time) >= NOW() - COALESCE((
                 SELECT
                     m.keep_belief_history
-                FROM fsm.machine_maintenance m
+                FROM $schema$.machine_maintenance m
             WHERE
                 m.machine_id = c.machine_id), 'infinity')) b;
 
 -- ---------------------------------------------------------------------------
--- fsm.current_belief: the belief held now about what is true now.
+-- $schema$.current_belief: the belief held now about what is true now.
 --
 -- The predicate is instance_state_live_idx's own, written the same way, so the
 -- partial index still serves the runtime's most frequent read.
 -- ---------------------------------------------------------------------------
-CREATE VIEW fsm.current_belief AS
+CREATE VIEW $schema$.current_belief AS
 SELECT
     s.machine_id,
     s.entity_id,
@@ -180,13 +180,13 @@ SELECT
     LOWER(s.valid_during) AS valid_from,
     LOWER(s.system_time) AS known_from
 FROM
-    fsm.instance_state s
+    $schema$.instance_state s
 WHERE
     UPPER(s.valid_during) = 'infinity';
 
 -- ---------------------------------------------------------------------------
--- fsm.blocked_drift: open commands whose derived blocked flag disagrees with
--- their siblings. Empty means healthy. See fsm.repair_blocked for the opt-in
+-- $schema$.blocked_drift: open commands whose derived blocked flag disagrees with
+-- their siblings. Empty means healthy. See $schema$.repair_blocked for the opt-in
 -- repair, which is never run for you.
 --
 -- The truth is recomputed from first principles rather than from the column
@@ -194,7 +194,7 @@ WHERE
 -- be unblocked. The window runs after WHERE, so min(seq) is the minimum over
 -- open siblings only. Cost is proportional to open commands, not to history.
 -- ---------------------------------------------------------------------------
-CREATE VIEW fsm.blocked_drift AS
+CREATE VIEW $schema$.blocked_drift AS
 SELECT
     o.command_id,
     o.machine_id,
@@ -211,7 +211,7 @@ FROM (
         c.blocked,
         c.seq > MIN(c.seq) OVER (PARTITION BY c.machine_id, c.entity_id) AS expected_blocked
     FROM
-        fsm.command c
+        $schema$.command c
     WHERE
         c.status IN ('ready', 'leased')) o
 WHERE

@@ -8,6 +8,8 @@
     </PropertyGroup>
 
     <ItemGroup>
+        <Compile Include="SchemaName.fs" />
+        <Compile Include="PostgresStoreSettings.fs" />
         <!-- Db.fs precedes DataSource.fs: the data source's resilience is built from the
              driver-failure classifier that lives with the rest of the adapter boundary. -->
         <Compile Include="Db.fs" />
@@ -61,6 +63,10 @@
         <PackageReference Include="FsToolkit.ErrorHandling" />
         <PackageReference Include="SqlHydra.Query" />
         <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+        <!-- Options validation lives with the settings it validates, and the version is
+             pinned here rather than in Directory.Packages.props, as the memory rule requires
+             for provider-edge dependencies. -->
+        <PackageReference Include="Microsoft.Extensions.Options" VersionOverride="10.0.12" />
     </ItemGroup>
 
 </Project>

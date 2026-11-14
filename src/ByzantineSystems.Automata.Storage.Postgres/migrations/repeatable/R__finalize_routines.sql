@@ -1,5 +1,5 @@
 -- ---------------------------------------------------------------------------
--- fsm.finalize_command: the one atomic step.
+-- $schema$.finalize_command: the one atomic step.
 --
 -- A worker that loses its connection mid-finalize does not know whether it
 -- committed. Without a defined rule it retries, is told the lease is lost, and
@@ -12,7 +12,7 @@
 --   exists        | another               | lease_lost
 --   none          | stale                 | lease_lost
 --
--- The table is already in the schema. fsm.command.status records the terminal
+-- The table is already in the schema. $schema$.command.status records the terminal
 -- states, so "a result exists" is a column; command_lease_token_matches_status
 -- forces a terminal row to carry a non-zero token, so "who wrote it" is a
 -- column too. The four rows are two comparisons.
@@ -25,7 +25,7 @@
 -- This is what makes an ambiguous outcome safe to retry, and why a cancelled
 -- Npgsql command or a dropped socket can be treated as "unknown, try again".
 --
--- It replaces fsm.ack_command, which got exactly this wrong: its update
+-- It replaces $schema$.ack_command, which got exactly this wrong: its update
 -- required status = 'leased', so a second acknowledgement by the same token
 -- reported lease_lost rather than the work already done.
 --
@@ -42,15 +42,15 @@
 --
 -- VOLATILE and PARALLEL UNSAFE because it writes.
 -- ---------------------------------------------------------------------------
-DROP FUNCTION IF EXISTS fsm.finalize_command (bigint, bigint, bigint, fsm.command_status, text, jsonb, jsonb, fsm.instance_status, timestamptz, jsonb, jsonb, jsonb, jsonb, text, text[], text[]);
+DROP FUNCTION IF EXISTS $schema$.finalize_command (bigint, bigint, bigint, $schema$.command_status, text, jsonb, jsonb, $schema$.instance_status, timestamptz, jsonb, jsonb, jsonb, jsonb, text, text[], text[]);
 
-DROP FUNCTION IF EXISTS fsm.finalize_command (bigint, bigint, bigint, fsm.command_status, jsonb, jsonb, fsm.instance_status, timestamptz, jsonb, jsonb, jsonb, jsonb, text, text[], text[]);
+DROP FUNCTION IF EXISTS $schema$.finalize_command (bigint, bigint, bigint, $schema$.command_status, jsonb, jsonb, $schema$.instance_status, timestamptz, jsonb, jsonb, jsonb, jsonb, text, text[], text[]);
 
-CREATE OR REPLACE FUNCTION fsm.finalize_command (p_command_id bigint, p_lease_token bigint, p_expected_epoch bigint, p_status fsm.command_status, p_error jsonb DEFAULT NULL, p_state jsonb DEFAULT NULL, p_instance_status fsm.instance_status DEFAULT NULL, p_effective_at timestamptz DEFAULT NULL, p_event jsonb DEFAULT NULL, p_actions jsonb DEFAULT NULL, p_from_state jsonb DEFAULT NULL, p_to_state jsonb DEFAULT NULL, p_handled_by text DEFAULT NULL, p_exited text[] DEFAULT NULL, p_entered text[] DEFAULT NULL)
+CREATE OR REPLACE FUNCTION $schema$.finalize_command (p_command_id bigint, p_lease_token bigint, p_expected_epoch bigint, p_status $schema$.command_status, p_error jsonb DEFAULT NULL, p_state jsonb DEFAULT NULL, p_instance_status $schema$.instance_status DEFAULT NULL, p_effective_at timestamptz DEFAULT NULL, p_event jsonb DEFAULT NULL, p_actions jsonb DEFAULT NULL, p_from_state jsonb DEFAULT NULL, p_to_state jsonb DEFAULT NULL, p_handled_by text DEFAULT NULL, p_exited text[] DEFAULT NULL, p_entered text[] DEFAULT NULL)
     RETURNS TABLE (
-        outcome fsm.finalize_outcome,
+        outcome $schema$.finalize_outcome,
         epoch bigint,
-        status fsm.command_status)
+        status $schema$.command_status)
     LANGUAGE plpgsql
     VOLATILE PARALLEL UNSAFE
     SET search_path = pg_catalog,
@@ -59,24 +59,24 @@ CREATE OR REPLACE FUNCTION fsm.finalize_command (p_command_id bigint, p_lease_to
 DECLARE
     v_machine_id text;
     v_entity_id text;
-    v_status fsm.command_status;
+    v_status $schema$.command_status;
     v_token bigint;
     v_chart_version integer;
     v_current_epoch bigint;
     v_action_queue text;
 BEGIN
     IF p_status NOT IN ('succeeded', 'rejected', 'dead_letter') THEN
-        RAISE EXCEPTION 'fsm.finalize_command: % is not a terminal status', p_status
+        RAISE EXCEPTION '$schema$.finalize_command: % is not a terminal status', p_status
             USING ERRCODE = 'invalid_parameter_value';
     END IF;
     -- A succeeded command carries a transition; the other two carry an error.
     -- Checking here keeps a caller from half-filling either shape.
     IF p_status = 'succeeded' AND (p_state IS NULL OR p_event IS NULL OR p_effective_at IS NULL) THEN
-        RAISE EXCEPTION 'fsm.finalize_command: a succeeded command requires its transition'
+        RAISE EXCEPTION '$schema$.finalize_command: a succeeded command requires its transition'
             USING ERRCODE = 'invalid_parameter_value';
     END IF;
     IF p_status <> 'succeeded' AND p_error IS NULL THEN
-        RAISE EXCEPTION 'fsm.finalize_command: a % command requires an error', p_status
+        RAISE EXCEPTION '$schema$.finalize_command: a % command requires an error', p_status
             USING ERRCODE = 'invalid_parameter_value';
     END IF;
     -- FOR UPDATE because everything below decides from these values and then
@@ -94,12 +94,12 @@ BEGIN
         v_token,
         v_chart_version
     FROM
-        fsm.command c
+        $schema$.command c
     WHERE
         c.command_id = p_command_id
     FOR UPDATE;
     IF NOT FOUND THEN
-        RAISE EXCEPTION 'fsm.finalize_command: no command %', p_command_id
+        RAISE EXCEPTION '$schema$.finalize_command: no command %', p_command_id
             USING ERRCODE = 'invalid_parameter_value';
     END IF;
     -- Already finished. Whether this caller wrote it is the whole question: if
@@ -108,17 +108,17 @@ BEGIN
         IF v_token = p_lease_token THEN
             RETURN QUERY
             SELECT
-                'already_finalized'::fsm.finalize_outcome,
+                'already_finalized'::$schema$.finalize_outcome,
                 COALESCE((
                     SELECT
                         t.epoch
-                    FROM fsm.transition t
+                    FROM $schema$.transition t
                     WHERE
                         t.command_id = p_command_id), p_expected_epoch), v_status;
         ELSE
             RETURN QUERY
             SELECT
-                'lease_lost'::fsm.finalize_outcome,
+                'lease_lost'::$schema$.finalize_outcome,
                 p_expected_epoch,
                 v_status;
         END IF;
@@ -133,7 +133,7 @@ BEGIN
     IF v_status <> 'leased' OR v_token <> p_lease_token THEN
         RETURN QUERY
         SELECT
-            'lease_lost'::fsm.finalize_outcome,
+            'lease_lost'::$schema$.finalize_outcome,
             p_expected_epoch,
             v_status;
         RETURN;
@@ -153,7 +153,7 @@ BEGIN
         INTO
             v_current_epoch
         FROM
-            fsm.instance_state s
+            $schema$.instance_state s
         WHERE
             s.machine_id = v_machine_id
             AND s.entity_id = v_entity_id
@@ -162,15 +162,15 @@ BEGIN
         IF v_current_epoch <> p_expected_epoch THEN
             RETURN QUERY
             SELECT
-                'conflict'::fsm.finalize_outcome,
+                'conflict'::$schema$.finalize_outcome,
                 v_current_epoch,
                 v_status;
             RETURN;
         END IF;
-        INSERT INTO fsm.transition (machine_id, entity_id, epoch, command_id, chart_version, event, actions, from_state, to_state, handled_by, exited, entered, status, effective_at)
+        INSERT INTO $schema$.transition (machine_id, entity_id, epoch, command_id, chart_version, event, actions, from_state, to_state, handled_by, exited, entered, status, effective_at)
             VALUES (v_machine_id, v_entity_id, p_expected_epoch + 1, p_command_id, v_chart_version, p_event, p_actions, p_from_state, p_to_state, p_handled_by, p_exited, p_entered, p_instance_status, p_effective_at);
         PERFORM
-            fsm.close_and_open (v_machine_id, v_entity_id, p_effective_at, p_state, p_instance_status, p_expected_epoch + 1, p_command_id, v_chart_version);
+            $schema$.close_and_open (v_machine_id, v_entity_id, p_effective_at, p_state, p_instance_status, p_expected_epoch + 1, p_command_id, v_chart_version);
         -- The actions this transition asked for, enqueued in this transaction.
         -- Ordinal is the position in the chart's action list, and together with
         -- the command id it is the identity a destination deduplicates on: a
@@ -184,16 +184,16 @@ BEGIN
             INTO
                 v_action_queue
             FROM
-                fsm.machine_maintenance m
+                $schema$.machine_maintenance m
             WHERE
                 m.machine_id = v_machine_id;
             IF NOT FOUND THEN
-                RAISE EXCEPTION 'fsm.finalize_command: action delivery is not registered for machine %', v_machine_id
+                RAISE EXCEPTION '$schema$.finalize_command: action delivery is not registered for machine %', v_machine_id
                     USING ERRCODE = 'invalid_parameter_value';
             END IF;
             IF v_action_queue <> '' THEN
                 PERFORM
-                    fsm.assert_queue_name (v_action_queue);
+                    $schema$.assert_queue_name (v_action_queue);
                 PERFORM
                     pgmq.send (v_action_queue::text, JSONB_BUILD_OBJECT('machine_id', v_machine_id, 'entity_id', v_entity_id, 'command_id', p_command_id, 'epoch', p_expected_epoch + 1, 'ordinal', a.ordinal - 1, 'action', a.value), 0::integer)
                 FROM
@@ -202,11 +202,11 @@ BEGIN
             END IF;
         END IF;
     ELSE
-        INSERT INTO fsm.command_error (command_id, error)
+        INSERT INTO $schema$.command_error (command_id, error)
             VALUES (p_command_id, p_error);
     END IF;
     UPDATE
-        fsm.command c
+        $schema$.command c
     SET
         status = p_status
     WHERE
@@ -216,7 +216,7 @@ BEGIN
     -- re-elected. A dead letter unblocks too: a command we have given up on
     -- must not wedge its entity forever.
     UPDATE
-        fsm.command c
+        $schema$.command c
     SET
         blocked = FALSE
     WHERE
@@ -224,7 +224,7 @@ BEGIN
             SELECT
                 n.command_id
             FROM
-                fsm.command n
+                $schema$.command n
             WHERE
                 n.machine_id = v_machine_id
                 AND n.entity_id = v_entity_id
@@ -234,7 +234,7 @@ BEGIN
             LIMIT 1);
     RETURN QUERY
     SELECT
-        'finalized'::fsm.finalize_outcome,
+        'finalized'::$schema$.finalize_outcome,
         CASE WHEN p_status = 'succeeded' THEN
             p_expected_epoch + 1
         ELSE

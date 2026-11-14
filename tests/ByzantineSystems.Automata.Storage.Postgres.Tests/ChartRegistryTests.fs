@@ -73,8 +73,9 @@ let tests =
 
               use insert =
                   new NpgsqlCommand(
-                      "INSERT INTO fsm.machine_chart_version (machine_id, version, fingerprint)
-                       VALUES (@machine_id, 4, @fingerprint)",
+                      sql
+                          "INSERT INTO fsm.machine_chart_version (machine_id, version, fingerprint)
+                           VALUES (@machine_id, 4, @fingerprint)",
                       holder,
                       transaction
                   )

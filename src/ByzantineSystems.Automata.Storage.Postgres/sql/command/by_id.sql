@@ -26,8 +26,8 @@ SELECT
     d.on_divergence AS correction_on_divergence,
     d.replay_limit AS correction_replay_limit
 FROM
-    fsm.command c
-    LEFT JOIN fsm.command_correction d ON d.command_id = c.command_id
+    $schema$.command c
+    LEFT JOIN $schema$.command_correction d ON d.command_id = c.command_id
 WHERE
     c.command_id = @command_id;
 

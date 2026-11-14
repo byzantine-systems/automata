@@ -14,15 +14,15 @@
 -- the function it names, and the ordering problem disappears.
 -- ---------------------------------------------------------------------------
 -- ---------------------------------------------------------------------------
--- fsm.temporal_versioning: archive the superseded row, stamp the new one.
+-- $schema$.temporal_versioning: archive the superseded row, stamp the new one.
 --
 -- Column-agnostic. It reads tg_table_schema and tg_table_name at fire time and
 -- writes OLD into <table>_history by naming convention, so one function serves
 -- every temporal table rather than one per table. Attach it with:
 --
 --   CREATE OR REPLACE TRIGGER <table>_versioning_trigger
---     BEFORE INSERT OR UPDATE OR DELETE ON fsm.<table>
---     FOR EACH ROW EXECUTE FUNCTION fsm.temporal_versioning ();
+--     BEFORE INSERT OR UPDATE OR DELETE ON $schema$.<table>
+--     FOR EACH ROW EXECUTE FUNCTION $schema$.temporal_versioning ();
 --
 -- ## The instant: statement_timestamp(), and why not the other two
 --
@@ -59,7 +59,7 @@
 -- Schema-qualified everywhere, and SET search_path, so a bare name cannot land
 -- wherever the connecting role's search_path happens to point.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fsm.temporal_versioning ()
+CREATE OR REPLACE FUNCTION $schema$.temporal_versioning ()
     RETURNS TRIGGER
     LANGUAGE plpgsql
     SET search_path = pg_catalog, pg_temp
@@ -81,12 +81,12 @@ END
 $$;
 
 CREATE OR REPLACE TRIGGER instance_state_versioning_trigger
-    BEFORE INSERT OR UPDATE OR DELETE ON fsm.instance_state
+    BEFORE INSERT OR UPDATE OR DELETE ON $schema$.instance_state
     FOR EACH ROW
-    EXECUTE FUNCTION fsm.temporal_versioning ();
+    EXECUTE FUNCTION $schema$.temporal_versioning ();
 
 -- ---------------------------------------------------------------------------
--- fsm.split_belief: the portion update, hand-rolled.
+-- $schema$.split_belief: the portion update, hand-rolled.
 --
 -- PostgreSQL carried SQL:2011's `UPDATE ... FOR PORTION OF` through the 19
 -- betas and dropped it again before rc1, so the split is written out rather
@@ -103,7 +103,7 @@ CREATE OR REPLACE TRIGGER instance_state_versioning_trigger
 -- Returns the number of rows the update matched, because no routine here
 -- returns void.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fsm.split_belief (p_machine_id text, p_entity_id text, p_at timestamptz, p_state jsonb, p_status fsm.instance_status, p_epoch bigint, p_command_id bigint, p_chart_version integer)
+CREATE OR REPLACE FUNCTION $schema$.split_belief (p_machine_id text, p_entity_id text, p_at timestamptz, p_state jsonb, p_status $schema$.instance_status, p_epoch bigint, p_command_id bigint, p_chart_version integer)
     RETURNS bigint
     LANGUAGE sql
     VOLATILE PARALLEL UNSAFE
@@ -114,7 +114,7 @@ CREATE OR REPLACE FUNCTION fsm.split_belief (p_machine_id text, p_entity_id text
         -- re-inserted unchanged. Empty when p_at is the live belief's own
         -- start: nothing precedes the new belief, which is the replaced
         -- case.
-        INSERT INTO fsm.instance_state (machine_id, entity_id, state, status, epoch, command_id, chart_version, valid_during)
+        INSERT INTO $schema$.instance_state (machine_id, entity_id, state, status, epoch, command_id, chart_version, valid_during)
         SELECT
             machine_id,
             entity_id,
@@ -125,7 +125,7 @@ CREATE OR REPLACE FUNCTION fsm.split_belief (p_machine_id text, p_entity_id text
             chart_version,
             TSTZRANGE(LOWER(valid_during), $3, '[)')
         FROM
-            fsm.instance_state
+            $schema$.instance_state
         WHERE
             machine_id = $1
             AND entity_id = $2
@@ -137,9 +137,9 @@ CREATE OR REPLACE FUNCTION fsm.split_belief (p_machine_id text, p_entity_id text
 updated AS (
     -- The covered portion, rewritten in place. GREATEST keeps the
     -- original start should a caller ever arrive with p_at behind it,
-    -- though fsm.close_and_open raises before that can happen.
+    -- though $schema$.close_and_open raises before that can happen.
     UPDATE
-        fsm.instance_state
+        $schema$.instance_state
     SET
         state = $4,
         status = $5,
@@ -161,12 +161,12 @@ FROM
 $$;
 
 -- ---------------------------------------------------------------------------
--- fsm.close_and_open: the one valid-time mutation.
+-- $schema$.close_and_open: the one valid-time mutation.
 --
 -- Every valid-time write routes through here, so the split is written and
 -- tested once instead of being re-derived at each call site.
 --
--- fsm.split_belief does the split: it rewrites the portion of the live row
+-- $schema$.split_belief does the split: it rewrites the portion of the live row
 -- covered by [p_at, infinity) and re-inserts the remainder as its own row,
 -- keeping the temporal key satisfied throughout. Both the update and the
 -- re-insert fire the versioning trigger, so the superseded belief is archived
@@ -190,9 +190,9 @@ $$;
 --
 -- VOLATILE and PARALLEL UNSAFE because it writes.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fsm.close_and_open (p_machine_id text, p_entity_id text, p_at timestamptz, p_state jsonb, p_status fsm.instance_status, p_epoch bigint, p_command_id bigint, p_chart_version integer)
+CREATE OR REPLACE FUNCTION $schema$.close_and_open (p_machine_id text, p_entity_id text, p_at timestamptz, p_state jsonb, p_status $schema$.instance_status, p_epoch bigint, p_command_id bigint, p_chart_version integer)
     RETURNS TABLE (
-        outcome fsm.belief_outcome,
+        outcome $schema$.belief_outcome,
         valid_from timestamptz)
     LANGUAGE plpgsql
     VOLATILE PARALLEL UNSAFE
@@ -207,7 +207,7 @@ BEGIN
     INTO
         v_live_from
     FROM
-        fsm.instance_state s
+        $schema$.instance_state s
     WHERE
         s.machine_id = p_machine_id
         AND s.entity_id = p_entity_id
@@ -217,23 +217,23 @@ BEGIN
             USING ERRCODE = 'invalid_parameter_value';
     END IF;
     IF v_live_from IS NULL THEN
-        INSERT INTO fsm.instance_state (machine_id, entity_id, state, status, epoch, command_id, chart_version, valid_during)
+        INSERT INTO $schema$.instance_state (machine_id, entity_id, state, status, epoch, command_id, chart_version, valid_during)
             VALUES (p_machine_id, p_entity_id, p_state, p_status, p_epoch, p_command_id, p_chart_version, TSTZRANGE(p_at, 'infinity', '[)'));
         RETURN QUERY
         SELECT
-            'opened'::fsm.belief_outcome,
+            'opened'::$schema$.belief_outcome,
             p_at;
         RETURN;
     END IF;
     PERFORM
-        fsm.split_belief (p_machine_id, p_entity_id, p_at, p_state, p_status, p_epoch, p_command_id, p_chart_version);
+        $schema$.split_belief (p_machine_id, p_entity_id, p_at, p_state, p_status, p_epoch, p_command_id, p_chart_version);
     RETURN QUERY
     SELECT
         CASE WHEN p_at > v_live_from THEN
             'split'
         ELSE
             'replaced'
-        END::fsm.belief_outcome,
+        END::$schema$.belief_outcome,
         p_at;
 END
 $$;

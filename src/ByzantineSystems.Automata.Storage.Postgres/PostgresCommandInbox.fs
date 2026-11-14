@@ -54,24 +54,24 @@ type PostgresCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'Entit
         Tap.requireEntityKey "entityId" key
         key
 
-    let submitCommand = StatementKey.create "command" "submit" |> Sql.prepareProgram
+    let prepare = Sql.prepareProgram context.Schema
 
-    let submitCorrection =
-        StatementKey.create "command" "submit_correction" |> Sql.prepareProgram
+    let submitCommand = StatementKey.create "command" "submit" |> prepare
 
-    let claimCommands = StatementKey.create "command" "claim" |> Sql.prepareProgram
+    let submitCorrection = StatementKey.create "command" "submit_correction" |> prepare
+
+    let claimCommands = StatementKey.create "command" "claim" |> prepare
 
     let deadLetterUndecodable =
-        StatementKey.create "command" "dead_letter_undecodable" |> Sql.prepareProgram
+        StatementKey.create "command" "dead_letter_undecodable" |> prepare
 
-    let commandById = StatementKey.create "command" "by_id" |> Sql.prepareProgram
+    let commandById = StatementKey.create "command" "by_id" |> prepare
 
-    let commandByKey = StatementKey.create "command" "find_by_key" |> Sql.prepareProgram
+    let commandByKey = StatementKey.create "command" "find_by_key" |> prepare
 
-    let rescheduleCommand =
-        StatementKey.create "command" "reschedule" |> Sql.prepareProgram
+    let rescheduleCommand = StatementKey.create "command" "reschedule" |> prepare
 
-    let extendLease = StatementKey.create "command" "extend_lease" |> Sql.prepareProgram
+    let extendLease = StatementKey.create "command" "extend_lease" |> prepare
 
     /// The schema stores the empty string for an unsupplied audit field.
     let optional (value: string) : string option = if value = "" then None else Some value

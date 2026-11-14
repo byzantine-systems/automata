@@ -30,9 +30,10 @@ type PostgresChartRegistry(options: ChartRegistryOptions) =
 
     let context = options.Context
 
-    let register = StatementKey.create "chart" "register" |> Sql.prepareProgram
+    let prepare = Sql.prepareProgram context.Schema
+    let register = StatementKey.create "chart" "register" |> prepare
 
-    let byVersion = StatementKey.create "chart" "by_version" |> Sql.prepareProgram
+    let byVersion = StatementKey.create "chart" "by_version" |> prepare
 
     let registrationTag: EnumCodec<RegistrationTag> =
         EnumCodec.create

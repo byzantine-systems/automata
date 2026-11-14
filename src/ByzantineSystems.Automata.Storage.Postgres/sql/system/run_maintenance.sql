@@ -1,6 +1,6 @@
 -- One maintenance pass. No rows back means another host, or pg_cron, is
 -- already running one, which is the single-flight answer rather than a
--- failure. See fsm.run_maintenance.
+-- failure. See $schema$.run_maintenance.
 SELECT
     m.machine_id,
     m.reaped,
@@ -9,5 +9,5 @@ SELECT
     m.purged_actions,
     m.drifted
 FROM
-    fsm.run_maintenance (@batch) m;
+    $schema$.run_maintenance (@batch) m;
 

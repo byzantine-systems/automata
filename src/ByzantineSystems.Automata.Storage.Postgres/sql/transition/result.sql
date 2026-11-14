@@ -21,9 +21,9 @@ SELECT
     t.committed_at,
     e.error
 FROM
-    fsm.command c
-    LEFT JOIN fsm.transition t ON t.command_id = c.command_id
-    LEFT JOIN fsm.command_error e ON e.command_id = c.command_id
+    $schema$.command c
+    LEFT JOIN $schema$.transition t ON t.command_id = c.command_id
+    LEFT JOIN $schema$.command_error e ON e.command_id = c.command_id
 WHERE
     c.command_id = @command_id;
 

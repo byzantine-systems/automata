@@ -10,6 +10,7 @@
     <ItemGroup>
         <Compile Include="TestSupport.fs" />
         <Compile Include="RegistrationTests.fs" />
+        <Compile Include="PostgresRegistrationTests.fs" />
         <Compile Include="ActionDispatchTests.fs" />
         <Compile Include="SupervisionAuditTests.fs" />
         <Compile Include="ValidationTests.fs" />

@@ -11,7 +11,6 @@
 SELECT
     j.scriptname
 FROM
-    public.schemaversions j
+    $schema$.schemaversions j
 ORDER BY
     j.scriptname;
-

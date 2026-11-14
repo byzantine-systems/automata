@@ -1,7 +1,7 @@
 -- ---------------------------------------------------------------------------
--- fsm.machine_chart_version: what a declared chart version means.
+-- $schema$.machine_chart_version: what a declared chart version means.
 --
--- First of the tables, ahead of the inbox, because fsm.command references it.
+-- First of the tables, ahead of the inbox, because $schema$.command references it.
 -- The order of these scripts is dependency order, and that is the whole reason
 -- this schema carries no ALTER TABLE ... ADD CONSTRAINT: a table is created
 -- complete or not at all, so reading its definition tells you everything that
@@ -32,11 +32,11 @@
 -- developer bumping the version.
 -- ---------------------------------------------------------------------------
 -- The outcome of a registration, as a checked text domain for the same reason
--- fsm.command_status is one: adding an outcome later must not be an ALTER TYPE
+-- $schema$.command_status is one: adding an outcome later must not be an ALTER TYPE
 -- whose new value cannot be used in the transaction that adds it.
-CREATE DOMAIN fsm.chart_registration AS text CONSTRAINT chart_registration_valid CHECK (VALUE IN ('registered', 'matched', 'mismatched'));
+CREATE DOMAIN $schema$.chart_registration AS text CONSTRAINT chart_registration_valid CHECK (VALUE IN ('registered', 'matched', 'mismatched'));
 
-CREATE TABLE fsm.machine_chart_version (
+CREATE TABLE $schema$.machine_chart_version (
     machine_id text NOT NULL,
     version integer NOT NULL,
     fingerprint text NOT NULL,
@@ -50,7 +50,7 @@ CREATE TABLE fsm.machine_chart_version (
     CONSTRAINT machine_chart_version_fingerprint_shape CHECK (fingerprint ~ '^[0-9a-f]{64}$')
 );
 
-COMMENT ON COLUMN fsm.machine_chart_version.fingerprint IS 'SHA-256 of the chart''s structure: root, and per node its id, parent, initial child, terminal flag and the kind of each rule in declaration order. Computed by the application, never here. Nodes are hashed in id order because sibling declaration order decides nothing; rules keep their order because first match wins.';
+COMMENT ON COLUMN $schema$.machine_chart_version.fingerprint IS 'SHA-256 of the chart''s structure: root, and per node its id, parent, initial child, terminal flag and the kind of each rule in declaration order. Computed by the application, never here. Nodes are hashed in id order because sibling declaration order decides nothing; rules keep their order because first match wins.';
 
-COMMENT ON COLUMN fsm.machine_chart_version.registered_at IS 'When this version was first claimed. Never updated: a matching re-registration is not a new fact.';
+COMMENT ON COLUMN $schema$.machine_chart_version.registered_at IS 'When this version was first claimed. Never updated: a matching re-registration is not a new fact.';
 

@@ -39,6 +39,10 @@ module internal Listener =
     /// minute rather than never.
     let keepAlive = TimeSpan.FromSeconds 30.
 
+    let channels (schema: SchemaName) =
+        let prefix = SchemaName.value schema
+        $"%s{prefix}_command", $"%s{prefix}_action"
+
     /// A dedicated connection that neither pools nor enlists, for going around a pooler.
     ///
     /// Building, opening and abandoning are separate steps so a failed open can be shown to
@@ -97,15 +101,18 @@ module internal Listener =
     /// database, and a payload is a machine id or a queue name and never data, so the payload is
     /// how this machine hears only its own.
     let route
+        (schema: SchemaName)
         (machine: string)
         (queue: string)
         (onCommands: unit -> unit)
         (onActions: unit -> unit)
         (notification: NpgsqlNotificationEventArgs)
         =
+        let commandChannel, actionChannel = channels schema
+
         match notification.Channel with
-        | "fsm_command" when notification.Payload = machine -> onCommands ()
-        | "fsm_action" when notification.Payload = queue -> onActions ()
+        | channel when channel = commandChannel && notification.Payload = machine -> onCommands ()
+        | channel when channel = actionChannel && notification.Payload = queue -> onActions ()
         | _ -> ()
 
     /// One quiet interval: a notification arrives, or a round trip proves the connection is
@@ -124,14 +131,16 @@ module internal Listener =
     /// PostgreSQL keeps nothing for a session that was not connected, so the moment listening
     /// starts is the one moment this knows it may have missed an announcement.
     let run
+        (schema: SchemaName)
         (conn: NpgsqlConnection)
         (handler: NpgsqlNotificationEventArgs -> unit)
         (missed: unit -> unit)
         (ct: CancellationToken)
         : Task<Result<unit, StoreError>> =
         backgroundTask {
+            let commandChannel, actionChannel = channels schema
             conn.Notification.Add handler
-            do! execute "LISTEN fsm_command; LISTEN fsm_action" conn ct
+            do! execute $"LISTEN %s{commandChannel}; LISTEN %s{actionChannel}" conn ct
             missed ()
             do! Recurring.repeat (fun () -> waitOrPing conn ct) ct
             return Ok()
@@ -158,13 +167,13 @@ type PostgresWorkNotifications(context: PostgresContext, queue: string, connecti
     let session (machine: string) onCommands onActions (ct: CancellationToken) =
         backgroundTask {
             use! conn = openConnection ct
-            let handler = Listener.route machine queue onCommands onActions
+            let handler = Listener.route context.Schema machine queue onCommands onActions
 
             let missed () =
                 onCommands ()
                 onActions ()
 
-            return! Listener.run conn handler missed ct
+            return! Listener.run context.Schema conn handler missed ct
         }
 
     interface IWorkNotifications with
