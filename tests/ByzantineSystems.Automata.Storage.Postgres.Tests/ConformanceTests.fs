@@ -93,6 +93,55 @@ let private contractHistoryEnv () : ContractHistoryEnv =
                 return stores ()
             } }
 
+// The shared action-queue equations, over this provider: one truncate-and-reseed per generated
+// case, and the database's own clock, so a reschedule's backoff elapses by sleeping.
+let private contractActionEnv () : ContractActionEnv =
+    let encode, decode = EntityKey.forEntityId<ContractEntity>
+
+    let stores () =
+        { Inbox =
+            PostgresCommandInbox<ContractEntityId, ContractEvent>(
+                { Context = context ()
+                  EventCodec = Serialization.systemTextJson<ContractEvent> ()
+                  EntityIdEncode = encode
+                  EntityIdDecode = decode }
+            )
+            :> ContractInbox
+          Processor =
+            PostgresCommandProcessorStore<ContractEntityId, ContractState, ContractEvent, ContractAction, ContractError>(
+                { Context = context ()
+                  StateCodec = Serialization.systemTextJson<ContractState> ()
+                  EventCodec = Serialization.systemTextJson<ContractEvent> ()
+                  ActionCodec = Serialization.systemTextJson<ContractAction list> ()
+                  ErrorCodec = Serialization.systemTextJson<ContractError> ()
+                  EntityIdEncode = encode
+                  EntityIdDecode = decode }
+            )
+            :> ContractProcessor
+          Queue =
+            PostgresActionQueue<ContractEntityId, ContractAction>(
+                { Context = context ()
+                  Queue = actionQueue
+                  ActionCodec = Serialization.systemTextJson<ContractAction> ()
+                  EntityIdEncode = encode
+                  EntityIdDecode = decode }
+            )
+            :> ContractActionQueue
+          Now = fun () -> DateTimeOffset.UtcNow
+          Advance = fun span -> Task.Delay(span + TimeSpan.FromMilliseconds 20.0) }
+
+    { Machine = machine
+      Version = version
+      ClaimLease = LeaseDuration.create (TimeSpan.FromSeconds 30.0)
+      ActionLease = LeaseDuration.create (TimeSpan.FromSeconds 30.0)
+      Backoff = Backoff.create (TimeSpan.FromMilliseconds 5.0) (TimeSpan.FromMilliseconds 40.0)
+      Fresh =
+        fun () ->
+            task {
+                do! reset ()
+                return stores ()
+            } }
+
 let private poisonFixture actions count payload =
     task {
         do! reset ()
@@ -194,6 +243,7 @@ let private settings: Conformance.Settings =
       PoisonCases = 12
       ReadyTokenCases = 9
       ClaimExclusivityCases = 12
+      ActionCases = 12
       RegistryCases = 20
       HistoryCases = 12 }
 
@@ -202,6 +252,7 @@ let tests =
         { Name = "PostgreSQL storage conformance"
           Inbox = contractEnv ()
           History = contractHistoryEnv ()
+          Action = contractActionEnv ()
           Registry = registryFresh
           PoisonCommand = poisonFixture false
           PoisonAction = poisonFixture true

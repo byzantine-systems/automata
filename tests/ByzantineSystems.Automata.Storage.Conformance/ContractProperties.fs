@@ -143,6 +143,32 @@ type ContractInboxEnv =
         Fresh: unit -> Task<ContractStores>
     }
 
+/// The queue that delivers what a commit asked for, for the contract action domain.
+type ContractActionQueue = IActionQueue<ContractEntityId, ContractAction>
+
+/// The stores one provider supplies per generated action case, plus its control of time.
+type ContractActionStores =
+    { Inbox: ContractInbox
+      Processor: ContractProcessor
+      Queue: ContractActionQueue
+      Now: unit -> DateTimeOffset
+      Advance: TimeSpan -> Task }
+
+/// Everything a provider fills in to run the shared action-queue property.
+type ContractActionEnv =
+    {
+        Machine: MachineId
+        Version: ChartVersion
+        /// The lease a command claim takes while the case commits it.
+        ClaimLease: LeaseDuration
+        /// The lease an action claim takes, short enough that a redelivery is observable.
+        ActionLease: LeaseDuration
+        /// The envelope a reschedule uses.
+        Backoff: Backoff
+        /// A fixture with nothing in it, once per generated case, shrinking reruns included.
+        Fresh: unit -> Task<ContractActionStores>
+    }
+
 /// One step of a generated trace, as raw choices.
 type InboxChoice =
     | Submit of entity: byte * key: byte * event: byte * delay: byte
@@ -181,21 +207,21 @@ let private failureOf (raw: byte) : CommandFailure<ContractError> =
     | 2 -> CommandFailure.Replay(ReplayError.Diverged(Epoch.ofUInt64 3UL, "the trace diverged"))
     | _ -> CommandFailure.Replay ReplayError.HistoryPurged
 
-let private contractSubmission env entity key event =
-    { MachineId = env.Machine
+let private contractSubmission (machine: MachineId) (version: ChartVersion) entity key event =
+    { MachineId = machine
       EntityId = entity
       IdempotencyKey = key
-      ChartVersion = env.Version
+      ChartVersion = version
       Kind = CommandKind.Event
       Event = event
       VisibleAt = None
       ReceivedAt = None
       Audit = AuditContext.empty }
 
-let private contractDraft env entity event raw fromState =
+let private contractDraft (machine: MachineId) entity event raw fromState =
     let state = Active(1 + int raw % 7)
 
-    { MachineId = env.Machine
+    { MachineId = machine
       EntityId = entity
       Event = event
       Actions = [ Fired(1 + int raw % 5) ]
@@ -301,7 +327,7 @@ let private runInboxTrace
             | _ -> Epoch.initial
 
         let draftOf (tracked: Tracked) raw =
-            contractDraft env tracked.EntityId tracked.Event raw (currentState tracked.Entity)
+            contractDraft env.Machine tracked.EntityId tracked.Event raw (currentState tracked.Entity)
 
         let resultMatches (tracked: Tracked) observed =
             match tracked.Status, observed with
@@ -1292,7 +1318,9 @@ let requestIdentityProperty name maxTests (env: ContractInboxEnv) =
                 task {
                     let! stores = env.Fresh()
                     let entity: ContractEntityId = entityId "request-identity"
-                    let original = contractSubmission env entity "identity" (Ping(int payload))
+
+                    let original =
+                        contractSubmission env.Machine env.Version entity "identity" (Ping(int payload))
 
                     let at =
                         DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero).AddSeconds(float seconds)
@@ -1397,7 +1425,7 @@ let arrivalOrderProperty name maxTests (env: ContractInboxEnv) =
                     let at = DateTimeOffset(at.Ticks / 10L * 10L, at.Offset)
 
                     let original =
-                        { contractSubmission env entity "first" Pong with
+                        { contractSubmission env.Machine env.Version entity "first" Pong with
                             ReceivedAt = Some at }
 
                     let ct = CancellationToken.None
@@ -1514,7 +1542,7 @@ let finalizeProperty name maxTests (env: ContractInboxEnv) =
                 let! stores = env.Fresh()
                 let entity: ContractEntityId = entityId "finalize"
                 let event = eventOf payload
-                let target = contractSubmission env entity "target" event
+                let target = contractSubmission env.Machine env.Version entity "target" event
 
                 match! stores.Inbox.SubmitAsync(target, ct) with
                 | Error _ -> return None
@@ -1526,7 +1554,12 @@ let finalizeProperty name maxTests (env: ContractInboxEnv) =
 
                                 let! outcome =
                                     stores.Inbox.SubmitAsync(
-                                        contractSubmission env entity "sibling" (eventOf siblingPayload),
+                                        contractSubmission
+                                            env.Machine
+                                            env.Version
+                                            entity
+                                            "sibling"
+                                            (eventOf siblingPayload),
                                         ct
                                     )
 
@@ -1558,7 +1591,9 @@ let finalizeProperty name maxTests (env: ContractInboxEnv) =
                 match! setup payload true with
                 | None -> return false
                 | Some(stores, first) ->
-                    let firstDraft = contractDraft env first.Work.EntityId first.Work.Event payload Idle
+                    let firstDraft =
+                        contractDraft env.Machine first.Work.EntityId first.Work.Event payload Idle
+
                     let before = stores.Now()
 
                     let! firstOutcome =
@@ -1575,7 +1610,12 @@ let finalizeProperty name maxTests (env: ContractInboxEnv) =
                         let secondPayload = byte ((int payload + 1) % 256)
 
                         let secondDraft =
-                            contractDraft env second.Work.EntityId second.Work.Event secondPayload firstDraft.ToState
+                            contractDraft
+                                env.Machine
+                                second.Work.EntityId
+                                second.Work.Event
+                                secondPayload
+                                firstDraft.ToState
 
                         let! secondOutcome =
                             stores.Processor.CommitAsync(
@@ -1607,7 +1647,9 @@ let finalizeProperty name maxTests (env: ContractInboxEnv) =
                 match! setup payload false with
                 | None -> return false
                 | Some(stores, held) ->
-                    let draft = contractDraft env held.Work.EntityId held.Work.Event payload Idle
+                    let draft =
+                        contractDraft env.Machine held.Work.EntityId held.Work.Event payload Idle
+
                     let ahead = Epoch.next Epoch.initial
                     let! conflict = stores.Processor.CommitAsync(held.Work.CommandId, held.Token, ahead, draft, ct)
                     let! pending = stores.Processor.TryGetResultAsync(held.Work.CommandId, ct)
@@ -1679,7 +1721,9 @@ let finalizeProperty name maxTests (env: ContractInboxEnv) =
                 match! setup payload false with
                 | None -> return false
                 | Some(stores, held) ->
-                    let draft = contractDraft env held.Work.EntityId held.Work.Event payload Idle
+                    let draft =
+                        contractDraft env.Machine held.Work.EntityId held.Work.Event payload Idle
+
                     let stale = LeaseToken.ofInt64 (max 0L (LeaseToken.value held.Token - 1L))
                     let! fenced = stores.Processor.CommitAsync(held.Work.CommandId, stale, Epoch.initial, draft, ct)
                     let! pending = stores.Processor.TryGetResultAsync(held.Work.CommandId, ct)
@@ -1700,7 +1744,8 @@ let finalizeProperty name maxTests (env: ContractInboxEnv) =
                 | Some(stores, held) ->
                     do! stores.Advance(LeaseDuration.value env.ClaimLease + env.Margin + env.Ticks 20)
 
-                    let draft = contractDraft env held.Work.EntityId held.Work.Event payload Idle
+                    let draft =
+                        contractDraft env.Machine held.Work.EntityId held.Work.Event payload Idle
 
                     let! outcome =
                         stores.Processor.CommitAsync(held.Work.CommandId, held.Token, Epoch.initial, draft, ct)
@@ -1720,7 +1765,9 @@ let finalizeProperty name maxTests (env: ContractInboxEnv) =
                     match reclaimed with
                     | None -> return false
                     | Some holder ->
-                        let draft = contractDraft env holder.Work.EntityId holder.Work.Event payload Idle
+                        let draft =
+                            contractDraft env.Machine holder.Work.EntityId holder.Work.Event payload Idle
+
                         let before = stores.Now()
 
                         let! fenced =
@@ -1753,7 +1800,10 @@ let finalizeProperty name maxTests (env: ContractInboxEnv) =
                 | None -> return false
                 | Some(stores, held) ->
                     let failure = failureOf payload
-                    let draft = contractDraft env held.Work.EntityId held.Work.Event payload Idle
+
+                    let draft =
+                        contractDraft env.Machine held.Work.EntityId held.Work.Event payload Idle
+
                     let epoch = Epoch.next Epoch.initial
 
                     let! committed =
@@ -1782,7 +1832,12 @@ let finalizeProperty name maxTests (env: ContractInboxEnv) =
                                 sibling.Work.CommandId,
                                 sibling.Token,
                                 epoch,
-                                contractDraft env sibling.Work.EntityId sibling.Work.Event siblingPayload draft.ToState,
+                                contractDraft
+                                    env.Machine
+                                    sibling.Work.EntityId
+                                    sibling.Work.Event
+                                    siblingPayload
+                                    draft.ToState,
                                 ct
                             )
 
@@ -1961,7 +2016,7 @@ let claimExclusivityProperty name maxTests (env: ContractInboxEnv) =
                         [ for e in 1..entityCount do
                               for c in 1..perEntityCount ->
                                   let entity: ContractEntityId = entityId $"claim-e{e}"
-                                  contractSubmission env entity $"claim-e{e}-c{c}" (Ping c) ]
+                                  contractSubmission env.Machine env.Version entity $"claim-e{e}-c{c}" (Ping c) ]
 
                     let! results =
                         submissions
@@ -2007,6 +2062,222 @@ let claimExclusivityProperty name maxTests (env: ContractInboxEnv) =
                         (List.length claimed)
                         entityCount
                         "every entity's head is claimed exactly once across all workers"
+                }
+        ))
+
+/// The action queue contract through public interfaces. A commit that asked for an action puts
+/// exactly that action in the queue; a finalize that wrote nothing queues nothing; completion,
+/// rescheduling and abandonment are fenced by the lease token; and a redelivery keeps the
+/// (command, ordinal) identity the destination deduplicates on.
+let actionQueueProperty name maxTests (env: ContractActionEnv) =
+    testCase name (fun () ->
+        Check.One(
+            Config.QuickThrowOnFailure.WithMaxTest(maxTests),
+            fun (payload: byte) ->
+                task {
+                    let! stores = env.Fresh()
+                    let ct = CancellationToken.None
+
+                    let ok label result =
+                        match result with
+                        | Ok value -> value
+                        | Error error -> failtestf "action contract: %s failed: %A" label error
+
+                    /// Submits and claims one command, then commits it and claims the action it
+                    /// queued, returning everything the identity assertions need. Each call uses
+                    /// its own entity, so every commit starts at the initial epoch.
+                    let produce (name: string) (key: string) =
+                        task {
+                            let id: ContractEntityId = entityId name
+
+                            let submission =
+                                contractSubmission env.Machine env.Version id key (Ping(int payload))
+
+                            let! accepted = stores.Inbox.SubmitAsync(submission, ct)
+
+                            let commandId =
+                                accepted
+                                |> ok "submit"
+                                |> function
+                                    | Accepted id -> id
+                                    | _ -> failtest "expected Accepted"
+
+                            let! held = stores.Inbox.ClaimAsync(env.Machine, ClaimBatch.create 1, env.ClaimLease, ct)
+
+                            let command =
+                                held
+                                |> ok "claim"
+                                |> function
+                                    | [ single ] -> single
+                                    | other -> failtestf "expected one command, got %d" (List.length other)
+
+                            let! committed =
+                                stores.Processor.CommitAsync(
+                                    command.Work.CommandId,
+                                    command.Token,
+                                    Epoch.initial,
+                                    contractDraft env.Machine id (Ping(int payload)) payload Idle,
+                                    ct
+                                )
+
+                            let epoch =
+                                committed
+                                |> ok "commit"
+                                |> function
+                                    | Finalized epoch -> epoch
+                                    | other -> failtestf "expected Finalized, got %A" other
+
+                            let! actions =
+                                stores.Queue.ClaimAsync(env.Machine, ClaimBatch.create 10, env.ActionLease, ct)
+
+                            let action =
+                                actions
+                                |> ok "claim action"
+                                |> function
+                                    | [ single ] -> single
+                                    | other -> failtestf "expected one action, got %d" (List.length other)
+
+                            return commandId, epoch, id, action
+                        }
+
+                    // Identity: the claimed action carries the command, position, epoch, entity,
+                    // machine and decoded payload that produced it, on its first delivery.
+                    let! commandId, epoch, id, action = produce "action-a1" "k1"
+                    Expect.equal action.Work.CommandId commandId "the command that emitted it"
+                    Expect.equal action.Work.Ordinal 0 "the first action in the list"
+                    Expect.equal action.Work.Epoch epoch "the epoch the commit wrote"
+                    Expect.equal action.Work.EntityId id "the entity"
+                    Expect.equal action.Work.MachineId env.Machine "the machine"
+                    Expect.equal action.DeliveryCount 1 "the first delivery"
+
+                    // Completion removes it, and a second completion finds nothing left.
+                    let! completed = stores.Queue.CompleteAsync(action, ct)
+                    Expect.equal (completed |> ok "complete") Updated "delivered"
+                    let! completedAgain = stores.Queue.CompleteAsync(action, ct)
+
+                    Expect.equal
+                        (completedAgain |> ok "complete again")
+                        LeaseUpdateOutcome.LeaseLost
+                        "a second completion finds nothing"
+
+                    // A forged token cannot complete, reschedule or abandon a live action.
+                    let! _, _, _, forged = produce "action-a2" "k2"
+
+                    let stale =
+                        { forged with
+                            Token = LeaseToken.ofInt64 (LeaseToken.value forged.Token + 1L) }
+
+                    let! staleComplete = stores.Queue.CompleteAsync(stale, ct)
+                    let! staleReschedule = stores.Queue.RescheduleAsync(stale, env.Backoff, ct)
+                    let! staleAbandon = stores.Queue.AbandonAsync(stale, Reason.create "forged", ct)
+                    Expect.equal (staleComplete |> ok "complete") LeaseUpdateOutcome.LeaseLost "completion is fenced"
+
+                    Expect.equal
+                        (staleReschedule |> ok "reschedule")
+                        LeaseUpdateOutcome.LeaseLost
+                        "rescheduling is fenced"
+
+                    Expect.equal (staleAbandon |> ok "abandon") LeaseUpdateOutcome.LeaseLost "abandoning is fenced"
+                    let! stillMine = stores.Queue.CompleteAsync(forged, ct)
+                    Expect.equal (stillMine |> ok "complete (real token)") Updated "the real holder is untouched"
+
+                    // A reschedule returns the work to the queue; its redelivery keeps the
+                    // (command, ordinal) identity and climbs the delivery count.
+                    let! _, _, _, reschedule = produce "action-a3" "k3"
+                    let! rescheduled = stores.Queue.RescheduleAsync(reschedule, env.Backoff, ct)
+                    Expect.equal (rescheduled |> ok "reschedule") Updated "the holder may reschedule"
+                    do! stores.Advance(Backoff.ceiling env.Backoff)
+                    let! redelivered = stores.Queue.ClaimAsync(env.Machine, ClaimBatch.create 10, env.ActionLease, ct)
+
+                    let second =
+                        redelivered
+                        |> ok "redeliver"
+                        |> function
+                            | [ single ] -> single
+                            | other -> failtestf "expected one redelivery, got %d" (List.length other)
+
+                    Expect.equal second.Work.CommandId reschedule.Work.CommandId "the same command"
+                    Expect.equal second.Work.Ordinal reschedule.Work.Ordinal "the same position"
+                    Expect.isGreaterThan second.DeliveryCount reschedule.DeliveryCount "counted as a redelivery"
+                    let! _ = stores.Queue.CompleteAsync(second, ct)
+                    ()
+
+                    // Abandonment removes the action.
+                    let! _, _, _, abandon = produce "action-a4" "k4"
+                    let! abandoned = stores.Queue.AbandonAsync(abandon, Reason.create "gave up", ct)
+                    Expect.equal (abandoned |> ok "abandon") Updated "given up on"
+                    let! afterAbandon = stores.Queue.ClaimAsync(env.Machine, ClaimBatch.create 10, env.ActionLease, ct)
+                    Expect.equal (afterAbandon |> ok "claim after abandon") [] "the action left the queue"
+
+                    // A fenced commit queues nothing.
+                    let fenced: ContractEntityId = entityId "action-fenced"
+
+                    let! _ =
+                        stores.Inbox.SubmitAsync(contractSubmission env.Machine env.Version fenced "kf" (Ping 1), ct)
+
+                    let! fencedClaim = stores.Inbox.ClaimAsync(env.Machine, ClaimBatch.create 1, env.ClaimLease, ct)
+
+                    let fencedCommand =
+                        fencedClaim
+                        |> ok "claim"
+                        |> function
+                            | [ single ] -> single
+                            | other -> failtestf "expected one command, got %d" (List.length other)
+
+                    let! fencedOut =
+                        stores.Processor.CommitAsync(
+                            fencedCommand.Work.CommandId,
+                            LeaseToken.ofInt64 999999L,
+                            Epoch.initial,
+                            contractDraft env.Machine fenced (Ping 1) payload Idle,
+                            ct
+                        )
+
+                    Expect.equal
+                        (fencedOut |> ok "fenced commit")
+                        FinalizeOutcome.LeaseLost
+                        "a stale token is fenced out"
+
+                    let! nothingAfterFence =
+                        stores.Queue.ClaimAsync(env.Machine, ClaimBatch.create 10, env.ActionLease, ct)
+
+                    Expect.equal
+                        (nothingAfterFence |> ok "claim after fence")
+                        []
+                        "no effects for a transition that never happened"
+
+                    // A rejection queues nothing.
+                    let rejected: ContractEntityId = entityId "action-rejected"
+
+                    let! _ =
+                        stores.Inbox.SubmitAsync(contractSubmission env.Machine env.Version rejected "kr" (Ping 1), ct)
+
+                    let! rejectClaim = stores.Inbox.ClaimAsync(env.Machine, ClaimBatch.create 1, env.ClaimLease, ct)
+
+                    let rejectCommand =
+                        rejectClaim
+                        |> ok "claim"
+                        |> function
+                            | [ single ] -> single
+                            | other -> failtestf "expected one command, got %d" (List.length other)
+
+                    let! rejectedOutcome =
+                        stores.Processor.RejectAsync(
+                            rejectCommand.Work.CommandId,
+                            rejectCommand.Token,
+                            CommandFailure.Domain(Refused "no"),
+                            ct
+                        )
+
+                    rejectedOutcome |> ok "reject" |> ignore
+
+                    let! nothingAfterReject =
+                        stores.Queue.ClaimAsync(env.Machine, ClaimBatch.create 10, env.ActionLease, ct)
+
+                    Expect.equal
+                        (nothingAfterReject |> ok "claim after reject")
+                        []
+                        "a refused command asked for nothing"
                 }
         ))
 

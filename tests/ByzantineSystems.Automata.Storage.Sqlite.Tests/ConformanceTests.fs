@@ -92,6 +92,56 @@ let private contractHistoryEnv () : ContractHistoryEnv =
       CommittedAtTolerance = TimeSpan.Zero
       Fresh = fun () -> Task.FromResult(stores ()) }
 
+// The shared action-queue equations, over this provider's fixture: a fresh migrated file per
+// generated case, and the fixture's frozen clock, so a reschedule's backoff elapses the instant
+// the trace says, without sleeping.
+let private contractActionEnv () : ContractActionEnv =
+    let encode, decode = EntityKey.forEntityId<ContractEntity>
+
+    let stores () =
+        let db = fixture "contract-action"
+
+        { Inbox =
+            SqliteCommandInbox<ContractEntityId, ContractEvent>(
+                { Context = db.Context
+                  EventCodec = Serialization.systemTextJson<ContractEvent> ()
+                  EntityIdEncode = encode
+                  EntityIdDecode = decode }
+            )
+            :> ContractInbox
+          Processor =
+            SqliteCommandProcessorStore<ContractEntityId, ContractState, ContractEvent, ContractAction, ContractError>(
+                { Context = db.Context
+                  ActionDelivery = ActionDelivery.Deliver(ActionQueueName.create "sqlite_actions")
+                  StateCodec = Serialization.systemTextJson<ContractState> ()
+                  EventCodec = Serialization.systemTextJson<ContractEvent> ()
+                  ActionCodec = Serialization.systemTextJson<ContractAction list> ()
+                  ErrorCodec = Serialization.systemTextJson<ContractError> ()
+                  EntityIdEncode = encode
+                  EntityIdDecode = decode }
+            )
+            :> ContractProcessor
+          Queue =
+            SqliteActionQueue<ContractEntityId, ContractAction>(
+                { Context = db.Context
+                  ActionCodec = Serialization.systemTextJson<ContractAction> ()
+                  EntityIdEncode = encode
+                  EntityIdDecode = decode }
+            )
+            :> ContractActionQueue
+          Now = fun () -> db.Clock.GetUtcNow()
+          Advance =
+            fun span ->
+                db.Clock.Advance span
+                Task.CompletedTask }
+
+    { Machine = testMachine
+      Version = version
+      ClaimLease = LeaseDuration.create (TimeSpan.FromSeconds 30.0)
+      ActionLease = LeaseDuration.create (TimeSpan.FromSeconds 30.0)
+      Backoff = Backoff.create (TimeSpan.FromMilliseconds 10.0) (TimeSpan.FromMilliseconds 100.0)
+      Fresh = fun () -> Task.FromResult(stores ()) }
+
 let private poisonFixture actions count payload =
     task {
         let db = fixture "poison-batch"
@@ -191,6 +241,7 @@ let private settings: Conformance.Settings =
       PoisonCases = 25
       ReadyTokenCases = 12
       ClaimExclusivityCases = 25
+      ActionCases = 25
       RegistryCases = 40
       HistoryCases = 30 }
 
@@ -199,6 +250,7 @@ let tests =
         { Name = "SQLite storage conformance"
           Inbox = contractEnv ()
           History = contractHistoryEnv ()
+          Action = contractActionEnv ()
           Registry = registryFresh
           PoisonCommand = poisonFixture false
           PoisonAction = poisonFixture true

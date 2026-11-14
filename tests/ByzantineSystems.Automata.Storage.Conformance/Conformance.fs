@@ -33,6 +33,7 @@ module Conformance =
           PoisonCases: int
           ReadyTokenCases: int
           ClaimExclusivityCases: int
+          ActionCases: int
           RegistryCases: int
           HistoryCases: int }
 
@@ -41,6 +42,7 @@ module Conformance =
         { Name: string
           Inbox: ContractInboxEnv
           History: ContractHistoryEnv
+          Action: ContractActionEnv
           Registry: unit -> Task<IChartRegistry>
           PoisonCommand: int -> int -> Task<PoisonBatchFixture>
           PoisonAction: int -> int -> Task<PoisonBatchFixture>
@@ -128,6 +130,11 @@ module Conformance =
                   "concurrent claims never overlap"
                   s.ClaimExclusivityCases
                   sut.Inbox
+
+              ContractProperties.actionQueueProperty
+                  "the action queue obeys the shared equations"
+                  s.ActionCases
+                  sut.Action
 
               ContractProperties.inboxReachability
                   "the generated inbox traces reach every behavior class"
