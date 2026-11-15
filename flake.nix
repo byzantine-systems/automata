@@ -177,6 +177,8 @@
                 pkgs.gnumake
                 # make schema-check formats the regenerated types before diffing them.
                 pkgs.fantomas
+                # make async-context-check scans with rg.
+                pkgs.ripgrep
               ];
 
               shellHook = ''
@@ -201,6 +203,7 @@
               bash
               gnumake
               postgresql_19
+              ripgrep
 
               # for dotnet
               netcoredbg
