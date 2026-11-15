@@ -38,11 +38,18 @@ type PostgresTemporalStore<'EntityId, 'State>(options: TemporalOptions<'EntityId
     let context = options.Context
 
     let encodeEntityId entityId =
-        options.EntityIdEncode entityId
-        |> ByzantineSystems.Automata.Storage.Internal.EntityKey.ofString
+        let key =
+            options.EntityIdEncode entityId
+            |> ByzantineSystems.Automata.Storage.Internal.EntityKey.ofString
 
-    let beliefAsOf = StatementKey.create "belief" "as_of" |> Sql.prepareProgram
-    let correctBeliefs = StatementKey.create "belief" "correct" |> Sql.prepareProgram
+        Tap.requireEntityKey "entityId" key
+        key
+
+    let prepare = Sql.prepareProgram context.Schema
+    let beliefAsOf = StatementKey.create "belief" "as_of" |> prepare
+    let beliefBefore = StatementKey.create "belief" "before" |> prepare
+    let beliefValidAt = StatementKey.create "belief" "valid_at" |> prepare
+    let correctBeliefs = StatementKey.create "belief" "correct" |> prepare
 
     /// Rebuilds one belief from a row of fsm.belief. The view cannot carry NOT NULL, so every
     /// column is required here rather than assumed; a row that will not decode fails on its first
@@ -102,8 +109,8 @@ type PostgresTemporalStore<'EntityId, 'State>(options: TemporalOptions<'EntityId
         }
 
     /// <summary>
-    /// One as-of read, from fsm.belief. <c>ValidAt</c> is this with <c>knownAt</c> set to now
-    /// rather than a second query: two queries that have to agree are two queries that can drift.
+    /// One as-of read from the optional temporal schema. ValidAtAsync instead selects the
+    /// currently held opinion directly, so no application clock participates in that question.
     ///
     /// Both windows are half-open by constraint, so <c>from &lt;= t &lt; to</c> on the view's
     /// bounds is exactly the containment the ranges state. The view serves live beliefs, recent
@@ -122,38 +129,73 @@ type PostgresTemporalStore<'EntityId, 'State>(options: TemporalOptions<'EntityId
                 beliefRow)
             ct
 
+    let currentOpinion statement machineId entityId validAt ct =
+        Sql.readProgram
+            context
+            (StoreProgram.tryQueryOne
+                statement
+                [ Params.machineId "machine_id" machineId
+                  Params.entityKey "entity_id" (encodeEntityId entityId)
+                  "valid_at", Param.Timestamp validAt ]
+                beliefRow)
+            ct
+
+    interface IPriorState<'EntityId, 'State> with
+        member _.BeforeAsync(machineId, entityId, at, cancellationToken) =
+            Tap.requireMachineId (nameof machineId) machineId
+            Tap.requireArg (nameof entityId) entityId
+
+            Tap.start cancellationToken (fun () ->
+                currentOpinion beliefBefore machineId entityId at cancellationToken
+                |> TaskResult.map (Option.map _.Snapshot))
+
     interface ITemporalReader<'EntityId, 'State> with
 
-        member _.ValidAt(machineId, entityId, validAt, ct) =
-            // The clock is read here and nowhere else in this type. "What do we think now" is the
-            // one temporal question whose second coordinate is the present; a caller wanting any
-            // other one calls AsOf and says so.
-            asOf machineId entityId validAt DateTimeOffset.UtcNow ct
+        member _.ValidAtAsync(machineId, entityId, validAt, cancellationToken) =
+            Tap.requireMachineId (nameof machineId) machineId
+            Tap.requireArg (nameof entityId) entityId
 
-        member _.AsOf(machineId, entityId, validAt, knownAt, ct) =
-            asOf machineId entityId validAt knownAt ct
+            Tap.start cancellationToken (fun () ->
+                currentOpinion beliefValidAt machineId entityId validAt cancellationToken)
+
+        member _.AsOfAsync(machineId, entityId, validAt, knownAt, cancellationToken) =
+            Tap.requireMachineId (nameof machineId) machineId
+            Tap.requireArg (nameof entityId) entityId
+
+            Tap.start cancellationToken (fun () -> asOf machineId entityId validAt knownAt cancellationToken)
 
     interface ICorrectionStore<'EntityId, 'State> with
 
-        member _.Correct(machineId, entityId, validFrom, beliefs, ct) =
-            backgroundTaskResult {
-                // The whole timeline is encoded before anything is sent.
-                let! payload = BeliefPayload.encode options.StateCodec beliefs
+        member _.CorrectAsync(machineId, entityId, expected, validFrom, beliefs, cancellationToken) =
+            Tap.requireMachineId (nameof machineId) machineId
+            Tap.requireArg (nameof entityId) entityId
+            Tap.requireArg (nameof beliefs) beliefs
 
-                let! superseded =
-                    Sql.runProgram
-                        context
-                        (StoreProgram.queryOne
-                            correctBeliefs
-                            [ Params.machineId "machine_id" machineId
-                              Params.entityKey "entity_id" (encodeEntityId entityId)
-                              "valid_from", Param.Timestamp validFrom
-                              "beliefs", Param.Jsonb payload ]
-                            (fun reader -> Row.int32 reader "superseded" |> Ok))
-                        ct
+            Tap.start cancellationToken (fun () ->
+                let key = encodeEntityId entityId
 
-                return
-                    match superseded with
-                    | 0 -> NothingSuperseded
-                    | superseded -> Corrected superseded
-            }
+                backgroundTaskResult {
+                    // The whole timeline is encoded before anything is sent.
+                    let! payload = BeliefBatch.encode options.StateCodec beliefs
+
+                    let! superseded =
+                        Sql.runProgram
+                            context
+                            (StoreProgram.queryOne
+                                correctBeliefs
+                                ([ Params.machineId "machine_id" machineId
+                                   Params.entityKey "entity_id" key
+                                   "expected_epoch", Param.Bigint(int64 (Epoch.value expected))
+                                   "valid_from", Param.Timestamp validFrom ]
+                                 @ BeliefBatch.parameters payload)
+                                (fun reader ->
+                                    if Row.bool reader "conflict" then
+                                        Ok(CorrectionOutcome.Conflict(Db.epochOf (Row.int64 reader "actual_epoch")))
+                                    else
+                                        match Row.int32 reader "superseded" with
+                                        | 0 -> Ok NothingSuperseded
+                                        | count -> Ok(Corrected count)))
+                            cancellationToken
+
+                    return superseded
+                })

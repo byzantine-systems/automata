@@ -10,7 +10,10 @@ open Expecto
 let tests =
     testList
         "ByzantineSystems.Automata.Storage.Postgres.Tests"
-        [ SqlResourceTests.tests
+        [ SchemaNameTests.tests
+          PostgresStoreSettingsTests.tests
+          SqlResourceTests.tests
+          ListenerTests.tests
           MaintenanceTests.pureTests
           MaintenanceTests.migratorTests
 
@@ -19,12 +22,14 @@ let tests =
                   "integration"
                   [ SqlTests.tests
                     CommandInboxTests.tests
+                    ConformanceTests.tests
+                    ProfileTests.conformance
                     ChartRegistryTests.tests
                     TemporalTests.tests
+                    TemporalBoundaryTests.tests
                     TemporalReaderTests.tests
                     CorrectionTests.tests
                     TemporalProperties.tests
-                    HistoryTests.tests
                     FinalizeTests.tests
                     ActionQueueTests.tests
                     ProcessorIntegrationTests.tests
@@ -33,7 +38,10 @@ let tests =
                     ReplayFinalizeProperties.tests
                     SchemaContractTests.tests
                     MaintenanceTests.integration
-                    PostgresSupervisionStoreTests.tests ]
+                    PostgresSupervisionStoreTests.tests
+                    TapTests.tests
+                    ProfileTests.tests
+                    TwoSchemaTests.tests ]
               |> testSequenced
           else
               ptestCase "AUTOMATA_TEST_DB is not set" (fun _ -> ()) ]

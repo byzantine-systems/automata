@@ -81,21 +81,33 @@ module internal MaintenanceEvents =
 [<RequireQualifiedAccess>]
 module internal MaintenanceLog =
 
-    let tickFailed (logger: ILogger) (tick: string) (error: StoreError) =
-        logger.LogWarning(
+    let private tickFailedLog =
+        LoggerMessage.Define<string, string>(
+            LogLevel.Warning,
             MaintenanceEvents.tickFailed,
-            "Maintenance tick {Tick} failed ({Failure}); trying again next tick.",
-            tick,
-            StoreError.caseName error
+            "Maintenance tick {Tick} failed ({Failure}); trying again next tick."
+        )
+
+    let tickFailed (logger: ILogger) (tick: string) (error: StoreError) =
+        tickFailedLog.Invoke(logger, tick, StoreError.caseName error, null)
+
+    let private queueFillingLog =
+        LoggerMessage.Define<float>(
+            LogLevel.Warning,
+            MaintenanceEvents.queueFilling,
+            "The notification queue is {Usage:P0} full. A session that ran LISTEN and is holding a long transaction open stops it being cleared, and a full queue fails every commit that notifies."
         )
 
     /// The server warns in its own log at half full, so this warns at the same point, where an
     /// application will see it.
     let queueFilling (logger: ILogger) (usage: float) =
-        logger.LogWarning(
-            MaintenanceEvents.queueFilling,
-            "The notification queue is {Usage:P0} full. A session that ran LISTEN and is holding a long transaction open stops it being cleared, and a full queue fails every commit that notifies.",
-            usage
+        queueFillingLog.Invoke(logger, usage, null)
+
+    let private passLog =
+        LoggerMessage.Define<string, int64, int64, int64, int64>(
+            LogLevel.Information,
+            MaintenanceEvents.pass,
+            "Maintenance for machine {MachineId}: reaped {Reaped} leases, purged {PurgedCommands} commands, {PurgedBeliefs} superseded beliefs and {PurgedActions} archived actions."
         )
 
     let pass (logger: ILogger) (report: MaintenanceReport) =
@@ -105,48 +117,62 @@ module internal MaintenanceLog =
             + report.PurgedBeliefs
             + report.PurgedActions > 0L
         then
-            logger.LogInformation(
-                MaintenanceEvents.pass,
-                "Maintenance for machine {MachineId}: reaped {Reaped} leases, purged {PurgedCommands} commands, {PurgedBeliefs} superseded beliefs and {PurgedActions} archived actions.",
+            passLog.Invoke(
+                logger,
                 MachineId.value report.MachineId,
                 report.Reaped,
                 report.PurgedCommands,
                 report.PurgedBeliefs,
-                report.PurgedActions
+                report.PurgedActions,
+                null
             )
 
-    let drift (logger: ILogger) (drift: BlockedDrift) =
-        logger.LogWarning(
+    let private driftLog =
+        LoggerMessage.Define<int64, string, bool, bool>(
+            LogLevel.Warning,
             MaintenanceEvents.drift,
-            "Command {CommandId} of machine {MachineId} is blocked={Blocked} but should be blocked={Expected}. This is a bug in submission or acknowledgement, not a condition to wait out.",
+            "Command {CommandId} of machine {MachineId} is blocked={Blocked} but should be blocked={Expected}. This is a bug in submission or acknowledgement, not a condition to wait out."
+        )
+
+    let drift (logger: ILogger) (drift: BlockedDrift) =
+        driftLog.Invoke(
+            logger,
             CommandId.value drift.CommandId,
             MachineId.value drift.MachineId,
             drift.Blocked,
-            drift.Expected
+            drift.Expected,
+            null
+        )
+
+    let private repairedLog =
+        LoggerMessage.Define<int64, bool>(
+            LogLevel.Warning,
+            MaintenanceEvents.repaired,
+            "Repaired the blocked flag of command {CommandId}; it is now {Blocked}."
         )
 
     let repaired (logger: ILogger) (block: RepairedBlock) =
-        logger.LogWarning(
-            MaintenanceEvents.repaired,
-            "Repaired the blocked flag of command {CommandId}; it is now {Blocked}.",
-            CommandId.value block.CommandId,
-            block.Blocked
+        repairedLog.Invoke(logger, CommandId.value block.CommandId, block.Blocked, null)
+
+    let private scheduledLog =
+        LoggerMessage.Define<TimeSpan, TimeSpan>(
+            LogLevel.Information,
+            MaintenanceEvents.scheduled,
+            "The database runs maintenance itself, notifying every {NotifyEvery} and running every {RunEvery}."
         )
 
     let scheduled (logger: ILogger) (options: MaintenanceOptions) =
-        logger.LogInformation(
-            MaintenanceEvents.scheduled,
-            "The database runs maintenance itself, notifying every {NotifyEvery} and running every {RunEvery}.",
-            options.NotifyEvery,
-            options.RunEvery
+        scheduledLog.Invoke(logger, options.NotifyEvery, options.RunEvery, null)
+
+    let private fellBackLog =
+        LoggerMessage.Define<string>(
+            LogLevel.Warning,
+            MaintenanceEvents.fellBack,
+            "The database cannot run maintenance itself ({Reason}); this process will run it instead."
         )
 
     let fellBack (logger: ILogger) (reason: string) =
-        logger.LogWarning(
-            MaintenanceEvents.fellBack,
-            "The database cannot run maintenance itself ({Reason}); this process will run it instead.",
-            reason
-        )
+        fellBackLog.Invoke(logger, reason, null)
 
 /// <summary>Running loops side by side.</summary>
 [<RequireQualifiedAccess>]
@@ -223,10 +249,10 @@ type internal MaintenanceService
 
         Task.CompletedTask
 
-    let notify = attempt "notify" maintenance.NotifyPending notified
+    let notify = attempt "notify" maintenance.NotifyPendingAsync notified
 
     let repair =
-        attempt "repair" maintenance.RepairDrift (logAll MaintenanceLog.repaired)
+        attempt "repair" maintenance.RepairDriftAsync (logAll MaintenanceLog.repaired)
 
     let drifted ct (drift: BlockedDrift list) : Task =
         backgroundTask {
@@ -237,11 +263,11 @@ type internal MaintenanceService
         }
 
     let checkDrift ct =
-        attempt "drift" maintenance.DetectDrift (drifted ct) ct
+        attempt "drift" maintenance.DetectDriftAsync (drifted ct) ct
 
     let pass ct : Task =
         backgroundTask {
-            do! attempt "run" (fun ct -> maintenance.Run(batch, ct)) (logAll MaintenanceLog.pass) ct
+            do! attempt "run" (fun ct -> maintenance.RunAsync(batch, ct)) (logAll MaintenanceLog.pass) ct
             do! checkDrift ct
         }
 
@@ -263,7 +289,7 @@ type internal MaintenanceService
         match options.Scheduler with
         | MaintenanceScheduler.InProcess -> Task.FromResult MaintenanceScheduler.InProcess
         | MaintenanceScheduler.InDatabase ->
-            maintenance.Schedule(options.NotifyEvery, options.RunEvery, batch, ct)
+            maintenance.ScheduleAsync(options.NotifyEvery, options.RunEvery, batch, ct)
             |> Task.map scheduling
 
     let run (scheduler: MaintenanceScheduler) (ct: CancellationToken) : Task<unit> =

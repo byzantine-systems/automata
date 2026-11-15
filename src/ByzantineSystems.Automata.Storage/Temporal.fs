@@ -48,12 +48,12 @@ type Belief<'EntityId, 'State> =
 type ITemporalReader<'EntityId, 'State> =
 
     /// <summary>
-    /// Today's opinion about an instant of business time. Equivalent to <c>AsOf</c> with
+    /// Today's opinion about an instant of business time. Equivalent to <c>AsOfAsync</c> with
     /// <c>knownAt</c> set to now, and offered separately because that is the question most
     /// callers actually have.
     /// </summary>
-    abstract ValidAt:
-        machineId: MachineId * entityId: 'EntityId * validAt: DateTimeOffset * ct: CancellationToken ->
+    abstract ValidAtAsync:
+        machineId: MachineId * entityId: 'EntityId * validAt: DateTimeOffset * cancellationToken: CancellationToken ->
             Task<Result<Belief<'EntityId, 'State> option, StoreError>>
 
     /// <summary>
@@ -63,12 +63,12 @@ type ITemporalReader<'EntityId, 'State> =
     /// of mind: the same instant in the world, two different answers, and the difference is the
     /// explanation an operator is asking for.
     /// </summary>
-    abstract AsOf:
+    abstract AsOfAsync:
         machineId: MachineId *
         entityId: 'EntityId *
         validAt: DateTimeOffset *
         knownAt: DateTimeOffset *
-        ct: CancellationToken ->
+        cancellationToken: CancellationToken ->
             Task<Result<Belief<'EntityId, 'State> option, StoreError>>
 
 /// <summary>
@@ -99,6 +99,8 @@ type CorrectedBelief<'State> =
 
 /// <summary>What correcting a belief timeline did.</summary>
 type CorrectionOutcome =
+    /// <summary>The entity moved before the operator correction could acquire its fence.</summary>
+    | Conflict of actual: Epoch
     /// <summary>
     /// The timeline was rewritten. <c>Superseded</c> counts the beliefs that were archived, which
     /// is what an operator checks against what they expected to change.
@@ -128,7 +130,7 @@ type ICorrectionStore<'EntityId, 'State> =
     /// <paramref name="beliefs" />, in one transaction.
     ///
     /// Superseded beliefs are archived rather than overwritten, so the previous opinion stays
-    /// answerable through <c>AsOf</c>. That is the whole point: a correction that erased what it
+    /// answerable through <c>AsOfAsync</c>. That is the whole point: a correction that erased what it
     /// replaced would leave an audit record claiming the new answer had always been the answer.
     ///
     /// The beliefs must be ordered by <c>ValidFrom</c>: when non-empty, the first starts exactly
@@ -139,12 +141,13 @@ type ICorrectionStore<'EntityId, 'State> =
     /// An empty list asserts that the entity had no belief from <paramref name="validFrom" />
     /// onward, which is how a correction undoes one rather than replacing it.
     /// </summary>
-    abstract Correct:
+    abstract CorrectAsync:
         machineId: MachineId *
         entityId: 'EntityId *
+        expected: Epoch *
         validFrom: DateTimeOffset *
         beliefs: CorrectedBelief<'State> list *
-        ct: CancellationToken ->
+        cancellationToken: CancellationToken ->
             Task<Result<CorrectionOutcome, StoreError>>
 
 /// <summary>The committed events a correction has to re-decide.</summary>
@@ -173,40 +176,59 @@ type CorrectionCommit<'EntityId, 'State, 'Event, 'Action> =
         /// <summary>The instant the belief timeline is rewritten from.</summary>
         ValidFrom: DateTimeOffset
         /// <summary>
-        /// The rewritten timeline, never empty: at least the correction's own belief is written,
-        /// or the next ordinary command would read a missing live belief and an epoch of zero.
-        /// The first belief is the earliest; the last is attributed to the correction's own epoch,
-        /// which is what the next ordinary command expects.
+        /// The rewritten timeline, never empty: the correction's own assertion is always present.
+        /// The core snapshot advances independently of this timeline and remains the epoch authority.
         /// </summary>
         Beliefs: CorrectedBelief<'State> * CorrectedBelief<'State> list
     }
 
 /// <summary>
-/// Replaying the past through the machine.
-///
-/// Optional, like the other temporal capabilities. A store offering it can list the events a
-/// correction has to re-decide, and commit a correction's transition, rewritten beliefs and
-/// closed command together.
+/// Reading a committed suffix and whether retention has made it incomplete.
+/// This capability requires only a transition log and a purge watermark, not temporal tables.
 /// </summary>
-type IReplayStore<'EntityId, 'State, 'Event, 'Action> =
+type ITransitionLog<'EntityId, 'State, 'Event, 'Action> =
 
     /// <summary>
     /// The committed transitions effective at or after <paramref name="from" />, at most
     /// <paramref name="limit" /> of them. Asking for one more than a budget allows is how a caller
     /// learns the budget would be exceeded.
     /// </summary>
-    abstract Suffix:
-        machineId: MachineId * entityId: 'EntityId * from: DateTimeOffset * limit: int * ct: CancellationToken ->
+    abstract SuffixAsync:
+        machineId: MachineId *
+        entityId: 'EntityId *
+        from: DateTimeOffset *
+        limit: int *
+        cancellationToken: CancellationToken ->
             Task<Result<ReplaySuffix<'EntityId, 'State, 'Event, 'Action>, StoreError>>
 
+/// <summary>The entity's state strictly before a business instant, independent of its representation.</summary>
+type IPriorState<'EntityId, 'State> =
+    /// <summary>Returns the state effective strictly before the supplied instant, or no prior state.</summary>
+    abstract BeforeAsync:
+        machineId: MachineId * entityId: 'EntityId * at: DateTimeOffset * cancellationToken: CancellationToken ->
+            Task<Result<Snapshot<'State> option, StoreError>>
+
+/// <summary>Atomic, fenced correction commits, independent of the representation of history.</summary>
+type ICorrectionCommitter<'EntityId, 'State, 'Event, 'Action> =
     /// <summary>
     /// Commits a correction, fenced like any other commit: the lease must still be held and the
     /// entity must still be at <paramref name="expected" />, or nothing is written.
     /// </summary>
-    abstract CommitCorrection:
+    abstract CommitCorrectionAsync:
         commandId: CommandId *
         token: LeaseToken<CommandWork> *
         expected: Epoch *
         commit: CorrectionCommit<'EntityId, 'State, 'Event, 'Action> *
-        ct: CancellationToken ->
+        cancellationToken: CancellationToken ->
             Task<Result<FinalizeOutcome, StoreError>>
+
+/// <summary>The complete set of operations required to plan and commit a correction.</summary>
+type CorrectionCapability<'EntityId, 'State, 'Event, 'Action> =
+    {
+        /// <summary>The committed suffix and its retention watermark.</summary>
+        Log: ITransitionLog<'EntityId, 'State, 'Event, 'Action>
+        /// <summary>The state immediately preceding the correction.</summary>
+        Prior: IPriorState<'EntityId, 'State>
+        /// <summary>The atomic correction writer.</summary>
+        Committer: ICorrectionCommitter<'EntityId, 'State, 'Event, 'Action>
+    }

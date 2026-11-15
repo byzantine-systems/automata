@@ -5,7 +5,7 @@
 SELECT
     c.fingerprint
 FROM
-    fsm.machine_chart_version c
+    $schema$.machine_chart_version c
 WHERE
     c.machine_id = @machine_id
     AND c.version = @version;

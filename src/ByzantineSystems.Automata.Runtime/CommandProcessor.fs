@@ -97,7 +97,7 @@ type CommandProcessor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: e
     let machineName = MachineId.value machineId
 
     // The aggregate store is used through one capability at a time. This is not ceremony: the
-    // inbox and the action queue both declare Claim and Reschedule with the same shape, so a
+    // inbox and the action queue both declare ClaimAsync and RescheduleAsync with the same shape, so a
     // call on the aggregate is genuinely ambiguous, and naming the capability is what says
     // which one a line means.
     let inbox = config.Store :> ICommandInbox<'EntityId, 'Event>
@@ -107,7 +107,7 @@ type CommandProcessor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: e
         config.Store :> ICommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
 
     let snapshotOf (entityId: 'EntityId) (ct: CancellationToken) =
-        reader.TryGetSnapshot(machineId, entityId, ct)
+        reader.TryGetSnapshotAsync(machineId, entityId, ct)
         |> TaskResult.mapError MachineError.Store
         |> TaskResult.map (function
             // An entity with no belief has never committed. Its first command resolves from the
@@ -120,23 +120,23 @@ type CommandProcessor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: e
     /// fence says somebody else owns the command. Renewing past that point would be arguing
     /// with a decision the database has already made.
     let renewWhile (leased: LeasedCommand<'EntityId, 'Event>) (work: Task<'T>) (ct: CancellationToken) =
-        let rec renew () =
-            task {
-                if work.IsCompleted then
-                    return ()
-                else
+        let renew () =
+            backgroundTask {
+                let mutable renewing = not work.IsCompleted
+
+                while renewing do
                     let! finished = Task.WhenAny(work :> Task, Task.Delay(policy.RenewAfter, config.TimeProvider, ct))
 
                     if Object.ReferenceEquals(finished, work :> Task) then
-                        return ()
+                        renewing <- false
                     else
-                        match! inbox.ExtendLease(leased.Work.CommandId, leased.Token, leaseDuration, ct) with
-                        | Ok Updated -> return! renew ()
+                        match! inbox.ExtendLeaseAsync(leased.Work.CommandId, leased.Token, leaseDuration, ct) with
+                        | Ok Updated -> ()
                         | Ok(LeaseUpdateOutcome.LeaseLost)
-                        | Error _ -> return ()
+                        | Error _ -> renewing <- false
             }
 
-        task {
+        backgroundTask {
             let renewal = renew ()
             let! result = work
             do! renewal
@@ -210,8 +210,8 @@ type CommandProcessor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: e
         | _ -> ()
 
     let reschedule (leased: LeasedCommand<'EntityId, 'Event>) (ct: CancellationToken) =
-        task {
-            match! inbox.Reschedule(leased.Work.CommandId, leased.Token, policy.Backoff, ct) with
+        backgroundTask {
+            match! inbox.RescheduleAsync(leased.Work.CommandId, leased.Token, policy.Backoff, ct) with
             | Ok Updated -> return Deferred
             | Ok(LeaseUpdateOutcome.LeaseLost)
             | Error _ -> return Fenced
@@ -224,7 +224,7 @@ type CommandProcessor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: e
         (outcome: FinalizeOutcome)
         (ct: CancellationToken)
         =
-        task {
+        backgroundTask {
             let record = leased.Work
 
             match outcome with
@@ -277,7 +277,7 @@ type CommandProcessor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: e
             (failure: CommandFailure<'Err>)
             (outcome: CommandOutcome)
             =
-            task {
+            backgroundTask {
                 match! finalize (record.CommandId, leased.Token, failure, ct) with
                 | Ok(Finalized _)
                 | Ok(AlreadyFinalized _) ->
@@ -296,12 +296,12 @@ type CommandProcessor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: e
         match disposition with
         | Retry when record.Attempts + 1 >= policy.MaxAttempts ->
             terminate
-                (fun args -> processor.DeadLetter args)
+                (fun args -> processor.DeadLetterAsync args)
                 (CommandFailure.Machine $"gave up after %d{record.Attempts + 1} attempts")
                 Abandoned
         | Retry -> reschedule leased ct
-        | Reject failure -> terminate (fun args -> processor.Reject args) failure Refused
-        | DeadLetter failure -> terminate (fun args -> processor.DeadLetter args) failure Abandoned
+        | Reject failure -> terminate (fun args -> processor.RejectAsync args) failure Refused
+        | DeadLetter failure -> terminate (fun args -> processor.DeadLetterAsync args) failure Abandoned
         | Escalate reason -> Task.FromResult(Escalating(record.CommandId, reason))
 
     /// <summary>
@@ -322,8 +322,8 @@ type CommandProcessor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: e
         let classify error =
             applyDisposition leased (policy.Classify(MachineError.Store error)) ct
 
-        task {
-            match Store.tryReplay config.Store with
+        backgroundTask {
+            match Store.tryCorrections config.Store with
             | None -> return! deadLetter (CommandFailure.Machine "this store cannot replay corrections")
             | Some replay ->
                 let planned =
@@ -331,23 +331,31 @@ type CommandProcessor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: e
 
                 match! renewWhile leased planned ct with
                 | Ok(plan, expected) ->
-                    match! replay.CommitCorrection(record.CommandId, leased.Token, expected, plan.Commit, ct) with
+                    match!
+                        replay.Committer.CommitCorrectionAsync(
+                            record.CommandId,
+                            leased.Token,
+                            expected,
+                            plan.Commit,
+                            ct
+                        )
+                    with
                     | Ok outcome -> return! interpretCommit leased plan.Commit.Transition outcome ct
                     | Error error -> return! classify error
                 | Error(CorrectionError.Replay error) -> return! deadLetter (CommandFailure.Replay error)
-                | Error CorrectionError.Unsupported ->
+                | Error(CorrectionError.Rejected _) ->
                     return! deadLetter (CommandFailure.Machine "this store cannot read or replay the past")
                 | Error(CorrectionError.Store error) -> return! classify error
         }
 
     /// One command, start to finish.
     let processOne (leased: LeasedCommand<'EntityId, 'Event>) (ct: CancellationToken) =
-        task {
+        backgroundTask {
             let record = leased.Work
             let started = config.TimeProvider.GetTimestamp()
 
             let decide () =
-                taskResult {
+                backgroundTaskResult {
                     let! state, epoch, status = snapshotOf record.EntityId ct
 
                     do!
@@ -375,7 +383,7 @@ type CommandProcessor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: e
                             resolution
 
                     let! outcome =
-                        processor.Commit(record.CommandId, leased.Token, epoch, draft, ct)
+                        processor.CommitAsync(record.CommandId, leased.Token, epoch, draft, ct)
                         |> TaskResult.mapError MachineError.Store
 
                     return draft, outcome
@@ -397,7 +405,7 @@ type CommandProcessor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: e
                     match record.Kind with
                     | CommandKind.Correction(at, correction) -> correct leased at correction ct
                     | CommandKind.Event ->
-                        task {
+                        backgroundTask {
                             match! renewWhile leased (decide ()) ct with
                             | Ok(draft, outcome) -> return! interpretCommit leased draft outcome ct
                             | Error error -> return! applyDisposition leased (policy.Classify error) ct
@@ -450,9 +458,9 @@ type CommandProcessor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: e
     /// a claim, for the same reason.
     /// </summary>
     member _.PollAsync(ct: CancellationToken) : Task<Result<PollReport, MachineError<'Err>>> =
-        taskResult {
+        backgroundTaskResult {
             let! batch =
-                inbox.Claim(machineId, claimBatch, leaseDuration, ct)
+                inbox.ClaimAsync(machineId, claimBatch, leaseDuration, ct)
                 |> TaskResult.mapError MachineError.Store
 
             match batch with
@@ -471,7 +479,7 @@ type CommandProcessor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: e
                 use gate = new SemaphoreSlim(policy.Concurrency)
 
                 let run (leased: LeasedCommand<'EntityId, 'Event>) =
-                    task {
+                    backgroundTask {
                         do! gate.WaitAsync ct
 
                         try
@@ -495,7 +503,7 @@ type CommandProcessor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: e
     member this.RunAsync(ct: CancellationToken) : Task<ProcessorStop> =
         /// Returns false when the wait ended because the processor is shutting down.
         let waitForWork () =
-            task {
+            backgroundTask {
                 try
                     let! _ = signal.WaitOrTimeoutAsync(policy.PollingInterval, config.TimeProvider, ct)
                     return true
@@ -503,24 +511,33 @@ type CommandProcessor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: e
                     return false
             }
 
-        let rec loop (totals: PollSummary) =
-            task {
+        backgroundTask {
+            let mutable totals = PollSummary.empty
+            let mutable running = true
+            let mutable stopped = ProcessorStop.Drained totals
+
+            while running do
                 if ct.IsCancellationRequested then
-                    return ProcessorStop.Drained totals
+                    stopped <- ProcessorStop.Drained totals
+                    running <- false
                 else
                     match! this.PollAsync ct with
                     | Ok report ->
-                        let totals = PollSummary.add totals report.Summary
+                        totals <- PollSummary.add totals report.Summary
 
                         match report.Escalation with
-                        | Some(commandId, reason) -> return ProcessorStop.Escalated(commandId, reason, totals)
+                        | Some(commandId, reason) ->
+                            stopped <- ProcessorStop.Escalated(commandId, reason, totals)
+                            running <- false
                         // A full batch means there is probably more waiting, so going straight
                         // round again drains a backlog at claim speed rather than poll speed.
-                        | None when report.Summary.Claimed = ClaimBatch.value claimBatch -> return! loop totals
+                        | None when report.Summary.Claimed = ClaimBatch.value claimBatch -> do! Task.Yield()
                         | None ->
                             match! waitForWork () with
-                            | true -> return! loop totals
-                            | false -> return ProcessorStop.Drained totals
+                            | true -> ()
+                            | false ->
+                                stopped <- ProcessorStop.Drained totals
+                                running <- false
                     | Error error ->
                         logger.LogWarning(
                             ProcessorEvents.pollFailed,
@@ -536,8 +553,10 @@ type CommandProcessor<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: e
                         )
 
                         match! waitForWork () with
-                        | true -> return! loop totals
-                        | false -> return ProcessorStop.Drained totals
-            }
+                        | true -> ()
+                        | false ->
+                            stopped <- ProcessorStop.Drained totals
+                            running <- false
 
-        loop PollSummary.empty
+            return stopped
+        }

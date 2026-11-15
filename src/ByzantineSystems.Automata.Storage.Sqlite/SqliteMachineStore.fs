@@ -67,7 +67,7 @@ module MachineStoreOptions =
 ///
 /// It composes the four implementations rather than reimplementing them, as the PostgreSQL store
 /// does. The interface implementations are explicit, so a caller has to say whether it means the
-/// inbox's <c>Claim</c> or the action queue's.
+/// inbox's <c>ClaimAsync</c> or the action queue's.
 ///
 /// The optional capabilities it leaves out are absent rather than stubbed, which is what the
 /// runtime's discovery by type test expects. There is no temporal reader, correction store or
@@ -124,55 +124,59 @@ type SqliteMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
 
     interface ICommandInbox<'EntityId, 'Event> with
 
-        member _.Submit(submission, ct) = inbox.Submit(submission, ct)
+        member _.SubmitAsync(submission, cancellationToken) =
+            inbox.SubmitAsync(submission, cancellationToken)
 
-        member _.Claim(machineId, batch, lease, ct) =
-            inbox.Claim(machineId, batch, lease, ct)
+        member _.ClaimAsync(machineId, batch, lease, cancellationToken) =
+            inbox.ClaimAsync(machineId, batch, lease, cancellationToken)
 
-        member _.Reschedule(commandId, token, backoff, ct) =
-            inbox.Reschedule(commandId, token, backoff, ct)
+        member _.RescheduleAsync(commandId, token, backoff, cancellationToken) =
+            inbox.RescheduleAsync(commandId, token, backoff, cancellationToken)
 
-        member _.ExtendLease(commandId, token, lease, ct) =
-            inbox.ExtendLease(commandId, token, lease, ct)
+        member _.ExtendLeaseAsync(commandId, token, lease, cancellationToken) =
+            inbox.ExtendLeaseAsync(commandId, token, lease, cancellationToken)
 
-        member _.TryGet(commandId, ct) = inbox.TryGet(commandId, ct)
+        member _.TryGetAsync(commandId, cancellationToken) =
+            inbox.TryGetAsync(commandId, cancellationToken)
 
-        member _.TryFind(machineId, entityId, key, ct) =
-            inbox.TryFind(machineId, entityId, key, ct)
+        member _.TryFindAsync(machineId, entityId, key, cancellationToken) =
+            inbox.TryFindAsync(machineId, entityId, key, cancellationToken)
 
     interface IStateReader<'EntityId, 'State, 'Event, 'Action> with
 
-        member _.TryGetSnapshot(machineId, entityId, ct) =
-            reader.TryGetSnapshot(machineId, entityId, ct)
+        member _.TryGetSnapshotAsync(machineId, entityId, cancellationToken) =
+            reader.TryGetSnapshotAsync(machineId, entityId, cancellationToken)
 
-        member _.History(machineId, entityId, paging, ct) =
-            reader.History(machineId, entityId, paging, ct)
+        member _.HistoryAsync(machineId, entityId, paging, cancellationToken) =
+            reader.HistoryAsync(machineId, entityId, paging, cancellationToken)
 
     interface ICommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err> with
 
-        member _.Commit(commandId, token, expected, draft, ct) =
-            processorStore.Commit(commandId, token, expected, draft, ct)
+        member _.CommitAsync(commandId, token, expected, draft, cancellationToken) =
+            processorStore.CommitAsync(commandId, token, expected, draft, cancellationToken)
 
-        member _.Reject(commandId, token, failure, ct) =
-            processorStore.Reject(commandId, token, failure, ct)
+        member _.RejectAsync(commandId, token, failure, cancellationToken) =
+            processorStore.RejectAsync(commandId, token, failure, cancellationToken)
 
-        member _.DeadLetter(commandId, token, failure, ct) =
-            processorStore.DeadLetter(commandId, token, failure, ct)
+        member _.DeadLetterAsync(commandId, token, failure, cancellationToken) =
+            processorStore.DeadLetterAsync(commandId, token, failure, cancellationToken)
 
-        member _.TryGetResult(commandId, ct) =
-            processorStore.TryGetResult(commandId, ct)
+        member _.TryGetResultAsync(commandId, cancellationToken) =
+            processorStore.TryGetResultAsync(commandId, cancellationToken)
 
     interface IActionQueue<'EntityId, 'Action> with
 
-        member _.Claim(machineId, batch, lease, ct) =
-            actionQueue.Claim(machineId, batch, lease, ct)
+        member _.ClaimAsync(machineId, batch, lease, cancellationToken) =
+            actionQueue.ClaimAsync(machineId, batch, lease, cancellationToken)
 
-        member _.Complete(action, ct) = actionQueue.Complete(action, ct)
+        member _.CompleteAsync(action, cancellationToken) =
+            actionQueue.CompleteAsync(action, cancellationToken)
 
-        member _.Reschedule(action, backoff, ct) =
-            actionQueue.Reschedule(action, backoff, ct)
+        member _.RescheduleAsync(action, backoff, cancellationToken) =
+            actionQueue.RescheduleAsync(action, backoff, cancellationToken)
 
-        member _.Abandon(action, reason, ct) = actionQueue.Abandon(action, reason, ct)
+        member _.AbandonAsync(action, reason, cancellationToken) =
+            actionQueue.AbandonAsync(action, reason, cancellationToken)
 
     /// <summary>
     /// The boot check. It only reads: there is no queue to create and no maintenance to register,
@@ -180,10 +184,13 @@ type SqliteMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     /// </summary>
     interface IStoreBoot with
 
-        member _.Boot(_, ct) =
-            Boot.inspect options.Context ct
-            |> TaskResult.map (function
-                | [] -> BootReport.Ready
-                | defects -> BootReport.Refused defects)
+        member _.BootAsync(machineId, cancellationToken) =
+            Tap.requireMachineId (nameof machineId) machineId
+
+            Tap.start cancellationToken (fun () ->
+                Boot.inspect options.Context cancellationToken
+                |> TaskResult.map (function
+                    | [] -> BootReport.Ready
+                    | defects -> BootReport.Refused defects))
 
     interface IMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>

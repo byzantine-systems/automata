@@ -138,6 +138,9 @@ module internal Boot =
             let version = Version.Parse(Row.string reader "version")
             let hasSchema = Row.bool reader "has_schema"
             let hasJournal = Row.bool reader "has_journal"
+            // ADO.NET's reader close takes no cancellation token; the close is a local state
+            // change, so there is nothing to cancel. It runs before the next statement on this
+            // connection, which tolerates one reader at a time.
             do! reader.CloseAsync()
 
             use pragma = command "PRAGMA journal_mode;"

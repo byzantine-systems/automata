@@ -45,7 +45,7 @@ let runWorker (db: string) (go: string) : int =
     let rec loop () =
         task {
             match!
-                inbox.Claim(
+                inbox.ClaimAsync(
                     testMachine,
                     ClaimBatch.create 3,
                     LeaseDuration.create (TimeSpan.FromSeconds 30.0),
@@ -62,7 +62,7 @@ let runWorker (db: string) (go: string) : int =
                     do! Task.Delay workTime
 
                     match!
-                        processor.Reject(
+                        processor.RejectAsync(
                             held.Work.CommandId,
                             held.Token,
                             CommandFailure.Domain(Refused "done"),

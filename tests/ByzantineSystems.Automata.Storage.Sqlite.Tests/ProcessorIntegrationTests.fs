@@ -105,7 +105,7 @@ let private stateOf (store: Store) name =
     task {
         let! snapshot =
             (store :> IStateReader<Entity, TestState, TestEvent, TestAction>)
-                .TryGetSnapshot(testMachine, entity name, noCancellation)
+                .TryGetSnapshotAsync(testMachine, entity name, noCancellation)
 
         return snapshot |> expectOk "snapshot" |> Option.map _.State
     }
@@ -201,9 +201,7 @@ let tests =
               do! Machine.stopAsync built noCancellation
           }
 
-          // This store cannot replay the past, so the runtime finds no replay capability and
-          // dead-letters a correction. What must hold is that the entity is not wedged by it.
-          testTask "a correction is dead-lettered with its reason and releases its entity" {
+          testTask "an unsupported correction is refused before submission" {
               let! db, store, built = started ()
 
               let! _ = enqueue built "corrected" "k1" (Start 1)
@@ -218,15 +216,14 @@ let tests =
                       CorrectionPolicy.defaults
                       noCancellation
 
-              let correctionId = correction |> expectOk "correct" |> commandIdOf
+              Expect.equal
+                  correction
+                  (Error(MachineError.Rejected MachineRejection.CorrectionsUnsupported))
+                  "unsupported corrections never enter the inbox"
+
               let! _ = enqueue built "corrected" "k2" (Start 2)
 
               do! drainUntil [ Machine.processor built ] (fun () -> (epochs db "corrected").Length = 2)
-
-              match! Machine.commandResult built correctionId noCancellation with
-              | Ok(Some(CommandResult.DeadLettered(CommandFailure.Machine reason))) ->
-                  Expect.stringContains reason "correction" "the reason says what the store cannot do"
-              | other -> failtestf "expected the correction to be dead-lettered, got %A" other
 
               let! state = stateOf store "corrected"
               Expect.equal state (Some(Active 3)) "the command after the correction still ran"

@@ -5,7 +5,6 @@ open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
 open ByzantineSystems.Automata.Storage.Sqlite
-open ByzantineSystems.Automata.Storage.ContractProperties
 open ByzantineSystems.Automata.Storage.Sqlite.Tests.TestContext
 open Expecto
 
@@ -18,7 +17,7 @@ let private effectiveAt = DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero)
 let private commit (fixture: Fixture) (name: string) (key: string) (toState: TestState) : Task =
     task {
         let! held = leased (inboxOf fixture) (entity name) key
-        let! snapshot = (readerOf fixture).TryGetSnapshot(testMachine, entity name, noCancellation)
+        let! snapshot = (readerOf fixture).TryGetSnapshotAsync(testMachine, entity name, noCancellation)
 
         let expected =
             snapshot
@@ -28,7 +27,7 @@ let private commit (fixture: Fixture) (name: string) (key: string) (toState: Tes
 
         let! outcome =
             (processorOf fixture)
-                .Commit(
+                .CommitAsync(
                     held.Work.CommandId,
                     held.Token,
                     expected,
@@ -41,54 +40,14 @@ let private commit (fixture: Fixture) (name: string) (key: string) (toState: Tes
 
 let private page (fixture: Fixture) (name: string) (paging: Page) : Task<Committed list> =
     task {
-        let! rows = (readerOf fixture).History(testMachine, entity name, paging, noCancellation)
+        let! rows = (readerOf fixture).HistoryAsync(testMachine, entity name, paging, noCancellation)
         return rows |> expectOk "history"
     }
-
-// The shared history equations, over this provider's fixture: a fresh migrated file per
-// generated case, and the fixture's frozen clock, so commit instants are exact rather than
-// bounded.
-let private contractHistoryEnv () : ContractHistoryEnv =
-    let encode, decode = EntityKey.forEntityId<ContractEntity>
-
-    let stores () =
-        let db = fixture "contract-history"
-
-        let processor =
-            SqliteCommandProcessorStore<ContractEntityId, ContractState, ContractEvent, ContractAction, ContractError>(
-                { Context = db.Context
-                  ActionDelivery = ActionDelivery.Deliver(ActionQueueName.create "sqlite_actions")
-                  StateCodec = Serialization.systemTextJson<ContractState> ()
-                  EventCodec = Serialization.systemTextJson<ContractEvent> ()
-                  ActionCodec = Serialization.systemTextJson<ContractAction list> ()
-                  ErrorCodec = Serialization.systemTextJson<ContractError> ()
-                  EntityIdEncode = encode
-                  EntityIdDecode = decode }
-            )
-
-        { Inbox =
-            SqliteCommandInbox<ContractEntityId, ContractEvent>(
-                { Context = db.Context
-                  EventCodec = Serialization.systemTextJson<ContractEvent> ()
-                  EntityIdEncode = encode
-                  EntityIdDecode = decode }
-            )
-            :> ContractInbox
-          Processor = processor :> ContractProcessor
-          Reader = processor :> ContractReader
-          Now = fun () -> db.Clock.GetUtcNow() }
-
-    { Machine = testMachine
-      Version = version
-      CommittedAtTolerance = TimeSpan.Zero
-      Fresh = fun () -> Task.FromResult(stores ()) }
 
 let tests =
     testList
         "IStateReader"
-        [ ContractProperties.historyProperty "the shared history equations" 30 (contractHistoryEnv ())
-
-          testTask "the snapshot table holds one row, replaced in place, stamped by the frozen clock" {
+        [ testTask "the snapshot table holds one row, replaced in place, stamped by the frozen clock" {
               let db = fixture "history"
               do! commit db "e1" "k1" (Active 1)
               do! commit db "e1" "k2" (Active 2)

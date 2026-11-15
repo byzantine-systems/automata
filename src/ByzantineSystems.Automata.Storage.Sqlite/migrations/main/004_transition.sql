@@ -11,7 +11,6 @@ CREATE TABLE fsm_transition (
     epoch INTEGER NOT NULL,
     command_id INTEGER NOT NULL,
     chart_version INTEGER NOT NULL,
-    event TEXT NOT NULL,
     actions TEXT NOT NULL,
     from_state TEXT NOT NULL,
     to_state TEXT NOT NULL,
@@ -31,7 +30,7 @@ CREATE TABLE fsm_transition (
     CONSTRAINT transition_pkey PRIMARY KEY (machine_id, entity_id, epoch),
     CONSTRAINT transition_epoch_positive CHECK (epoch > 0),
     CONSTRAINT transition_status_valid CHECK (status IN ('running', 'suspended', 'terminated')),
-    CONSTRAINT transition_documents_are_json CHECK (JSON_VALID(event) AND JSON_VALID(from_state) AND JSON_VALID(to_state)),
+    CONSTRAINT transition_documents_are_json CHECK (JSON_VALID(from_state) AND JSON_VALID(to_state)),
     CONSTRAINT transition_actions_is_array CHECK (JSON_TYPE(actions) = 'array'),
     CONSTRAINT transition_paths_are_arrays CHECK (JSON_TYPE(exited) = 'array' AND JSON_TYPE(entered) = 'array'),
     -- One command can never produce two transitions, whatever a retry does.

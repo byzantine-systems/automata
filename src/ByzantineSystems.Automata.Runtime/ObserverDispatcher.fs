@@ -38,12 +38,14 @@ type internal ObserverDispatcher<'EntityId, 'State, 'Event, 'Action>
 
     /// <summary>Drains the channel until completed or cancelled, observing each transition.</summary>
     member _.RunAsync(ct: CancellationToken) : Task =
-        let rec drain () =
-            task {
+        backgroundTask {
+            let mutable draining = true
+
+            while draining do
                 // Cancellation ends the loop; anything else is a defect in the channel itself
                 // and is left to propagate to whoever owns this task.
                 let! ready =
-                    task {
+                    backgroundTask {
                         try
                             return! reader.WaitToReadAsync(ct).AsTask()
                         with :? System.OperationCanceledException when ct.IsCancellationRequested ->
@@ -51,7 +53,7 @@ type internal ObserverDispatcher<'EntityId, 'State, 'Event, 'Action>
                     }
 
                 if not ready then
-                    return ()
+                    draining <- false
                 else
                     let mutable transition =
                         Unchecked.defaultof<CommittedTransition<'EntityId, 'State, 'Event, 'Action>>
@@ -60,12 +62,8 @@ type internal ObserverDispatcher<'EntityId, 'State, 'Event, 'Action>
                         // Observation is explicitly best-effort. Discarding here keeps a user
                         // callback from faulting a worker that has already committed.
                         let! _ = observer transition CancellationToken.None |> TaskOutcome.captureUnit
-                        return! drain ()
-                    else
-                        return! drain ()
-            }
-
-        drain ()
+                        ()
+        }
 
     /// <summary>Completes the channel so the drain loop finishes; idempotent.</summary>
     member _.Complete() : unit = writer.TryComplete() |> ignore

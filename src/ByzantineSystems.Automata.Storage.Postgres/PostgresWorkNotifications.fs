@@ -39,16 +39,43 @@ module internal Listener =
     /// minute rather than never.
     let keepAlive = TimeSpan.FromSeconds 30.
 
+    let channels (schema: SchemaName) =
+        let prefix = SchemaName.value schema
+        $"%s{prefix}_command", $"%s{prefix}_action"
+
+    /// A dedicated connection that neither pools nor enlists, for going around a pooler.
+    ///
+    /// Building, opening and abandoning are separate steps so a failed open can be shown to
+    /// clean up the connection it built: a listener that loses the race to connect must not
+    /// leak it.
+    let internal openDirectWith
+        (build: unit -> NpgsqlConnection)
+        (openAsync: NpgsqlConnection -> CancellationToken -> Task)
+        (abandon: NpgsqlConnection -> unit)
+        (ct: CancellationToken)
+        : Task<NpgsqlConnection> =
+        backgroundTask {
+            let conn = build ()
+
+            try
+                do! openAsync conn ct
+                return conn
+            with error ->
+                abandon conn
+                return raise error
+        }
+
     /// A dedicated connection that neither pools nor enlists, for going around a pooler.
     let openDirect (connectionString: string) (ct: CancellationToken) : Task<NpgsqlConnection> =
-        backgroundTask {
-            let builder =
-                NpgsqlConnectionStringBuilder(connectionString, Pooling = false, Enlist = false)
+        openDirectWith
+            (fun () ->
+                let builder =
+                    NpgsqlConnectionStringBuilder(connectionString, Pooling = false, Enlist = false)
 
-            let conn = new NpgsqlConnection(builder.ConnectionString)
-            do! conn.OpenAsync ct
-            return conn
-        }
+                new NpgsqlConnection(builder.ConnectionString))
+            (fun conn ct -> conn.OpenAsync ct)
+            (fun conn -> conn.Dispose())
+            ct
 
     /// A connection from the data source, opened with any ambient transaction suppressed. A
     /// listening session inside a long transaction stops the server clearing its notification
@@ -74,15 +101,18 @@ module internal Listener =
     /// database, and a payload is a machine id or a queue name and never data, so the payload is
     /// how this machine hears only its own.
     let route
+        (schema: SchemaName)
         (machine: string)
         (queue: string)
         (onCommands: unit -> unit)
         (onActions: unit -> unit)
         (notification: NpgsqlNotificationEventArgs)
         =
+        let commandChannel, actionChannel = channels schema
+
         match notification.Channel with
-        | "fsm_command" when notification.Payload = machine -> onCommands ()
-        | "fsm_action" when notification.Payload = queue -> onActions ()
+        | channel when channel = commandChannel && notification.Payload = machine -> onCommands ()
+        | channel when channel = actionChannel && notification.Payload = queue -> onActions ()
         | _ -> ()
 
     /// One quiet interval: a notification arrives, or a round trip proves the connection is
@@ -101,14 +131,16 @@ module internal Listener =
     /// PostgreSQL keeps nothing for a session that was not connected, so the moment listening
     /// starts is the one moment this knows it may have missed an announcement.
     let run
+        (schema: SchemaName)
         (conn: NpgsqlConnection)
         (handler: NpgsqlNotificationEventArgs -> unit)
         (missed: unit -> unit)
         (ct: CancellationToken)
         : Task<Result<unit, StoreError>> =
         backgroundTask {
+            let commandChannel, actionChannel = channels schema
             conn.Notification.Add handler
-            do! execute "LISTEN fsm_command; LISTEN fsm_action" conn ct
+            do! execute $"LISTEN %s{commandChannel}; LISTEN %s{actionChannel}" conn ct
             missed ()
             do! Recurring.repeat (fun () -> waitOrPing conn ct) ct
             return Ok()
@@ -135,20 +167,25 @@ type PostgresWorkNotifications(context: PostgresContext, queue: string, connecti
     let session (machine: string) onCommands onActions (ct: CancellationToken) =
         backgroundTask {
             use! conn = openConnection ct
-            let handler = Listener.route machine queue onCommands onActions
+            let handler = Listener.route context.Schema machine queue onCommands onActions
 
             let missed () =
                 onCommands ()
                 onActions ()
 
-            return! Listener.run conn handler missed ct
+            return! Listener.run context.Schema conn handler missed ct
         }
 
     interface IWorkNotifications with
 
-        member _.Listen(machineId, onCommands, onActions, ct) =
-            match connection with
-            | ListenerConnection.Off -> Task.FromResult(Ok())
-            | ListenerConnection.SameDataSource
-            | ListenerConnection.Direct _ ->
-                Db.protectOnce (session (MachineId.value machineId) onCommands onActions) ct
+        member _.ListenAsync(machineId, onCommands, onActions, cancellationToken) =
+            Tap.requireMachineId (nameof machineId) machineId
+            Tap.requireArg (nameof onCommands) onCommands
+            Tap.requireArg (nameof onActions) onActions
+
+            Tap.start cancellationToken (fun () ->
+                match connection with
+                | ListenerConnection.Off -> Task.FromResult(Ok())
+                | ListenerConnection.SameDataSource
+                | ListenerConnection.Direct _ ->
+                    Db.protectOnce (session (MachineId.value machineId) onCommands onActions) cancellationToken)

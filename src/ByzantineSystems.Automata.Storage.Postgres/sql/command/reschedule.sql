@@ -7,5 +7,5 @@ SELECT
     r.outcome,
     r.visible_at
 FROM
-    fsm.reschedule_command (@command_id, @lease_token, @base_ms, @cap_ms) r;
+    $schema$.reschedule_command (@command_id, @lease_token, @base_ms, @cap_ms) r;
 

@@ -33,59 +33,6 @@ type CommandProcessorOptions<'EntityId, 'State, 'Event, 'Action, 'Err> =
         EntityIdDecode: string -> Result<'EntityId, string>
     }
 
-/// <summary>
-/// A replay error as the error column stores it: a kind, and the fields that kind has. Written by
-/// this library alone, so every field is required on the way back.
-/// </summary>
-[<RequireQualifiedAccess>]
-module internal ReplayMapping =
-
-    let toJson (error: ReplayError) : string =
-        let node = System.Text.Json.Nodes.JsonObject()
-
-        match error with
-        | ReplayError.UnknownChartVersion version ->
-            node["kind"] <- "unknown_chart_version"
-            node["version"] <- ChartVersion.value version
-        | ReplayError.Diverged(epoch, reason) ->
-            node["kind"] <- "diverged"
-            node["epoch"] <- int64 (Epoch.value epoch)
-            node["reason"] <- reason
-        | ReplayError.BudgetExceeded limit ->
-            node["kind"] <- "budget_exceeded"
-            node["limit"] <- limit
-        | ReplayError.HistoryPurged -> node["kind"] <- "history_purged"
-
-        node.ToJsonString()
-
-    let ofJson (element: JsonElement) : Result<ReplayError, StoreError> =
-        let fail () =
-            Error(Db.decodeFailure (nameof ReplayError) "an unreadable replay error")
-
-        let field (name: string) (read: JsonElement -> 'T) =
-            match element.TryGetProperty name with
-            | true, value -> Ok(read value)
-            | _ -> fail ()
-
-        match element.TryGetProperty "kind" with
-        | true, kind ->
-            match kind.GetString() with
-            | "unknown_chart_version" ->
-                field "version" _.GetInt32()
-                |> Result.bind (fun version ->
-                    ChartVersion.tryCreate version
-                    |> Result.mapError (Db.decodeFailure "ChartVersion"))
-                |> Result.map ReplayError.UnknownChartVersion
-            | "diverged" ->
-                Result.map2
-                    (fun epoch reason -> ReplayError.Diverged(Db.epochOf epoch, reason))
-                    (field "epoch" _.GetInt64())
-                    (field "reason" _.GetString())
-            | "budget_exceeded" -> field "limit" _.GetInt32() |> Result.map ReplayError.BudgetExceeded
-            | "history_purged" -> Ok ReplayError.HistoryPurged
-            | _ -> fail ()
-        | _ -> fail ()
-
 /// <summary>What finalizing reads about a command before deciding anything.</summary>
 type internal FinalizeTarget =
     { Machine: MachineId
@@ -94,37 +41,14 @@ type internal FinalizeTarget =
       Holder: LeaseToken<CommandWork>
       Version: int64 }
 
-/// <summary>
-/// Where a finalizing caller stands with its command, as the command row shows it. Decided
-/// before anything is written, and the only thing that decides whether anything is.
-/// </summary>
-type internal LeaseStanding =
-    /// <summary>No command has this id.</summary>
-    | Unknown
-
-    /// <summary>
-    /// The caller's own lease already finished it: a retry, answered with what it did and the
-    /// resolution that was stored.
-    /// </summary>
-    | FinishedByCaller of status: CommandStatus
-
-    /// <summary>Finished under somebody else's lease.</summary>
-    | FinishedByAnother
-
-    /// <summary>
-    /// Open, and held by somebody else. Expiry is not consulted: the token is the fence, and a
-    /// worker past its deadline whose command nobody reclaimed still holds the only token.
-    /// </summary>
-    | HeldByAnother
-
-    /// <summary>Open, and the caller holds it: the finalize writes.</summary>
-    | HeldByCaller of FinalizeTarget
-
-/// <summary>Operations on <see cref="T:ByzantineSystems.Automata.Storage.Sqlite.LeaseStanding" />.</summary>
+/// <summary>Classifies a SQLite command using the shared finalization vocabulary.</summary>
 [<RequireQualifiedAccess>]
 module internal LeaseStanding =
 
-    let classify (held: LeaseToken<CommandWork>) (target: FinalizeTarget option) : LeaseStanding =
+    let classify
+        (held: LeaseToken<CommandWork>)
+        (target: FinalizeTarget option)
+        : FinalizationStanding<FinalizeTarget> =
         match target with
         | None -> Unknown
         | Some target ->
@@ -167,8 +91,12 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     let context = options.Context
 
     let encodeEntityId entityId =
-        options.EntityIdEncode entityId
-        |> ByzantineSystems.Automata.Storage.Internal.EntityKey.ofString
+        let key =
+            options.EntityIdEncode entityId
+            |> ByzantineSystems.Automata.Storage.Internal.EntityKey.ofString
+
+        Tap.requireEntityKey "entityId" key
+        key
 
     let statement domain operation =
         StatementKey.create domain operation |> Sql.prepareProgram
@@ -189,65 +117,16 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
 
     let commandResult = StatementKey.create "command" "result" |> Sql.prepareProgram
 
-    let encodeDraft
-        (draft: TransitionDraft<'EntityId, 'State, 'Event, 'Action>)
-        : Result<EncodedDraft<'EntityId, 'State, 'Event, 'Action>, StoreError> =
-        match
-            options.EventCodec.Encode draft.Event,
-            options.ActionCodec.Encode draft.Actions,
-            options.StateCodec.Encode draft.FromState,
-            options.StateCodec.Encode draft.ToState
-        with
-        | Ok event, Ok actions, Ok fromState, Ok toState ->
-            Ok
-                { Source = draft
-                  EventJson = event
-                  ActionsJson = actions
-                  FromJson = fromState
-                  ToJson = toState }
-        | Error error, _, _, _
-        | _, Error error, _, _
-        | _, _, Error error, _
-        | _, _, _, Error error -> Error(Db.toStoreError error)
+    let encodeDraft expected draft =
+        DraftEncoding.encode options.StateCodec options.ActionCodec (Some expected) draft
 
     /// <summary>
     /// The failure column is a tagged envelope rather than the bare domain error, because the
     /// cases have to be told apart on the way back out. A domain error is the application's own
     /// value, encoded by its codec; a machine reason and a replay error are this library's.
     /// </summary>
-    let encodeFailure (failure: CommandFailure<'Err>) : Result<string, StoreError> =
-        match failure with
-        | CommandFailure.Domain error ->
-            options.ErrorCodec.Encode error
-            |> Result.mapError Db.toStoreError
-            |> Result.map (fun encoded -> $"""{{"domain":%s{encoded}}}""")
-        | CommandFailure.Machine reason -> Ok $"""{{"machine":%s{JsonSerializer.Serialize reason}}}"""
-        | CommandFailure.Replay error -> Ok $"""{{"replay":%s{ReplayMapping.toJson error}}}"""
-
-    let readFailure (json: string) : Result<CommandFailure<'Err>, StoreError> =
-        match Db.parseJson (nameof CommandFailure) json with
-        | Error error -> Error error
-        | Ok parsed ->
-            use document = parsed
-            let root = document.RootElement
-
-            match root.TryGetProperty "domain" with
-            | true, domain ->
-                domain.GetRawText()
-                |> options.ErrorCodec.Decode
-                |> Result.mapError Db.toStoreError
-                |> Result.map CommandFailure.Domain
-            | _ ->
-                match root.TryGetProperty "machine", root.TryGetProperty "replay" with
-                | (true, machine), _ when machine.ValueKind = JsonValueKind.String ->
-                    Ok(CommandFailure.Machine(machine.GetString()))
-                | _, (true, replay) -> ReplayMapping.ofJson replay |> Result.map CommandFailure.Replay
-                | _ ->
-                    Error(
-                        Db.decodeFailure
-                            (nameof CommandFailure)
-                            "a command error carried no domain, machine or replay tag"
-                    )
+    let encodeFailure failure =
+        FailureEncoding.encode options.ErrorCodec failure
 
     /// The exited and entered paths, stored as JSON arrays of state ids.
     let encodePath (states: StateId list) : string =
@@ -271,25 +150,27 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     /// into a compile error in this reader rather than a value it silently leaves out. Shared
     /// by the history page and the result read, so one row shape has one reader.
     /// </summary>
-    let transitionRow (reader: SqliteDataReader) : main.fsm_transition =
-        { machine_id = Row.string reader "machine_id"
-          entity_id = Row.string reader "entity_id"
-          epoch = Row.int64 reader "epoch"
-          command_id = Row.int64 reader "command_id"
-          chart_version = Row.int64 reader "chart_version"
-          event = Row.string reader "event"
-          actions = Row.string reader "actions"
-          from_state = Row.string reader "from_state"
-          to_state = Row.string reader "to_state"
-          handled_by = Row.string reader "handled_by"
-          exited = Row.string reader "exited"
-          entered = Row.string reader "entered"
-          status = Row.string reader "status"
-          effective_at = Row.int64 reader "effective_at"
-          committed_at = Row.int64 reader "committed_at" }
+    let transitionRow (reader: SqliteDataReader) : main.fsm_transition * string =
+        let row: main.fsm_transition =
+            { machine_id = Row.string reader "machine_id"
+              entity_id = Row.string reader "entity_id"
+              epoch = Row.int64 reader "epoch"
+              command_id = Row.int64 reader "command_id"
+              chart_version = Row.int64 reader "chart_version"
+              actions = Row.string reader "actions"
+              from_state = Row.string reader "from_state"
+              to_state = Row.string reader "to_state"
+              handled_by = Row.string reader "handled_by"
+              exited = Row.string reader "exited"
+              entered = Row.string reader "entered"
+              status = Row.string reader "status"
+              effective_at = Row.int64 reader "effective_at"
+              committed_at = Row.int64 reader "committed_at" }
+
+        row, Row.string reader "event"
 
     let toTransition
-        (row: main.fsm_transition)
+        ((row, eventJson): main.fsm_transition * string)
         : Result<CommittedTransition<'EntityId, 'State, 'Event, 'Action>, StoreError> =
         let decode (codec: Codec<'T>) (json: string) =
             codec.Decode json |> Result.mapError Db.toStoreError
@@ -300,7 +181,7 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                 |> options.EntityIdDecode
                 |> Result.mapError (Db.decodeFailure "EntityId")
 
-            let! event = decode options.EventCodec row.event
+            let! event = decode options.EventCodec eventJson
             let! actions = decode options.ActionCodec row.actions
             let! fromState = decode options.StateCodec row.from_state
             let! toState = decode options.StateCodec row.to_state
@@ -369,18 +250,26 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
             else
                 Some(transitionRow reader)
 
-        let error =
-            let marker = reader.GetOrdinal "error"
-
-            if reader.IsDBNull marker then
-                None
-            else
-                Some(Row.string reader "error")
-
         let failure () =
-            match error with
-            | Some error -> readFailure error
-            | None -> Error(Db.decodeFailure (nameof CommandResult) "a failed command has no recorded error")
+            let optional column =
+                if reader.IsDBNull(reader.GetOrdinal column) then
+                    None
+                else
+                    Some(Row.string reader column)
+
+            FailureEncoding.decode
+                options.ErrorCodec
+                { Kind = optional "failure_kind"
+                  Domain = optional "domain_error"
+                  Machine = optional "machine_reason"
+                  Replay =
+                    optional "replay_kind"
+                    |> Option.map (fun kind ->
+                        kind,
+                        int (Row.int64 reader "failure_version"),
+                        Row.int64 reader "failure_epoch",
+                        Row.string reader "replay_reason",
+                        int (Row.int64 reader "failure_budget")) }
 
         EnumCodec.read Row.string EnumCodec.commandStatus "command_status" reader
         |> Result.bind (fun status ->
@@ -453,9 +342,8 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                 StoreProgram.executeDiscard
                     insertTransition
                     (written
-                     @ [ "@event", Param.Text encoded.EventJson
-                         "@actions", Param.Text encoded.ActionsJson
-                         "@from_state", Param.Text encoded.FromJson
+                     @ [ "@actions", Param.Text encoded.ActionsJson
+                         "@from_state", Param.TextOrNull(CommitOrigin.payload encoded.Origin)
                          "@to_state", Param.Text encoded.ToJson
                          "@handled_by", Param.Text(StateId.value draft.HandledBy)
                          "@exited", Param.Text(encodePath draft.Exited)
@@ -480,12 +368,20 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     let recordError
         (now: int64)
         (commandId: CommandId)
-        (error: string)
+        (error: EncodedFailure)
         : StoreProgram<WriteAccess, (string * Param) list, SqliteDataReader, unit> =
+        let fields = FailureEncoding.fields error
+
         StoreProgram.executeDiscard
             insertError
             [ Params.commandId "@command_id" commandId
-              "@error", Param.Text error
+              "@kind", Param.Text fields.Kind
+              "@domain", Param.Text fields.Domain
+              "@reason", Param.Text fields.Reason
+              "@replay_kind", Param.Text fields.ReplayKind
+              "@version", Param.Integer(int64 fields.Version)
+              "@failure_epoch", Param.Integer fields.Epoch
+              "@budget", Param.Integer(int64 fields.Budget)
               "@now", Param.Integer now ]
 
     /// <summary>
@@ -554,17 +450,19 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
         Sql.writeProgramWith
             context
             (fun now ->
-                store {
-                    let! read =
-                        StoreProgram.tryQueryOne
-                            finalizeRead
-                            [ Params.commandId "@command_id" commandId ]
-                            finalizeTargetRow
+                let standing =
+                    store {
+                        let! read =
+                            StoreProgram.tryQueryOne
+                                finalizeRead
+                                [ Params.commandId "@command_id" commandId ]
+                                finalizeTargetRow
 
-                    match LeaseStanding.classify token read with
-                    | Unknown ->
-                        return! StoreProgram.fail (StoreError.NotFound $"command %d{CommandId.value commandId}")
-                    | FinishedByCaller status ->
+                        return LeaseStanding.classify token read
+                    }
+
+                let already status =
+                    store {
                         let! committed =
                             StoreProgram.tryQueryOne
                                 committedEpoch
@@ -573,17 +471,23 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
 
                         return
                             AlreadyFinalized(committed |> Option.defaultValue (Resolution.unmoved resolution), status)
-                    | FinishedByAnother
-                    | HeldByAnother -> return FinalizeOutcome.LeaseLost
-                    | HeldByCaller target -> return! resolve now commandId target resolution
-                })
+                    }
+
+                FinalizeProgram.finish (
+                    CheckedFinalization(
+                        standing,
+                        already,
+                        (fun target -> resolve now commandId target resolution),
+                        StoreError.NotFound $"command %d{CommandId.value commandId}"
+                    )
+                ))
             ct
 
     /// <summary>
     /// A rejection or a dead letter. The failure is encoded before the write begins, so the
     /// transaction only writes.
     /// </summary>
-    let fail (resolve: string -> Resolution<'EntityId, 'State, 'Event, 'Action>) commandId token failure ct =
+    let fail (resolve: EncodedFailure -> Resolution<'EntityId, 'State, 'Event, 'Action>) commandId token failure ct =
         backgroundTaskResult {
             let! encoded = encodeFailure failure
             return! finalize commandId token (resolve encoded) ct
@@ -591,52 +495,77 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
 
     interface IStateReader<'EntityId, 'State, 'Event, 'Action> with
 
-        member _.TryGetSnapshot(machineId, entityId, ct) =
-            Sql.readProgram
-                context
-                (StoreProgram.tryQueryOne
-                    entitySnapshot
-                    [ Params.machineId "@machine_id" machineId
-                      Params.entityKey "@entity_id" (encodeEntityId entityId) ]
-                    snapshotRow)
-                ct
+        member _.TryGetSnapshotAsync(machineId, entityId, cancellationToken) =
+            Tap.requireMachineId (nameof machineId) machineId
+            Tap.requireArg (nameof entityId) entityId
 
-        member _.History(machineId, entityId, paging, ct) =
-            // An absent cursor is zero, which transition_epoch_positive makes smaller than any
-            // stored epoch, so one query shape serves every page.
-            let after =
-                Page.cursor paging
-                |> Option.map (Epoch.value >> int64)
-                |> Option.defaultValue 0L
+            Tap.start cancellationToken (fun () ->
+                Sql.readProgram
+                    context
+                    (StoreProgram.tryQueryOne
+                        entitySnapshot
+                        [ Params.machineId "@machine_id" machineId
+                          Params.entityKey "@entity_id" (encodeEntityId entityId) ]
+                        snapshotRow)
+                    cancellationToken)
 
-            Sql.readProgram
-                context
-                (StoreProgram.queryRows
-                    historyPage
-                    [ Params.machineId "@machine_id" machineId
-                      Params.entityKey "@entity_id" (encodeEntityId entityId)
-                      "@after", Param.Integer after
-                      "@limit", Param.Integer(int64 (Page.limit paging)) ]
-                    (transitionRow >> toTransition))
-                ct
+        member _.HistoryAsync(machineId, entityId, paging, cancellationToken) =
+            Tap.requireMachineId (nameof machineId) machineId
+            Tap.requireArg (nameof entityId) entityId
+
+            Tap.start cancellationToken (fun () ->
+                // An absent cursor is zero, which transition_epoch_positive makes smaller than any
+                // stored epoch, so one query shape serves every page.
+                let after =
+                    Page.cursor paging
+                    |> Option.map (Epoch.value >> int64)
+                    |> Option.defaultValue 0L
+
+                Sql.readProgram
+                    context
+                    (StoreProgram.queryRows
+                        historyPage
+                        [ Params.machineId "@machine_id" machineId
+                          Params.entityKey "@entity_id" (encodeEntityId entityId)
+                          "@after", Param.Integer after
+                          "@limit", Param.Integer(int64 (Page.limit paging)) ]
+                        (transitionRow >> toTransition))
+                    cancellationToken)
 
     interface ICommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err> with
 
-        member _.Commit(commandId, token, expected, draft, ct) =
+        member _.CommitAsync(commandId, token, expected, draft, cancellationToken) =
+            Tap.requireArg (nameof commandId) commandId
+            Tap.requireArg (nameof token) token
+            Tap.requireArg (nameof draft) draft
+
             // Encoded before the write begins: one file has one writer, so codec work inside the
             // transaction would be time every machine sharing the file waits for.
-            backgroundTaskResult {
-                let! encoded = encodeDraft draft
-                return! finalize commandId token (Commit(expected, encoded)) ct
-            }
+            Tap.start cancellationToken (fun () ->
+                backgroundTaskResult {
+                    let! encoded = encodeDraft expected draft
+                    return! finalize commandId token (Commit(expected, encoded)) cancellationToken
+                })
 
-        member _.Reject(commandId, token, error, ct) = fail Reject commandId token error ct
+        member _.RejectAsync(commandId, token, error, cancellationToken) =
+            Tap.requireArg (nameof commandId) commandId
+            Tap.requireArg (nameof token) token
+            Tap.requireArg (nameof error) error
 
-        member _.DeadLetter(commandId, token, error, ct) =
-            fail DeadLetter commandId token error ct
+            Tap.start cancellationToken (fun () -> fail Reject commandId token error cancellationToken)
 
-        member _.TryGetResult(commandId, ct) =
-            Sql.readProgram
-                context
-                (StoreProgram.tryQueryOne commandResult [ Params.commandId "@command_id" commandId ] resultRow)
-                ct
+        member _.DeadLetterAsync(commandId, token, error, cancellationToken) =
+            Tap.requireArg (nameof commandId) commandId
+            Tap.requireArg (nameof token) token
+            Tap.requireArg (nameof error) error
+
+            Tap.start cancellationToken (fun () -> fail DeadLetter commandId token error cancellationToken)
+
+        member _.TryGetResultAsync(commandId, cancellationToken) =
+            Tap.requireArg (nameof commandId) commandId
+
+            Tap.start cancellationToken (fun () ->
+                Sql.readProgram
+                    context
+                    (StoreProgram.tryQueryOne commandResult [ Params.commandId "@command_id" commandId ] resultRow)
+                    cancellationToken)

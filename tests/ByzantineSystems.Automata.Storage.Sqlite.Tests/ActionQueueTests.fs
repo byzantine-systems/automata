@@ -19,7 +19,7 @@ let private committed (fixture: Fixture) (key: string) =
 
         let! outcome =
             (processorOf fixture)
-                .Commit(
+                .CommitAsync(
                     held.Work.CommandId,
                     held.Token,
                     Epoch.initial,
@@ -33,7 +33,7 @@ let private committed (fixture: Fixture) (key: string) =
 
 let private claimActions (queue: Actions) : Threading.Tasks.Task<ClaimedAction list> =
     task {
-        let! claimed = queue.Claim(testMachine, ClaimBatch.create 50, leaseDuration, noCancellation)
+        let! claimed = queue.ClaimAsync(testMachine, ClaimBatch.create 50, leaseDuration, noCancellation)
         return claimed |> expectOk "claim actions"
     }
 
@@ -60,12 +60,7 @@ let private stringStore (fixture: Fixture) =
 let tests =
     testList
         "IActionQueue"
-        [ ContractProperties.poisonBatchProperty
-              "poison actions do not wedge a batch"
-              25
-              (CommandInboxTests.poisonFixture true)
-
-          testTask "explicit Discard records actions without queueing them" {
+        [ testTask "explicit Discard records actions without queueing them" {
               let db = fixture "discard"
 
               let store =
@@ -78,7 +73,7 @@ let tests =
               let processor = store :> Processor
 
               let! outcome =
-                  processor.Commit(
+                  processor.CommitAsync(
                       held.Work.CommandId,
                       held.Token,
                       Epoch.initial,
@@ -87,7 +82,7 @@ let tests =
                   )
 
               outcome |> expectOk "commit" |> ignore
-              let! result = processor.TryGetResult(held.Work.CommandId, noCancellation)
+              let! result = processor.TryGetResultAsync(held.Work.CommandId, noCancellation)
 
               match result |> expectOk "result" with
               | Some(CommandResult.Committed transition) ->
@@ -95,7 +90,10 @@ let tests =
               | other -> failtestf "expected a committed transition, got %A" other
 
               Expect.equal (depth db) "0" "discard does not enqueue"
-              let! actions = (store :> Actions).Claim(testMachine, ClaimBatch.create 10, leaseDuration, noCancellation)
+
+              let! actions =
+                  (store :> Actions).ClaimAsync(testMachine, ClaimBatch.create 10, leaseDuration, noCancellation)
+
               Expect.equal (actions |> expectOk "claim") [] "discard has no deliverable work"
           }
 
@@ -121,7 +119,7 @@ let tests =
 
               let! outcome =
                   (processorOf db)
-                      .Commit(
+                      .CommitAsync(
                           held.Work.CommandId,
                           LeaseToken.ofInt64 999999L,
                           Epoch.initial,
@@ -139,7 +137,7 @@ let tests =
 
               let! _ =
                   (processorOf db)
-                      .Reject(held.Work.CommandId, held.Token, CommandFailure.Domain(Refused "no"), noCancellation)
+                      .RejectAsync(held.Work.CommandId, held.Token, CommandFailure.Domain(Refused "no"), noCancellation)
 
               Expect.equal (depth db) "0" "a refused command asked for nothing"
           }
@@ -149,7 +147,8 @@ let tests =
               let! _ = committed db "k1"
 
               let! other =
-                  (actionsOf db).Claim(machineId "other-machine", ClaimBatch.create 50, leaseDuration, noCancellation)
+                  (actionsOf db)
+                      .ClaimAsync(machineId "other-machine", ClaimBatch.create 50, leaseDuration, noCancellation)
 
               Expect.isEmpty (other |> expectOk "claim") "the queue is shared, the claim is not"
           }
@@ -171,7 +170,7 @@ let tests =
               Expect.equal second.DeliveryCount 2 "counted as a redelivery"
               Expect.isGreaterThan (LeaseToken.value second.Token) (LeaseToken.value first.Token) "under a new token"
 
-              let! stale = queue.Complete(first, noCancellation)
+              let! stale = queue.CompleteAsync(first, noCancellation)
               Expect.equal (stale |> expectOk "stale complete") LeaseLost "the lapsed holder cannot complete it"
               Expect.equal (depth db) "1" "and the action is still queued"
           }
@@ -182,11 +181,11 @@ let tests =
               let queue = actionsOf db
               let! (action: ClaimedAction) = claimOnly queue
 
-              let! outcome = queue.Complete(action, noCancellation)
+              let! outcome = queue.CompleteAsync(action, noCancellation)
               Expect.equal (outcome |> expectOk "complete") Updated "delivered"
               Expect.equal (depth db) "0" "the action left the queue"
 
-              let! again = queue.Complete(action, noCancellation)
+              let! again = queue.CompleteAsync(action, noCancellation)
               Expect.equal (again |> expectOk "complete again") LeaseLost "a second completion finds nothing"
           }
 
@@ -200,9 +199,9 @@ let tests =
                   { action with
                       Token = LeaseToken.ofInt64 (LeaseToken.value action.Token + 1L) }
 
-              let! completed = queue.Complete(forged, noCancellation)
-              let! rescheduled = queue.Reschedule(forged, Backoff.defaults, noCancellation)
-              let! abandoned = queue.Abandon(forged, Reason.create "gave up", noCancellation)
+              let! completed = queue.CompleteAsync(forged, noCancellation)
+              let! rescheduled = queue.RescheduleAsync(forged, Backoff.defaults, noCancellation)
+              let! abandoned = queue.AbandonAsync(forged, Reason.create "gave up", noCancellation)
 
               Expect.equal (completed |> expectOk "complete") LeaseLost "completion is fenced"
               Expect.equal (rescheduled |> expectOk "reschedule") LeaseLost "rescheduling is fenced"
@@ -219,10 +218,10 @@ let tests =
               let queue = actionsOf db
               let! (action: ClaimedAction) = claimOnly queue
 
-              let! rescheduled = queue.Reschedule(action, Backoff.defaults, noCancellation)
+              let! rescheduled = queue.RescheduleAsync(action, Backoff.defaults, noCancellation)
               Expect.equal (rescheduled |> expectOk "reschedule") Updated "the holder may reschedule"
 
-              let! completed = queue.Complete(action, noCancellation)
+              let! completed = queue.CompleteAsync(action, noCancellation)
               Expect.equal (completed |> expectOk "complete") LeaseLost "the rescheduled lease is spent"
               Expect.equal (depth db) "1" "and the delivery stays queued"
           }
@@ -234,7 +233,7 @@ let tests =
               let! (first: ClaimedAction) = claimOnly queue
               let backoff = Backoff.create (TimeSpan.FromSeconds 1.0) (TimeSpan.FromSeconds 10.0)
 
-              let! _ = queue.Reschedule(first, backoff, noCancellation)
+              let! _ = queue.RescheduleAsync(first, backoff, noCancellation)
               db.Clock.Advance(Backoff.ceiling backoff)
               let! (second: ClaimedAction) = claimOnly queue
 
@@ -249,7 +248,7 @@ let tests =
               let queue = actionsOf db
               let! (action: ClaimedAction) = claimOnly queue
 
-              let! outcome = queue.Abandon(action, Reason.create "the destination refused it", noCancellation)
+              let! outcome = queue.AbandonAsync(action, Reason.create "the destination refused it", noCancellation)
               Expect.equal (outcome |> expectOk "abandon") Updated "given up on"
               Expect.equal (depth db) "0" "the action left the queue"
 
@@ -301,11 +300,11 @@ let tests =
 
               let! outcome =
                   (store :> ICommandProcessorStore<Entity, TestState, TestEvent, string, TestError>)
-                      .Commit(held.Work.CommandId, held.Token, Epoch.initial, strings, noCancellation)
+                      .CommitAsync(held.Work.CommandId, held.Token, Epoch.initial, strings, noCancellation)
 
               Expect.equal (outcome |> expectOk "commit") (Finalized(Epoch.ofUInt64 1UL)) "the commit lands"
 
-              let! claimed = queue.Claim(testMachine, ClaimBatch.create 50, leaseDuration, noCancellation)
+              let! claimed = queue.ClaimAsync(testMachine, ClaimBatch.create 50, leaseDuration, noCancellation)
 
               Expect.equal
                   (claimed

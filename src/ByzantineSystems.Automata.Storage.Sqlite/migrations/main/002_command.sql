@@ -166,10 +166,36 @@ END;
 -- ---------------------------------------------------------------------------
 CREATE TABLE fsm_command_error (
     command_id INTEGER NOT NULL PRIMARY KEY,
-    error TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('domain', 'machine', 'replay')),
     recorded_at INTEGER NOT NULL,
-    CONSTRAINT command_error_is_json CHECK (JSON_VALID(error)),
+    UNIQUE (command_id, kind),
     CONSTRAINT command_error_command_fkey FOREIGN KEY (command_id) REFERENCES fsm_command (command_id)
+) STRICT;
+
+CREATE TABLE fsm_command_error_domain (
+    command_id INTEGER NOT NULL PRIMARY KEY,
+    kind TEXT NOT NULL DEFAULT 'domain' CHECK (kind = 'domain'),
+    error TEXT NOT NULL CHECK (JSON_VALID(error)),
+    FOREIGN KEY (command_id, kind) REFERENCES fsm_command_error (command_id, kind)
+) STRICT;
+CREATE TABLE fsm_command_error_machine (
+    command_id INTEGER NOT NULL PRIMARY KEY,
+    kind TEXT NOT NULL DEFAULT 'machine' CHECK (kind = 'machine'), reason TEXT NOT NULL,
+    FOREIGN KEY (command_id, kind) REFERENCES fsm_command_error (command_id, kind)
+) STRICT;
+CREATE TABLE fsm_command_error_replay (
+    command_id INTEGER NOT NULL PRIMARY KEY,
+    kind TEXT NOT NULL DEFAULT 'replay' CHECK (kind = 'replay'),
+    replay_kind TEXT NOT NULL CHECK (replay_kind IN ('unknown_chart_version', 'diverged', 'budget_exceeded', 'history_purged')),
+    version INTEGER NOT NULL DEFAULT 0, epoch INTEGER NOT NULL DEFAULT 0,
+    reason TEXT NOT NULL DEFAULT '', budget INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (command_id, kind) REFERENCES fsm_command_error (command_id, kind),
+    CHECK (CASE replay_kind
+        WHEN 'unknown_chart_version' THEN version > 0 AND epoch = 0 AND reason = '' AND budget = 0
+        WHEN 'diverged' THEN version = 0 AND epoch >= 0 AND budget = 0
+        WHEN 'budget_exceeded' THEN version = 0 AND epoch = 0 AND reason = ''
+        WHEN 'history_purged' THEN version = 0 AND epoch = 0 AND reason = '' AND budget = 0
+        ELSE FALSE END)
 ) STRICT;
 
 -- ---------------------------------------------------------------------------

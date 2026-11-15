@@ -47,9 +47,15 @@ module Store =
     /// <summary>The store's ability to change the past, or <c>None</c> when it offers none.</summary>
     let tryCorrections
         (store: IMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>)
-        : ICorrectionStore<'EntityId, 'State> option =
-        match store with
-        | :? ICorrectionStore<'EntityId, 'State> as corrections -> Some corrections
+        : CorrectionCapability<'EntityId, 'State, 'Event, 'Action> option =
+        match box store, box store, box store with
+        | (:? ITransitionLog<'EntityId, 'State, 'Event, 'Action> as log),
+          (:? IPriorState<'EntityId, 'State> as prior),
+          (:? ICorrectionCommitter<'EntityId, 'State, 'Event, 'Action> as committer) ->
+            Some
+                { Log = log
+                  Prior = prior
+                  Committer = committer }
         | _ -> None
 
     /// <summary>The store's boot check, or <c>None</c> when it has none to run.</summary>
@@ -64,12 +70,4 @@ module Store =
     let tryNotifications (store: IMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>) : IWorkNotifications option =
         match store with
         | :? IWorkNotifications as notifications -> Some notifications
-        | _ -> None
-
-    /// <summary>The store's ability to replay a correction, or <c>None</c> when it offers none.</summary>
-    let tryReplay
-        (store: IMachineStore<'EntityId, 'State, 'Event, 'Action, 'Err>)
-        : IReplayStore<'EntityId, 'State, 'Event, 'Action> option =
-        match store with
-        | :? IReplayStore<'EntityId, 'State, 'Event, 'Action> as replay -> Some replay
         | _ -> None

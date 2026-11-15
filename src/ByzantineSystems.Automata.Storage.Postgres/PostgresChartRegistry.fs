@@ -30,9 +30,10 @@ type PostgresChartRegistry(options: ChartRegistryOptions) =
 
     let context = options.Context
 
-    let register = StatementKey.create "chart" "register" |> Sql.prepareProgram
+    let prepare = Sql.prepareProgram context.Schema
+    let register = StatementKey.create "chart" "register" |> prepare
 
-    let byVersion = StatementKey.create "chart" "by_version" |> Sql.prepareProgram
+    let byVersion = StatementKey.create "chart" "by_version" |> prepare
 
     let registrationTag: EnumCodec<RegistrationTag> =
         EnumCodec.create
@@ -61,31 +62,37 @@ type PostgresChartRegistry(options: ChartRegistryOptions) =
 
     interface IChartRegistry with
 
-        member _.Register(identity, ct) =
-            let registrationRow reader =
-                result {
-                    let! tag = EnumCodec.read Row.string registrationTag "registration" reader
+        member _.RegisterAsync(identity, cancellationToken) =
+            Tap.requireArg (nameof identity) identity
 
-                    match tag with
-                    | RegistrationTag.Registered -> return ChartRegistration.Registered
-                    | RegistrationTag.Matched -> return ChartRegistration.Matched
-                    | RegistrationTag.Mismatched ->
-                        let! stored = parse (Row.string reader "stored_fingerprint")
-                        return ChartRegistration.Mismatched stored
-                }
+            Tap.start cancellationToken (fun () ->
+                let registrationRow reader =
+                    result {
+                        let! tag = EnumCodec.read Row.string registrationTag "registration" reader
 
-            Sql.runProgram
-                context
-                (StoreProgram.queryOne
-                    register
-                    (key identity.MachineId identity.Version
-                     @ [ "fingerprint", Param.Text(ChartFingerprint.value identity.Fingerprint) ])
-                    registrationRow)
-                ct
+                        match tag with
+                        | RegistrationTag.Registered -> return ChartRegistration.Registered
+                        | RegistrationTag.Matched -> return ChartRegistration.Matched
+                        | RegistrationTag.Mismatched ->
+                            let! stored = parse (Row.string reader "stored_fingerprint")
+                            return ChartRegistration.Mismatched stored
+                    }
 
-        member _.TryGet(machineId, version, ct) =
-            Sql.readProgram
-                context
-                (StoreProgram.tryQueryOne byVersion (key machineId version) (fun reader ->
-                    parse (Row.string reader "fingerprint")))
-                ct
+                Sql.runProgram
+                    context
+                    (StoreProgram.queryOne
+                        register
+                        (key identity.MachineId identity.Version
+                         @ [ "fingerprint", Param.Text(ChartFingerprint.value identity.Fingerprint) ])
+                        registrationRow)
+                    cancellationToken)
+
+        member _.TryGetAsync(machineId, version, cancellationToken) =
+            Tap.requireMachineId (nameof machineId) machineId
+
+            Tap.start cancellationToken (fun () ->
+                Sql.readProgram
+                    context
+                    (StoreProgram.tryQueryOne byVersion (key machineId version) (fun reader ->
+                        parse (Row.string reader "fingerprint")))
+                    cancellationToken)

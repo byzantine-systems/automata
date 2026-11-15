@@ -10,9 +10,19 @@ let tests =
           DispositionTests.tests
           ProcessorTests.tests
           ProcessorTests.poisonTests
+          LoopTests.tests
           ReplayTests.tests
           MachineTests.tests
           WorkSignalsTests.tests ]
 
 [<EntryPoint>]
-let main argv = runTestsWithCLIArgs [] argv tests
+let main argv =
+    if Array.contains "--recurring-stress" argv then
+        try
+            LoopTests.runRecurringStress ()
+            0
+        with error ->
+            eprintfn "%s" (string error)
+            1
+    else
+        runTestsWithCLIArgs [] argv tests

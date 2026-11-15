@@ -20,9 +20,9 @@ type internal Statement = private { Key: string; Text: string }
 [<RequireQualifiedAccess>]
 module internal Statement =
 
-    let load (domain: string) (operation: string) : Statement =
+    let load (schema: SchemaName) (domain: string) (operation: string) : Statement =
         { Key = $"%s{domain}/%s{operation}"
-          Text = SqlResources.get domain operation }
+          Text = SqlResources.get domain operation |> SqlTemplate.substitute schema }
 
     let key (statement: Statement) : string = statement.Key
 
@@ -42,6 +42,10 @@ type internal Param =
     | Timestamp of DateTimeOffset
     | Jsonb of string
     | TextArray of string list
+    | JsonbArray of string list
+    | TimestampArray of DateTimeOffset list
+    | BigintArray of int64 list
+    | IntArray of int list
     | TextOrNull of string option
     | JsonbOrNull of string option
     | TimestampOrNull of DateTimeOffset option
@@ -92,6 +96,11 @@ module internal Sql =
             | Param.Timestamp value -> NpgsqlDbType.TimestampTz, box (Db.timestamp value)
             | Param.Jsonb value -> NpgsqlDbType.Jsonb, text name value
             | Param.TextArray values -> NpgsqlDbType.Array ||| NpgsqlDbType.Text, array name values
+            | Param.JsonbArray values -> NpgsqlDbType.Array ||| NpgsqlDbType.Jsonb, array name values
+            | Param.TimestampArray values ->
+                NpgsqlDbType.Array ||| NpgsqlDbType.TimestampTz, box (values |> List.map Db.timestamp |> List.toArray)
+            | Param.BigintArray values -> NpgsqlDbType.Array ||| NpgsqlDbType.Bigint, box (List.toArray values)
+            | Param.IntArray values -> NpgsqlDbType.Array ||| NpgsqlDbType.Integer, box (List.toArray values)
             | Param.TextOrNull value -> NpgsqlDbType.Text, orNull (text name) value
             | Param.JsonbOrNull value -> NpgsqlDbType.Jsonb, orNull (text name) value
             | Param.TimestampOrNull value -> NpgsqlDbType.TimestampTz, orNull (Db.timestamp >> box) value
@@ -179,47 +188,48 @@ module internal Sql =
             | Error error -> return Error error
         }
 
-    let private programStatements = ConcurrentDictionary<StatementKey, Statement>()
+    let private programStatements =
+        ConcurrentDictionary<SchemaName * StatementKey, Statement>()
 
-    let private programStatement key =
+    let private programStatement schema key =
         programStatements.GetOrAdd(
-            key,
-            fun key ->
+            (schema, key),
+            fun (schema, key) ->
                 let domain, operation = StatementKey.parts key
-                Statement.load domain operation
+                Statement.load schema domain operation
         )
 
-    let prepareProgram (key: StatementKey) =
-        programStatement key |> ignore
+    let prepareProgram (schema: SchemaName) (key: StatementKey) =
+        programStatement schema key |> ignore
         key
 
     let private programSession
-        (dataSource: NpgsqlDataSource)
+        (context: PostgresContext)
         (program: StoreProgram<'Access, (string * Param) list, NpgsqlDataReader, 'T>)
         (ct: CancellationToken)
         =
         backgroundTask {
-            use! conn = dataSource.OpenConnectionAsync(ct).AsTask()
+            use! conn = context.DataSource.OpenConnectionAsync(ct).AsTask()
 
             let interpreter =
                 { new IStoreInterpreter<(string * Param) list, NpgsqlDataReader> with
                     member _.ExecuteAsync(key, parameters, cancellationToken) =
-                        execute conn (programStatement key) parameters cancellationToken
+                        execute conn (programStatement context.Schema key) parameters cancellationToken
 
                     member _.QueryOneAsync<'Row>
                         (key, parameters, read: Read<NpgsqlDataReader, 'Row>, cancellationToken)
                         : Task<Result<'Row, StoreError>> =
-                        queryOne conn (programStatement key) parameters read cancellationToken
+                        queryOne conn (programStatement context.Schema key) parameters read cancellationToken
 
                     member _.TryQueryOneAsync<'Row>
                         (key, parameters, read: Read<NpgsqlDataReader, 'Row>, cancellationToken)
                         : Task<Result<'Row option, StoreError>> =
-                        tryQueryOne conn (programStatement key) parameters read cancellationToken
+                        tryQueryOne conn (programStatement context.Schema key) parameters read cancellationToken
 
                     member _.QueryRowsAsync<'Row>
                         (key, parameters, read: Read<NpgsqlDataReader, 'Row>, cancellationToken)
                         : Task<Result<'Row list, StoreError>> =
-                        queryRows conn (programStatement key) parameters read cancellationToken }
+                        queryRows conn (programStatement context.Schema key) parameters read cancellationToken }
 
             return! StoreProgram.run interpreter ct program
         }
@@ -229,25 +239,25 @@ module internal Sql =
         (program: StoreProgram<WriteAccess, (string * Param) list, NpgsqlDataReader, 'T>)
         (ct: CancellationToken)
         : Task<Result<'T, StoreError>> =
-        Db.protect context.Resilience (programSession context.DataSource program) ct
+        Db.protect context.Resilience (programSession context program) ct
 
     let readProgram
         (context: PostgresContext)
         (program: StoreProgram<ReadAccess, (string * Param) list, NpgsqlDataReader, 'T>)
         (ct: CancellationToken)
         : Task<Result<'T, StoreError>> =
-        Db.protect context.Resilience (programSession context.DataSource program) ct
+        Db.protect context.Resilience (programSession context program) ct
 
     let attemptProgram
         (context: PostgresContext)
         (program: StoreProgram<WriteAccess, (string * Param) list, NpgsqlDataReader, 'T>)
         (ct: CancellationToken)
         : Task<Db.Attempt<'T>> =
-        Db.attempt context.Resilience (programSession context.DataSource program) ct
+        Db.attempt context.Resilience (programSession context program) ct
 
     let runProgramOnce
         (context: PostgresContext)
         (program: StoreProgram<WriteAccess, (string * Param) list, NpgsqlDataReader, 'T>)
         (ct: CancellationToken)
         : Task<Result<'T, StoreError>> =
-        Db.protectOnce (programSession context.DataSource program) ct
+        Db.protectOnce (programSession context program) ct

@@ -128,12 +128,12 @@ type ActionDispatcher<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectError whe
         | Ok(Ok()) -> ()
 
     let deliver (action: LeasedAction<'EntityId, 'Action>) (ct: CancellationToken) =
-        task {
+        backgroundTask {
             if poisoned action then
                 let reason =
                     Reason.create $"delivered %d{action.DeliveryCount} times without an outcome"
 
-                let! outcome = queue.Abandon(action, reason, ct)
+                let! outcome = queue.AbandonAsync(action, reason, ct)
 
                 return fenced outcome GaveUp
             else
@@ -152,14 +152,14 @@ type ActionDispatcher<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectError whe
                     handlerFailed action attempt
 
                 if succeeded then
-                    let! outcome = queue.Complete(action, ct)
+                    let! outcome = queue.CompleteAsync(action, ct)
                     return fenced outcome Delivered
                 elif action.DeliveryCount >= policy.MaxAttempts then
                     let reason = Reason.create $"undelivered after %d{action.DeliveryCount} attempts"
-                    let! outcome = queue.Abandon(action, reason, ct)
+                    let! outcome = queue.AbandonAsync(action, reason, ct)
                     return fenced outcome GaveUp
                 else
-                    let! outcome = queue.Reschedule(action, policy.Backoff, ct)
+                    let! outcome = queue.RescheduleAsync(action, policy.Backoff, ct)
                     return fenced outcome Retrying
         }
 
@@ -224,9 +224,9 @@ type ActionDispatcher<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectError whe
 
     /// <summary>Claims one batch of actions and delivers them, bounded by the policy's concurrency.</summary>
     member _.PollAsync(ct: CancellationToken) : Task<Result<DeliveryReport, MachineError<'Err>>> =
-        taskResult {
+        backgroundTaskResult {
             let! batch =
-                queue.Claim(machineId, claimBatch, leaseDuration, ct)
+                queue.ClaimAsync(machineId, claimBatch, leaseDuration, ct)
                 |> TaskResult.mapError MachineError.Store
 
             match batch with
@@ -242,7 +242,7 @@ type ActionDispatcher<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectError whe
                 use gate = new SemaphoreSlim(policy.Concurrency)
 
                 let run (action: LeasedAction<'EntityId, 'Action>) =
-                    task {
+                    backgroundTask {
                         do! gate.WaitAsync ct
 
                         try
@@ -266,7 +266,7 @@ type ActionDispatcher<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectError whe
     /// </summary>
     member this.RunAsync(ct: CancellationToken) : Task<DeliveryReport> =
         let waitForWork () =
-            task {
+            backgroundTask {
                 try
                     let! _ = signal.WaitOrTimeoutAsync(policy.PollingInterval, config.TimeProvider, ct)
                     return true
@@ -274,36 +274,36 @@ type ActionDispatcher<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectError whe
                     return false
             }
 
-        let rec loop (totals: DeliveryReport) =
-            task {
+        backgroundTask {
+            let mutable totals = DeliveryReport.empty
+            let mutable running = true
+
+            while running do
                 if ct.IsCancellationRequested then
-                    return totals
+                    running <- false
                 else
                     let! outcome = this.PollAsync ct
 
-                    let totals =
-                        match outcome with
-                        | Ok report -> DeliveryReport.add totals report
-                        | Error error ->
-                            logger.LogWarning(
-                                DispatcherEvents.pollFailed,
-                                "Action poll failed for machine {MachineId}: {Failure}.",
-                                machineName,
-                                (match error with
-                                 | Store _ -> "store"
-                                 | Timeout _ -> "timeout"
-                                 | CircuitOpen _ -> "circuit-open"
-                                 | _ -> "unclassified")
-                            )
-
-                            totals
+                    match outcome with
+                    | Ok report -> totals <- DeliveryReport.add totals report
+                    | Error error ->
+                        logger.LogWarning(
+                            DispatcherEvents.pollFailed,
+                            "Action poll failed for machine {MachineId}: {Failure}.",
+                            machineName,
+                            (match error with
+                             | Store _ -> "store"
+                             | Timeout _ -> "timeout"
+                             | CircuitOpen _ -> "circuit-open"
+                             | _ -> "unclassified")
+                        )
 
                     match outcome with
-                    | Ok report when report.Claimed = ClaimBatch.value claimBatch -> return! loop totals
+                    | Ok report when report.Claimed = ClaimBatch.value claimBatch -> do! Task.Yield()
                     | _ ->
                         match! waitForWork () with
-                        | true -> return! loop totals
-                        | false -> return totals
-            }
+                        | true -> ()
+                        | false -> running <- false
 
-        loop DeliveryReport.empty
+            return totals
+        }

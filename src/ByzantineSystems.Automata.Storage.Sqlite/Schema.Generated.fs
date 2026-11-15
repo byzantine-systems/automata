@@ -217,7 +217,7 @@ module main =
 
     type fsm_command_error =
         { command_id: int64
-          error: string
+          kind: string
           recorded_at: int64 }
 
         interface IWriteColumns with
@@ -225,8 +225,8 @@ module main =
                 [ { WriteColumn.Name = "command_id"
                     Value = box this.command_id
                     ProviderDbType = None }
-                  { WriteColumn.Name = "error"
-                    Value = box this.error
+                  { WriteColumn.Name = "kind"
+                    Value = box this.kind
                     ProviderDbType = None }
                   { WriteColumn.Name = "recorded_at"
                     Value = box this.recorded_at
@@ -306,7 +306,6 @@ module main =
           epoch: int64
           command_id: int64
           chart_version: int64
-          event: string
           actions: string
           from_state: string
           to_state: string
@@ -333,9 +332,6 @@ module main =
                     ProviderDbType = None }
                   { WriteColumn.Name = "chart_version"
                     Value = box this.chart_version
-                    ProviderDbType = None }
-                  { WriteColumn.Name = "event"
-                    Value = box this.event
                     ProviderDbType = None }
                   { WriteColumn.Name = "actions"
                     Value = box this.actions

@@ -47,9 +47,10 @@ type IChartRegistry =
     /// Claims a version for a fingerprint, or reports what the stored one already says.
     /// Idempotent, and safe to call concurrently from every process that runs the machine.
     /// </summary>
-    abstract Register: identity: ChartIdentity * ct: CancellationToken -> Task<Result<ChartRegistration, StoreError>>
+    abstract RegisterAsync:
+        identity: ChartIdentity * cancellationToken: CancellationToken -> Task<Result<ChartRegistration, StoreError>>
 
     /// <summary>Reads the fingerprint a version is registered under, if any.</summary>
-    abstract TryGet:
-        machineId: MachineId * version: ChartVersion * ct: CancellationToken ->
+    abstract TryGetAsync:
+        machineId: MachineId * version: ChartVersion * cancellationToken: CancellationToken ->
             Task<Result<ChartFingerprint option, StoreError>>

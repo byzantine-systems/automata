@@ -32,22 +32,43 @@ let tests =
         "Postgres temporal reader"
         [ testTask "an entity with no belief has nothing to read" {
               do! reset ()
-              let! belief = (newTemporalReader ()).ValidAt(machine, entity "missing", jan 12, noCancellation)
+              let! belief = (newTemporalReader ()).ValidAtAsync(machine, entity "missing", jan 12, noCancellation)
               Expect.isNone (belief |> expectOk "valid at") "no belief, no answer"
           }
 
           testTask "an instant before the entity existed has nothing to read" {
               do! reset ()
               believe "e1" (jan 10) (Active 1) 1L
-              let! belief = (newTemporalReader ()).ValidAt(machine, entity "e1", jan 9, noCancellation)
+              let! belief = (newTemporalReader ()).ValidAtAsync(machine, entity "e1", jan 9, noCancellation)
               Expect.isNone (belief |> expectOk "valid at") "the entity had no belief then"
+          }
+
+          testTask "ValidAt reads the current database opinion despite a skewed application clock" {
+              do! reset ()
+              believe "e1" (jan 10) (Active 1) 1L
+
+              let reader = newTemporalReader ()
+
+              let! old =
+                  reader.AsOfAsync(
+                      machine,
+                      entity "e1",
+                      jan 12,
+                      DateTimeOffset(2020, 1, 1, 0, 0, 0, TimeSpan.Zero),
+                      noCancellation
+                  )
+
+              Expect.isNone (old |> expectOk "past opinion") "explicit historical knowledge predates the belief"
+              let! belief = reader.ValidAtAsync(machine, entity "e1", jan 12, noCancellation)
+
+              Expect.isSome (belief |> expectOk "valid at") "the application clock cannot hide a live belief"
           }
 
           testTask "a live belief reads back with both upper bounds open" {
               do! reset ()
               believe "e1" (jan 10) (Active 1) 1L
 
-              let! belief = (newTemporalReader ()).ValidAt(machine, entity "e1", jan 12, noCancellation)
+              let! belief = (newTemporalReader ()).ValidAtAsync(machine, entity "e1", jan 12, noCancellation)
 
               let belief = expectBelief belief "valid at"
 
@@ -66,8 +87,8 @@ let tests =
               believe "e1" (jan 10) (Active 1) 1L
               believe "e1" (jan 14) (Active 2) 2L
 
-              let! earlier = (newTemporalReader ()).ValidAt(machine, entity "e1", jan 12, noCancellation)
-              let! later = (newTemporalReader ()).ValidAt(machine, entity "e1", jan 16, noCancellation)
+              let! earlier = (newTemporalReader ()).ValidAtAsync(machine, entity "e1", jan 12, noCancellation)
+              let! later = (newTemporalReader ()).ValidAtAsync(machine, entity "e1", jan 16, noCancellation)
 
               Expect.equal (Some(Active 1)) (stateOf earlier "earlier") "the belief that covered noon"
 
@@ -79,7 +100,7 @@ let tests =
               believe "e1" (jan 10) (Active 1) 1L
               believe "e1" (jan 14) (Active 2) 2L
 
-              let! belief = (newTemporalReader ()).ValidAt(machine, entity "e1", jan 12, noCancellation)
+              let! belief = (newTemporalReader ()).ValidAtAsync(machine, entity "e1", jan 12, noCancellation)
 
               Expect.equal
                   (Some(jan 14))
@@ -93,7 +114,7 @@ let tests =
 
               let! belief =
                   (newTemporalReader ())
-                      .AsOf(
+                      .AsOfAsync(
                           machine,
                           entity "e1",
                           jan 12,
@@ -108,10 +129,10 @@ let tests =
               do! reset ()
               believe "e1" (jan 10) (Active 1) 1L
 
-              let! now = (newTemporalReader ()).ValidAt(machine, entity "e1", jan 12, noCancellation)
+              let! now = (newTemporalReader ()).ValidAtAsync(machine, entity "e1", jan 12, noCancellation)
 
               let! explicit =
-                  (newTemporalReader ()).AsOf(machine, entity "e1", jan 12, DateTimeOffset.UtcNow, noCancellation)
+                  (newTemporalReader ()).AsOfAsync(machine, entity "e1", jan 12, DateTimeOffset.UtcNow, noCancellation)
 
               Expect.equal (stateOf now "valid at") (stateOf explicit "as of") "the same question asked two ways"
           } ]

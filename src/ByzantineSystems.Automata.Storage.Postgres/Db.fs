@@ -134,7 +134,7 @@ module internal Db =
     ///
     /// Everything reached this way is idempotent by construction and not by hope. A read
     /// repeats freely. <c>fsm.submit_command</c> deduplicates on its idempotency key.
-    /// <c>fsm.finalize_command</c> answers a repeat from the same lease with what that lease
+    /// <c>fsm.command_standing</c> answers a repeat from the same lease with what that lease
     /// already did, which is the entire reason it was written that way. The fenced lease
     /// updates compare a token that a second attempt still carries.
     /// </summary>

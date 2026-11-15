@@ -10,8 +10,11 @@
     <ItemGroup>
         <Compile Include="Property.fs" />
         <Compile Include="ArgumentTests.fs" />
+        <Compile Include="TapShapeTests.fs" />
         <Compile Include="StoreProgramTests.fs" />
         <Compile Include="EnumCodecTests.fs" />
+        <Compile Include="FailureTests.fs" />
+        <Compile Include="FinalizeTests.fs" />
         <Compile Include="Program.fs" />
     </ItemGroup>
 

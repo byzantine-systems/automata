@@ -11,7 +11,12 @@ SELECT
     a.msg_id,
     a.read_ct,
     a.vt,
-    a.message
+    a.machine_id,
+    a.entity_id,
+    a.command_id,
+    a.epoch,
+    a.ordinal,
+    a.action
 FROM
-    fsm.claim_actions (@queue, @batch, @lease) a;
+    $schema$.claim_actions (@queue, @batch, @lease) a;
 

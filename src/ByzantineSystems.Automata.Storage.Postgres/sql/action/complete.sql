@@ -4,5 +4,5 @@
 -- the legitimate owner from a worker that stalled past its visibility timeout
 -- and woke up after somebody else reclaimed the message.
 SELECT
-    fsm.complete_action (@queue, @msg_id, @read_ct) AS outcome;
+    $schema$.complete_action (@queue, @msg_id, @read_ct) AS outcome;
 

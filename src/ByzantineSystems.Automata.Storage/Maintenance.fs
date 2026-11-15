@@ -53,20 +53,24 @@ type BootReport =
 /// command at a time, long after the deploy that caused them.
 /// </summary>
 type IStoreBoot =
-    abstract Boot: machineId: MachineId * ct: CancellationToken -> Task<Result<BootReport, StoreError>>
+    abstract BootAsync:
+        machineId: MachineId * cancellationToken: CancellationToken -> Task<Result<BootReport, StoreError>>
 
 /// <summary>
 /// Hearing that work may be waiting, from another process.
 ///
-/// Optional. <c>Listen</c> runs until cancelled or until it fails, calling back when the store
+/// Optional. <c>ListenAsync</c> runs until cancelled or until it fails, calling back when the store
 /// says a command or an action of this machine may be claimable. Cancellation is how it is meant
 /// to end, and it answers <c>Ok</c> when it does. A callback is a hint and nothing more: losing
 /// every one of them costs the polling interval and never a command, which is what lets a
 /// failed listener be retried rather than treated as a fault.
 /// </summary>
 type IWorkNotifications =
-    abstract Listen:
-        machineId: MachineId * onCommands: (unit -> unit) * onActions: (unit -> unit) * ct: CancellationToken ->
+    abstract ListenAsync:
+        machineId: MachineId *
+        onCommands: (unit -> unit) *
+        onActions: (unit -> unit) *
+        cancellationToken: CancellationToken ->
             Task<Result<unit, StoreError>>
 
 /// <summary>How long a class of history is kept.</summary>
@@ -179,31 +183,32 @@ type IDatabaseMaintenance =
     /// Wakes whoever is listening for machines and queues with claimable work, and says how full
     /// the notification queue is.
     /// </summary>
-    abstract NotifyPending: ct: CancellationToken -> Task<Result<NotifyReport, StoreError>>
+    abstract NotifyPendingAsync: cancellationToken: CancellationToken -> Task<Result<NotifyReport, StoreError>>
 
     /// <summary>
     /// One pass: reaps long-expired leases, applies each machine's retention, and counts drift
     /// without repairing it. Each task is bounded by <paramref name="batch" />. An empty list
     /// means another process is running a pass right now.
     /// </summary>
-    abstract Run: batch: ClaimBatch * ct: CancellationToken -> Task<Result<MaintenanceReport list, StoreError>>
+    abstract RunAsync:
+        batch: ClaimBatch * cancellationToken: CancellationToken -> Task<Result<MaintenanceReport list, StoreError>>
 
     /// <summary>Every open command whose blocked flag has drifted. Empty means healthy.</summary>
-    abstract DetectDrift: ct: CancellationToken -> Task<Result<BlockedDrift list, StoreError>>
+    abstract DetectDriftAsync: cancellationToken: CancellationToken -> Task<Result<BlockedDrift list, StoreError>>
 
     /// <summary>
     /// Rewrites every drifted blocked flag and says which. Never called by a pass: drift is a
     /// symptom of a bug elsewhere, and repairing it silently would hide that bug.
     /// </summary>
-    abstract RepairDrift: ct: CancellationToken -> Task<Result<RepairedBlock list, StoreError>>
+    abstract RepairDriftAsync: cancellationToken: CancellationToken -> Task<Result<RepairedBlock list, StoreError>>
 
     /// <summary>
     /// Asks the database to run both ticks itself. Idempotent: asking again updates the schedule
     /// rather than adding a second one.
     /// </summary>
-    abstract Schedule:
-        notifyEvery: TimeSpan * runEvery: TimeSpan * batch: ClaimBatch * ct: CancellationToken ->
+    abstract ScheduleAsync:
+        notifyEvery: TimeSpan * runEvery: TimeSpan * batch: ClaimBatch * cancellationToken: CancellationToken ->
             Task<Result<Scheduling, StoreError>>
 
     /// <summary>Removes both scheduled ticks. Returns how many were removed.</summary>
-    abstract Unschedule: ct: CancellationToken -> Task<Result<int, StoreError>>
+    abstract UnscheduleAsync: cancellationToken: CancellationToken -> Task<Result<int, StoreError>>

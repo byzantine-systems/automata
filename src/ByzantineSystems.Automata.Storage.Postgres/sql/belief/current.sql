@@ -8,10 +8,10 @@ SELECT
     epoch,
     command_id,
     chart_version,
-    valid_from,
-    known_from
+    effective_at AS valid_from,
+    committed_at AS known_from
 FROM
-    fsm.current_belief
+    $schema$.entity_state
 WHERE
     machine_id = @machine_id
     AND entity_id = @entity_id;

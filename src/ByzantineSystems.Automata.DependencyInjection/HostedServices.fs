@@ -145,7 +145,7 @@ type private HostedTaskCompletion<'T> =
 module private HostedTask =
 
     let capture (work: Task<'T>) : Task<HostedTaskCompletion<'T>> =
-        task {
+        backgroundTask {
             try
                 let! value = work
                 return Completed value
@@ -154,7 +154,7 @@ module private HostedTask =
         }
 
     let captureUnit (work: Task) : Task<HostedTaskCompletion<unit>> =
-        task {
+        backgroundTask {
             do! work
             return ()
         }
@@ -163,7 +163,7 @@ module private HostedTask =
     /// Awaits work that is expected to end by the given token's cancellation, and lets anything
     /// else through.
     let awaitOwnedCancellation (owner: CancellationToken) (work: Task) : Task =
-        task {
+        backgroundTask {
             try
                 do! work
             with :? OperationCanceledException when owner.IsCancellationRequested ->
@@ -193,7 +193,7 @@ type internal GenerationChild<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectE
     let mutable stopping = 0
 
     let processorTask =
-        task {
+        backgroundTask {
             match! Machine.processor(machine).RunAsync(processorCancellation.Token) with
             | ProcessorStop.Drained _ -> return ()
             | ProcessorStop.Escalated(commandId, reason, _) ->
@@ -202,11 +202,11 @@ type internal GenerationChild<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectE
 
     /// One delivery, in a scope of its own that is disposed however the handler ended.
     let handleIn resolve (action: LeasedAction<'EntityId, 'Action>) ct =
-        task {
+        backgroundTask {
             let scope = scopeFactory.CreateAsyncScope()
 
             let! outcome =
-                task {
+                backgroundTask {
                     let handler: IActionHandler<'EntityId, 'Action, 'EffectError> =
                         resolve scope.ServiceProvider
 
@@ -224,17 +224,18 @@ type internal GenerationChild<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectE
     let actionTask =
         match delivery with
         | ActionDelivery.Scoped resolve ->
-            task {
+            backgroundTask {
                 let! _ =
                     Machine.dispatcher machine (handleIn resolve)
                     |> _.RunAsync(actionCancellation.Token)
 
                 return ()
             }
-        | ActionDelivery.Elsewhere -> task { do! Task.Delay(Timeout.InfiniteTimeSpan, actionCancellation.Token) }
+        | ActionDelivery.Elsewhere ->
+            backgroundTask { do! Task.Delay(Timeout.InfiniteTimeSpan, actionCancellation.Token) }
 
     let completion =
-        task {
+        backgroundTask {
             let! completed = Task.WhenAny(machine.Completion, processorTask, actionTask)
 
             if Volatile.Read(&stopping) = 0 then
@@ -245,7 +246,7 @@ type internal GenerationChild<'EntityId, 'State, 'Event, 'Action, 'Err, 'EffectE
         member _.Completion = completion
 
         member _.StopAsync(ct: CancellationToken) =
-            task {
+            backgroundTask {
                 Interlocked.Exchange(&stopping, 1) |> ignore
 
                 actionCancellation.Cancel()
@@ -284,7 +285,7 @@ module internal Generation =
         (delivery: ActionDelivery<'EntityId, 'Action, 'EffectError>)
         (ct: CancellationToken)
         : Task<ISupervisedChild> =
-        task {
+        backgroundTask {
             match! Machine.startAsync machine registry ct with
             | Error error -> return raise (AutomataChartRegistrationException error)
             | Ok(Startup.Refused defects) -> return raise (AutomataBootRefusedException defects)
@@ -335,7 +336,7 @@ type internal AutomataHostedService<'EntityId, 'State, 'Event, 'Action, 'Err, 'E
         { Id = options.MachineKey
           Start =
             fun ct ->
-                task {
+                backgroundTask {
                     let machine =
                         options.MachineFactory services
                         |> Result.defaultWith (fun errors -> raise (AutomataMachineConfigurationException errors))
@@ -359,7 +360,7 @@ type internal AutomataHostedService<'EntityId, 'State, 'Event, 'Action, 'Err, 'E
         | Error supervisorErrors -> invalidOp $"invalid automata supervisor configuration: %A{supervisorErrors}"
 
     let persistNewEvents (root: ISupervisor) fromIndex ct =
-        task {
+        backgroundTask {
             let! events = root.EventsAsync(ct)
             let pending = events |> List.skip fromIndex
 
@@ -372,7 +373,7 @@ type internal AutomataHostedService<'EntityId, 'State, 'Event, 'Action, 'Err, 'E
                       Reason = event.Reason
                       At = event.At }
 
-                let! stored = auditStore.Record(record, ct)
+                let! stored = auditStore.RecordAsync(record, ct)
 
                 match stored with
                 | Ok() -> AutomataLog.supervisionEvent logger options.MachineKey event
@@ -385,15 +386,15 @@ type internal AutomataHostedService<'EntityId, 'State, 'Event, 'Action, 'Err, 'E
         validate ()
         let baseTask = base.StartAsync(ct)
 
-        task {
+        backgroundTask {
             do! baseTask
             do! started.Task.WaitAsync(ct)
         }
 
     override _.ExecuteAsync(stoppingToken: CancellationToken) =
-        task {
+        backgroundTask {
             let run =
-                task {
+                backgroundTask {
                     let! root = Supervisor.start spec stoppingToken options.TimeProvider
                     supervisor <- Some root
                     started.TrySetResult() |> ignore
@@ -402,7 +403,7 @@ type internal AutomataHostedService<'EntityId, 'State, 'Event, 'Action, 'Err, 'E
                     // watching. Stopping the host ends the watch by cancellation, which is the
                     // ordinary way it ends and not a failure; StopAsync persists what is left.
                     let observe () =
-                        task {
+                        backgroundTask {
                             let! next = persistNewEvents root persistedEvents stoppingToken
                             persistedEvents <- next
 
@@ -435,7 +436,7 @@ type internal AutomataHostedService<'EntityId, 'State, 'Event, 'Action, 'Err, 'E
     override this.StopAsync(ct: CancellationToken) : Task =
         let baseTask = base.StopAsync(ct)
 
-        task {
+        backgroundTask {
             match supervisor with
             | Some root -> do! root.StopAsync(ct)
             | None -> ()

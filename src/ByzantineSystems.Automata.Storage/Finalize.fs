@@ -3,13 +3,54 @@ namespace ByzantineSystems.Automata.Storage.Internal
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
 
-/// <summary>A committed draft with its four payloads already encoded, so the transaction only writes.</summary>
+/// <summary>Only a first commit supplies an origin; continuing commits use the locked snapshot.</summary>
+[<RequireQualifiedAccess>]
+type internal CommitOrigin =
+    | Initial of string
+    | Continuing
+
+[<RequireQualifiedAccess>]
+module internal CommitOrigin =
+    let payload =
+        function
+        | CommitOrigin.Initial state -> Some state
+        | CommitOrigin.Continuing -> None
+
+/// <summary>A committed draft with its state and action payloads encoded before writing.</summary>
 type internal EncodedDraft<'EntityId, 'State, 'Event, 'Action> =
     { Source: TransitionDraft<'EntityId, 'State, 'Event, 'Action>
-      EventJson: string
       ActionsJson: string
-      FromJson: string
+      Origin: CommitOrigin
       ToJson: string }
+
+/// <summary>Shared payload preparation. None denotes a correction with an explicit origin.</summary>
+[<RequireQualifiedAccess>]
+module internal DraftEncoding =
+    let encode
+        (stateCodec: Codec<'State>)
+        (actionCodec: Codec<'Action list>)
+        (expected: Epoch option)
+        (draft: TransitionDraft<'EntityId, 'State, 'Event, 'Action>)
+        =
+        let origin =
+            match expected with
+            | Some epoch when epoch <> Epoch.initial -> Ok CommitOrigin.Continuing
+            | Some _
+            | None -> stateCodec.Encode draft.FromState |> Result.map CommitOrigin.Initial
+
+        match actionCodec.Encode draft.Actions, origin, stateCodec.Encode draft.ToState with
+        | Ok actions, Ok origin, Ok destination ->
+            Ok
+                { Source = draft
+                  ActionsJson = actions
+                  Origin = origin
+                  ToJson = destination }
+        | Error(EncodeError(name, error)), _, _
+        | Error(DecodeError(name, error)), _, _
+        | _, Error(EncodeError(name, error)), _
+        | _, Error(DecodeError(name, error)), _
+        | _, _, Error(EncodeError(name, error))
+        | _, _, Error(DecodeError(name, error)) -> Error(StoreError.Serialization(name, error))
 
 /// <summary>How a leased command ends. Each case carries exactly what that ending writes.</summary>
 type internal Resolution<'EntityId, 'State, 'Event, 'Action> =
@@ -17,10 +58,10 @@ type internal Resolution<'EntityId, 'State, 'Event, 'Action> =
     | Commit of expected: Epoch * draft: EncodedDraft<'EntityId, 'State, 'Event, 'Action>
 
     /// <summary>The chart refused the event. The encoded failure is recorded and no state moves.</summary>
-    | Reject of error: string
+    | Reject of error: EncodedFailure
 
     /// <summary>The machine gave up on the command. The encoded failure is recorded and no state moves.</summary>
-    | DeadLetter of error: string
+    | DeadLetter of error: EncodedFailure
 
 /// <summary>Operations on <see cref="T:ByzantineSystems.Automata.Storage.Internal.Resolution`4" />.</summary>
 [<RequireQualifiedAccess>]
@@ -43,3 +84,35 @@ module internal Resolution =
         | Commit(expected, _) -> expected
         | Reject _
         | DeadLetter _ -> Epoch.initial
+
+/// <summary>Where a finalizing caller stands before any writes are permitted.</summary>
+type internal FinalizationStanding<'Target> =
+    | Unknown
+    | FinishedByCaller of CommandStatus
+    | FinishedByAnother
+    | HeldByAnother
+    | HeldByCaller of 'Target
+
+/// <summary>Atomic routine or checked statement sequence, interpreted within one write session.</summary>
+type internal FinalizationInstruction<'Params, 'Reader, 'Target> =
+    | AtomicFinalization of StoreProgram<WriteAccess, 'Params, 'Reader, FinalizeOutcome>
+    | CheckedFinalization of
+        read: StoreProgram<WriteAccess, 'Params, 'Reader, FinalizationStanding<'Target>> *
+        already: (CommandStatus -> StoreProgram<WriteAccess, 'Params, 'Reader, FinalizeOutcome>) *
+        resolve: ('Target -> StoreProgram<WriteAccess, 'Params, 'Reader, FinalizeOutcome>) *
+        missing: StoreError
+
+[<RequireQualifiedAccess>]
+module internal FinalizeProgram =
+    let finish instruction =
+        store {
+            match instruction with
+            | AtomicFinalization program -> return! program
+            | CheckedFinalization(read, already, resolve, missing) ->
+                match! read with
+                | Unknown -> return! StoreProgram.fail missing
+                | FinishedByCaller status -> return! already status
+                | FinishedByAnother
+                | HeldByAnother -> return FinalizeOutcome.LeaseLost
+                | HeldByCaller target -> return! resolve target
+        }

@@ -64,8 +64,10 @@ let private ownStore () =
     let encode, decode = EntityKey.forEntityId<TestEntity>
     let source = DataSource.create connectionString
 
-    PostgresMachineStore<Entity, TestState, TestEvent, TestAction, TestError>(
-        { Context = PostgresContext.create source TransientPolicy.defaults ignore
+    PostgresBitemporalMachineStore<Entity, TestState, TestEvent, TestAction, TestError>(
+        { Context =
+            PostgresContext.create source TransientPolicy.defaults ignore
+            |> PostgresContext.withSchema schema
           ActionDelivery = ActionDelivery.Deliver(ActionQueueName.create actionQueue)
           StateCodec = Serialization.systemTextJson<TestState> ()
           EventCodec = Serialization.systemTextJson<TestEvent> ()
@@ -76,10 +78,11 @@ let private ownStore () =
           Retention = RetentionPolicy.keepEverything
           ReapAfter = LeaseDuration.create (TimeSpan.FromMinutes 5.)
           Listener = ListenerConnection.SameDataSource }
+        |> MachineStoreOptions.bitemporal
     )
 
 let private buildMachine
-    (machineStore: PostgresMachineStore<Entity, TestState, TestEvent, TestAction, TestError>)
+    (machineStore: PostgresBitemporalMachineStore<Entity, TestState, TestEvent, TestAction, TestError>)
     (time: TimeProvider)
     =
     // Qualified because this suite binds `machine` to its own machine id, which shadows the
@@ -124,18 +127,18 @@ let private drainUntil
             failtest "the processors did not settle within the budget"
     }
 
-let private stateOf (store: PostgresMachineStore<Entity, TestState, TestEvent, TestAction, TestError>) name =
+let private stateOf (store: PostgresBitemporalMachineStore<Entity, TestState, TestEvent, TestAction, TestError>) name =
     task {
         let! snapshot =
             (store :> IStateReader<Entity, TestState, TestEvent, TestAction>)
-                .TryGetSnapshot(machine, entity name, noCancellation)
+                .TryGetSnapshotAsync(machine, entity name, noCancellation)
 
         return snapshot |> expectOk "snapshot"
     }
 
 let private transitionEpochs name =
     rows
-        "SELECT epoch, event FROM fsm.transition WHERE entity_id = @entity ORDER BY epoch"
+        "SELECT t.epoch, c.event FROM fsm.transition t JOIN fsm.command c ON c.command_id = t.command_id WHERE t.entity_id = @entity ORDER BY t.epoch"
         [ "entity", box name ]
         (fun reader -> reader.GetInt64 0, reader.GetString 1)
 

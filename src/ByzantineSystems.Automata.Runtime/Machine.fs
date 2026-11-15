@@ -49,9 +49,9 @@ type Machine<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: equality>
         (background: Task list)
         (ct: CancellationToken)
         =
-        task {
+        backgroundTask {
             let stopComponents =
-                task {
+                backgroundTask {
                     observerBus |> Option.iter _.Complete()
                     lifetime |> Option.iter _.Cancel()
 
@@ -95,7 +95,7 @@ type Machine<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: equality>
     /// when the store listens to nothing, and neither is a reason to go round again.
     let listenOnce (notifications: IWorkNotifications) (ct: CancellationToken) () : Task<bool> =
         backgroundTask {
-            match! notifications.Listen(config.MachineId, commandSignal.TrySignal, actionSignal.TrySignal, ct) with
+            match! notifications.ListenAsync(config.MachineId, commandSignal.TrySignal, actionSignal.TrySignal, ct) with
             | Ok() -> return false
             | Error error ->
                 listenerFailed error
@@ -147,11 +147,11 @@ type Machine<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: equality>
     member _.StartAsync(registry: IChartRegistry, ct: CancellationToken) : Task<Result<Startup, StoreError>> =
         let boot () =
             match Store.tryBoot config.Store with
-            | Some store -> store.Boot(config.MachineId, ct)
+            | Some store -> store.BootAsync(config.MachineId, ct)
             | None -> Task.FromResult(Ok BootReport.Ready)
 
         let register () =
-            registry.Register(
+            registry.RegisterAsync(
                 { MachineId = config.MachineId
                   Version = config.ChartVersion
                   Fingerprint = Chart.fingerprint config.Chart },
@@ -165,8 +165,8 @@ type Machine<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: equality>
             ChartCatalog.entries config.Catalog
             |> List.filter (fun (version, _) -> version <> config.ChartVersion)
             |> List.map (fun (version, chart) ->
-                task {
-                    match! registry.TryGet(config.MachineId, version, ct) with
+                backgroundTask {
+                    match! registry.TryGetAsync(config.MachineId, version, ct) with
                     | Ok(Some stored) when stored <> Chart.fingerprint chart ->
                         return
                             Ok(
@@ -202,7 +202,7 @@ type Machine<'EntityId, 'State, 'Event, 'Action, 'Err when 'EntityId: equality>
                 | Stopping _
                 | Stopped _ -> invalidOp "A stopped machine cannot be started again.")
 
-        taskResult {
+        backgroundTaskResult {
             ct.ThrowIfCancellationRequested()
 
             // The store first, because the catalog check reads it: a schema that is missing
@@ -315,12 +315,12 @@ module Machine =
         (envelope: EventEnvelope<'Event>)
         (ct: CancellationToken)
         : Task<Result<SubmissionOutcome, MachineError<'Err>>> =
-        taskResult {
+        backgroundTaskResult {
             do! machine.TryAcceptWork()
 
             let! outcome =
                 (inboxOf machine)
-                    .Submit(
+                    .SubmitAsync(
                         { MachineId = machine.MachineId
                           EntityId = entityId
                           IdempotencyKey = EventEnvelope.idempotencyKey envelope
@@ -354,8 +354,8 @@ module Machine =
     /// the chart version that first decided it, and rewrites the entity's beliefs from that
     /// instant. It waits its turn behind the entity's queued commands like any other command.
     ///
-    /// Needs a store that can read and replay the past; on one that cannot, the correction is
-    /// dead-lettered with the reason. No historical action is re-emitted.
+    /// Needs a complete correction capability; on one that cannot, the request is refused
+    /// before submission. No historical action is re-emitted.
     /// </summary>
     let correct
         (machine: Machine<'EntityId, 'State, 'Event, 'Action, 'Err>)
@@ -365,7 +365,12 @@ module Machine =
         (policy: CorrectionPolicy)
         (ct: CancellationToken)
         : Task<Result<SubmissionOutcome, MachineError<'Err>>> =
-        submit (CommandKind.Correction(at, policy)) machine entityId envelope ct
+        if ct.IsCancellationRequested then
+            Task.FromCanceled<Result<SubmissionOutcome, MachineError<'Err>>> ct
+        else
+            match Store.tryCorrections machine.RuntimeConfig.Store with
+            | None -> TaskResult.error (MachineError.Rejected MachineRejection.CorrectionsUnsupported)
+            | Some _ -> submit (CommandKind.Correction(at, policy)) machine entityId envelope ct
 
     /// <summary>
     /// What a correction would do, without doing it: the same reads and the same replay a worker
@@ -390,34 +395,43 @@ module Machine =
         (commandId: CommandId)
         (ct: CancellationToken)
         : Task<Result<CommandResult<'EntityId, 'State, 'Event, 'Action, 'Err> option, MachineError<'Err>>> =
-        (processorOf machine).TryGetResult(commandId, ct)
+        (processorOf machine).TryGetResultAsync(commandId, ct)
         |> TaskResult.mapError MachineError.Store
 
     /// Polls the store for a command's outcome, raced against the local notification, until it
-    /// settles. Outside send's own computation expression so the recursion does not force a
-    /// dynamic state machine on every call.
-    let rec private awaitSettled
+    /// settles. Outside send's own computation expression so the polling state stays isolated
+    /// from submission and waiter cleanup.
+    let private awaitSettled
         (machine: Machine<'EntityId, 'State, 'Event, 'Action, 'Err>)
         (identifier: CommandId)
         (notified: Task<CommandResult<'EntityId, 'State, 'Event, 'Action, 'Err>>)
         (ct: CancellationToken)
         : Task<Result<CommandResult<'EntityId, 'State, 'Event, 'Action, 'Err>, MachineError<'Err>>> =
-        task {
-            match! commandResult machine identifier ct with
-            | Error error -> return Error error
-            | Ok(Some CommandResult.Pending)
-            | Ok None ->
-                let delay =
-                    Task.Delay(machine.ResultPollInterval, machine.RuntimeConfig.TimeProvider, ct)
+        backgroundTask {
+            let mutable waiting = true
+            let mutable outcome = Ok CommandResult.Pending
 
-                let! first = Task.WhenAny(notified :> Task, delay)
+            while waiting do
+                match! commandResult machine identifier ct with
+                | Error error ->
+                    outcome <- Error error
+                    waiting <- false
+                | Ok(Some CommandResult.Pending)
+                | Ok None ->
+                    let delay =
+                        Task.Delay(machine.ResultPollInterval, machine.RuntimeConfig.TimeProvider, ct)
 
-                if Object.ReferenceEquals(first, notified :> Task) then
-                    let! result = notified
-                    return Ok result
-                else
-                    return! awaitSettled machine identifier notified ct
-            | Ok(Some settled) -> return Ok settled
+                    let! first = Task.WhenAny(notified :> Task, delay)
+
+                    if Object.ReferenceEquals(first, notified :> Task) then
+                        let! result = notified
+                        outcome <- Ok result
+                        waiting <- false
+                | Ok(Some settled) ->
+                    outcome <- Ok settled
+                    waiting <- false
+
+            return outcome
         }
 
     /// <summary>
@@ -438,10 +452,10 @@ module Machine =
         (envelope: EventEnvelope<'Event>)
         (ct: CancellationToken)
         : Task<Result<CommandResult<'EntityId, 'State, 'Event, 'Action, 'Err>, MachineError<'Err>>> =
-        taskResult {
+        backgroundTaskResult {
             do! machine.TryAcceptWork()
 
-            // Every retry passes through Submit's request-identity check. A lookup by key alone
+            // Every retry passes through SubmitAsync's request-identity check. A lookup by key alone
             // cannot distinguish an identical retry from a different request using that key.
             let! submitted = enqueue machine entityId envelope ct
 
@@ -468,7 +482,7 @@ module Machine =
         (entityId: 'EntityId)
         (ct: CancellationToken)
         : Task<Result<Snapshot<'State> option, MachineError<'Err>>> =
-        (stateReaderOf machine).TryGetSnapshot(machine.MachineId, entityId, ct)
+        (stateReaderOf machine).TryGetSnapshotAsync(machine.MachineId, entityId, ct)
         |> TaskResult.mapError MachineError.Store
 
     /// <summary>
@@ -488,7 +502,7 @@ module Machine =
         (paging: Page)
         (ct: CancellationToken)
         : Task<Result<CommittedTransition<'EntityId, 'State, 'Event, 'Action> list, MachineError<'Err>>> =
-        (stateReaderOf machine).History(machine.MachineId, entityId, paging, ct)
+        (stateReaderOf machine).HistoryAsync(machine.MachineId, entityId, paging, ct)
         |> TaskResult.mapError MachineError.Store
 
     /// <summary>
@@ -503,8 +517,8 @@ module Machine =
     /// <example>
     /// <code lang="fsharp">
     /// match Machine.temporal machine with
-    /// | Some reader -> reader.AsOf(Machine.machineId machine, orderId, validAt, knownAt, ct)
-    /// | None -> failwith "this store does not keep history"
+    /// | Some reader -> reader.AsOfAsync(Machine.machineId machine, orderId, validAt, knownAt, ct)
+    /// | None -> () // This store does not offer temporal reads.
     /// </code>
     /// </example>
     let temporal
@@ -520,7 +534,7 @@ module Machine =
     /// </summary>
     let corrections
         (machine: Machine<'EntityId, 'State, 'Event, 'Action, 'Err>)
-        : ICorrectionStore<'EntityId, 'State> option =
+        : CorrectionCapability<'EntityId, 'State, 'Event, 'Action> option =
         Store.tryCorrections machine.RuntimeConfig.Store
 
     /// <summary>The logical machine name the chart, inbox and store are keyed by.</summary>

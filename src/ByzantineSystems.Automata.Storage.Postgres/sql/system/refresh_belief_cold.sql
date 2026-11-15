@@ -5,5 +5,5 @@
 -- CONCURRENTLY refuses to run inside a transaction block, and a multi-statement
 -- command is one. Readers take the boundary from the view's own rows, so a
 -- refresh that is late, slow or fails costs speed and never correctness.
-REFRESH MATERIALIZED VIEW CONCURRENTLY fsm.belief_cold;
+REFRESH MATERIALIZED VIEW CONCURRENTLY $temporal_schema$.belief_cold;
 

@@ -18,7 +18,7 @@ let private effectiveAt = DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero)
 /// entity: any other entity with a claimable head would otherwise be returned instead, silently.
 let private claimKey (inbox: Inbox) (key: string) : Task<Claimed> =
     task {
-        let! claimed = inbox.Claim(machine, ClaimBatch.create 50, lease, noCancellation)
+        let! claimed = inbox.ClaimAsync(machine, ClaimBatch.create 50, lease, noCancellation)
 
         return
             claimed
@@ -29,14 +29,14 @@ let private claimKey (inbox: Inbox) (key: string) : Task<Claimed> =
 
 let private leased (inbox: Inbox) (name: string) (key: string) : Task<Claimed> =
     task {
-        let! _ = inbox.Submit(submission (entity name) key (Start 1), noCancellation)
+        let! _ = inbox.SubmitAsync(submission (entity name) key (Start 1), noCancellation)
         return! claimKey inbox key
     }
 
 let private commit (processor: Processor) (held: Claimed) (expected: Epoch) (toState: TestState) =
     task {
         let! outcome =
-            processor.Commit(
+            processor.CommitAsync(
                 held.Work.CommandId,
                 held.Token,
                 expected,
@@ -58,11 +58,48 @@ let tests =
         "Postgres finalize"
         [
 
+          testTask "submitted events remain immutable while command lifecycle can advance" {
+              do! reset ()
+              let! held = leased (newInbox ()) "immutable" "immutable"
+              let id = CommandId.value held.Work.CommandId
+
+              Expect.isError
+                  (exec $"UPDATE fsm.command SET event = '{{}}' WHERE command_id = {id}")
+                  "history cannot be rewritten through its command"
+
+              let! result = commit (newProcessor ()) held Epoch.initial (Active 1)
+              Expect.equal result (Finalized(Epoch.next Epoch.initial)) "lifecycle writes remain possible"
+          }
+
+          testTask "direct ordinary commits reject incompatible origin shapes atomically" {
+              do! reset ()
+              let inbox = newInbox ()
+              let! first = leased inbox "origins" "first"
+
+              let invoke (held: Claimed) expected origin =
+                  exec
+                      $"SELECT * FROM fsm.finish_command({CommandId.value held.Work.CommandId},{LeaseToken.value held.Token},{expected},'succeeded',
+                       p_instance_status => 'running', p_effective_at => '2026-01-01', p_actions => '[]', p_from_state => {origin},
+                       p_to_state => '{{}}', p_handled_by => 'root', p_exited => '{{}}', p_entered => '{{}}')"
+
+              let refuses phrase (result: Result<unit, exn>) =
+                  match result with
+                  | Error error -> Expect.stringContains error.Message phrase "the origin validation refused it"
+                  | Ok() -> failtest "invalid origin accepted"
+
+              invoke first 0 "NULL" |> refuses "initial commit requires"
+              Expect.equal (counts ()) "0/0/0" "validation wrote nothing"
+              let! _ = commit (newProcessor ()) first Epoch.initial (Active 1)
+              let! second = leased inbox "origins" "second"
+              invoke second 1 "'{}'::jsonb" |> refuses "continuing commit derives"
+              Expect.equal (counts ()) "1/1/0" "only the first commit remains"
+          }
+
           testTask "committing appends the transition, advances the belief and closes the command" {
               do! reset ()
               let inbox = newInbox ()
               let! held = leased inbox "e1" "first"
-              let! _ = inbox.Submit(submission (entity "e1") "second" Finish, noCancellation)
+              let! _ = inbox.SubmitAsync(submission (entity "e1") "second" Finish, noCancellation)
 
               let! outcome = commit (newProcessor ()) held Epoch.initial (Active 7)
 
@@ -89,13 +126,13 @@ let tests =
               let processor = newProcessor ()
               let! _ = commit processor first Epoch.initial (Active 1)
 
-              let! _ = inbox.Submit(submission (entity "e1") "k2" Finish, noCancellation)
+              let! _ = inbox.SubmitAsync(submission (entity "e1") "k2" Finish, noCancellation)
               let! second = claimKey inbox "k2"
 
               // An effective instant before the live belief's lower bound, which close_and_open
               // refuses. By then the transition row has already been inserted.
               let! outcome =
-                  processor.Commit(
+                  processor.CommitAsync(
                       second.Work.CommandId,
                       second.Token,
                       Epoch.next Epoch.initial,
@@ -125,10 +162,10 @@ let tests =
               // a property of the schema rather than of the code above it.
               match
                   exec
-                      "INSERT INTO fsm.transition (machine_id, entity_id, epoch, command_id, chart_version, event,
+                      "INSERT INTO fsm.transition (machine_id, entity_id, epoch, command_id, chart_version,
                                                    actions, from_state, to_state, handled_by, exited, entered,
                                                    status, effective_at)
-                       SELECT machine_id, entity_id, epoch + 1, command_id, chart_version, event, actions,
+                       SELECT machine_id, entity_id, epoch + 1, command_id, chart_version, actions,
                               from_state, to_state, handled_by, exited, entered, status, effective_at
                        FROM fsm.transition"
               with
@@ -146,7 +183,7 @@ let tests =
               let! first = leased inbox "e1" "k1"
 
               let! _ =
-                  processor.Commit(
+                  processor.CommitAsync(
                       first.Work.CommandId,
                       first.Token,
                       Epoch.initial,
@@ -154,12 +191,12 @@ let tests =
                       noCancellation
                   )
 
-              let! _ = inbox.Submit(submission (entity "e2") "k2" (Start 2), noCancellation)
+              let! _ = inbox.SubmitAsync(submission (entity "e2") "k2" (Start 2), noCancellation)
               let! second = claimKey inbox "k2"
 
               // A wildly back-dated business instant on the second command.
               let! _ =
-                  processor.Commit(
+                  processor.CommitAsync(
                       second.Work.CommandId,
                       second.Token,
                       Epoch.initial,

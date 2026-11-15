@@ -2,29 +2,30 @@
 -- to replay. Ordering by effective_at then epoch is deterministic: two transitions of one entity
 -- cannot share an epoch, which is the log's key.
 SELECT
-    machine_id,
-    entity_id,
-    epoch,
-    command_id,
-    chart_version,
-    event,
-    actions,
-    from_state,
-    to_state,
-    handled_by,
-    exited,
-    entered,
-    status,
-    effective_at,
-    committed_at
+    t.machine_id,
+    t.entity_id,
+    t.epoch,
+    t.command_id,
+    t.chart_version,
+    c.event,
+    t.actions,
+    t.from_state,
+    t.to_state,
+    t.handled_by,
+    t.exited,
+    t.entered,
+    t.status,
+    t.effective_at,
+    t.committed_at
 FROM
-    fsm.transition
+    $schema$.transition t
+    JOIN $schema$.command c ON c.command_id = t.command_id
 WHERE
-    machine_id = @machine_id
-    AND entity_id = @entity_id
-    AND effective_at >= @from
+    t.machine_id = @machine_id
+    AND t.entity_id = @entity_id
+    AND t.effective_at >= @from
 ORDER BY
-    effective_at,
-    epoch
+    t.effective_at,
+    t.epoch
 LIMIT @limit;
 

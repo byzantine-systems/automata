@@ -7,4 +7,11 @@ let main argv =
     runTestsWithCLIArgs
         []
         argv
-        (testList "storage" [ ArgumentTests.tests; StoreProgramTests.tests; EnumCodecTests.tests ])
+        (testList
+            "storage"
+            [ ArgumentTests.tests
+              TapShapeTests.tests
+              StoreProgramTests.tests
+              EnumCodecTests.tests
+              FailureTests.tests
+              FinalizeTests.tests ])

@@ -41,7 +41,14 @@ let tests =
 
               let! outcome =
                   (newCorrections ())
-                      .Correct(machine, entity "e1", jan 10, [ corrected (jan 10) (Active 1) 1L ], noCancellation)
+                      .CorrectAsync(
+                          machine,
+                          entity "e1",
+                          Epoch.initial,
+                          jan 10,
+                          [ corrected (jan 10) (Active 1) 1L ],
+                          noCancellation
+                      )
 
               Expect.equal NothingSuperseded (outcome |> expectOk "correct") "there was nothing there to supersede"
               Expect.equal 1 (liveBeliefs ()).Length "the timeline is now the supplied one"
@@ -57,7 +64,14 @@ let tests =
 
               let! outcome =
                   (newCorrections ())
-                      .Correct(machine, entity "e1", jan 12, [ corrected (jan 12) (Active 7) 1L ], noCancellation)
+                      .CorrectAsync(
+                          machine,
+                          entity "e1",
+                          Epoch.initial,
+                          jan 12,
+                          [ corrected (jan 12) (Active 7) 1L ],
+                          noCancellation
+                      )
 
               Expect.equal (Corrected 2) (outcome |> expectOk "correct") "the split belief and the later one"
 
@@ -75,10 +89,17 @@ let tests =
 
               let! _ =
                   (newCorrections ())
-                      .Correct(machine, entity "e1", jan 12, [ corrected (jan 12) (Active 7) 1L ], noCancellation)
+                      .CorrectAsync(
+                          machine,
+                          entity "e1",
+                          Epoch.initial,
+                          jan 12,
+                          [ corrected (jan 12) (Active 7) 1L ],
+                          noCancellation
+                      )
 
-              let! before = (newTemporalReader ()).ValidAt(machine, entity "e1", jan 11, noCancellation)
-              let! after = (newTemporalReader ()).ValidAt(machine, entity "e1", jan 13, noCancellation)
+              let! before = (newTemporalReader ()).ValidAtAsync(machine, entity "e1", jan 11, noCancellation)
+              let! after = (newTemporalReader ()).ValidAtAsync(machine, entity "e1", jan 13, noCancellation)
 
               Expect.equal (Some(Active 1)) (stateOf before "before") "what was true at 11 was never in question"
 
@@ -94,7 +115,14 @@ let tests =
 
               let! _ =
                   (newCorrections ())
-                      .Correct(machine, entity "e1", jan 12, [ corrected (jan 12) (Active 7) 1L ], noCancellation)
+                      .CorrectAsync(
+                          machine,
+                          entity "e1",
+                          Epoch.initial,
+                          jan 12,
+                          [ corrected (jan 12) (Active 7) 1L ],
+                          noCancellation
+                      )
 
               Expect.isGreaterThan (archivedCount ()) archivedBefore "the replaced belief went to the history twin"
           }
@@ -110,10 +138,17 @@ let tests =
 
               let! _ =
                   (newCorrections ())
-                      .Correct(machine, entity "e1", jan 12, [ corrected (jan 12) (Active 7) 1L ], noCancellation)
+                      .CorrectAsync(
+                          machine,
+                          entity "e1",
+                          Epoch.initial,
+                          jan 12,
+                          [ corrected (jan 12) (Active 7) 1L ],
+                          noCancellation
+                      )
 
-              let! held = (newTemporalReader ()).AsOf(machine, entity "e1", jan 13, before, noCancellation)
-              let! now = (newTemporalReader ()).ValidAt(machine, entity "e1", jan 13, noCancellation)
+              let! held = (newTemporalReader ()).AsOfAsync(machine, entity "e1", jan 13, before, noCancellation)
+              let! now = (newTemporalReader ()).ValidAtAsync(machine, entity "e1", jan 13, noCancellation)
 
               Expect.equal (Some(Active 1)) (stateOf held "as of before") "what we thought before the correction"
 
@@ -124,14 +159,15 @@ let tests =
               do! reset ()
               believe "e1" (jan 10) (Active 1) 1L
 
-              let! outcome = (newCorrections ()).Correct(machine, entity "e1", jan 12, [], noCancellation)
+              let! outcome =
+                  (newCorrections ()).CorrectAsync(machine, entity "e1", Epoch.initial, jan 12, [], noCancellation)
 
               Expect.equal (Corrected 1) (outcome |> expectOk "correct") "the live belief was split"
 
-              let! after = (newTemporalReader ()).ValidAt(machine, entity "e1", jan 13, noCancellation)
+              let! after = (newTemporalReader ()).ValidAtAsync(machine, entity "e1", jan 13, noCancellation)
               Expect.isNone (after |> expectOk "after") "the entity had no belief from then on"
 
-              let! before = (newTemporalReader ()).ValidAt(machine, entity "e1", jan 11, noCancellation)
+              let! before = (newTemporalReader ()).ValidAtAsync(machine, entity "e1", jan 11, noCancellation)
               Expect.isSome (before |> expectOk "before") "and still had one before"
           }
 
@@ -141,9 +177,10 @@ let tests =
 
               let! _ =
                   (newCorrections ())
-                      .Correct(
+                      .CorrectAsync(
                           machine,
                           entity "e1",
+                          Epoch.initial,
                           jan 12,
                           [ corrected (jan 12) (Active 7) 1L
                             corrected (jan 14) (Active 8) 2L
@@ -170,9 +207,10 @@ let tests =
 
               let! outcome =
                   (newCorrections ())
-                      .Correct(
+                      .CorrectAsync(
                           machine,
                           entity "e1",
+                          Epoch.initial,
                           jan 12,
                           [ corrected (jan 16) (Active 7) 1L; corrected (jan 14) (Active 8) 2L ],
                           noCancellation
@@ -195,7 +233,14 @@ let tests =
 
               let! outcome =
                   (newCorrections ())
-                      .Correct(machine, entity "e1", jan 12, [ corrected (jan 11) (Active 7) 1L ], noCancellation)
+                      .CorrectAsync(
+                          machine,
+                          entity "e1",
+                          Epoch.initial,
+                          jan 12,
+                          [ corrected (jan 11) (Active 7) 1L ],
+                          noCancellation
+                      )
 
               match outcome with
               | Error(StoreError.Unexpected _) -> ()
@@ -212,7 +257,14 @@ let tests =
 
               let! outcome =
                   (newCorrections ())
-                      .Correct(machine, entity "e1", jan 12, [ corrected (jan 13) (Active 7) 1L ], noCancellation)
+                      .CorrectAsync(
+                          machine,
+                          entity "e1",
+                          Epoch.initial,
+                          jan 12,
+                          [ corrected (jan 13) (Active 7) 1L ],
+                          noCancellation
+                      )
 
               match outcome with
               | Error(StoreError.Unexpected _) -> ()

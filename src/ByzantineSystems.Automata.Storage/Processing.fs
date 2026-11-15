@@ -198,8 +198,8 @@ module Page =
 type IStateReader<'EntityId, 'State, 'Event, 'Action> =
 
     /// <summary>The entity's current belief, or <c>None</c> when it has never committed.</summary>
-    abstract TryGetSnapshot:
-        machineId: MachineId * entityId: 'EntityId * ct: CancellationToken ->
+    abstract TryGetSnapshotAsync:
+        machineId: MachineId * entityId: 'EntityId * cancellationToken: CancellationToken ->
             Task<Result<Snapshot<'State> option, StoreError>>
 
     /// <summary>
@@ -208,8 +208,8 @@ type IStateReader<'EntityId, 'State, 'Event, 'Action> =
     /// Ascending because this is a log rather than a feed: it is read to follow what happened in
     /// the order it happened, and the epoch that orders it is gapless.
     /// </summary>
-    abstract History:
-        machineId: MachineId * entityId: 'EntityId * paging: Page * ct: CancellationToken ->
+    abstract HistoryAsync:
+        machineId: MachineId * entityId: 'EntityId * paging: Page * cancellationToken: CancellationToken ->
             Task<Result<CommittedTransition<'EntityId, 'State, 'Event, 'Action> list, StoreError>>
 
 /// <summary>
@@ -226,28 +226,34 @@ type ICommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err> =
     /// command. <paramref name="expected" /> is the epoch the caller resolved against; a
     /// different one means the entity moved on and nothing is written.
     /// </summary>
-    abstract Commit:
+    abstract CommitAsync:
         commandId: CommandId *
         token: LeaseToken<CommandWork> *
         expected: Epoch *
         draft: TransitionDraft<'EntityId, 'State, 'Event, 'Action> *
-        ct: CancellationToken ->
+        cancellationToken: CancellationToken ->
             Task<Result<FinalizeOutcome, StoreError>>
 
     /// <summary>Records that the command was refused. No transition, and the state does not move.</summary>
-    abstract Reject:
-        commandId: CommandId * token: LeaseToken<CommandWork> * failure: CommandFailure<'Err> * ct: CancellationToken ->
+    abstract RejectAsync:
+        commandId: CommandId *
+        token: LeaseToken<CommandWork> *
+        failure: CommandFailure<'Err> *
+        cancellationToken: CancellationToken ->
             Task<Result<FinalizeOutcome, StoreError>>
 
     /// <summary>
-    /// Gives up on a command. Like <c>Reject</c>, and it releases the entity for the same reason:
+    /// Gives up on a command. Like <c>RejectAsync</c>, and it releases the entity for the same reason:
     /// a command nobody can process must not stop everything behind it.
     /// </summary>
-    abstract DeadLetter:
-        commandId: CommandId * token: LeaseToken<CommandWork> * failure: CommandFailure<'Err> * ct: CancellationToken ->
+    abstract DeadLetterAsync:
+        commandId: CommandId *
+        token: LeaseToken<CommandWork> *
+        failure: CommandFailure<'Err> *
+        cancellationToken: CancellationToken ->
             Task<Result<FinalizeOutcome, StoreError>>
 
     /// <summary>Reads what became of a command, without waiting for it.</summary>
-    abstract TryGetResult:
-        commandId: CommandId * ct: CancellationToken ->
+    abstract TryGetResultAsync:
+        commandId: CommandId * cancellationToken: CancellationToken ->
             Task<Result<CommandResult<'EntityId, 'State, 'Event, 'Action, 'Err> option, StoreError>>

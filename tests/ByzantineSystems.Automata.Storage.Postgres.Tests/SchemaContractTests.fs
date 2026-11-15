@@ -1,6 +1,7 @@
 module ByzantineSystems.Automata.Storage.Postgres.Tests.SchemaContractTests
 
 open System
+open System.Text.RegularExpressions
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage.Postgres
 open Expecto
@@ -55,7 +56,20 @@ let private transitionColumns =
       "effective_at"
       "committed_at" ]
 
-let private resultColumns = [ "command_status" ] @ transitionColumns @ [ "error" ]
+let private resultColumns =
+    [ "command_status" ]
+    @ transitionColumns
+    @ [ "failure_kind"
+        "domain_error"
+        "machine_reason"
+        "replay_kind"
+        "failure_version"
+        "failure_epoch"
+        "replay_reason"
+        "failure_budget" ]
+
+let private resource domain operation =
+    SqlResources.get domain operation |> SqlTemplate.substitute schema
 
 /// Builds the plan probe from the routine's own body, read back out of the catalog. Copying the
 /// statement into the test instead would let the two drift, which is exactly the failure this
@@ -66,7 +80,7 @@ let private explainClaim () : string =
     let body =
         use read =
             new NpgsqlCommand(
-                "SELECT prosrc FROM pg_proc WHERE oid = 'fsm.claim_commands(text,integer,interval)'::regprocedure",
+                sql "SELECT prosrc FROM pg_proc WHERE oid = 'fsm.claim_commands(text,integer,interval)'::regprocedure",
                 conn
             )
 
@@ -96,12 +110,63 @@ let tests =
                   "absence in this schema is always a value, so that a CHECK cannot pass by being unknown"
           }
 
+          testTask "purge_commands deletes every table that references fsm.command" {
+              do! reset ()
+
+              // Every table with a foreign key into fsm.command. The keys are NO ACTION, so a
+              // child the purge does not delete would leave a dangling reference and wedge
+              // run_maintenance for every machine once one row ages past the horizon. This is
+              // the generic form of the correction wedge: it fails when the next child table
+              // arrives without a matching delete, not only when the correction one is missing.
+              let children =
+                  rows "WITH RECURSIVE deps(oid) AS (
+                         SELECT 'fsm.command'::regclass::oid UNION
+                         SELECT con.conrelid FROM pg_constraint con JOIN deps d ON con.confrelid = d.oid WHERE con.contype = 'f')
+                        SELECT DISTINCT c.relname
+                       FROM pg_constraint con
+                       JOIN pg_class c ON c.oid = con.conrelid
+                        WHERE con.contype = 'f' AND con.confrelid IN (SELECT oid FROM deps)
+                       ORDER BY c.relname" [] (fun reader -> reader.GetString 0)
+                  |> Set.ofList
+
+              Expect.isNonEmpty children "fsm.command has referents worth guarding"
+
+              // Read back from the catalog rather than the migration file, so a routine that
+              // drifted from what is deployed fails here too.
+              let definition =
+                  scalar<string>
+                      "SELECT pg_get_functiondef('fsm.purge_commands(text,timestamptz,integer)'::regprocedure)"
+
+              let targets =
+                  Regex.Matches(
+                      definition,
+                      $@"DELETE\s+FROM\s+{Regex.Escape schemaValue}\.([a-z_]+)",
+                      RegexOptions.IgnoreCase
+                  )
+                  |> Seq.cast<Match>
+                  |> Seq.map (fun matched -> matched.Groups[1].Value)
+                  |> Set.ofSeq
+
+              Expect.equal
+                  (Set.difference (Set.remove "entity_state" children) targets |> Set.toList)
+                  []
+                  "every table with a foreign key into fsm.command has a matching DELETE in purge_commands"
+
+              Expect.isTrue
+                  (Regex.IsMatch(
+                      definition,
+                      $@"NOT\s+EXISTS\s*\(\s*SELECT\s+1\s+FROM\s+{Regex.Escape schemaValue}\.entity_state\s+s\s+WHERE\s+s.command_id\s*=\s*c.command_id",
+                      RegexOptions.IgnoreCase
+                  ))
+                  "snapshot commands are excluded, never deleted with their snapshot"
+          }
+
           testTask "the claim returns exactly the columns the reader expects" {
               do! reset ()
 
               let columns =
                   columnsOf
-                      (SqlResources.get "command" "claim")
+                      (resource "command" "claim")
                       [ "machine_id", box "none"
                         "batch", box 1
                         "lease", box (TimeSpan.FromSeconds 30.0) ]
@@ -112,11 +177,11 @@ let tests =
           testTask "command lookups return the shared record shape" {
               do! reset ()
 
-              let byId = columnsOf (SqlResources.get "command" "by_id") [ "command_id", box 0L ]
+              let byId = columnsOf (resource "command" "by_id") [ "command_id", box 0L ]
 
               let byKey =
                   columnsOf
-                      (SqlResources.get "command" "find_by_key")
+                      (resource "command" "find_by_key")
                       [ "machine_id", box "none"
                         "entity_id", box "none"
                         "idempotency_key", box "none" ]
@@ -129,7 +194,7 @@ let tests =
               do! reset ()
 
               let columns =
-                  columnsOf (SqlResources.get "chart" "by_version") [ "machine_id", box "none"; "version", box 1 ]
+                  columnsOf (resource "chart" "by_version") [ "machine_id", box "none"; "version", box 1 ]
 
               Expect.equal columns [ "fingerprint" ] "the registry reads this column by name"
           }
@@ -138,7 +203,7 @@ let tests =
               do! reset ()
 
               let belief =
-                  columnsOf (SqlResources.get "belief" "current") [ "machine_id", box "none"; "entity_id", box "none" ]
+                  columnsOf (resource "belief" "current") [ "machine_id", box "none"; "entity_id", box "none" ]
 
               let beliefColumns =
                   [ "machine_id"
@@ -155,7 +220,7 @@ let tests =
 
               let page =
                   columnsOf
-                      (SqlResources.get "transition" "history_page")
+                      (resource "transition" "history_page")
                       [ "machine_id", box "none"
                         "entity_id", box "none"
                         "after", box 0L
@@ -163,14 +228,13 @@ let tests =
 
               Expect.equal page transitionColumns "the history reader maps these columns by name"
 
-              let result =
-                  columnsOf (SqlResources.get "transition" "result") [ "command_id", box 0L ]
+              let result = columnsOf (resource "transition" "result") [ "command_id", box 0L ]
 
               Expect.equal result resultColumns "the result reader maps these columns by name"
 
               let suffix =
                   columnsOf
-                      (SqlResources.get "transition" "suffix")
+                      (resource "transition" "suffix")
                       [ "machine_id", box "none"
                         "entity_id", box "none"
                         "from", box (DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero))
@@ -180,35 +244,28 @@ let tests =
 
               let watermark =
                   columnsOf
-                      (SqlResources.get "transition" "purge_watermark")
+                      (resource "transition" "purge_watermark")
                       [ "machine_id", box "none"; "entity_id", box "none" ]
 
               Expect.equal watermark [ "max_purged_effective_at" ] "the watermark probe reads one column"
           }
 
-          testTask "the current belief view uses its partial index" {
+          testTask "the current snapshot read uses its primary key" {
               do! reset ()
 
-              // Ten superseded valid-time versions per entity plus one live one, which is what
-              // this table looks like in use. The shape matters: with a single version per
-              // entity the temporal key is the same size as the partial index and the planner
-              // reasonably picks either. Once history accumulates, the partial index stays
-              // proportional to the live frontier while the key grows with every version.
+              // Seed the actual snapshot read boundary. An empty table legitimately scans;
+              // seeding only temporal beliefs cannot test the core snapshot access path.
               exec
-                  """INSERT INTO fsm.instance_state (machine_id, entity_id, state, status, epoch, command_id, chart_version, valid_during)
-                     SELECT 'plan-probe', 'e' || e, '{}'::jsonb, 'running', 1, 1, 1,
-                            tstzrange('2026-01-01'::timestamptz + (v || ' days')::interval,
-                                      '2026-01-01'::timestamptz + ((v + 1) || ' days')::interval, '[)')
-                     FROM generate_series(1, 2000) e, generate_series(0, 9) v;
-
-                     INSERT INTO fsm.instance_state (machine_id, entity_id, state, status, epoch, command_id, chart_version, valid_during)
-                     SELECT 'plan-probe', 'e' || e, '{}'::jsonb, 'running', 1, 1, 1, tstzrange('2026-03-01', 'infinity', '[)')
-                     FROM generate_series(1, 2000) e"""
+                  """INSERT INTO fsm.machine_chart_version(machine_id, version, fingerprint) VALUES('plan-probe', 1, repeat('a',64));
+                     INSERT INTO fsm.command(machine_id, entity_id, seq, idempotency_key, chart_version, event, request_digest)
+                     SELECT 'plan-probe', 'e' || e, 1, 'seed', 1, '{}', decode(repeat('00',32),'hex') FROM generate_series(1,2000) e;
+                     INSERT INTO fsm.entity_state(machine_id, entity_id, state, status, epoch, command_id, chart_version, effective_at)
+                     SELECT machine_id, entity_id, '{}', 'running', 1, command_id, 1, now() FROM fsm.command WHERE machine_id = 'plan-probe'"""
               |> function
                   | Ok() -> ()
                   | Error error -> failtestf "seeding failed: %s" error.Message
 
-              exec "ANALYZE fsm.instance_state"
+              exec "ANALYZE fsm.entity_state"
               |> function
                   | Ok() -> ()
                   | Error error -> failtestf "analyze failed: %s" error.Message
@@ -217,16 +274,13 @@ let tests =
                   use conn = (dataSource ()).OpenConnection()
 
                   use cmd =
-                      new NpgsqlCommand(
-                          "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + SqlResources.get "belief" "current",
-                          conn
-                      )
+                      new NpgsqlCommand("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + resource "belief" "current", conn)
 
                   cmd.Parameters.AddWithValue("machine_id", "plan-probe") |> ignore
                   cmd.Parameters.AddWithValue("entity_id", "e1234") |> ignore
                   cmd.ExecuteScalar() |> string
 
-              Expect.stringContains plan "instance_state_live_idx" "the current-state read must use the partial index"
+              Expect.stringContains plan "entity_state_pkey" "the snapshot read uses its primary key"
 
               Expect.isFalse
                   (plan.Contains "Seq Scan")
@@ -305,8 +359,8 @@ let tests =
           testTask "a blocked command can never be leased" {
               do! reset ()
               let inbox = newInbox ()
-              let! _ = inbox.Submit(submission (entityId "e1") "k1" Finish, noCancellation)
-              let! _ = inbox.Submit(submission (entityId "e1") "k2" Finish, noCancellation)
+              let! _ = inbox.SubmitAsync(submission (entityId "e1") "k1" Finish, noCancellation)
+              let! _ = inbox.SubmitAsync(submission (entityId "e1") "k2" Finish, noCancellation)
 
               // The non-clamped check: derived state that drifts must fail loudly at the write.
               match exec "UPDATE fsm.command SET status = 'leased', lease_token = 1 WHERE seq = 2" with
@@ -321,8 +375,8 @@ let tests =
           testTask "an entity cannot have two claimable commands" {
               do! reset ()
               let inbox = newInbox ()
-              let! _ = inbox.Submit(submission (entityId "e1") "k1" Finish, noCancellation)
-              let! _ = inbox.Submit(submission (entityId "e1") "k2" Finish, noCancellation)
+              let! _ = inbox.SubmitAsync(submission (entityId "e1") "k1" Finish, noCancellation)
+              let! _ = inbox.SubmitAsync(submission (entityId "e1") "k2" Finish, noCancellation)
 
               match exec "UPDATE fsm.command SET blocked = false WHERE seq = 2" with
               | Ok() -> failtest "two unblocked commands for one entity should be impossible"
@@ -336,7 +390,7 @@ let tests =
           testTask "a ready command cannot carry a lease token" {
               do! reset ()
               let inbox = newInbox ()
-              let! _ = inbox.Submit(submission (entityId "e1") "k1" Finish, noCancellation)
+              let! _ = inbox.SubmitAsync(submission (entityId "e1") "k1" Finish, noCancellation)
 
               match exec "UPDATE fsm.command SET lease_token = 5 WHERE seq = 1" with
               | Ok() -> failtest "a ready command holding a token should be impossible"

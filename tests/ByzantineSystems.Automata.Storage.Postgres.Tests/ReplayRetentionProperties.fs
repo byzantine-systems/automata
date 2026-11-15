@@ -26,13 +26,13 @@ let private keepCommandsFor span =
 
 let private submit (name: string) (key: string) =
     task {
-        let! outcome = (newInbox ()).Submit(submission (entity name) key (Start 1), noCancellation)
+        let! outcome = (newInbox ()).SubmitAsync(submission (entity name) key (Start 1), noCancellation)
         outcome |> expectOk "submit" |> ignore
     }
 
 let private commitAt (name: string) (key: string) (effectiveAt: DateTimeOffset) (expected: Epoch) =
     task {
-        let! batch = (newInbox ()).Claim(machine, ClaimBatch.create 50, LeaseDuration.create lease, noCancellation)
+        let! batch = (newInbox ()).ClaimAsync(machine, ClaimBatch.create 50, LeaseDuration.create lease, noCancellation)
 
         let leased =
             batch
@@ -42,7 +42,7 @@ let private commitAt (name: string) (key: string) (effectiveAt: DateTimeOffset) 
 
         let! outcome =
             (newProcessor ())
-                .Commit(
+                .CommitAsync(
                     leased.Work.CommandId,
                     leased.Token,
                     expected,
@@ -55,7 +55,7 @@ let private commitAt (name: string) (key: string) (effectiveAt: DateTimeOffset) 
 
 let private suffixIncomplete (name: string) (from: DateTimeOffset) : Task<bool> =
     task {
-        let! result = (newReplayStore ()).Suffix(machine, entity name, from, 100, noCancellation)
+        let! result = (newReplayStore ()).Log.SuffixAsync(machine, entity name, from, 100, noCancellation)
         return (result |> expectOk "suffix").Incomplete
     }
 
@@ -111,7 +111,7 @@ let private retentionProperty =
                         arrange
                             $"UPDATE fsm.command SET received_at = now() - interval '2 hours' WHERE entity_id = '{name}' AND seq <= {purged}"
 
-                    let! _ = (newMaintenance ()).Run(ClaimBatch.create 100, noCancellation)
+                    let! _ = (newMaintenance ()).RunAsync(ClaimBatch.create 100, noCancellation)
 
                     let watermark = if purged = 0 then None else List.tryItem (purged - 1) times
                     let probe = baseTime.AddMinutes(float (int case.From % 120))
@@ -148,7 +148,7 @@ let private regressions =
               arrange
                   $"UPDATE fsm.command SET received_at = now() - interval '2 hours' WHERE entity_id = '{name}' AND seq = 1"
 
-              let! _ = (newMaintenance ()).Run(ClaimBatch.create 100, noCancellation)
+              let! _ = (newMaintenance ()).RunAsync(ClaimBatch.create 100, noCancellation)
 
               let! after = suffixIncomplete name (baseTime.AddHours 11.)
               Expect.isFalse after "the surviving 12h transition is all a suffix from 11h needs"
@@ -170,13 +170,13 @@ let private regressions =
               arrange
                   $"UPDATE fsm.command SET received_at = now() - interval '2 hours' WHERE entity_id = '{name}' AND seq = 1"
 
-              let! _ = (newMaintenance ()).Run(ClaimBatch.create 100, noCancellation)
+              let! _ = (newMaintenance ()).RunAsync(ClaimBatch.create 100, noCancellation)
 
               let! exactly = suffixIncomplete name (baseTime.AddHours 10.)
               Expect.isTrue exactly "the purged transition is effective exactly at the watermark"
           }
 
-          testTask "a purge that leaves no transition still reports what it removed" {
+          testTask "a rejection does not make the snapshot's successful command purgeable" {
               // The newest command is a rejection with no transition, so purging the committed
               // predecessor empties the log. The watermark still says a suffix before it is lost.
               do! reset ()
@@ -187,7 +187,7 @@ let private regressions =
               do! commitAt name "k1" (baseTime.AddHours 10.) Epoch.initial
 
               let! batch =
-                  (newInbox ()).Claim(machine, ClaimBatch.create 50, LeaseDuration.create lease, noCancellation)
+                  (newInbox ()).ClaimAsync(machine, ClaimBatch.create 50, LeaseDuration.create lease, noCancellation)
 
               let k2 =
                   batch
@@ -197,20 +197,20 @@ let private regressions =
 
               let! _ =
                   (newProcessor ())
-                      .Reject(k2.Work.CommandId, k2.Token, CommandFailure.Machine "refused", noCancellation)
+                      .RejectAsync(k2.Work.CommandId, k2.Token, CommandFailure.Machine "refused", noCancellation)
 
               arrange
                   $"UPDATE fsm.command SET received_at = now() - interval '2 hours' WHERE entity_id = '{name}' AND seq = 1"
 
-              let! _ = (newMaintenance ()).Run(ClaimBatch.create 100, noCancellation)
+              let! _ = (newMaintenance ()).RunAsync(ClaimBatch.create 100, noCancellation)
 
               Expect.equal
                   (scalar<int64> $"SELECT count(*) FROM fsm.transition WHERE entity_id = '{name}'")
-                  0L
-                  "no transition survives"
+                  1L
+                  "the snapshot pins its producing command and transition"
 
               let! before = suffixIncomplete name (baseTime.AddHours 9.)
-              Expect.isTrue before "the removed transition is still part of a suffix from before it"
+              Expect.isFalse before "no committed transition was removed"
           } ]
 
 let tests =

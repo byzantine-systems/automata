@@ -14,7 +14,8 @@ open Polly
 /// </summary>
 type PostgresContext =
     { DataSource: NpgsqlDataSource
-      Resilience: ResiliencePipeline }
+      Resilience: ResiliencePipeline
+      Schema: SchemaName }
 
 /// <summary>Builds the pooled data source the stores read and write through.</summary>
 [<RequireQualifiedAccess>]
@@ -54,11 +55,8 @@ module PostgresContext =
     /// <summary>Pairs an existing data source with a policy of the caller's choosing.</summary>
     let create (dataSource: NpgsqlDataSource) (policy: TransientPolicy) (onEvent: PipelineEventSink) : PostgresContext =
         { DataSource = dataSource
-          Resilience = DataSource.resilience policy onEvent }
+          Resilience = DataSource.resilience policy onEvent
+          Schema = SchemaName.defaults }
 
-    /// <summary>
-    /// A context from a connection string alone, on the default policy and with no event sink.
-    /// The data source it builds is owned by the caller, who disposes it.
-    /// </summary>
-    let ofConnectionString (connectionString: string) : PostgresContext =
-        create (DataSource.create connectionString) TransientPolicy.defaults ignore
+    /// <summary>Uses a validated schema for all statements executed through this context.</summary>
+    let withSchema (schema: SchemaName) (context: PostgresContext) : PostgresContext = { context with Schema = schema }

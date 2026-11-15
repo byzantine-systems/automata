@@ -4,5 +4,5 @@ SELECT
     r.registration,
     r.stored_fingerprint
 FROM
-    fsm.register_chart_version (@machine_id, @version, @fingerprint) r;
+    $schema$.register_chart_version (@machine_id, @version, @fingerprint) r;
 

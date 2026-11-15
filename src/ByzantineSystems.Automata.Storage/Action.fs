@@ -40,7 +40,7 @@ type LeasedAction<'EntityId, 'Action> = Leased<ActionWork, ActionRecord<'EntityI
 /// Delivery of the actions a commit produced.
 ///
 /// Enqueueing is not on this interface: an action is enqueued by
-/// <see cref="M:ByzantineSystems.Automata.Storage.ICommandProcessorStore`5.Commit" />, inside
+/// <see cref="M:ByzantineSystems.Automata.Storage.ICommandProcessorStore`5.CommitAsync" />, inside
 /// the same transaction as the state change, which is what makes "the transition happened and
 /// its effects were queued" a single fact. This interface is only the consumer side.
 ///
@@ -55,17 +55,18 @@ type IActionQueue<'EntityId, 'Action> =
     /// per-entity order that matters was decided when the commands were committed, and holding
     /// a slow destination's actions in that order would stall every other entity behind it.
     /// </summary>
-    abstract Claim:
-        machineId: MachineId * batch: ClaimBatch * lease: LeaseDuration * ct: CancellationToken ->
+    abstract ClaimAsync:
+        machineId: MachineId * batch: ClaimBatch * lease: LeaseDuration * cancellationToken: CancellationToken ->
             Task<Result<LeasedAction<'EntityId, 'Action> list, StoreError>>
 
     /// <summary>Marks an action delivered. Fenced: a lease that was taken over cannot complete it.</summary>
-    abstract Complete:
-        action: LeasedAction<'EntityId, 'Action> * ct: CancellationToken -> Task<Result<LeaseUpdateOutcome, StoreError>>
+    abstract CompleteAsync:
+        action: LeasedAction<'EntityId, 'Action> * cancellationToken: CancellationToken ->
+            Task<Result<LeaseUpdateOutcome, StoreError>>
 
     /// <summary>Returns a failed delivery to the queue after a backoff. Fenced.</summary>
-    abstract Reschedule:
-        action: LeasedAction<'EntityId, 'Action> * backoff: Backoff * ct: CancellationToken ->
+    abstract RescheduleAsync:
+        action: LeasedAction<'EntityId, 'Action> * backoff: Backoff * cancellationToken: CancellationToken ->
             Task<Result<LeaseUpdateOutcome, StoreError>>
 
     /// <summary>
@@ -73,8 +74,8 @@ type IActionQueue<'EntityId, 'Action> =
     /// The queue's own archive is operational forensics; the record this writes is the business
     /// fact that an effect the machine asked for never happened.
     /// </summary>
-    abstract Abandon:
-        action: LeasedAction<'EntityId, 'Action> * reason: Reason * ct: CancellationToken ->
+    abstract AbandonAsync:
+        action: LeasedAction<'EntityId, 'Action> * reason: Reason * cancellationToken: CancellationToken ->
             Task<Result<LeaseUpdateOutcome, StoreError>>
 
 /// The consumer side of explicit Discard: no claim can issue a delivery lease.
@@ -88,7 +89,13 @@ module internal ActionQueues =
                 Task.FromResult(Ok value)
 
         { new IActionQueue<'EntityId, 'Action> with
-            member _.Claim(_, _, _, ct) = answer ct []
-            member _.Complete(_, ct) = answer ct LeaseUpdateOutcome.LeaseLost
-            member _.Reschedule(_, _, ct) = answer ct LeaseUpdateOutcome.LeaseLost
-            member _.Abandon(_, _, ct) = answer ct LeaseUpdateOutcome.LeaseLost }
+            member _.ClaimAsync(_, _, _, cancellationToken) = answer cancellationToken []
+
+            member _.CompleteAsync(_, cancellationToken) =
+                answer cancellationToken LeaseUpdateOutcome.LeaseLost
+
+            member _.RescheduleAsync(_, _, cancellationToken) =
+                answer cancellationToken LeaseUpdateOutcome.LeaseLost
+
+            member _.AbandonAsync(_, _, cancellationToken) =
+                answer cancellationToken LeaseUpdateOutcome.LeaseLost }

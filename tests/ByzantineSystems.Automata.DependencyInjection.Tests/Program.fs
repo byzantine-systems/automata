@@ -7,6 +7,7 @@ let tests =
     testList
         "ByzantineSystems.Automata.DependencyInjection.Tests"
         [ RegistrationTests.registrationTests
+          PostgresRegistrationTests.postgresRegistrationTests
           ActionDispatchTests.actionDispatchTests
           SupervisionAuditTests.supervisionAuditTests
           ValidationTests.validationTests

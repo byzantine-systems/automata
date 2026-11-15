@@ -8,5 +8,5 @@ SELECT
     r.command_id,
     r.blocked
 FROM
-    fsm.repair_blocked () r;
+    $schema$.repair_blocked () r;
 

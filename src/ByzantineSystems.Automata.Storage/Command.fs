@@ -305,8 +305,8 @@ type ICommandInbox<'EntityId, 'Event> =
     /// Arrival time is nondecreasing in per-entity sequence order: database timestamps are
     /// clamped to the predecessor, while an explicitly earlier arrival is refused.
     /// </summary>
-    abstract Submit:
-        submission: CommandSubmission<'EntityId, 'Event> * ct: CancellationToken ->
+    abstract SubmitAsync:
+        submission: CommandSubmission<'EntityId, 'Event> * cancellationToken: CancellationToken ->
             Task<Result<SubmissionOutcome, StoreError>>
 
     /// <summary>
@@ -314,29 +314,32 @@ type ICommandInbox<'EntityId, 'Event> =
     /// commands for the same entity. The lease outlives this call: processing happens outside any
     /// transaction, and the token is what protects the work meanwhile.
     /// </summary>
-    abstract Claim:
-        machineId: MachineId * batch: ClaimBatch * lease: LeaseDuration * ct: CancellationToken ->
+    abstract ClaimAsync:
+        machineId: MachineId * batch: ClaimBatch * lease: LeaseDuration * cancellationToken: CancellationToken ->
             Task<Result<LeasedCommand<'EntityId, 'Event> list, StoreError>>
 
     /// <summary>
     /// Returns a failed command for a later attempt. It keeps its place in the entity's order, so
     /// nothing else for that entity runs ahead of it.
     /// </summary>
-    abstract Reschedule:
-        commandId: CommandId * token: LeaseToken<CommandWork> * backoff: Backoff * ct: CancellationToken ->
+    abstract RescheduleAsync:
+        commandId: CommandId * token: LeaseToken<CommandWork> * backoff: Backoff * cancellationToken: CancellationToken ->
             Task<Result<LeaseUpdateOutcome, StoreError>>
 
     /// <summary>Pushes out the deadline of a lease still held, for work that runs long.</summary>
-    abstract ExtendLease:
-        commandId: CommandId * token: LeaseToken<CommandWork> * lease: LeaseDuration * ct: CancellationToken ->
+    abstract ExtendLeaseAsync:
+        commandId: CommandId *
+        token: LeaseToken<CommandWork> *
+        lease: LeaseDuration *
+        cancellationToken: CancellationToken ->
             Task<Result<LeaseUpdateOutcome, StoreError>>
 
     /// <summary>Reads a command's current state without waiting for it.</summary>
-    abstract TryGet:
-        commandId: CommandId * ct: CancellationToken ->
+    abstract TryGetAsync:
+        commandId: CommandId * cancellationToken: CancellationToken ->
             Task<Result<CommandRecord<'EntityId, 'Event> option, StoreError>>
 
     /// <summary>Reads a command by the key it was submitted under.</summary>
-    abstract TryFind:
-        machineId: MachineId * entityId: 'EntityId * idempotencyKey: string * ct: CancellationToken ->
+    abstract TryFindAsync:
+        machineId: MachineId * entityId: 'EntityId * idempotencyKey: string * cancellationToken: CancellationToken ->
             Task<Result<CommandRecord<'EntityId, 'Event> option, StoreError>>

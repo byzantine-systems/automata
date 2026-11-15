@@ -33,30 +33,30 @@ type private StubMaintenance(scheduling: Scheduling) =
     member _.Schedules = Volatile.Read &schedules
 
     interface IDatabaseMaintenance with
-        member this.NotifyPending(_) =
+        member this.NotifyPendingAsync(cancellationToken) =
             Interlocked.Increment &notifies |> ignore
             Task.FromResult this.NotifyOutcome
 
-        member this.Run(_, _) =
+        member this.RunAsync(_, cancellationToken) =
             Interlocked.Increment &runs |> ignore
 
             match this.RunFault with
             | Some fault -> Task.FromException<Result<MaintenanceReport list, StoreError>> fault
             | None -> Task.FromResult(Ok [])
 
-        member this.DetectDrift(_) =
+        member this.DetectDriftAsync(cancellationToken) =
             Interlocked.Increment &detections |> ignore
             Task.FromResult(Ok this.Drift)
 
-        member _.RepairDrift(_) =
+        member _.RepairDriftAsync(cancellationToken) =
             Interlocked.Increment &repairs |> ignore
             Task.FromResult(Ok [])
 
-        member _.Schedule(_, _, _, _) =
+        member _.ScheduleAsync(_, _, _, cancellationToken) =
             Interlocked.Increment &schedules |> ignore
             Task.FromResult(Ok scheduling)
 
-        member _.Unschedule(_) = Task.FromResult(Ok 0)
+        member _.UnscheduleAsync(cancellationToken) = Task.FromResult(Ok 0)
 
 let private fast (stub: StubMaintenance) (scheduler: MaintenanceScheduler) : MaintenanceOptions =
     { MaintenanceOptions.defaults (fun _ -> stub :> IDatabaseMaintenance) with

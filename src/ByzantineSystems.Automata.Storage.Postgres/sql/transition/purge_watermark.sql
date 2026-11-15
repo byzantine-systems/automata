@@ -4,7 +4,7 @@
 SELECT
     max_purged_effective_at
 FROM
-    fsm.entity_purge
+    $schema$.entity_purge
 WHERE
     machine_id = @machine_id
     AND entity_id = @entity_id;

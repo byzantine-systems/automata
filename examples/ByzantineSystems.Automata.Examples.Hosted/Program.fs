@@ -197,6 +197,11 @@ let private readConnectionString () : string option =
     |> List.map Environment.GetEnvironmentVariable
     |> List.tryFind (String.IsNullOrWhiteSpace >> not)
 
+let private readSchema () =
+    match Environment.GetEnvironmentVariable "BS_AUTOMATA_SCHEMA" |> Option.ofObj with
+    | None -> Ok SchemaName.defaults
+    | Some value -> SchemaName.tryCreate value
+
 /// <summary>
 /// The whole production shape: one context, supervised processing and delivery, database
 /// maintenance, and a caller. Everything a host registers is here and nothing else is needed.
@@ -226,13 +231,25 @@ let configure (services: IServiceCollection) (context: PostgresContext) =
 
 [<EntryPoint>]
 let main argv =
-    match readConnectionString () with
-    | None ->
+    match readConnectionString (), readSchema () with
+    | None, _ ->
         eprintfn "Set BS_AUTOMATA_CONN to a PostgreSQL connection string, then run `make migrate`."
         1
-    | Some connectionString ->
+    | _, Error error ->
+        eprintfn "Invalid BS_AUTOMATA_SCHEMA: %A" error
+        1
+    | Some connectionString, Ok schema ->
         let builder = Host.CreateApplicationBuilder(argv)
-        configure builder.Services (PostgresContext.ofConnectionString connectionString)
+
+        // One pooled data source for the process, built here and disposed after the host has
+        // stopped: every store below shares this one pool and this one circuit.
+        use source = DataSource.create connectionString
+
+        let context =
+            PostgresContext.create source TransientPolicy.defaults ignore
+            |> PostgresContext.withSchema schema
+
+        configure builder.Services context
         use host = builder.Build()
 
         let logger =
@@ -240,9 +257,18 @@ let main argv =
 
         // Migrated before the host starts, through the host's own logging, so a schema that
         // cannot be brought up to date stops everything before any worker boots against it.
-        match Migrator.migrate logger connectionString with
+        match
+            Migrator.migrate
+                logger
+                { ConnectionString = connectionString
+                  Schema = schema
+                  Beliefs = BeliefModel.Snapshot }
+        with
         | Error(MigrationError.Failed(script, error)) ->
             logger.LogError(error, "Migration failed at {Script}", script)
+            1
+        | Error(MigrationError.ProfileMismatch(configured, installed)) ->
+            logger.LogError("Profile mismatch: configured {Configured}, installed {Installed}.", configured, installed)
             1
         | Ok _ ->
             host.Run()

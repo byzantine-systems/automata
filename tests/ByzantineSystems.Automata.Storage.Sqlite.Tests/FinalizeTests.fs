@@ -13,7 +13,7 @@ let private effectiveAt = DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero)
 let private commit (processor: Processor) (held: Claimed) (expected: Epoch) (toState: TestState) =
     task {
         let! outcome =
-            processor.Commit(
+            processor.CommitAsync(
                 held.Work.CommandId,
                 held.Token,
                 expected,
@@ -87,7 +87,7 @@ let tests =
 
               let! outcome =
                   (processorOf db)
-                      .Reject(
+                      .RejectAsync(
                           CommandId.ofInt64 404L,
                           LeaseToken.ofInt64 1L,
                           CommandFailure.Domain(Refused "no"),
@@ -114,7 +114,7 @@ let tests =
 
               let! outcome =
                   (processorOf db)
-                      .Commit(
+                      .CommitAsync(
                           held.Work.CommandId,
                           held.Token,
                           Epoch.initial,
@@ -141,7 +141,7 @@ let tests =
                       exec
                           db.Db
                           "INSERT INTO fsm_transition
-                           SELECT machine_id, entity_id, epoch + 1, command_id, chart_version, event, actions,
+                           SELECT machine_id, entity_id, epoch + 1, command_id, chart_version, actions,
                                   from_state, to_state, handled_by, exited, entered, status, effective_at, committed_at
                            FROM fsm_transition;"
                           [])

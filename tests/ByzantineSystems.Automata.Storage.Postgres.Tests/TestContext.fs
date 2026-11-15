@@ -1,6 +1,9 @@
 module ByzantineSystems.Automata.Storage.Postgres.Tests.TestContext
 
 open System
+open System.Security.Cryptography
+open System.Text
+open System.Text.RegularExpressions
 open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
@@ -42,7 +45,42 @@ let version = ChartVersion.create 1
 let fingerprint = String.replicate 64 "a"
 
 /// The queue a commit enqueues its actions into, shared by every test in this suite.
-let actionQueue = "automata_test_actions"
+let schema =
+    match Environment.GetEnvironmentVariable "AUTOMATA_TEST_SCHEMA" |> Option.ofObj with
+    | None -> SchemaName.defaults
+    | Some value ->
+        match SchemaName.tryCreate value with
+        | Ok schema -> schema
+        | Error error -> invalidOp $"Invalid AUTOMATA_TEST_SCHEMA '{value}': %A{error}"
+
+let schemaValue = SchemaName.value schema
+
+let actionQueue =
+    let digest =
+        SHA256.HashData(Encoding.UTF8.GetBytes schemaValue) |> Convert.ToHexString
+
+    $"automata_test_%s{digest[..15].ToLowerInvariant()}"
+
+/// Rewrites default-schema SQL used by tests to the selected validated schema.
+let sql (text: string) =
+    let temporal =
+        [ "instance_state_history"
+          "instance_state"
+          "current_belief"
+          "belief_cold"
+          "belief"
+          "close_and_open"
+          "split_belief"
+          "temporal_versioning"
+          "correct_beliefs" ]
+
+    (text, temporal)
+    ||> List.fold (fun text name ->
+        Regex.Replace(text, @"\bfsm\." + Regex.Escape(name) + @"\b", $"{schemaValue}_temporal.{name}"))
+    |> fun text ->
+        text
+            .Replace("fsm.", $"{schemaValue}.", StringComparison.Ordinal)
+            .Replace("'fsm'", $"'{schemaValue}'", StringComparison.Ordinal)
 
 let connectionString =
     match Environment.GetEnvironmentVariable "AUTOMATA_TEST_DB" with
@@ -60,7 +98,9 @@ let dataSource () : NpgsqlDataSource = dataSourceHolder.Force()
 /// The data source paired with the resilience every call through it runs under. Tests share one,
 /// so the circuit breaker sees the whole suite's traffic exactly as an application's would.
 let private contextHolder =
-    lazy (PostgresContext.create (dataSource ()) TransientPolicy.defaults ignore)
+    lazy
+        (PostgresContext.create (dataSource ()) TransientPolicy.defaults ignore
+         |> PostgresContext.withSchema schema)
 
 let context () : PostgresContext = contextHolder.Force()
 
@@ -69,19 +109,29 @@ let migrate () : unit =
     use conn = (dataSource ()).OpenConnection()
 
     use cmd =
-        new NpgsqlCommand("DROP SCHEMA IF EXISTS fsm CASCADE; DROP TABLE IF EXISTS public.schemaversions;", conn)
+        new NpgsqlCommand(
+            $"DROP SCHEMA IF EXISTS {schemaValue}_temporal CASCADE; DROP SCHEMA IF EXISTS {schemaValue} CASCADE;",
+            conn
+        )
 
     cmd.ExecuteNonQuery() |> ignore
 
-    match Migrator.migrate Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance connectionString with
+    match
+        Migrator.migrate
+            Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance
+            { ConnectionString = connectionString
+              Schema = schema
+              Beliefs = BeliefModel.Bitemporal }
+    with
     | Ok _ -> ()
     | Error(MigrationError.Failed(script, error)) ->
         failwithf "the fixture could not migrate at %s: %s" script error.Message
+    | Error(MigrationError.ProfileMismatch _ as error) -> failtestf "unexpected profile: %A" error
 
     // The action queue is the application's to create, not the migration's: its name is
     // configuration, and one machine's queue is not another's. An application calls this once at
     // startup; here the fixture stands in for that startup.
-    use ensure = new NpgsqlCommand("SELECT fsm.ensure_action_queue(@queue);", conn)
+    use ensure = new NpgsqlCommand(sql "SELECT fsm.ensure_action_queue(@queue);", conn)
     ensure.Parameters.AddWithValue("queue", actionQueue) |> ignore
     ensure.ExecuteNonQuery() |> ignore
 
@@ -106,14 +156,11 @@ let reset () : Task =
 
         use! conn = (dataSource ()).OpenConnectionAsync(noCancellation).AsTask()
 
-        use cmd =
-            new NpgsqlCommand(
-                // action_dead_letter references fsm.command, and TRUNCATE refuses to leave a
-                // foreign key dangling, so it is truncated in the same statement rather than
-                // separately.
-                "TRUNCATE fsm.command, fsm.command_error, fsm.transition, fsm.machine_chart_version,
+        let resetSql =
+            sql
+                $"""TRUNCATE fsm.entity_state, fsm.command, fsm.command_error, fsm.command_error_domain, fsm.command_error_machine, fsm.command_error_replay, fsm.transition, fsm.machine_chart_version,
                           fsm.supervision_event, fsm.instance_state, fsm.instance_state_history,
-                          fsm.action_dead_letter, fsm.machine_maintenance, fsm.belief_cold_state,
+                          fsm.action_dead_letter, fsm.action_quarantine, fsm.machine_maintenance,
                           fsm.command_correction, fsm.entity_purge
                           RESTART IDENTITY;
                  -- A materialized view cannot be truncated; refreshed over the emptied history,
@@ -121,14 +168,16 @@ let reset () : Task =
                  REFRESH MATERIALIZED VIEW fsm.belief_cold;
                  INSERT INTO fsm.machine_chart_version (machine_id, version, fingerprint)
                   VALUES (@machine_id, @version, @fingerprint);
-                  INSERT INTO fsm.machine_maintenance(machine_id, action_queue) VALUES (@machine_id, @queue);
+                 INSERT INTO fsm.machine_maintenance(machine_id, action_queue) VALUES (@machine_id, @queue);
                  -- The queue survives the truncate because it is pgmq's table, not ours.
                  -- Emptying it keeps one test's undelivered actions out of the next one.
                  SELECT pgmq.purge_queue(@queue);
                  -- The archive too, or one test's delivered actions are the next one's purge.
-                 DELETE FROM pgmq.a_automata_test_actions;",
-                conn
-            )
+                 DELETE FROM pgmq.a_%s{actionQueue};"""
+
+        // action_dead_letter references fsm.command, and TRUNCATE refuses to leave a foreign key
+        // dangling, so it is truncated in the same statement rather than separately.
+        use cmd = new NpgsqlCommand(resetSql, conn)
 
         cmd.Parameters.AddWithValue("machine_id", MachineId.value machine) |> ignore
         cmd.Parameters.AddWithValue("queue", actionQueue) |> ignore
@@ -159,16 +208,29 @@ let private processorStore () =
           ActionCodec = Serialization.systemTextJson<TestAction list> ()
           ErrorCodec = Serialization.systemTextJson<TestError> ()
           EntityIdEncode = encode
-          EntityIdDecode = decode }
+          EntityIdDecode = decode },
+        beliefs = BeliefModel.Bitemporal
     )
 
 let newProcessor () : Processor = processorStore () :> Processor
 
 let newReader () : Reader = processorStore () :> Reader
 
-type Replay = IReplayStore<Entity, TestState, TestEvent, TestAction>
+type Replay = CorrectionCapability<Entity, TestState, TestEvent, TestAction>
 
-let newReplayStore () : Replay = processorStore () :> Replay
+let newReplayStore () : Replay =
+    let processor = processorStore ()
+
+    { Log = processor :> ITransitionLog<Entity, TestState, TestEvent, TestAction>
+      Prior =
+        PostgresTemporalStore<Entity, TestState>(
+            { Context = context ()
+              StateCodec = Serialization.systemTextJson<TestState> ()
+              EntityIdEncode = fst (EntityKey.forEntityId<TestEntity>)
+              EntityIdDecode = snd (EntityKey.forEntityId<TestEntity>) }
+        )
+        :> IPriorState<Entity, TestState>
+      Committer = processor :> ICorrectionCommitter<Entity, TestState, TestEvent, TestAction> }
 
 /// A minimal committed transition, for tests that care about what finalize does to the inbox and
 /// the log rather than about the chart that produced it.
@@ -256,19 +318,19 @@ let commandIdOf (outcome: SubmissionOutcome) : CommandId =
     | SubmissionOutcome.Refused reason -> failtestf "submission was refused: %A" reason
 
 /// Runs a raw statement, returning the failure so a constraint test can inspect it.
-let exec (sql: string) : Result<unit, exn> =
+let exec (statement: string) : Result<unit, exn> =
     try
         use conn = (dataSource ()).OpenConnection()
-        use cmd = new NpgsqlCommand(sql, conn)
+        use cmd = new NpgsqlCommand(sql statement, conn)
         cmd.ExecuteNonQuery() |> ignore
         Ok()
     with ex ->
         Error ex
 
 /// Reads one scalar, for assertions about rows the contract deliberately does not expose.
-let scalar<'T> (sql: string) : 'T =
+let scalar<'T> (statement: string) : 'T =
     use conn = (dataSource ()).OpenConnection()
-    use cmd = new NpgsqlCommand(sql, conn)
+    use cmd = new NpgsqlCommand(sql statement, conn)
     cmd.ExecuteScalar() :?> 'T
 
 /// Every nullable column of a table in the fsm schema. Must stay empty: absence in this schema is always a
@@ -280,7 +342,8 @@ let nullableColumns () : (string * string) list =
         new NpgsqlCommand(
             // Base tables only. A view cannot carry NOT NULL, so every view column reports
             // nullable whatever the tables under it say; the rule is about what is stored.
-            "SELECT c.table_name, c.column_name FROM information_schema.columns c JOIN information_schema.tables t ON t.table_schema = c.table_schema AND t.table_name = c.table_name WHERE c.table_schema = 'fsm' AND t.table_type = 'BASE TABLE' AND c.is_nullable = 'YES' ORDER BY c.table_name, c.column_name",
+            sql
+                "SELECT c.table_name, c.column_name FROM information_schema.columns c JOIN information_schema.tables t ON t.table_schema = c.table_schema AND t.table_name = c.table_name WHERE c.table_schema = 'fsm' AND t.table_type = 'BASE TABLE' AND c.is_nullable = 'YES' ORDER BY c.table_name, c.column_name",
             conn
         )
 
@@ -301,7 +364,8 @@ let blockedDriftRows () : string list =
 
     use cmd =
         new NpgsqlCommand(
-            "SELECT command_id, machine_id, entity_id, seq, blocked, expected_blocked FROM fsm.blocked_drift ORDER BY machine_id, entity_id, seq",
+            sql
+                "SELECT command_id, machine_id, entity_id, seq, blocked, expected_blocked FROM fsm.blocked_drift ORDER BY machine_id, entity_id, seq",
             conn
         )
 
@@ -322,9 +386,9 @@ let blockedDriftRows () : string list =
 ///
 /// Lets a test execute the file the library actually embeds rather than a restatement of it, the
 /// way blockedDriftRows does, without having to rewrite the statement to fit the test.
-let rows (sql: string) (parameters: (string * obj) list) (project: NpgsqlDataReader -> 'T) : 'T list =
+let rows (statement: string) (parameters: (string * obj) list) (project: NpgsqlDataReader -> 'T) : 'T list =
     use conn = (dataSource ()).OpenConnection()
-    use cmd = new NpgsqlCommand(sql, conn)
+    use cmd = new NpgsqlCommand(sql statement, conn)
 
     for name, value in parameters do
         cmd.Parameters.AddWithValue(name, value) |> ignore
@@ -340,9 +404,9 @@ let rows (sql: string) (parameters: (string * obj) list) (project: NpgsqlDataRea
     go []
 
 /// The column names a query actually returns, for asserting the reader's contract.
-let columnsOf (sql: string) (parameters: (string * obj) list) : string list =
+let columnsOf (statement: string) (parameters: (string * obj) list) : string list =
     use conn = (dataSource ()).OpenConnection()
-    use cmd = new NpgsqlCommand(sql, conn)
+    use cmd = new NpgsqlCommand(sql statement, conn)
 
     for name, value in parameters do
         cmd.Parameters.AddWithValue(name, value) |> ignore
@@ -375,7 +439,7 @@ let believe (name: string) (at: DateTimeOffset) (state: TestState) (epoch: int64
 let newMachineStore (retention: RetentionPolicy) =
     let encode, decode = EntityKey.forEntityId<TestEntity>
 
-    PostgresMachineStore<Entity, TestState, TestEvent, TestAction, TestError>(
+    PostgresBitemporalMachineStore<Entity, TestState, TestEvent, TestAction, TestError>(
         { Context = context ()
           ActionDelivery = ActionDelivery.Deliver(ActionQueueName.create actionQueue)
           StateCodec = Serialization.systemTextJson<TestState> ()
@@ -387,6 +451,7 @@ let newMachineStore (retention: RetentionPolicy) =
           Retention = retention
           ReapAfter = LeaseDuration.create (TimeSpan.FromMinutes 5.)
           Listener = ListenerConnection.SameDataSource }
+        |> MachineStoreOptions.bitemporal
     )
 
 let newMaintenance () : IDatabaseMaintenance =
@@ -396,7 +461,7 @@ let newMaintenance () : IDatabaseMaintenance =
 let boot (retention: RetentionPolicy) : Task<unit> =
     task {
         let store = newMachineStore retention :> IStoreBoot
-        let! report = store.Boot(machine, noCancellation)
+        let! report = store.BootAsync(machine, noCancellation)
 
         match report with
         | Ok BootReport.Ready -> ()
@@ -410,9 +475,9 @@ let arrange (sql: string) : unit =
     | Error error -> failtestf "arranging failed: %s" error.Message
 
 /// The JSON plan of a statement, planned but not run.
-let explain (sql: string) : string =
+let explain (statement: string) : string =
     use conn = (dataSource ()).OpenConnection()
-    use cmd = new NpgsqlCommand($"EXPLAIN (FORMAT JSON) {sql}", conn)
+    use cmd = new NpgsqlCommand(sql $"EXPLAIN (FORMAT JSON) {statement}", conn)
     cmd.ExecuteScalar() |> string
 
 /// Every (node type, relation) pair in a JSON plan, walked rather than string-matched, so a

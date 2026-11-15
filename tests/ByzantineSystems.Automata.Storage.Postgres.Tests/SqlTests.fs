@@ -9,7 +9,7 @@ open Expecto
 /// A submission under a chart version nobody registered, which the server refuses under the
 /// command's foreign key to the version table.
 let private unregisteredSubmission =
-    let submit = StatementKey.create "command" "submit" |> Sql.prepareProgram
+    let submit = StatementKey.create "command" "submit" |> Sql.prepareProgram schema
 
     StoreProgram.queryOne
         submit
@@ -53,7 +53,7 @@ let tests =
 
               let byVersion =
                   StoreProgram.queryOne
-                      (StatementKey.create "chart" "by_version" |> Sql.prepareProgram)
+                      (StatementKey.create "chart" "by_version" |> Sql.prepareProgram schema)
                       [ "machine_id", Param.Text "nobody"; "version", Param.Int 1 ]
                       (fun reader -> Row.string reader "fingerprint" |> Ok)
 
@@ -67,8 +67,10 @@ let tests =
 
           testTask "one refuses a statement that returns more than one row" {
               let journal =
-                  StoreProgram.queryOne (StatementKey.create "system" "journal" |> Sql.prepareProgram) [] (fun reader ->
-                      Row.string reader "scriptname" |> Ok)
+                  StoreProgram.queryOne
+                      (StatementKey.create "system" "journal" |> Sql.prepareProgram schema)
+                      []
+                      (fun reader -> Row.string reader "scriptname" |> Ok)
 
               let! outcome = Sql.readProgram (context ()) journal noCancellation
 

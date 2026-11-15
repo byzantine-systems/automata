@@ -54,114 +54,49 @@ module private ProcessorMapping =
 /// <summary>
 /// The PostgreSQL end of processing a command.
 ///
-/// Every operation is one call to <c>fsm.finalize_command</c>, which is one transaction: the
-/// transition, the belief, the result and the inbox row move together or not at all. Retrying
+/// Every operation is one call to the profile commit routine, which is one transaction: the
+/// transition, the state, the result and the inbox row move together or not at all. Retrying
 /// after an ambiguous failure is safe, because the routine answers a repeated call from the same
 /// lease with what that lease already did.
 /// </summary>
-/// <summary>
-/// A replay error as the error column stores it: a kind, and the fields that kind has. Written by
-/// this library alone, so every field is required on the way back.
-/// </summary>
-[<RequireQualifiedAccess>]
-module private ReplayMapping =
-
-    let toJson (error: ReplayError) : string =
-        let node = System.Text.Json.Nodes.JsonObject()
-
-        match error with
-        | ReplayError.UnknownChartVersion version ->
-            node["kind"] <- "unknown_chart_version"
-            node["version"] <- ChartVersion.value version
-        | ReplayError.Diverged(epoch, reason) ->
-            node["kind"] <- "diverged"
-            node["epoch"] <- int64 (Epoch.value epoch)
-            node["reason"] <- reason
-        | ReplayError.BudgetExceeded limit ->
-            node["kind"] <- "budget_exceeded"
-            node["limit"] <- limit
-        | ReplayError.HistoryPurged -> node["kind"] <- "history_purged"
-
-        node.ToJsonString()
-
-    let ofJson (element: JsonElement) : Result<ReplayError, StoreError> =
-        let fail () =
-            Error(Db.decodeFailure (nameof ReplayError) "an unreadable replay error")
-
-        let field (name: string) (read: JsonElement -> 'T) =
-            match element.TryGetProperty name with
-            | true, value -> Ok(read value)
-            | _ -> fail ()
-
-        match element.TryGetProperty "kind" with
-        | true, kind ->
-            match kind.GetString() with
-            | "unknown_chart_version" ->
-                field "version" _.GetInt32()
-                |> Result.bind (fun version ->
-                    ChartVersion.tryCreate version
-                    |> Result.mapError (Db.decodeFailure "ChartVersion"))
-                |> Result.map ReplayError.UnknownChartVersion
-            | "diverged" ->
-                Result.map2
-                    (fun epoch reason -> ReplayError.Diverged(Db.epochOf epoch, reason))
-                    (field "epoch" _.GetInt64())
-                    (field "reason" _.GetString())
-            | "budget_exceeded" -> field "limit" _.GetInt32() |> Result.map ReplayError.BudgetExceeded
-            | "history_purged" -> Ok ReplayError.HistoryPurged
-            | _ -> fail ()
-        | _ -> fail ()
-
 type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
-    (options: CommandProcessorOptions<'EntityId, 'State, 'Event, 'Action, 'Err>) =
+    (options: CommandProcessorOptions<'EntityId, 'State, 'Event, 'Action, 'Err>, ?beliefs: BeliefModel) =
 
     let context = options.Context
 
     let encodeEntityId entityId =
-        options.EntityIdEncode entityId
-        |> ByzantineSystems.Automata.Storage.Internal.EntityKey.ofString
+        let key =
+            options.EntityIdEncode entityId
+            |> ByzantineSystems.Automata.Storage.Internal.EntityKey.ofString
 
-    let finalizeCommand = StatementKey.create "command" "finalize" |> Sql.prepareProgram
+        Tap.requireEntityKey "entityId" key
+        key
+
+    let prepare = Sql.prepareProgram context.Schema
+
+    let finalizeCommand =
+        match defaultArg beliefs BeliefModel.Snapshot with
+        | BeliefModel.Snapshot -> StatementKey.create "command" "finalize" |> prepare
+        | BeliefModel.Bitemporal -> StatementKey.create "command" "finalize_temporal" |> prepare
 
     let finalizeCorrection =
-        StatementKey.create "command" "finalize_correction" |> Sql.prepareProgram
+        StatementKey.create "command" "finalize_correction" |> prepare
 
-    let currentBelief = StatementKey.create "belief" "current" |> Sql.prepareProgram
+    let finalizeFailure = StatementKey.create "command" "finalize_failure" |> prepare
 
-    let historyPage =
-        StatementKey.create "transition" "history_page" |> Sql.prepareProgram
+    let currentBelief = StatementKey.create "belief" "current" |> prepare
 
-    let transitionResult =
-        StatementKey.create "transition" "result" |> Sql.prepareProgram
+    let historyPage = StatementKey.create "transition" "history_page" |> prepare
 
-    let transitionSuffix =
-        StatementKey.create "transition" "suffix" |> Sql.prepareProgram
+    let transitionResult = StatementKey.create "transition" "result" |> prepare
+
+    let transitionSuffix = StatementKey.create "transition" "suffix" |> prepare
 
     let transitionWatermark =
-        StatementKey.create "transition" "purge_watermark" |> Sql.prepareProgram
+        StatementKey.create "transition" "purge_watermark" |> prepare
 
-    /// What a commit sends beyond the command's identity: the draft and its four encoded
-    /// payloads, encoded before anything is sent.
-    let encodeDraft
-        (draft: TransitionDraft<'EntityId, 'State, 'Event, 'Action>)
-        : Result<EncodedDraft<'EntityId, 'State, 'Event, 'Action>, StoreError> =
-        match
-            options.EventCodec.Encode draft.Event,
-            options.ActionCodec.Encode draft.Actions,
-            options.StateCodec.Encode draft.FromState,
-            options.StateCodec.Encode draft.ToState
-        with
-        | Ok event, Ok actions, Ok fromState, Ok toState ->
-            Ok
-                { Source = draft
-                  EventJson = event
-                  ActionsJson = actions
-                  FromJson = fromState
-                  ToJson = toState }
-        | Error error, _, _, _
-        | _, Error error, _, _
-        | _, _, Error error, _
-        | _, _, _, Error error -> Error(Db.toStoreError error)
+    let encodeDraft expected draft =
+        DraftEncoding.encode options.StateCodec options.ActionCodec expected draft
 
     let states (ids: StateId list) : string list = ids |> List.map StateId.value
 
@@ -173,7 +108,7 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
         }
 
     /// <summary>
-    /// One call to <c>fsm.finalize_command</c>. Which half of its parameters is filled follows
+    /// One call to the profile commit routine. Which half of its parameters is filled follows
     /// from how the command ends, so the two shapes cannot be half-filled or mixed: a commit
     /// sends its transition and no error, a failure sends its error and no transition.
     ///
@@ -193,29 +128,16 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                 let draft = encoded.Source
 
                 [ "error", Param.JsonbOrNull None
-                  "state", Param.JsonbOrNull(Some encoded.ToJson)
                   "instance_status", Param.TextOrNull(Some(EnumCodec.encode EnumCodec.instanceStatus draft.Status))
                   "effective_at", Param.TimestampOrNull(Some draft.EffectiveAt)
-                  "event", Param.JsonbOrNull(Some encoded.EventJson)
                   "actions", Param.JsonbOrNull(Some encoded.ActionsJson)
-                  "from_state", Param.JsonbOrNull(Some encoded.FromJson)
+                  "from_state", Param.JsonbOrNull(CommitOrigin.payload encoded.Origin)
                   "to_state", Param.JsonbOrNull(Some encoded.ToJson)
                   "handled_by", Param.TextOrNull(Some(StateId.value draft.HandledBy))
                   "exited", Param.TextArrayOrNull(Some(states draft.Exited))
                   "entered", Param.TextArrayOrNull(Some(states draft.Entered)) ]
-            | Reject error
-            | DeadLetter error ->
-                [ "error", Param.JsonbOrNull(Some error)
-                  "state", Param.JsonbOrNull None
-                  "instance_status", Param.TextOrNull None
-                  "effective_at", Param.TimestampOrNull None
-                  "event", Param.JsonbOrNull None
-                  "actions", Param.JsonbOrNull None
-                  "from_state", Param.JsonbOrNull None
-                  "to_state", Param.JsonbOrNull None
-                  "handled_by", Param.TextOrNull None
-                  "exited", Param.TextArrayOrNull None
-                  "entered", Param.TextArrayOrNull None ]
+            | Reject _
+            | DeadLetter _ -> invalidOp "Failures use the relational failure program."
 
         StoreProgram.queryOne
             finalizeCommand
@@ -225,6 +147,8 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                "status", Param.Text(EnumCodec.encode EnumCodec.commandStatus (Resolution.status resolution)) ]
              @ ending)
             (finalizeOutcome expected)
+        |> AtomicFinalization
+        |> FinalizeProgram.finish
 
     /// <summary>
     /// The failure column is a tagged envelope rather than the bare domain error, because the
@@ -233,43 +157,12 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     /// library wrote. Reading a row and guessing which one it holds is not possible once they
     /// share a column, so the tag goes in.
     /// </summary>
-    let encodeFailure (failure: CommandFailure<'Err>) : Result<string, StoreError> =
-        match failure with
-        | CommandFailure.Domain error ->
-            options.ErrorCodec.Encode error
-            |> Result.mapError Db.toStoreError
-            |> Result.map (fun encoded -> $"""{{"domain":%s{encoded}}}""")
-        | CommandFailure.Machine reason -> Ok $"""{{"machine":%s{JsonSerializer.Serialize reason}}}"""
-        | CommandFailure.Replay error -> Ok $"""{{"replay":%s{ReplayMapping.toJson error}}}"""
-
-    let readFailure (json: string) : Result<CommandFailure<'Err>, StoreError> =
-        match Db.parseJson (nameof CommandFailure) json with
-        | Error error -> Error error
-        | Ok parsed ->
-            use document = parsed
-            let root = document.RootElement
-
-            match root.TryGetProperty "domain" with
-            | true, domain ->
-                domain.GetRawText()
-                |> options.ErrorCodec.Decode
-                |> Result.mapError Db.toStoreError
-                |> Result.map CommandFailure.Domain
-            | _ ->
-                match root.TryGetProperty "machine", root.TryGetProperty "replay" with
-                | (true, machine), _ when machine.ValueKind = JsonValueKind.String ->
-                    Ok(CommandFailure.Machine(machine.GetString()))
-                | _, (true, replay) -> ReplayMapping.ofJson replay |> Result.map CommandFailure.Replay
-                | _ ->
-                    Error(
-                        Db.decodeFailure
-                            (nameof CommandFailure)
-                            "a command error carried no domain, machine or replay tag"
-                    )
+    let encodeFailure failure =
+        FailureEncoding.encode options.ErrorCodec failure
 
     /// A rejection or a dead letter, encoded before anything is sent.
     let fail
-        (resolve: string -> Resolution<'EntityId, 'State, 'Event, 'Action>)
+        (resolve: EncodedFailure -> Resolution<'EntityId, 'State, 'Event, 'Action>)
         (commandId: CommandId)
         token
         (failure: CommandFailure<'Err>)
@@ -277,7 +170,26 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
         =
         backgroundTaskResult {
             let! encoded = encodeFailure failure
-            return! Sql.runProgram context (finalize commandId token (resolve encoded)) ct
+            let fields = FailureEncoding.fields encoded
+
+            return!
+                Sql.runProgram
+                    context
+                    (StoreProgram.queryOne
+                        finalizeFailure
+                        [ Params.commandId "command_id" commandId
+                          Params.commandLease "lease_token" token
+                          "status",
+                          Param.Text(EnumCodec.encode EnumCodec.commandStatus (Resolution.status (resolve encoded)))
+                          "kind", Param.Text fields.Kind
+                          "domain", Param.Jsonb fields.Domain
+                          "reason", Param.Text fields.Reason
+                          "replay_kind", Param.Text fields.ReplayKind
+                          "version", Param.Int fields.Version
+                          "failure_epoch", Param.Bigint fields.Epoch
+                          "budget", Param.Int fields.Budget ]
+                        (finalizeOutcome Epoch.initial))
+                    ct
         }
 
     /// <summary>
@@ -287,27 +199,29 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     /// by the history page, the result read and the replay suffix, so one row shape has one
     /// reader.
     /// </summary>
-    let transitionRow (reader: NpgsqlDataReader) : fsm.transition =
-        { machine_id = Row.string reader "machine_id"
-          entity_id = Row.string reader "entity_id"
-          epoch = Row.int64 reader "epoch"
-          command_id = Row.int64 reader "command_id"
-          chart_version = Row.int32 reader "chart_version"
-          event = Row.string reader "event"
-          actions = Row.string reader "actions"
-          from_state = Row.string reader "from_state"
-          to_state = Row.string reader "to_state"
-          handled_by = Row.string reader "handled_by"
-          exited = reader.GetFieldValue<string[]>(reader.GetOrdinal "exited")
-          entered = reader.GetFieldValue<string[]>(reader.GetOrdinal "entered")
-          status = Row.string reader "status"
-          effective_at = reader.GetDateTime(reader.GetOrdinal "effective_at")
-          committed_at = reader.GetDateTime(reader.GetOrdinal "committed_at") }
+    let transitionRow (reader: NpgsqlDataReader) : fsm.transition * string =
+        let row: fsm.transition =
+            { machine_id = Row.string reader "machine_id"
+              entity_id = Row.string reader "entity_id"
+              epoch = Row.int64 reader "epoch"
+              command_id = Row.int64 reader "command_id"
+              chart_version = Row.int32 reader "chart_version"
+              actions = Row.string reader "actions"
+              from_state = Row.string reader "from_state"
+              to_state = Row.string reader "to_state"
+              handled_by = Row.string reader "handled_by"
+              exited = reader.GetFieldValue<string[]>(reader.GetOrdinal "exited")
+              entered = reader.GetFieldValue<string[]>(reader.GetOrdinal "entered")
+              status = Row.string reader "status"
+              effective_at = reader.GetDateTime(reader.GetOrdinal "effective_at")
+              committed_at = reader.GetDateTime(reader.GetOrdinal "committed_at") }
+
+        row, Row.string reader "event"
 
     /// Rebuilds a committed transition from its row. Seven decodes can fail independently, and
     /// none of them is expected: each means the row is not what this code was compiled for.
     let toTransition
-        (row: fsm.transition)
+        ((row, eventJson): fsm.transition * string)
         : Result<CommittedTransition<'EntityId, 'State, 'Event, 'Action>, StoreError> =
         let decode (codec: Codec<'T>) (json: string) =
             codec.Decode json |> Result.mapError Db.toStoreError
@@ -324,7 +238,7 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                 |> options.EntityIdDecode
                 |> Result.mapError (Db.decodeFailure "EntityId")
 
-            let! event = decode options.EventCodec row.event
+            let! event = decode options.EventCodec eventJson
             let! actions = decode options.ActionCodec row.actions
             let! fromState = decode options.StateCodec row.from_state
             let! toState = decode options.StateCodec row.to_state
@@ -402,18 +316,26 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
             else
                 Some(transitionRow reader)
 
-        let error =
-            let marker = reader.GetOrdinal "error"
-
-            if reader.IsDBNull marker then
-                None
-            else
-                Some(Row.string reader "error")
-
         let failure () =
-            match error with
-            | Some error -> readFailure error
-            | None -> Error(Db.decodeFailure (nameof CommandResult) "a failed command has no recorded error")
+            let optional column =
+                if reader.IsDBNull(reader.GetOrdinal column) then
+                    None
+                else
+                    Some(Row.string reader column)
+
+            FailureEncoding.decode
+                options.ErrorCodec
+                { Kind = optional "failure_kind"
+                  Domain = optional "domain_error"
+                  Machine = optional "machine_reason"
+                  Replay =
+                    optional "replay_kind"
+                    |> Option.map (fun kind ->
+                        kind,
+                        Row.int32 reader "failure_version",
+                        Row.int64 reader "failure_epoch",
+                        Row.string reader "replay_reason",
+                        Row.int32 reader "failure_budget") }
 
         EnumCodec.read Row.string EnumCodec.commandStatus "command_status" reader
         |> Result.bind (fun status ->
@@ -428,118 +350,160 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
 
     interface IStateReader<'EntityId, 'State, 'Event, 'Action> with
 
-        member _.TryGetSnapshot(machineId, entityId, ct) =
-            Sql.readProgram
-                context
-                (StoreProgram.tryQueryOne
-                    currentBelief
-                    [ Params.machineId "machine_id" machineId
-                      Params.entityKey "entity_id" (encodeEntityId entityId) ]
-                    snapshotRow)
-                ct
+        member _.TryGetSnapshotAsync(machineId, entityId, cancellationToken) =
+            Tap.requireMachineId (nameof machineId) machineId
+            Tap.requireArg (nameof entityId) entityId
 
-        member _.History(machineId, entityId, paging, ct) =
-            // An absent cursor is zero rather than a null, because transition_epoch_positive
-            // forbids a stored epoch of zero. One query shape then serves every page.
-            let after =
-                Page.cursor paging
-                |> Option.map (Epoch.value >> int64)
-                |> Option.defaultValue 0L
+            Tap.start cancellationToken (fun () ->
+                Sql.readProgram
+                    context
+                    (StoreProgram.tryQueryOne
+                        currentBelief
+                        [ Params.machineId "machine_id" machineId
+                          Params.entityKey "entity_id" (encodeEntityId entityId) ]
+                        snapshotRow)
+                    cancellationToken)
 
-            Sql.readProgram
-                context
-                (StoreProgram.queryRows
-                    historyPage
-                    [ Params.machineId "machine_id" machineId
-                      Params.entityKey "entity_id" (encodeEntityId entityId)
-                      "after", Param.Bigint after
-                      "limit", Param.Int(Page.limit paging) ]
-                    (transitionRow >> toTransition))
-                ct
+        member _.HistoryAsync(machineId, entityId, paging, cancellationToken) =
+            Tap.requireMachineId (nameof machineId) machineId
+            Tap.requireArg (nameof entityId) entityId
+
+            Tap.start cancellationToken (fun () ->
+                // An absent cursor is zero rather than a null, because transition_epoch_positive
+                // forbids a stored epoch of zero. One query shape then serves every page.
+                let after =
+                    Page.cursor paging
+                    |> Option.map (Epoch.value >> int64)
+                    |> Option.defaultValue 0L
+
+                Sql.readProgram
+                    context
+                    (StoreProgram.queryRows
+                        historyPage
+                        [ Params.machineId "machine_id" machineId
+                          Params.entityKey "entity_id" (encodeEntityId entityId)
+                          "after", Param.Bigint after
+                          "limit", Param.Int(Page.limit paging) ]
+                        (transitionRow >> toTransition))
+                    cancellationToken)
 
     interface ICommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err> with
 
-        member _.Commit(commandId, token, expected, draft, ct) =
-            backgroundTaskResult {
-                let! encoded = encodeDraft draft
-                return! Sql.runProgram context (finalize commandId token (Commit(expected, encoded))) ct
-            }
+        member _.CommitAsync(commandId, token, expected, draft, cancellationToken) =
+            Tap.requireArg (nameof commandId) commandId
+            Tap.requireArg (nameof token) token
+            Tap.requireArg (nameof draft) draft
 
-        member _.Reject(commandId, token, error, ct) = fail Reject commandId token error ct
+            Tap.start cancellationToken (fun () ->
+                backgroundTaskResult {
+                    let! encoded = encodeDraft (Some expected) draft
 
-        member _.DeadLetter(commandId, token, error, ct) =
-            fail DeadLetter commandId token error ct
-
-        member _.TryGetResult(commandId, ct) =
-            Sql.readProgram
-                context
-                (StoreProgram.tryQueryOne transitionResult [ Params.commandId "command_id" commandId ] resultRow)
-                ct
-
-    interface IReplayStore<'EntityId, 'State, 'Event, 'Action> with
-
-        member _.Suffix(machineId, entityId, from, limit, ct) =
-            Sql.readProgram
-                context
-                (store {
-                    let! suffix =
-                        StoreProgram.queryRows
-                            transitionSuffix
-                            [ Params.machineId "machine_id" machineId
-                              Params.entityKey "entity_id" (encodeEntityId entityId)
-                              "from", Param.Timestamp from
-                              "limit", Param.Int limit ]
-                            (transitionRow >> toTransition)
-
-                    // Retention purges an entity's oldest commands with their transitions, and
-                    // records the greatest effective instant it removed as a watermark. A suffix
-                    // whose start is at or before that watermark may have lost events; one that
-                    // starts strictly after it has not. The suffix is read first, so a concurrent
-                    // purge cannot pair a post-purge suffix with a stale pre-purge watermark.
-                    let! watermark =
-                        StoreProgram.tryQueryOne
-                            transitionWatermark
-                            [ Params.machineId "machine_id" machineId
-                              Params.entityKey "entity_id" (encodeEntityId entityId) ]
-                            (fun reader -> Row.timestamp reader "max_purged_effective_at" |> Ok)
-
-                    let incomplete =
-                        match watermark with
-                        | Some maxPurged -> maxPurged >= from
-                        | None -> false
-
-                    return
-                        { Transitions = suffix
-                          Incomplete = incomplete }
+                    return!
+                        Sql.runProgram context (finalize commandId token (Commit(expected, encoded))) cancellationToken
                 })
-                ct
 
-        member _.CommitCorrection(commandId, token, expected, commit, ct) =
-            backgroundTaskResult {
-                // Everything is encoded before anything is sent, so a state that will not encode
-                // fails the correction rather than half-writing it.
-                let! encoded = encodeDraft commit.Transition
-                let head, tail = commit.Beliefs
-                let! beliefs = BeliefPayload.encode options.StateCodec (head :: tail)
-                let draft = commit.Transition
+        member _.RejectAsync(commandId, token, error, cancellationToken) =
+            Tap.requireArg (nameof commandId) commandId
+            Tap.requireArg (nameof token) token
+            Tap.requireArg (nameof error) error
 
-                return!
-                    Sql.runProgram
-                        context
-                        (StoreProgram.queryOne
-                            finalizeCorrection
-                            [ Params.commandId "command_id" commandId
-                              Params.commandLease "lease_token" token
-                              "expected_epoch", Param.Bigint(int64 (Epoch.value expected))
-                              "valid_from", Param.Timestamp commit.ValidFrom
-                              "beliefs", Param.Jsonb beliefs
-                              "instance_status", Param.Text(EnumCodec.encode EnumCodec.instanceStatus draft.Status)
-                              "event", Param.Jsonb encoded.EventJson
-                              "from_state", Param.Jsonb encoded.FromJson
-                              "to_state", Param.Jsonb encoded.ToJson
-                              "handled_by", Param.Text(StateId.value draft.HandledBy)
-                              "exited", Param.TextArray(states draft.Exited)
-                              "entered", Param.TextArray(states draft.Entered) ]
-                            (finalizeOutcome expected))
-                        ct
-            }
+            Tap.start cancellationToken (fun () -> fail Reject commandId token error cancellationToken)
+
+        member _.DeadLetterAsync(commandId, token, error, cancellationToken) =
+            Tap.requireArg (nameof commandId) commandId
+            Tap.requireArg (nameof token) token
+            Tap.requireArg (nameof error) error
+
+            Tap.start cancellationToken (fun () -> fail DeadLetter commandId token error cancellationToken)
+
+        member _.TryGetResultAsync(commandId, cancellationToken) =
+            Tap.requireArg (nameof commandId) commandId
+
+            Tap.start cancellationToken (fun () ->
+                Sql.readProgram
+                    context
+                    (StoreProgram.tryQueryOne transitionResult [ Params.commandId "command_id" commandId ] resultRow)
+                    cancellationToken)
+
+    interface ITransitionLog<'EntityId, 'State, 'Event, 'Action> with
+
+        member _.SuffixAsync(machineId, entityId, from, limit, cancellationToken) =
+            Tap.requireMachineId (nameof machineId) machineId
+            Tap.requireArg (nameof entityId) entityId
+
+            Tap.start cancellationToken (fun () ->
+                // Encoded before the program is built, so a null entity id is a usage error
+                // at the call site rather than a failure inside the read: the builder defers
+                // everything it is handed.
+                let key = encodeEntityId entityId
+
+                Sql.readProgram
+                    context
+                    (store {
+                        let! suffix =
+                            StoreProgram.queryRows
+                                transitionSuffix
+                                [ Params.machineId "machine_id" machineId
+                                  Params.entityKey "entity_id" key
+                                  "from", Param.Timestamp from
+                                  "limit", Param.Int limit ]
+                                (transitionRow >> toTransition)
+
+                        // Retention purges an entity's oldest commands with their transitions, and
+                        // records the greatest effective instant it removed as a watermark. A suffix
+                        // whose start is at or before that watermark may have lost events; one that
+                        // starts strictly after it has not. The suffix is read first, so a concurrent
+                        // purge cannot pair a post-purge suffix with a stale pre-purge watermark.
+                        let! watermark =
+                            StoreProgram.tryQueryOne
+                                transitionWatermark
+                                [ Params.machineId "machine_id" machineId; Params.entityKey "entity_id" key ]
+                                (fun reader -> Row.timestamp reader "max_purged_effective_at" |> Ok)
+
+                        let incomplete =
+                            match watermark with
+                            | Some maxPurged -> maxPurged >= from
+                            | None -> false
+
+                        return
+                            { Transitions = suffix
+                              Incomplete = incomplete }
+                    })
+                    cancellationToken)
+
+    interface ICorrectionCommitter<'EntityId, 'State, 'Event, 'Action> with
+
+        member _.CommitCorrectionAsync(commandId, token, expected, commit, cancellationToken) =
+            Tap.requireArg (nameof commandId) commandId
+            Tap.requireArg (nameof token) token
+            Tap.requireArg (nameof commit) commit
+
+            Tap.start cancellationToken (fun () ->
+                backgroundTaskResult {
+                    // Everything is encoded before anything is sent, so a state that will not encode
+                    // fails the correction rather than half-writing it.
+                    let! encoded = encodeDraft None commit.Transition
+                    let head, tail = commit.Beliefs
+                    let! beliefs = BeliefBatch.encode options.StateCodec (head :: tail)
+                    let draft = commit.Transition
+
+                    return!
+                        Sql.runProgram
+                            context
+                            (StoreProgram.queryOne
+                                finalizeCorrection
+                                ([ Params.commandId "command_id" commandId
+                                   Params.commandLease "lease_token" token
+                                   "expected_epoch", Param.Bigint(int64 (Epoch.value expected))
+                                   "valid_from", Param.Timestamp commit.ValidFrom
+                                   "instance_status",
+                                   Param.Text(EnumCodec.encode EnumCodec.instanceStatus draft.Status)
+                                   "from_state", Param.JsonbOrNull(CommitOrigin.payload encoded.Origin)
+                                   "to_state", Param.Jsonb encoded.ToJson
+                                   "handled_by", Param.Text(StateId.value draft.HandledBy)
+                                   "exited", Param.TextArray(states draft.Exited)
+                                   "entered", Param.TextArray(states draft.Entered) ]
+                                 @ BeliefBatch.parameters beliefs)
+                                (finalizeOutcome expected))
+                            cancellationToken
+                })

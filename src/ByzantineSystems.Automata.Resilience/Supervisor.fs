@@ -359,7 +359,7 @@ module Supervisor =
     /// Best-effort child stop: give it its shutdown budget, then its completion a
     /// short grace. Canceling the monitor after that grace makes abandonment bounded.
     let private stopChild (timeProvider: TimeProvider) (childSpec: ChildSpec) (instance: ChildInstance) : Task =
-        task {
+        backgroundTask {
             use budget = new CancellationTokenSource(childSpec.Shutdown)
 
             let stopTask =
@@ -413,7 +413,7 @@ module Supervisor =
         let agent =
             MailboxProcessor.Start(fun inbox ->
                 let startEffect index generation purpose childSpec =
-                    task {
+                    backgroundTask {
                         let! result = startChild childSpec childrenCancellation.Token |> TaskOutcome.capture
 
                         inbox.Post(StartFinished(index, generation, purpose, result))
@@ -421,7 +421,7 @@ module Supervisor =
                     |> ignore<Task>
 
                 let monitorEffect index instance =
-                    task {
+                    backgroundTask {
                         let! outcome =
                             instance.Child.Completion.WaitAsync(instance.MonitorCancellation.Token)
                             |> TaskOutcome.captureUnit
@@ -437,7 +437,7 @@ module Supervisor =
                     |> ignore<Task>
 
                 let stopEffect index childSpec instance afterStop =
-                    task {
+                    backgroundTask {
                         let! outcome = stopChild timeProvider childSpec instance |> TaskOutcome.captureUnit
 
                         match outcome with
@@ -449,7 +449,7 @@ module Supervisor =
                     |> ignore<Task>
 
                 let delayEffect index generation delay =
-                    task {
+                    backgroundTask {
                         let! outcome =
                             Task.Delay(delay, timeProvider, childrenCancellation.Token)
                             |> TaskOutcome.captureUnit
@@ -963,7 +963,7 @@ module Supervisor =
             member _.Completion: Task = completion.Task
 
             member _.StopAsync(stopToken: CancellationToken) : Task<unit> =
-                task {
+                backgroundTask {
                     let waiter =
                         TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
 
@@ -991,7 +991,7 @@ module Supervisor =
         | Ok spec ->
             let instance = SupervisorInstance(spec, timeProvider, ct)
 
-            task {
+            backgroundTask {
                 do! instance.Begin()
                 return instance :> ISupervisor
             }

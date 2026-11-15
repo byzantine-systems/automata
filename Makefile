@@ -7,6 +7,8 @@ NIX ?= nix
 FANTOMAS ?= fantomas
 DB_CONNECTION_STRING ?= Host=127.0.0.1;Port=5432;Database=$(PROJECT_NAME);Username=$(PROJECT_NAME);Password=$(PROJECT_NAME)
 DB_URL ?= postgresql://$(PROJECT_NAME):$(PROJECT_NAME)@127.0.0.1:5432/$(PROJECT_NAME)
+SCHEMA ?= fsm
+BELIEFS ?= snapshot
 
 SOLUTION := bs-automata.slnx
 POSTGRES_PROJECT := src/ByzantineSystems.Automata.Storage.Postgres/ByzantineSystems.Automata.Storage.Postgres.fsproj
@@ -52,9 +54,12 @@ PROJECT_FILES := $(wildcard src/*/*.fsproj tests/*/*.fsproj tools/*/*.fsproj exa
 RESTORE_INPUTS := Makefile $(SOLUTION) global.json nuget.config $(PROJECT_FILES) \
 	$(wildcard Directory.Build.* Directory.Packages.*)
 
-.PHONY: build test test-unit test-integration coverage migrate schema-generate schema-check migrate-sqlite-schema schema-generate-sqlite schema-check-sqlite run-example run-example-supervision run-example-hosted db db-reset fmt docs nix-lock pack package-smoke push
+.PHONY: async-context-check build test test-unit test-integration test-integration-schema coverage migrate schema-generate schema-check migrate-sqlite-schema schema-generate-sqlite schema-check-sqlite run-example run-example-supervision run-example-hosted db db-reset fmt docs nix-lock pack package-smoke push
 
-build:
+async-context-check:
+	bash scripts/verify-async-context.sh
+
+build: async-context-check
 	$(DOTNET) build $(SOLUTION) -m:1
 
 test: test-unit
@@ -69,6 +74,12 @@ test-integration: build
 	@for project in $(INTEGRATION_TEST_PROJECTS); do \
 		$(DOTNET) run --project $$project --no-build || exit 1; \
 	done
+
+# The PostgreSQL suite is schema-agnostic: run it on the default schema and on a second one,
+# to prove a machine does not depend on the literal 'fsm'. This is the D7 CI matrix.
+test-integration-schema: build
+	AUTOMATA_TEST_DB='$(DB_CONNECTION_STRING)' $(DOTNET) run --project tests/ByzantineSystems.Automata.Storage.Postgres.Tests/ByzantineSystems.Automata.Storage.Postgres.Tests.fsproj --no-build
+	AUTOMATA_TEST_DB='$(DB_CONNECTION_STRING)' AUTOMATA_TEST_SCHEMA='automata_ci' $(DOTNET) run --project tests/ByzantineSystems.Automata.Storage.Postgres.Tests/ByzantineSystems.Automata.Storage.Postgres.Tests.fsproj --no-build
 
 coverage:
 	@test -n "$${AUTOMATA_TEST_DB:-}" || { echo "AUTOMATA_TEST_DB must be set to run all coverage tests." >&2; exit 1; }
@@ -95,7 +106,7 @@ coverage:
 	@echo "HTML coverage report: $(COVERAGE_DIR)/html/index.html"
 
 migrate:
-	BS_AUTOMATA_CONN='$(DB_CONNECTION_STRING)' $(DOTNET) run --project $(MIGRATE_PROJECT)
+	BS_AUTOMATA_CONN='$(DB_CONNECTION_STRING)' BS_AUTOMATA_SCHEMA='$(SCHEMA)' BS_AUTOMATA_BELIEFS='$(BELIEFS)' $(DOTNET) run --project $(MIGRATE_PROJECT)
 
 # The generated schema types come from the migrated database, so both targets migrate first.
 # Regenerate after any migration that changes a table or view the stores read.
@@ -142,11 +153,14 @@ run-example-hosted:
 db:
 	psql '$(DB_URL)'
 
-# cron.job rows outlive DROP SCHEMA, so the pg_cron ticks are removed first; the DO block
-# makes that a no-op on a database where the routine was never installed.
+# Global pg_cron jobs and pgmq queues outlive DROP SCHEMA, so remove this installation's
+# objects first. The block is a no-op when the schema was never migrated. The leading guard
+# refuses anything the store itself would refuse — invalid characters, the pg_ prefix and the
+# protected schemas — because this recipe drops with CASCADE and must not be talked into
+# dropping a schema Automata does not own.
 db-reset:
-	psql '$(DB_URL)' -v ON_ERROR_STOP=1 -c "DO \$$\$$ BEGIN IF to_regproc('fsm.unschedule_maintenance') IS NOT NULL THEN PERFORM fsm.unschedule_maintenance(); END IF; END \$$\$$;" -c 'DROP SCHEMA IF EXISTS fsm CASCADE; DROP TABLE IF EXISTS public.schemaversions;'
-	$(MAKE) migrate DB_CONNECTION_STRING='$(DB_CONNECTION_STRING)'
+	PGOPTIONS='-c automata.schema=$(SCHEMA)' psql '$(DB_URL)' --set=ON_ERROR_STOP=1 -c "DO \$$\$$ DECLARE schema_name text := current_setting('automata.schema'); queue_name text; BEGIN IF schema_name !~ '^[a-z_][a-z0-9_]*\$$' OR schema_name IN ('public', 'information_schema', 'pgmq', 'cron') OR left(schema_name, 3) = 'pg_' THEN RAISE EXCEPTION 'db-reset refuses the schema name %', schema_name; END IF; IF to_regnamespace(schema_name) IS NOT NULL THEN IF to_regprocedure(format('%I.unschedule_maintenance()', schema_name)) IS NOT NULL THEN EXECUTE format('SELECT %I.unschedule_maintenance()', schema_name); END IF; IF to_regclass(format('%I.machine_maintenance', schema_name)) IS NOT NULL THEN FOR queue_name IN EXECUTE format('SELECT DISTINCT action_queue FROM %I.machine_maintenance WHERE action_queue <> ''''', schema_name) LOOP PERFORM pgmq.drop_queue(queue_name); END LOOP; END IF; END IF; FOR queue_name IN SELECT substring(c.relname FROM 3) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'pgmq' AND left(c.relname, 2) = 'q_' AND pg_catalog.obj_description(c.oid, 'pg_class') = format('automata:%s', schema_name) LOOP PERFORM pgmq.drop_queue(queue_name); END LOOP; EXECUTE format('DROP SCHEMA IF EXISTS %I CASCADE', schema_name); EXECUTE format('DROP SCHEMA IF EXISTS %I CASCADE', schema_name || '_temporal'); END \$$\$$;"
+	$(MAKE) migrate DB_CONNECTION_STRING='$(DB_CONNECTION_STRING)' SCHEMA='$(SCHEMA)'
 
 fmt:
 	$(NIX) fmt

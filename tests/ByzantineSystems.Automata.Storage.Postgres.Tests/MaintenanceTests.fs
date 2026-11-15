@@ -9,12 +9,14 @@ open ByzantineSystems.Automata.Storage
 open ByzantineSystems.Automata.Storage.Postgres
 open Expecto
 open Npgsql
+open FsCheck
 open TestContext
 
 let private entity name : Entity = entityId name
 let private lease = TimeSpan.FromSeconds 30.0
 let private hour = TimeSpan.FromHours 1.0
 let private effectiveAt = DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero)
+let private commandChannel, actionChannel = Listener.channels schema
 
 let private keepCommandsFor span =
     { RetentionPolicy.keepEverything with
@@ -27,7 +29,7 @@ let private keepCommandsFor span =
 
 let private submit (name: string) (key: string) =
     task {
-        let! outcome = (newInbox ()).Submit(submission (entity name) key (Start 1), noCancellation)
+        let! outcome = (newInbox ()).SubmitAsync(submission (entity name) key (Start 1), noCancellation)
         return outcome |> expectOk "submit" |> commandIdOf
     }
 
@@ -37,13 +39,13 @@ let private submitCorrection (name: string) (key: string) =
             { submission (entity name) key (Start 1) with
                 Kind = CommandKind.Correction(effectiveAt, CorrectionPolicy.defaults) }
 
-        let! outcome = (newInbox ()).Submit(correction, noCancellation)
+        let! outcome = (newInbox ()).SubmitAsync(correction, noCancellation)
         return outcome |> expectOk "submit correction" |> commandIdOf
     }
 
 let private claimed (key: string) =
     task {
-        let! batch = (newInbox ()).Claim(machine, ClaimBatch.create 50, LeaseDuration.create lease, noCancellation)
+        let! batch = (newInbox ()).ClaimAsync(machine, ClaimBatch.create 50, LeaseDuration.create lease, noCancellation)
 
         return
             batch
@@ -56,7 +58,7 @@ let private commit (leased: LeasedCommand<Entity, TestEvent>) (expected: Epoch) 
     task {
         let! outcome =
             (newProcessor ())
-                .Commit(
+                .CommitAsync(
                     leased.Work.CommandId,
                     leased.Token,
                     expected,
@@ -71,14 +73,14 @@ let private reject (leased: LeasedCommand<Entity, TestEvent>) =
     task {
         let! outcome =
             (newProcessor ())
-                .Reject(leased.Work.CommandId, leased.Token, CommandFailure.Machine "refused", noCancellation)
+                .RejectAsync(leased.Work.CommandId, leased.Token, CommandFailure.Machine "refused", noCancellation)
 
         outcome |> expectOk "reject" |> ignore
     }
 
 let private run (batch: int) =
     task {
-        let! reports = (newMaintenance ()).Run(ClaimBatch.create batch, noCancellation)
+        let! reports = (newMaintenance ()).RunAsync(ClaimBatch.create batch, noCancellation)
         return reports |> expectOk "run"
     }
 
@@ -115,7 +117,7 @@ let private settle (conn: NpgsqlConnection) (quiet: TimeSpan) =
 
 let private notify () =
     task {
-        let! tick = (newMaintenance ()).NotifyPending noCancellation
+        let! tick = (newMaintenance ()).NotifyPendingAsync noCancellation
         return tick |> expectOk "notify"
     }
 
@@ -129,7 +131,7 @@ let private explainNotify () : string =
 
     let body =
         use read =
-            new NpgsqlCommand("SELECT prosrc FROM pg_proc WHERE oid = 'fsm.notify_pending()'::regprocedure", conn)
+            new NpgsqlCommand(sql "SELECT prosrc FROM pg_proc WHERE oid = 'fsm.notify_pending()'::regprocedure", conn)
 
         read.ExecuteScalar() :?> string
 
@@ -178,7 +180,7 @@ let pureTests =
                     HasPgmq = false }
 
               Expect.equal
-                  (Boot.defects nothing None [ "a" ])
+                  (Boot.defects SchemaName.defaults nothing None [ "a" ])
                   [ BootDefect.MissingPrerequisite "btree_gist"
                     BootDefect.MissingPrerequisite "pgmq"
                     BootDefect.SchemaMissing ]
@@ -194,9 +196,28 @@ let pureTests =
                     HasPgmq = true }
 
               Expect.equal
-                  (Boot.defects noRoutines (Some [ "a" ]) [ "a" ])
+                  (Boot.defects SchemaName.defaults noRoutines (Some [ "a" ]) [ "a" ])
                   [ BootDefect.MissingPrerequisite "fsm routines (the repeatable migrations)" ]
                   "numbered migrations alone are not a working schema"
+          }
+
+          test "a missing journal names the configured schema, not the legacy public one" {
+              let noJournal =
+                  { HasSchema = true
+                    HasJournal = false
+                    HasRoutines = true
+                    HasBtreeGist = true
+                    HasPgmq = true }
+
+              let schema =
+                  match SchemaName.tryCreate "automata_ci" with
+                  | Ok schema -> schema
+                  | Error error -> failtestf "automata_ci must validate: %A" error
+
+              Expect.equal
+                  (Boot.defects schema noJournal None [ "a" ])
+                  [ BootDefect.MissingPrerequisite "migration journal automata_ci.schemaversions" ]
+                  "the operator is told which schema's journal to look for"
           }
 
           test "keeping forever is written as an infinite interval" {
@@ -216,12 +237,40 @@ let migratorTests =
               match
                   Migrator.migrate
                       Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance
-                      "Host=unreachable.invalid;Timeout=1"
+                      { ConnectionString = "Host=unreachable.invalid;Timeout=1"
+                        Schema = SchemaName.defaults
+                        Beliefs = BeliefModel.Snapshot }
               with
               | Error(MigrationError.Failed(script, error)) ->
                   Expect.equal script "" "no script had started"
                   Expect.isNotNull error "and the cause travels with it"
               | Ok report -> failtestf "an unreachable database should not migrate, got %A" report
+              | Error(MigrationError.ProfileMismatch _ as error) -> failtestf "unexpected profile: %A" error
+          }
+
+          testTask "reapplying the same profile does not replay numbered migrations" {
+              if not TestContext.configured then
+                  skiptest "set AUTOMATA_TEST_DB to a migrated PostgreSQL instance"
+
+              do! reset ()
+
+              match
+                  Migrator.migrate
+                      Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance
+                      { ConnectionString = connectionString
+                        Schema = schema
+                        Beliefs = BeliefModel.Bitemporal }
+              with
+              | Ok report ->
+                  Expect.isFalse
+                      (report.Applied |> List.exists (fun script -> script.Contains ".main."))
+                      "a numbered script must never replay against an installed schema"
+
+                  Expect.equal
+                      (scalar<int64> "SELECT count(*) FROM fsm.schemaversions")
+                      10L
+                      "the core journal carries every applied numbered script"
+              | Error error -> failtestf "a repeated migration should succeed, got %A" error
           } ]
 
 let bootTests =
@@ -239,15 +288,16 @@ let bootTests =
                   MachineStoreOptions.forEntityId<TestEntity, TestState, TestEvent, TestAction, TestError>
                       (context ())
                       (ActionDelivery.Deliver(ActionQueueName.create actionQueue))
-                  |> PostgresMachineStore
+                  |> MachineStoreOptions.bitemporal
+                  |> PostgresBitemporalMachineStore
 
-              let! booted = (store :> IStoreBoot).Boot(machine, noCancellation)
+              let! booted = (store :> IStoreBoot).BootAsync(machine, noCancellation)
               Expect.equal (booted |> expectOk "boot") BootReport.Ready "the defaults are a working store"
 
               let inbox = store :> ICommandInbox<Entity, TestEvent>
-              let! submitted = inbox.Submit(submission (entity "e1") "k1" (Start 1), noCancellation)
+              let! submitted = inbox.SubmitAsync(submission (entity "e1") "k1" (Start 1), noCancellation)
               let commandId = submitted |> expectOk "submit" |> commandIdOf
-              let! found = inbox.TryGet(commandId, noCancellation)
+              let! found = inbox.TryGetAsync(commandId, noCancellation)
 
               Expect.equal
                   (found |> expectOk "read" |> Option.map (fun record -> record.Event))
@@ -285,7 +335,53 @@ let bootTests =
 let retentionTests =
     testList
         "Postgres retention"
-        [ testTask "old terminal commands are purged with everything that references them" {
+        [ testCase "retention removes every relational failure constructor" (fun () ->
+              Check.One(
+                  Config.QuickThrowOnFailure.WithMaxTest(6),
+                  fun (payload: byte) ->
+                      task {
+                          do! reset ()
+
+                          let failures =
+                              [ CommandFailure.Domain(Refused $"domain-{payload}")
+                                CommandFailure.Machine $"machine-{payload}"
+                                CommandFailure.Replay(
+                                    ReplayError.UnknownChartVersion(ChartVersion.create (1 + int payload))
+                                )
+                                CommandFailure.Replay(
+                                    ReplayError.Diverged(Epoch.ofUInt64 (uint64 payload), "diverged")
+                                )
+                                CommandFailure.Replay(ReplayError.BudgetExceeded(int payload))
+                                CommandFailure.Replay ReplayError.HistoryPurged ]
+
+                          for index, failure in List.indexed failures do
+                              let key = $"failure-{index}"
+                              let! _ = submit "failure-retention" key
+                              let! held = claimed key
+
+                              let! result =
+                                  (newProcessor ())
+                                      .RejectAsync(held.Work.CommandId, held.Token, failure, noCancellation)
+
+                              expectOk "reject" result |> ignore
+
+                          let! _ = submit "failure-retention" "survivor"
+                          let purged = scalar<int64> "SELECT fsm.purge_commands('pg-tests', 'infinity', 100)"
+                          Expect.equal purged 6L "all failed predecessors are purgeable"
+
+                          for table in
+                              [ "command_error"
+                                "command_error_domain"
+                                "command_error_machine"
+                                "command_error_replay" ] do
+                              Expect.equal (count $"SELECT count(*) FROM fsm.{table}") 0L $"no orphan in {table}"
+
+                          return true
+                      }
+                      |> fun running -> running.GetAwaiter().GetResult()
+              ))
+
+          testTask "old terminal commands are purged with everything that references them" {
               do! reset ()
               do! boot (keepCommandsFor hour)
               let! _ = submit "e1" "k1"
@@ -299,8 +395,16 @@ let retentionTests =
 
               let! reports = run 100
 
-              Expect.equal (reportFor reports).PurgedCommands 2L "the committed and the rejected command"
-              Expect.equal (count "SELECT count(*) FROM fsm.transition") 0L "the transition went with its command"
+              Expect.equal
+                  (reportFor reports).PurgedCommands
+                  1L
+                  "only the rejected command; the snapshot pins its successful predecessor"
+
+              Expect.equal
+                  (count "SELECT count(*) FROM fsm.transition")
+                  1L
+                  "the snapshot's successful command and transition survive"
+
               Expect.equal (count "SELECT count(*) FROM fsm.command_error") 0L "and so did the error"
 
               Expect.equal
@@ -369,7 +473,7 @@ let retentionTests =
               for key in [ "k1"; "k2"; "k3" ] do
                   let! _ = submit "e1" key
                   let! leased = claimed key
-                  let! snapshot = (newReader ()).TryGetSnapshot(machine, entity "e1", noCancellation)
+                  let! snapshot = (newReader ()).TryGetSnapshotAsync(machine, entity "e1", noCancellation)
 
                   let expected =
                       snapshot
@@ -426,10 +530,11 @@ let retentionTests =
               let! _ = commit first Epoch.initial
 
               let! actions =
-                  (newActionQueue ()).Claim(machine, ClaimBatch.create 10, LeaseDuration.create lease, noCancellation)
+                  (newActionQueue ())
+                      .ClaimAsync(machine, ClaimBatch.create 10, LeaseDuration.create lease, noCancellation)
 
               for action in actions |> expectOk "claim actions" do
-                  let! _ = (newActionQueue ()).Complete(action, noCancellation)
+                  let! _ = (newActionQueue ()).CompleteAsync(action, noCancellation)
                   ()
 
               arrange $"UPDATE pgmq.a_{actionQueue} SET archived_at = now() - interval '2 hours'"
@@ -477,7 +582,8 @@ let reaperTests =
               Expect.equal (reportFor reports).Reaped 0L "inside the grace period"
 
               let! extended =
-                  (newInbox ()).ExtendLease(held.Work.CommandId, held.Token, LeaseDuration.create lease, noCancellation)
+                  (newInbox ())
+                      .ExtendLeaseAsync(held.Work.CommandId, held.Token, LeaseDuration.create lease, noCancellation)
 
               Expect.equal (extended |> expectOk "extend") Updated "its holder can still keep it"
           } ]
@@ -502,13 +608,13 @@ let driftTests =
                   "and does not repair it"
 
               let maintenance = newMaintenance ()
-              let! drift = maintenance.DetectDrift noCancellation
+              let! drift = maintenance.DetectDriftAsync noCancellation
               Expect.equal (drift |> expectOk "detect" |> List.length) 1 "detection names the command"
 
-              let! repaired = maintenance.RepairDrift noCancellation
+              let! repaired = maintenance.RepairDriftAsync noCancellation
               Expect.equal (repaired |> expectOk "repair" |> List.length) 1 "repair changes exactly it"
 
-              let! after = maintenance.DetectDrift noCancellation
+              let! after = maintenance.DetectDriftAsync noCancellation
               Expect.isEmpty (after |> expectOk "detect again") "healthy afterwards"
           } ]
 
@@ -526,7 +632,7 @@ let private oldBelief () =
 let private heldAt (knownAt: DateTimeOffset) =
     task {
         let! belief =
-            (newTemporalReader ()).AsOf(machine, entity "e1", effectiveAt.AddHours 16., knownAt, noCancellation)
+            (newTemporalReader ()).AsOfAsync(machine, entity "e1", effectiveAt.AddHours 16., knownAt, noCancellation)
 
         return belief |> expectOk "as of" |> Option.map (fun b -> b.Snapshot.State)
     }
@@ -604,7 +710,10 @@ let singleFlightTests =
               use transaction = holder.BeginTransaction()
 
               use take =
-                  new NpgsqlCommand("SELECT pg_advisory_xact_lock(hashtextextended('fsm.run_maintenance', 0))", holder)
+                  new NpgsqlCommand(
+                      sql "SELECT pg_advisory_xact_lock(hashtextextended('fsm.run_maintenance', 0))",
+                      holder
+                  )
 
               take.ExecuteScalar() |> ignore
 
@@ -623,7 +732,7 @@ let notifyTests =
               do! reset ()
               do! boot RetentionPolicy.keepEverything
               let! _ = submit "e1" "k1"
-              let! conn, heard = listenOn "fsm_command"
+              let! conn, heard = listenOn commandChannel
               use _ = conn
 
               let! tick = notify ()
@@ -633,7 +742,7 @@ let notifyTests =
 
               Expect.contains
                   (List.ofSeq heard)
-                  ("fsm_command", MachineId.value machine)
+                  (commandChannel, MachineId.value machine)
                   "the payload is the machine id, never data"
           }
 
@@ -645,8 +754,8 @@ let notifyTests =
                   { submission (entity "e1") "k1" (Start 1) with
                       VisibleAt = Some(DateTimeOffset.UtcNow.AddHours 1.) }
 
-              let! _ = (newInbox ()).Submit(later, noCancellation)
-              let! conn, heard = listenOn "fsm_command"
+              let! _ = (newInbox ()).SubmitAsync(later, noCancellation)
+              let! conn, heard = listenOn commandChannel
               use _ = conn
 
               let! _ = notify ()
@@ -661,13 +770,13 @@ let notifyTests =
               let! _ = submit "e1" "k1"
               let! first = claimed "k1"
               let! _ = commit first Epoch.initial
-              let! conn, heard = listenOn "fsm_action"
+              let! conn, heard = listenOn actionChannel
               use _ = conn
 
               let! _ = notify ()
               do! settle conn (TimeSpan.FromSeconds 2.)
 
-              Expect.contains (List.ofSeq heard) ("fsm_action", actionQueue) "the payload is the queue name"
+              Expect.contains (List.ofSeq heard) (actionChannel, actionQueue) "the payload is the queue name"
           }
 
           testTask "a tick reports how full the notification queue is" {
@@ -686,7 +795,7 @@ let notifyTests =
               let store = newMachineStore RetentionPolicy.keepEverything :> IWorkNotifications
 
               let listening =
-                  store.Listen(
+                  store.ListenAsync(
                       machine,
                       (fun () -> Interlocked.Increment commands |> ignore),
                       (fun () -> Interlocked.Increment actions |> ignore),
@@ -725,7 +834,7 @@ let cronTests =
               let maintenance = newMaintenance ()
 
               let! scheduling =
-                  maintenance.Schedule(
+                  maintenance.ScheduleAsync(
                       TimeSpan.FromSeconds 1.,
                       TimeSpan.FromMinutes 1.,
                       ClaimBatch.create 100,
@@ -740,7 +849,7 @@ let cronTests =
 
               Expect.equal (scheduling |> expectOk "schedule") expected "the database cannot run it"
 
-              let! removed = maintenance.Unschedule noCancellation
+              let! removed = maintenance.UnscheduleAsync noCancellation
               Expect.equal (removed |> expectOk "unschedule") 0 "nothing to remove"
           }
 
@@ -764,6 +873,7 @@ let cronTests =
               let maintenance =
                   PostgresMaintenance(
                       PostgresContext.create source ByzantineSystems.Automata.Resilience.TransientPolicy.defaults ignore
+                      |> PostgresContext.withSchema schema
                   )
                   :> IDatabaseMaintenance
 
@@ -771,13 +881,16 @@ let cronTests =
                   use conn = source.OpenConnection()
 
                   use cmd =
-                      new NpgsqlCommand("SELECT count(*) FROM cron.job WHERE jobname LIKE 'automata-%'", conn)
+                      new NpgsqlCommand(
+                          $"SELECT count(*) FROM cron.job WHERE jobname LIKE 'automata-{schemaValue}-%%'",
+                          conn
+                      )
 
                   cmd.ExecuteScalar() :?> int64
 
               for _ in 1..2 do
                   let! scheduled =
-                      maintenance.Schedule(
+                      maintenance.ScheduleAsync(
                           TimeSpan.FromSeconds 1.,
                           TimeSpan.FromMinutes 1.,
                           ClaimBatch.create 100,
@@ -788,7 +901,7 @@ let cronTests =
 
               Expect.equal (jobs ()) 3L "asserting again updates rather than duplicating"
 
-              let! removed = maintenance.Unschedule noCancellation
+              let! removed = maintenance.UnscheduleAsync noCancellation
               Expect.equal (removed |> expectOk "unschedule") 3 "all three, by name"
               Expect.equal (jobs ()) 0L "nothing left calling a schema that may be dropped next"
           } ]

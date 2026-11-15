@@ -35,7 +35,7 @@ type WorkSignal() =
 
     /// <summary>Returns true when a hint is consumed, or false when the signal is completed.</summary>
     member _.WaitAsync(ct: CancellationToken) : Task<bool> =
-        task {
+        backgroundTask {
             let! available = reader.WaitToReadAsync(ct)
 
             if not available then
@@ -47,7 +47,7 @@ type WorkSignal() =
 
     /// <summary>Waits for a hint, signal completion, or the polling interval.</summary>
     member this.WaitOrTimeoutAsync(interval: TimeSpan, timeProvider: TimeProvider, ct: CancellationToken) : Task<bool> =
-        task {
+        backgroundTask {
             use waiting = CancellationTokenSource.CreateLinkedTokenSource(ct)
             let hint = this.WaitAsync(waiting.Token)
             let elapsed = Task.Delay(interval, timeProvider, waiting.Token)

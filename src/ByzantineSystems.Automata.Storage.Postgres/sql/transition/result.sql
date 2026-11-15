@@ -9,7 +9,7 @@ SELECT
     t.epoch,
     t.command_id,
     t.chart_version,
-    t.event,
+    c.event,
     t.actions,
     t.from_state,
     t.to_state,
@@ -19,11 +19,21 @@ SELECT
     t.status,
     t.effective_at,
     t.committed_at,
-    e.error
+    e.kind AS failure_kind,
+    d.error AS domain_error,
+    m.reason AS machine_reason,
+    r.replay_kind,
+    r.version AS failure_version,
+    r.epoch AS failure_epoch,
+    r.reason AS replay_reason,
+    r.budget AS failure_budget
 FROM
-    fsm.command c
-    LEFT JOIN fsm.transition t ON t.command_id = c.command_id
-    LEFT JOIN fsm.command_error e ON e.command_id = c.command_id
+    $schema$.command c
+    LEFT JOIN $schema$.transition t ON t.command_id = c.command_id
+    LEFT JOIN $schema$.command_error e ON e.command_id = c.command_id
+    LEFT JOIN $schema$.command_error_domain d ON d.command_id = e.command_id
+    LEFT JOIN $schema$.command_error_machine m ON m.command_id = e.command_id
+    LEFT JOIN $schema$.command_error_replay r ON r.command_id = e.command_id
 WHERE
     c.command_id = @command_id;
 

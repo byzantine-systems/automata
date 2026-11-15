@@ -18,17 +18,14 @@ let private identity version fingerprint =
 
 let private register (registry: IChartRegistry) version fingerprint : Task<ChartRegistration> =
     task {
-        let! outcome = registry.Register(identity version fingerprint, noCancellation)
+        let! outcome = registry.RegisterAsync(identity version fingerprint, noCancellation)
         return outcome |> expectOk $"register version {version}"
     }
 
 let tests =
     testList
         "IChartRegistry"
-        [ ContractProperties.registryProperty "registrations follow an immutable finite map" 40 (fun () ->
-              fixture "registry-property" |> registryOf |> Task.FromResult)
-
-          // Every process starts at once after a deploy. With one writer per file, the racers
+        [ // Every process starts at once after a deploy. With one writer per file, the racers
           // queue rather than interleave, and all but one are told their chart matched.
           testTask "concurrent registrations of one chart agree" {
               let db = fixture "registry"

@@ -31,7 +31,7 @@ module internal Boot =
     /// </summary>
     let expectedMigrations: string list =
         Assembly.GetExecutingAssembly().GetManifestResourceNames()
-        |> Array.filter (fun name -> name.Contains ".migrations.main.")
+        |> Array.filter (fun name -> name.Contains ".migrations.common.main.")
         |> Array.sort
         |> List.ofArray
 
@@ -53,7 +53,14 @@ module internal Boot =
     /// exist, which is the answer <see cref="T:ByzantineSystems.Automata.Storage.Postgres.CatalogCheck" />
     /// gave before anyone tried to read it.
     /// </summary>
-    let defects (check: CatalogCheck) (applied: string list option) (expected: string list) : BootDefect list =
+    let defects
+        (schema: SchemaName)
+        (check: CatalogCheck)
+        (applied: string list option)
+        (expected: string list)
+        : BootDefect list =
+        let name = SchemaName.value schema
+
         [ if not check.HasBtreeGist then
               BootDefect.MissingPrerequisite "btree_gist"
           if not check.HasPgmq then
@@ -62,13 +69,13 @@ module internal Boot =
               BootDefect.SchemaMissing
           else
               match applied with
-              | None -> BootDefect.MissingPrerequisite "migration journal public.schemaversions"
+              | None -> BootDefect.MissingPrerequisite $"migration journal {name}.schemaversions"
               | Some applied -> yield! compare expected applied
 
               // A schema whose numbered migrations all ran but whose routines are missing is one
               // whose repeatable scripts never did, and nothing it could be asked would work.
               if not check.HasRoutines then
-                  BootDefect.MissingPrerequisite "fsm routines (the repeatable migrations)" ]
+                  BootDefect.MissingPrerequisite $"{name} routines (the repeatable migrations)" ]
 
     /// <summary>
     /// How long to keep something, as PostgreSQL reads an interval. Text rather than a
@@ -82,17 +89,12 @@ module internal Boot =
             String.Format(CultureInfo.InvariantCulture, "{0} microseconds", span.Ticks / 10L)
         | Retain.For span -> invalidArg (nameof retain) $"A retention period must be positive, not {span}."
 
-    let private bootCheck =
-        StatementKey.create "system" "boot_check" |> Sql.prepareProgram
-
-    let private journalOf = StatementKey.create "system" "journal" |> Sql.prepareProgram
-
-    let private registerMaintenance =
-        StatementKey.create "system" "register_maintenance" |> Sql.prepareProgram
+    let private prepare schema domain operation =
+        StatementKey.create domain operation |> Sql.prepareProgram schema
 
     /// <summary>Reads the catalog check. Never fails for a missing object; see boot_check.sql.</summary>
-    let check: StoreProgram<ReadAccess, (string * Param) list, NpgsqlDataReader, CatalogCheck> =
-        StoreProgram.queryOne bootCheck [] (fun reader ->
+    let check (schema: SchemaName) : StoreProgram<ReadAccess, (string * Param) list, NpgsqlDataReader, CatalogCheck> =
+        StoreProgram.queryOne (prepare schema "system" "boot_check") [] (fun reader ->
             Ok
                 { HasSchema = Row.bool reader "has_schema"
                   HasJournal = Row.bool reader "has_journal"
@@ -102,10 +104,11 @@ module internal Boot =
 
     /// <summary>The applied migrations, read only once the check has said the journal exists.</summary>
     let journal
+        (schema: SchemaName)
         (check: CatalogCheck)
         : StoreProgram<ReadAccess, (string * Param) list, NpgsqlDataReader, string list option> =
         if check.HasJournal then
-            StoreProgram.queryRows journalOf [] (fun row -> Row.string row "scriptname" |> Ok)
+            StoreProgram.queryRows (prepare schema "system" "journal") [] (fun row -> Row.string row "scriptname" |> Ok)
             |> StoreProgram.map Some
         else
             StoreProgram.ok None
@@ -115,11 +118,45 @@ module internal Boot =
         Sql.readProgram
             context
             (store {
-                let! check = check
-                let! applied = journal check
-                return defects check applied expectedMigrations
+                let! check = check context.Schema
+                let! applied = journal context.Schema check
+                return defects context.Schema check applied expectedMigrations
             })
             ct
+
+    /// <summary>Checks the configured store type against the installed profile before boot writes anything.</summary>
+    let inspectProfile context beliefs ct =
+        backgroundTaskResult {
+            let! catalog = inspect context ct
+
+            let catalog =
+                match beliefs with
+                | BeliefModel.Snapshot -> catalog |> List.filter ((<>) (BootDefect.MissingPrerequisite "btree_gist"))
+                | BeliefModel.Bitemporal -> catalog
+
+            if not catalog.IsEmpty then
+                return catalog
+            else
+                let! installed, temporal =
+                    Sql.readProgram
+                        context
+                        (StoreProgram.queryOne (prepare context.Schema "system" "profile") [] (fun row ->
+                            let complete =
+                                match beliefs with
+                                | BeliefModel.Snapshot -> Row.bool row "snapshot_installed"
+                                | BeliefModel.Bitemporal -> Row.bool row "temporal_installed"
+
+                            Ok(Row.string row "beliefs", complete)))
+                        ct
+
+                return
+                    [ if installed <> BeliefModel.value beliefs then
+                          BootDefect.Misconfigured
+                              $"Configured {BeliefModel.value beliefs} store against {installed} profile."
+                      if installed = BeliefModel.value beliefs && not temporal then
+                          BootDefect.MissingPrerequisite
+                              $"{BeliefModel.value beliefs} profile migrations for {SchemaName.value context.Schema}" ]
+        }
 
     /// <summary>Writes this machine's maintenance registration. An upsert, so safe on every boot.</summary>
     let register
@@ -133,7 +170,7 @@ module internal Boot =
         Sql.runProgram
             context
             (StoreProgram.executeDiscard
-                registerMaintenance
+                (prepare context.Schema "system" "register_maintenance")
                 [ "machine_id", Param.Text(MachineId.value machineId)
                   "action_queue", Param.Text queue
                   "keep_commands", Param.Text(interval retention.Commands)
@@ -152,7 +189,7 @@ module internal Boot =
 type PostgresMaintenance(context: PostgresContext) =
 
     let statement domain operation =
-        StatementKey.create domain operation |> Sql.prepareProgram
+        StatementKey.create domain operation |> Sql.prepareProgram context.Schema
 
     let notifyPending = statement "system" "notify_pending"
     let runMaintenance = statement "system" "run_maintenance"
@@ -162,7 +199,6 @@ type PostgresMaintenance(context: PostgresContext) =
     let unscheduleMaintenance = statement "system" "unschedule"
     let beliefColdStale = statement "system" "belief_cold_stale"
     let refreshBeliefCold = statement "system" "refresh_belief_cold"
-    let markBeliefCold = statement "system" "mark_belief_cold"
 
     let schedulingOf (value: string) : Result<Scheduling, StoreError> =
         match value with
@@ -175,7 +211,7 @@ type PostgresMaintenance(context: PostgresContext) =
     /// Refreshes the materialized cold layer of <c>fsm.belief</c> when a day has turned since the
     /// last refresh, and does nothing otherwise, so a pass every minute costs one cheap check.
     ///
-    /// Three statements on one connection rather than one routine, because
+    /// Two statements on one connection rather than one routine, because
     /// <c>REFRESH ... CONCURRENTLY</c> cannot run inside a function or a transaction. Safe to
     /// repeat and safe to race: a second host's refresh waits for the first and finds nothing new.
     /// </summary>
@@ -187,7 +223,6 @@ type PostgresMaintenance(context: PostgresContext) =
 
                 if stale then
                     do! StoreProgram.executeDiscard refreshBeliefCold []
-                    do! StoreProgram.executeDiscard markBeliefCold []
             })
             ct
 
@@ -223,69 +258,75 @@ type PostgresMaintenance(context: PostgresContext) =
 
     interface IDatabaseMaintenance with
 
-        member _.NotifyPending(ct) =
-            Sql.runProgram
-                context
-                (StoreProgram.queryOne notifyPending [] (fun row ->
-                    Ok
-                        { Sent = Row.int32 row "sent"
-                          QueueUsage = row.GetDouble(row.GetOrdinal "queue_usage") }))
-                ct
+        member _.NotifyPendingAsync(cancellationToken) =
+            Tap.start cancellationToken (fun () ->
+                Sql.runProgram
+                    context
+                    (StoreProgram.queryOne notifyPending [] (fun row ->
+                        Ok
+                            { Sent = Row.int32 row "sent"
+                              QueueUsage = row.GetDouble(row.GetOrdinal "queue_usage") }))
+                    cancellationToken)
 
-        member _.Run(batch, ct) =
-            backgroundTaskResult {
-                let! reports =
-                    Sql.runProgram
-                        context
-                        (StoreProgram.queryRows
-                            runMaintenance
-                            [ "batch", Param.Int(ClaimBatch.value batch) ]
-                            (fun row ->
-                                result {
-                                    let! machineId =
-                                        Row.string row "machine_id"
-                                        |> MachineId.tryCreate
-                                        |> Result.mapError (Db.decodeFailure "MachineId")
+        member _.RunAsync(batch, cancellationToken) =
+            Tap.start cancellationToken (fun () ->
+                backgroundTaskResult {
+                    let! reports =
+                        Sql.runProgram
+                            context
+                            (StoreProgram.queryRows
+                                runMaintenance
+                                [ "batch", Param.Int(ClaimBatch.value batch) ]
+                                (fun row ->
+                                    result {
+                                        let! machineId =
+                                            Row.string row "machine_id"
+                                            |> MachineId.tryCreate
+                                            |> Result.mapError (Db.decodeFailure "MachineId")
 
-                                    return
-                                        { MachineId = machineId
-                                          Reaped = Row.int64 row "reaped"
-                                          PurgedCommands = Row.int64 row "purged_commands"
-                                          PurgedBeliefs = Row.int64 row "purged_beliefs"
-                                          PurgedActions = Row.int64 row "purged_actions"
-                                          Drifted = Row.int64 row "drifted" }
-                                }))
-                        ct
+                                        return
+                                            { MachineId = machineId
+                                              Reaped = Row.int64 row "reaped"
+                                              PurgedCommands = Row.int64 row "purged_commands"
+                                              PurgedBeliefs = Row.int64 row "purged_beliefs"
+                                              PurgedActions = Row.int64 row "purged_actions"
+                                              Drifted = Row.int64 row "drifted" }
+                                    }))
+                            cancellationToken
 
-                do! refreshColdBeliefs ct
-                return reports
-            }
+                    do! refreshColdBeliefs cancellationToken
+                    return reports
+                })
 
-        member _.DetectDrift(ct) =
-            Sql.readProgram context (StoreProgram.queryRows blockedDrift [] driftRow) ct
+        member _.DetectDriftAsync(cancellationToken) =
+            Tap.start cancellationToken (fun () ->
+                Sql.readProgram context (StoreProgram.queryRows blockedDrift [] driftRow) cancellationToken)
 
-        member _.RepairDrift(ct) =
-            Sql.runProgram
-                context
-                (StoreProgram.queryRows repairBlocked [] (fun row ->
-                    Ok
-                        { RepairedBlock.CommandId = CommandId.ofInt64 (Row.int64 row "command_id")
-                          Blocked = Row.bool row "blocked" }))
-                ct
+        member _.RepairDriftAsync(cancellationToken) =
+            Tap.start cancellationToken (fun () ->
+                Sql.runProgram
+                    context
+                    (StoreProgram.queryRows repairBlocked [] (fun row ->
+                        Ok
+                            { RepairedBlock.CommandId = CommandId.ofInt64 (Row.int64 row "command_id")
+                              Blocked = Row.bool row "blocked" }))
+                    cancellationToken)
 
-        member _.Schedule(notifyEvery, runEvery, batch, ct) =
-            Sql.runProgram
-                context
-                (StoreProgram.queryOne
-                    scheduleMaintenance
-                    [ "notify_every", Param.Interval notifyEvery
-                      "run_every", Param.Interval runEvery
-                      "batch", Param.Int(ClaimBatch.value batch) ]
-                    (fun row -> Row.string row "scheduling" |> schedulingOf))
-                ct
+        member _.ScheduleAsync(notifyEvery, runEvery, batch, cancellationToken) =
+            Tap.start cancellationToken (fun () ->
+                Sql.runProgram
+                    context
+                    (StoreProgram.queryOne
+                        scheduleMaintenance
+                        [ "notify_every", Param.Interval notifyEvery
+                          "run_every", Param.Interval runEvery
+                          "batch", Param.Int(ClaimBatch.value batch) ]
+                        (fun row -> Row.string row "scheduling" |> schedulingOf))
+                    cancellationToken)
 
-        member _.Unschedule(ct) =
-            Sql.runProgram
-                context
-                (StoreProgram.queryOne unscheduleMaintenance [] (fun row -> Row.int32 row "removed" |> Ok))
-                ct
+        member _.UnscheduleAsync(cancellationToken) =
+            Tap.start cancellationToken (fun () ->
+                Sql.runProgram
+                    context
+                    (StoreProgram.queryOne unscheduleMaintenance [] (fun row -> Row.int32 row "removed" |> Ok))
+                    cancellationToken)

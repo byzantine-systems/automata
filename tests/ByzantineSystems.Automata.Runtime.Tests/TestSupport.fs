@@ -103,6 +103,11 @@ type StubStore<'Err>() =
 
     member val SubmitOutcome: Result<SubmissionOutcome, StoreError> = Ok(Accepted(CommandId.ofInt64 1L)) with get, set
 
+    /// Overrides submission when a test needs to control asynchronous completion rather than
+    /// return the scripted outcome immediately.
+    member val SubmitOverride: (CancellationToken -> Task<Result<SubmissionOutcome, StoreError>>) option =
+        None with get, set
+
     member val ResultOutcome: Result<
         CommandResult<EntityId<TestEntity>, TestState, TestEvent, TestAction, 'Err> option,
         StoreError
@@ -126,9 +131,12 @@ type StubStore<'Err>() =
 
     interface ICommandInbox<EntityId<TestEntity>, TestEvent> with
 
-        member this.Submit(_, _) = Task.FromResult this.SubmitOutcome
+        member this.SubmitAsync(_, cancellationToken) =
+            match this.SubmitOverride with
+            | Some submit -> submit cancellationToken
+            | None -> Task.FromResult this.SubmitOutcome
 
-        member this.Claim(_, batch, _, _) =
+        member this.ClaimAsync(_, batch, _, cancellationToken) =
             match this.ClaimOutcome with
             | Error error -> Task.FromResult(Error error)
             | Ok() ->
@@ -142,40 +150,40 @@ type StubStore<'Err>() =
 
                 Task.FromResult(Ok(List.ofSeq drained))
 
-        member this.Reschedule(commandId, _, _, _) =
+        member this.RescheduleAsync(commandId, _, _, cancellationToken) =
             lock this.Reschedules (fun () -> this.Reschedules.Add commandId)
             Task.FromResult this.RescheduleOutcome
 
-        member this.ExtendLease(commandId, _, _, _) =
+        member this.ExtendLeaseAsync(commandId, _, _, cancellationToken) =
             lock this.Extensions (fun () -> this.Extensions.Add commandId)
             Task.FromResult this.ExtendOutcome
 
-        member _.TryGet(_, _) = Task.FromResult(Ok None)
-        member _.TryFind(_, _, _, _) = Task.FromResult(Ok None)
+        member _.TryGetAsync(_, cancellationToken) = Task.FromResult(Ok None)
+        member _.TryFindAsync(_, _, _, cancellationToken) = Task.FromResult(Ok None)
 
     interface IStateReader<EntityId<TestEntity>, TestState, TestEvent, TestAction> with
-        member this.TryGetSnapshot(_, _, _) = Task.FromResult(Ok this.Snapshot)
-        member this.History(_, _, _, _) = Task.FromResult(Ok this.Log)
+        member this.TryGetSnapshotAsync(_, _, cancellationToken) = Task.FromResult(Ok this.Snapshot)
+        member this.HistoryAsync(_, _, _, cancellationToken) = Task.FromResult(Ok this.Log)
 
     interface ICommandProcessorStore<EntityId<TestEntity>, TestState, TestEvent, TestAction, 'Err> with
 
-        member this.Commit(commandId, _, _, _, _) =
+        member this.CommitAsync(commandId, _, _, _, cancellationToken) =
             lock this.Commits (fun () -> this.Commits.Add commandId)
             Task.FromResult this.CommitOutcome
 
-        member this.Reject(commandId, _, failure, _) =
+        member this.RejectAsync(commandId, _, failure, cancellationToken) =
             lock this.Rejections (fun () -> this.Rejections.Add(commandId, failure))
             Task.FromResult this.RejectOutcome
 
-        member this.DeadLetter(commandId, _, failure, _) =
+        member this.DeadLetterAsync(commandId, _, failure, cancellationToken) =
             lock this.DeadLetters (fun () -> this.DeadLetters.Add(commandId, failure))
             Task.FromResult this.DeadLetterOutcome
 
-        member this.TryGetResult(_, _) = Task.FromResult this.ResultOutcome
+        member this.TryGetResultAsync(_, cancellationToken) = Task.FromResult this.ResultOutcome
 
     interface IActionQueue<EntityId<TestEntity>, TestAction> with
 
-        member _.Claim(_, batch, _, _) =
+        member _.ClaimAsync(_, batch, _, cancellationToken) =
             let drained = ResizeArray()
             let mutable taking = true
 
@@ -186,13 +194,13 @@ type StubStore<'Err>() =
 
             Task.FromResult(Ok(List.ofSeq drained))
 
-        member this.Complete(action, _) =
+        member this.CompleteAsync(action, cancellationToken) =
             lock this.Deliveries (fun () -> this.Deliveries.Add(action.Work.CommandId, action.Work.Ordinal))
             Task.FromResult(Ok Updated)
 
-        member _.Reschedule(_, _, _) = Task.FromResult(Ok Updated)
+        member _.RescheduleAsync(_, _, cancellationToken) = Task.FromResult(Ok Updated)
 
-        member this.Abandon(action, reason, _) =
+        member this.AbandonAsync(action, reason, cancellationToken) =
             lock this.Abandonments (fun () -> this.Abandonments.Add(action.Work.CommandId, Reason.value reason))
             Task.FromResult(Ok Updated)
 
@@ -211,18 +219,30 @@ type TemporalStubStore<'Err>() =
     member val Beliefs: Belief<EntityId<TestEntity>, TestState> option = None with get, set
 
     interface ITemporalReader<EntityId<TestEntity>, TestState> with
-        member this.ValidAt(_, _, _, _) = Task.FromResult(Ok this.Beliefs)
-        member this.AsOf(_, _, _, _, _) = Task.FromResult(Ok this.Beliefs)
+        member this.ValidAtAsync(_, _, _, cancellationToken) = Task.FromResult(Ok this.Beliefs)
+        member this.AsOfAsync(_, _, _, _, cancellationToken) = Task.FromResult(Ok this.Beliefs)
 
     interface ICorrectionStore<EntityId<TestEntity>, TestState> with
-        member _.Correct(_, _, _, _, _) = Task.FromResult(Ok NothingSuperseded)
+        member _.CorrectAsync(_, _, _, _, _, cancellationToken) = Task.FromResult(Ok NothingSuperseded)
+
+    interface ITransitionLog<EntityId<TestEntity>, TestState, TestEvent, TestAction> with
+        member _.SuffixAsync(_, _, _, _, _) =
+            Task.FromResult(Ok { Transitions = []; Incomplete = false })
+
+    interface IPriorState<EntityId<TestEntity>, TestState> with
+        member this.BeforeAsync(_, _, _, _) =
+            Task.FromResult(Ok(this.Beliefs |> Option.map _.Snapshot))
+
+    interface ICorrectionCommitter<EntityId<TestEntity>, TestState, TestEvent, TestAction> with
+        member _.CommitCorrectionAsync(_, _, _, _, _) =
+            Task.FromResult(Ok FinalizeOutcome.LeaseLost)
 
 /// <summary>A store with a boot check that answers whatever the test scripted.</summary>
 type BootingStubStore<'Err>(report: BootReport) =
     inherit StubStore<'Err>()
 
     interface IStoreBoot with
-        member _.Boot(_, _) = Task.FromResult(Ok report)
+        member _.BootAsync(_, cancellationToken) = Task.FromResult(Ok report)
 
 /// <summary>
 /// A store that can announce work. <c>Announce</c> calls the listener's command callback, the way
@@ -241,7 +261,7 @@ type NotifyingStubStore<'Err>(failures: int) =
         onCommands |> Option.iter (fun signal -> signal ())
 
     interface IWorkNotifications with
-        member this.Listen(_, commands, _, ct) =
+        member this.ListenAsync(_, commands, _, cancellationToken) =
             this.Listens <- this.Listens + 1
 
             if remainingFailures > 0 then
@@ -252,7 +272,7 @@ type NotifyingStubStore<'Err>(failures: int) =
 
                 task {
                     try
-                        do! Task.Delay(Timeout.InfiniteTimeSpan, ct)
+                        do! Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken)
                     with :? OperationCanceledException ->
                         ()
 
@@ -266,11 +286,11 @@ type StubRegistry(?outcome: ChartRegistration) =
     member val Registrations = 0 with get, set
 
     interface IChartRegistry with
-        member this.Register(_, _) =
+        member this.RegisterAsync(_, cancellationToken) =
             this.Registrations <- this.Registrations + 1
             Task.FromResult(Ok answer)
 
-        member _.TryGet(_, _, _) = Task.FromResult(Ok None)
+        member _.TryGetAsync(_, _, cancellationToken) = Task.FromResult(Ok None)
 
 /// <summary>Builds one leased command for a stub to hand out.</summary>
 let leasedCommand (id: int64) (entity: string) (event: TestEvent) (attempts: int) =

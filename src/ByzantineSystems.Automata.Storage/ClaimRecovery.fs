@@ -16,7 +16,7 @@ module internal ClaimRecovery =
         (rows: 'Row list)
         (ct: CancellationToken)
         : Task<Result<'Work list, StoreError>> =
-        task {
+        backgroundTask {
             let healthy = ResizeArray<'Work>()
 
             for row in rows do
