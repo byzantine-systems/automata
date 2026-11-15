@@ -198,15 +198,21 @@ INSERT INTO $schema$.entity_purge (machine_id, entity_id, max_purged_effective_a
         entity_id)
         DO UPDATE SET
             max_purged_effective_at = GREATEST ($schema$.entity_purge.max_purged_effective_at, EXCLUDED.max_purged_effective_at)), domain_errors AS (
-            DELETE FROM $schema$.command_error_domain e USING doomed d WHERE e.command_id = d.command_id), machine_errors AS (
-            DELETE FROM $schema$.command_error_machine e USING doomed d WHERE e.command_id = d.command_id), replay_errors AS (
-            DELETE FROM $schema$.command_error_replay e USING doomed d WHERE e.command_id = d.command_id), errors AS (
-            DELETE FROM $schema$.command_error e
+            DELETE FROM $schema$.command_error_domain e
             USING doomed d
-            WHERE e.command_id = d.command_id), undelivered AS (
+            WHERE e.command_id = d.command_id), machine_errors AS (
                     DELETE
-                        FROM $schema$.action_dead_letter a USING doomed d
-            WHERE a.command_id = d.command_id), purged AS (
+                        FROM $schema$.command_error_machine e USING doomed d
+            WHERE e.command_id = d.command_id), replay_errors AS (
+        DELETE
+            FROM $schema$.command_error_replay e USING doomed d
+WHERE e.command_id = d.command_id), errors AS (
+        DELETE
+            FROM $schema$.command_error e USING doomed d
+WHERE e.command_id = d.command_id), undelivered AS (
+        DELETE
+            FROM $schema$.action_dead_letter a USING doomed d
+WHERE a.command_id = d.command_id), purged AS (
         DELETE
             FROM $schema$.command c USING doomed d
 WHERE c.command_id = d.command_id
@@ -272,16 +278,29 @@ BEGIN
     PERFORM
         $schema$.assert_queue_name (p_queue);
     WITH doomed AS (
-        SELECT q.queue, q.msg_id FROM $schema$.action_quarantine q
-        WHERE q.queue = p_queue AND q.recorded_at < p_before
-        ORDER BY q.recorded_at, q.msg_id LIMIT p_batch FOR UPDATE SKIP LOCKED
-    ) DELETE FROM $schema$.action_quarantine q USING doomed d WHERE q.queue = d.queue AND q.msg_id = d.msg_id;
+        SELECT
+            q.queue,
+            q.msg_id
+        FROM
+            $schema$.action_quarantine q
+        WHERE
+            q.queue = p_queue
+            AND q.recorded_at < p_before
+        ORDER BY
+            q.recorded_at,
+            q.msg_id
+        LIMIT p_batch
+        FOR UPDATE
+            SKIP LOCKED)
+    DELETE FROM $schema$.action_quarantine q USING doomed d
+    WHERE q.queue = d.queue
+        AND q.msg_id = d.msg_id;
     GET DIAGNOSTICS v_quarantined = ROW_COUNT;
     IF TO_REGCLASS(FORMAT('pgmq.%I', 'a_' || p_queue)) IS NULL THEN
         RETURN v_quarantined;
     END IF;
     EXECUTE FORMAT('WITH doomed AS MATERIALIZED (SELECT a.msg_id FROM pgmq.%1$I a WHERE a.archived_at < $1 ORDER BY a.msg_id LIMIT $2) DELETE FROM pgmq.%1$I a USING doomed d WHERE a.msg_id = d.msg_id', 'a_' || p_queue)
-    USING p_before, GREATEST(0, p_batch - v_quarantined);
+    USING p_before, GREATEST (0, p_batch - v_quarantined);
     GET DIAGNOSTICS v_purged = ROW_COUNT;
     RETURN v_purged + v_quarantined;
 END
@@ -659,3 +678,4 @@ END IF;
     RETURN v_removed;
 END
 $$;
+

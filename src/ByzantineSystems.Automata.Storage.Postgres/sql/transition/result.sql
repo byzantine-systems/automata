@@ -36,3 +36,4 @@ FROM
     LEFT JOIN $schema$.command_error_replay r ON r.command_id = e.command_id
 WHERE
     c.command_id = @command_id;
+

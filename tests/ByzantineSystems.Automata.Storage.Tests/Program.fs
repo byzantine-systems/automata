@@ -13,4 +13,5 @@ let main argv =
               TapShapeTests.tests
               StoreProgramTests.tests
               EnumCodecTests.tests
-              FailureTests.tests ])
+              FailureTests.tests
+              FinalizeTests.tests ])

@@ -165,8 +165,16 @@ let private planTests =
           <| fun db ->
               let steps = plan db (SqlResources.get "command" "history_page")
 
-              Expect.exists steps (fun step -> step.StartsWith "SEARCH t " && step.Contains "fsm_transition") "the log alias seeks its index"
-              Expect.exists steps (fun step -> step.StartsWith "SEARCH c " && step.Contains "PRIMARY KEY") "the command join uses its primary key"
+              Expect.exists
+                  steps
+                  (fun step -> step.StartsWith "SEARCH t " && step.Contains "fsm_transition")
+                  "the log alias seeks its index"
+
+              Expect.exists
+                  steps
+                  (fun step -> step.StartsWith "SEARCH c " && step.Contains "PRIMARY KEY")
+                  "the command join uses its primary key"
+
               noSort steps
 
           fixture "deleting a command finds its snapshot by index"

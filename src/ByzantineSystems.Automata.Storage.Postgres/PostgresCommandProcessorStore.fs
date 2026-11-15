@@ -95,25 +95,8 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
     let transitionWatermark =
         StatementKey.create "transition" "purge_watermark" |> prepare
 
-    /// What a commit sends beyond the command's identity: the draft and its four encoded
-    /// payloads, encoded before anything is sent.
-    let encodeDraft
-        (draft: TransitionDraft<'EntityId, 'State, 'Event, 'Action>)
-        : Result<EncodedDraft<'EntityId, 'State, 'Event, 'Action>, StoreError> =
-        match
-            options.ActionCodec.Encode draft.Actions,
-            options.StateCodec.Encode draft.FromState,
-            options.StateCodec.Encode draft.ToState
-        with
-        | Ok actions, Ok fromState, Ok toState ->
-            Ok
-                { Source = draft
-                  ActionsJson = actions
-                  FromJson = fromState
-                  ToJson = toState }
-        | Error error, _, _
-        | _, Error error, _
-        | _, _, Error error -> Error(Db.toStoreError error)
+    let encodeDraft expected draft =
+        DraftEncoding.encode options.StateCodec options.ActionCodec expected draft
 
     let states (ids: StateId list) : string list = ids |> List.map StateId.value
 
@@ -148,7 +131,7 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                   "instance_status", Param.TextOrNull(Some(EnumCodec.encode EnumCodec.instanceStatus draft.Status))
                   "effective_at", Param.TimestampOrNull(Some draft.EffectiveAt)
                   "actions", Param.JsonbOrNull(Some encoded.ActionsJson)
-                  "from_state", Param.JsonbOrNull(Some encoded.FromJson)
+                  "from_state", Param.JsonbOrNull(CommitOrigin.payload encoded.Origin)
                   "to_state", Param.JsonbOrNull(Some encoded.ToJson)
                   "handled_by", Param.TextOrNull(Some(StateId.value draft.HandledBy))
                   "exited", Param.TextArrayOrNull(Some(states draft.Exited))
@@ -164,6 +147,8 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                "status", Param.Text(EnumCodec.encode EnumCodec.commandStatus (Resolution.status resolution)) ]
              @ ending)
             (finalizeOutcome expected)
+        |> AtomicFinalization
+        |> FinalizeProgram.finish
 
     /// <summary>
     /// The failure column is a tagged envelope rather than the bare domain error, because the
@@ -411,7 +396,7 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
 
             Tap.start cancellationToken (fun () ->
                 backgroundTaskResult {
-                    let! encoded = encodeDraft draft
+                    let! encoded = encodeDraft (Some expected) draft
 
                     return!
                         Sql.runProgram context (finalize commandId token (Commit(expected, encoded))) cancellationToken
@@ -497,7 +482,7 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                 backgroundTaskResult {
                     // Everything is encoded before anything is sent, so a state that will not encode
                     // fails the correction rather than half-writing it.
-                    let! encoded = encodeDraft commit.Transition
+                    let! encoded = encodeDraft None commit.Transition
                     let head, tail = commit.Beliefs
                     let! beliefs = BeliefBatch.encode options.StateCodec (head :: tail)
                     let draft = commit.Transition
@@ -513,7 +498,7 @@ type PostgresCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                                    "valid_from", Param.Timestamp commit.ValidFrom
                                    "instance_status",
                                    Param.Text(EnumCodec.encode EnumCodec.instanceStatus draft.Status)
-                                   "from_state", Param.Jsonb encoded.FromJson
+                                   "from_state", Param.JsonbOrNull(CommitOrigin.payload encoded.Origin)
                                    "to_state", Param.Jsonb encoded.ToJson
                                    "handled_by", Param.Text(StateId.value draft.HandledBy)
                                    "exited", Param.TextArray(states draft.Exited)

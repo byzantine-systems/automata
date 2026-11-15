@@ -5,3 +5,4 @@ SELECT
     f.status
 FROM
     $temporal_schema$.commit_correction (@command_id, @lease_token, @expected_epoch, @valid_from, @states, @statuses, @valid_froms, @epochs, @command_ids, @chart_versions, @instance_status::$schema$.instance_status, @from_state::jsonb, @to_state::jsonb, @handled_by, @exited, @entered) f;
+

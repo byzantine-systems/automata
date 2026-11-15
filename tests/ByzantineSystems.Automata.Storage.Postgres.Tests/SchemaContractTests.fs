@@ -250,29 +250,22 @@ let tests =
               Expect.equal watermark [ "max_purged_effective_at" ] "the watermark probe reads one column"
           }
 
-          testTask "the current belief view uses its partial index" {
+          testTask "the current snapshot read uses its primary key" {
               do! reset ()
 
-              // Ten superseded valid-time versions per entity plus one live one, which is what
-              // this table looks like in use. The shape matters: with a single version per
-              // entity the temporal key is the same size as the partial index and the planner
-              // reasonably picks either. Once history accumulates, the partial index stays
-              // proportional to the live frontier while the key grows with every version.
+              // Seed the actual snapshot read boundary. An empty table legitimately scans;
+              // seeding only temporal beliefs cannot test the core snapshot access path.
               exec
-                  """INSERT INTO fsm.instance_state (machine_id, entity_id, state, status, epoch, command_id, chart_version, valid_during)
-                     SELECT 'plan-probe', 'e' || e, '{}'::jsonb, 'running', 1, 1, 1,
-                            tstzrange('2026-01-01'::timestamptz + (v || ' days')::interval,
-                                      '2026-01-01'::timestamptz + ((v + 1) || ' days')::interval, '[)')
-                     FROM generate_series(1, 2000) e, generate_series(0, 9) v;
-
-                     INSERT INTO fsm.instance_state (machine_id, entity_id, state, status, epoch, command_id, chart_version, valid_during)
-                     SELECT 'plan-probe', 'e' || e, '{}'::jsonb, 'running', 1, 1, 1, tstzrange('2026-03-01', 'infinity', '[)')
-                     FROM generate_series(1, 2000) e"""
+                  """INSERT INTO fsm.machine_chart_version(machine_id, version, fingerprint) VALUES('plan-probe', 1, repeat('a',64));
+                     INSERT INTO fsm.command(machine_id, entity_id, seq, idempotency_key, chart_version, event, request_digest)
+                     SELECT 'plan-probe', 'e' || e, 1, 'seed', 1, '{}', decode(repeat('00',32),'hex') FROM generate_series(1,2000) e;
+                     INSERT INTO fsm.entity_state(machine_id, entity_id, state, status, epoch, command_id, chart_version, effective_at)
+                     SELECT machine_id, entity_id, '{}', 'running', 1, command_id, 1, now() FROM fsm.command WHERE machine_id = 'plan-probe'"""
               |> function
                   | Ok() -> ()
                   | Error error -> failtestf "seeding failed: %s" error.Message
 
-              exec "ANALYZE fsm.instance_state"
+              exec "ANALYZE fsm.entity_state"
               |> function
                   | Ok() -> ()
                   | Error error -> failtestf "analyze failed: %s" error.Message

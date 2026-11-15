@@ -2,8 +2,8 @@
 
 The PostgreSQL provider defaults to current snapshots plus the committed transition log.
 Bitemporal history is an explicit installation and store-type choice. PostgreSQL 19 is
-required for the optional temporal keys. Phase E is a **clean-reset boundary**: pre-E
-installations must be reset; these scripts do not preserve or upgrade their data.
+required for the optional temporal keys. The current layout is a **clean-reset boundary**
+relative to earlier releases: these scripts do not preserve or upgrade pre-existing data.
 
 ## Migration layout
 
@@ -48,7 +48,33 @@ split/open routines, `belief`, `current_belief`, `belief_cold`, and correction/h
 routines. Core snapshot operation requires none of those objects.
 
 No stored column is nullable. Optional values use the schema's documented sentinels. User
-state, events, actions, and errors remain codec-backed payloads.
+state, events, and actions remain codec-backed payloads.
+
+## Failure, event, and origin ownership
+
+A command failure is relational: `command_error` is a discriminant header with exactly one child
+among `command_error_domain`, `command_error_machine`, and `command_error_replay`. Only the domain
+error is a codec-backed JSON payload; machine reasons and replay metadata are typed columns with
+checked discriminants and sentinel-filled fields. The header and child are written in one
+transaction, and `purge_commands` removes the complete transitive graph. Supervision reasons are
+plain `text`.
+
+`transition` stores no event column. History, result, and replay-suffix reads join the submitted
+command by its primary key, so the event is owned once and never rewritten: PostgreSQL rejects
+updates naming `command.event`, and SQLite already refuses every submitted request column. An
+ordinary continuing commit derives its origin from the locked `entity_state` row; only the first
+commit supplies an initial origin, and corrections retain an explicit source. A single destination
+payload feeds the transition, the snapshot, and the optional timeline.
+
+Temporal corrections travel as six typed arrays projected from ordered belief rows. The database
+validates cardinality, nulls, and ordering before rewriting. An empty operator batch erases a
+suffix; a committed replay requires at least one belief. A user state that encodes JSON `null` is
+distinct from SQL `NULL`.
+
+Corrupt action envelopes that carry no usable business identity are preserved in
+`action_quarantine` keyed by queue and message id, and archived under the same fence and
+transaction. Its retention shares the action-archive batch budget. A poison message cannot strand
+the healthy rows claimed alongside it.
 
 ## Install, reset, and opt in
 
@@ -61,7 +87,7 @@ make db-reset SCHEMA=fsm BELIEFS=snapshot
 Build a snapshot store with `MachineStoreOptions.forEntityId ... |> PostgresMachineStore`.
 Temporal and correction capability discovery returns `None`.
 
-To opt in on an existing **Phase E** snapshot installation:
+To opt in on an existing **current-layout** snapshot installation:
 
 ```sh
 make migrate SCHEMA=fsm BELIEFS=bitemporal

@@ -12,6 +12,7 @@ CREATE OR REPLACE FUNCTION $schema$.finish_command (p_command_id bigint, p_lease
 DECLARE
     standing record;
     queue_name text;
+    origin_state jsonb;
 BEGIN
     IF p_status NOT IN ('succeeded', 'rejected', 'dead_letter') THEN
         RAISE EXCEPTION 'not a terminal status: %', p_status
@@ -48,8 +49,31 @@ BEGIN
                 standing.status;
             RETURN;
         END IF;
+        IF p_expected_epoch = 0 THEN
+            IF p_from_state IS NULL THEN
+                RAISE EXCEPTION 'an initial commit requires its origin'
+                    USING ERRCODE = 'invalid_parameter_value';
+            END IF;
+            origin_state := p_from_state;
+        ELSE
+            IF p_from_state IS NOT NULL THEN
+                RAISE EXCEPTION 'a continuing commit derives its origin'
+                    USING ERRCODE = 'invalid_parameter_value';
+            END IF;
+            -- command_standing holds this row lock and serializes absent snapshots as well.
+            SELECT
+                s.state
+            INTO
+                STRICT origin_state
+            FROM
+                $schema$.entity_state s
+            WHERE
+                s.machine_id = standing.machine_id
+                AND s.entity_id = standing.entity_id
+            FOR UPDATE;
+        END IF;
         PERFORM
-            $schema$.append_transition (standing.machine_id, standing.entity_id, p_expected_epoch + 1, p_command_id, standing.chart_version, p_actions, p_from_state, p_to_state, p_handled_by, p_exited, p_entered, p_instance_status, p_effective_at);
+            $schema$.append_transition (standing.machine_id, standing.entity_id, p_expected_epoch + 1, p_command_id, standing.chart_version, p_actions, origin_state, p_to_state, p_handled_by, p_exited, p_entered, p_instance_status, p_effective_at);
         PERFORM
             $schema$.set_entity_state (standing.machine_id, standing.entity_id, p_to_state, p_instance_status, p_expected_epoch + 1, p_command_id, standing.chart_version, p_effective_at);
         IF p_actions IS NOT NULL AND JSONB_ARRAY_LENGTH(p_actions) > 0 THEN
@@ -76,7 +100,8 @@ BEGIN
             END IF;
         END IF;
     ELSE
-        RAISE EXCEPTION 'failures use fail_command' USING ERRCODE = 'invalid_parameter_value';
+        RAISE EXCEPTION 'failures use fail_command'
+            USING ERRCODE = 'invalid_parameter_value';
     END IF;
     PERFORM
         $schema$.close_command (p_command_id, p_status);
@@ -91,3 +116,4 @@ BEGIN
         p_status;
 END
 $$;
+

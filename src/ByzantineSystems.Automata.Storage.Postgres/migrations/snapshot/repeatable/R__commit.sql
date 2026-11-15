@@ -23,3 +23,4 @@ END IF;
         $schema$.finish_command (p_command_id, p_lease_token, p_expected_epoch, p_status, p_error, p_instance_status, p_effective_at, p_actions, p_from_state, p_to_state, p_handled_by, p_exited, p_entered);
 END
 $$;
+

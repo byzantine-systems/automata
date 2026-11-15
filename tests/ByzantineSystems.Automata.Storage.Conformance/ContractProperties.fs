@@ -2440,6 +2440,87 @@ type ContractHistoryEnv =
 type private ContractTransition = CommittedTransition<ContractEntityId, ContractState, ContractEvent, ContractAction>
 
 /// A draft cannot replace the immutable event owned by its associated command.
+let originOwnershipProperty name maxTests (env: ContractHistoryEnv) =
+    testCase name (fun () ->
+        Check.One(
+            Config.QuickThrowOnFailure.WithMaxTest(maxTests),
+            fun (generated: byte list) ->
+                task {
+                    let! stores = env.Fresh()
+                    let ct = CancellationToken.None
+                    let entity: ContractEntityId = entityId "origin-owner"
+                    let mutable previous = Idle
+
+                    for index, value in (0uy :: 1uy :: List.truncate 4 generated) |> List.indexed do
+                        let event = Ping(int value)
+
+                        let! submitted =
+                            stores.Inbox.SubmitAsync(
+                                contractSubmission env.Machine env.Version entity (string index) event,
+                                ct
+                            )
+
+                        Expect.isOk submitted "submit"
+
+                        let! claimed =
+                            stores.Inbox.ClaimAsync(
+                                env.Machine,
+                                ClaimBatch.create 1,
+                                LeaseDuration.create (TimeSpan.FromMinutes 1.),
+                                ct
+                            )
+
+                        let held =
+                            match claimed with
+                            | Ok [ held ] -> held
+                            | other -> failtestf "claim: %A" other
+
+                        let draft =
+                            { contractDraft env.Machine entity event value Idle with
+                                Actions = []
+                                EffectiveAt = DateTimeOffset(2026, 1, 1, 0, 0, index, TimeSpan.Zero) }
+
+                        let! committed =
+                            stores.Processor.CommitAsync(
+                                held.Work.CommandId,
+                                held.Token,
+                                Epoch.ofUInt64 (uint64 index),
+                                draft,
+                                ct
+                            )
+
+                        Expect.equal committed (Ok(Finalized(Epoch.ofUInt64 (uint64 (index + 1))))) "commit"
+                        let! result = stores.Processor.TryGetResultAsync(held.Work.CommandId, ct)
+
+                        match result with
+                        | Ok(Some(CommandResult.Committed result)) ->
+                            Expect.equal
+                                result.Draft.FromState
+                                previous
+                                "origin comes from the previous snapshot, not the stale draft"
+
+                            Expect.equal result.Draft.ToState draft.ToState "destination preserved"
+                        | other -> failtestf "result: %A" other
+
+                        previous <- draft.ToState
+
+                    let! history = stores.Reader.HistoryAsync(env.Machine, entity, Page.create 10, ct)
+
+                    match history with
+                    | Ok history ->
+                        for before, after in List.pairwise history do
+                            Expect.equal
+                                after.Draft.FromState
+                                before.Draft.ToState
+                                "history is a contiguous state chain"
+                    | Error error -> failtestf "history: %A" error
+
+                    return true
+                }
+                |> fun running -> running.GetAwaiter().GetResult()
+        ))
+
+/// A draft cannot replace the immutable event owned by its associated command.
 let eventOwnershipProperty name maxTests (env: ContractHistoryEnv) =
     testCase name (fun () ->
         Check.One(

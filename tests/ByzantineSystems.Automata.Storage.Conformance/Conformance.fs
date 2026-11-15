@@ -145,6 +145,10 @@ module Conformance =
                   behaviorClasses
 
               ContractProperties.historyProperty "the shared history equations" s.HistoryCases sut.History
+              ContractProperties.originOwnershipProperty
+                  "ordinary transition origins form the snapshot chain"
+                  s.HistoryCases
+                  sut.History
               ContractProperties.eventOwnershipProperty
                   "the submitted command owns the transition event"
                   s.HistoryCases

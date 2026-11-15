@@ -9,6 +9,7 @@ open ByzantineSystems.Automata.Storage
 open ByzantineSystems.Automata.Storage.Postgres
 open Expecto
 open Npgsql
+open FsCheck
 open TestContext
 
 let private entity name : Entity = entityId name
@@ -334,7 +335,53 @@ let bootTests =
 let retentionTests =
     testList
         "Postgres retention"
-        [ testTask "old terminal commands are purged with everything that references them" {
+        [ testCase "retention removes every relational failure constructor" (fun () ->
+              Check.One(
+                  Config.QuickThrowOnFailure.WithMaxTest(6),
+                  fun (payload: byte) ->
+                      task {
+                          do! reset ()
+
+                          let failures =
+                              [ CommandFailure.Domain(Refused $"domain-{payload}")
+                                CommandFailure.Machine $"machine-{payload}"
+                                CommandFailure.Replay(
+                                    ReplayError.UnknownChartVersion(ChartVersion.create (1 + int payload))
+                                )
+                                CommandFailure.Replay(
+                                    ReplayError.Diverged(Epoch.ofUInt64 (uint64 payload), "diverged")
+                                )
+                                CommandFailure.Replay(ReplayError.BudgetExceeded(int payload))
+                                CommandFailure.Replay ReplayError.HistoryPurged ]
+
+                          for index, failure in List.indexed failures do
+                              let key = $"failure-{index}"
+                              let! _ = submit "failure-retention" key
+                              let! held = claimed key
+
+                              let! result =
+                                  (newProcessor ())
+                                      .RejectAsync(held.Work.CommandId, held.Token, failure, noCancellation)
+
+                              expectOk "reject" result |> ignore
+
+                          let! _ = submit "failure-retention" "survivor"
+                          let purged = scalar<int64> "SELECT fsm.purge_commands('pg-tests', 'infinity', 100)"
+                          Expect.equal purged 6L "all failed predecessors are purgeable"
+
+                          for table in
+                              [ "command_error"
+                                "command_error_domain"
+                                "command_error_machine"
+                                "command_error_replay" ] do
+                              Expect.equal (count $"SELECT count(*) FROM fsm.{table}") 0L $"no orphan in {table}"
+
+                          return true
+                      }
+                      |> fun running -> running.GetAwaiter().GetResult()
+              ))
+
+          testTask "old terminal commands are purged with everything that references them" {
               do! reset ()
               do! boot (keepCommandsFor hour)
               let! _ = submit "e1" "k1"

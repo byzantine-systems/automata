@@ -20,6 +20,8 @@ type private Instruction =
 type private ProgramStep =
     | ExecuteStep
     | QueryStep
+    | TryQueryStep
+    | RowsQueryStep
 
 let private canceled<'T> (cancellationToken: CancellationToken) =
     Task.FromCanceled<Result<'T, StoreError>>(cancellationToken)
@@ -38,13 +40,16 @@ type private RecordingInterpreter
         ?queryBatches: Map<string, string> list list
     ) =
     let instructions = ResizeArray<Instruction>()
+    let arguments = ResizeArray<StatementKey * Map<string, string>>()
     let mutable remaining = rows
     let mutable remainingBatches = defaultArg queryBatches [ rows ]
 
     member _.Instructions = instructions |> Seq.toList
+    member _.Arguments = arguments |> Seq.toList
 
     interface IStoreInterpreter<Map<string, string>, Map<string, string>> with
-        member _.ExecuteAsync(key, _, cancellationToken) =
+        member _.ExecuteAsync(key, parameters, cancellationToken) =
+            arguments.Add(key, parameters)
             instructions.Add(Execute key)
 
             if cancellationToken.IsCancellationRequested then
@@ -53,7 +58,8 @@ type private RecordingInterpreter
                 failed<int> failureAt key
                 |> Option.defaultWith (fun () -> Task.FromResult(Ok(defaultArg changedRows 1)))
 
-        member _.QueryOneAsync<'T>(key, _, read, cancellationToken) =
+        member _.QueryOneAsync<'T>(key, parameters, read, cancellationToken) =
+            arguments.Add(key, parameters)
             instructions.Add(QueryOne key)
 
             if cancellationToken.IsCancellationRequested then
@@ -76,7 +82,8 @@ type private RecordingInterpreter
                             )
                         )
 
-        member _.TryQueryOneAsync<'T>(key, _, read, cancellationToken) =
+        member _.TryQueryOneAsync<'T>(key, parameters, read, cancellationToken) =
+            arguments.Add(key, parameters)
             instructions.Add(TryQueryOne key)
 
             if cancellationToken.IsCancellationRequested then
@@ -91,7 +98,8 @@ type private RecordingInterpreter
                         Task.FromResult(read row |> Result.map Some)
                     | [] -> Task.FromResult(Ok None)
 
-        member _.QueryRowsAsync<'T>(key, _, read, cancellationToken) =
+        member _.QueryRowsAsync<'T>(key, parameters, read, cancellationToken) =
+            arguments.Add(key, parameters)
             instructions.Add(QueryRows key)
 
             if cancellationToken.IsCancellationRequested then
@@ -113,7 +121,6 @@ type private RecordingInterpreter
                             batch
                             (Ok [])
 
-                    remaining <- []
                     Task.FromResult result
 
 let private parameters = Map.empty<string, string>
@@ -142,6 +149,8 @@ let private expectedInstruction index =
     function
     | ExecuteStep -> Execute(keyAt index)
     | QueryStep -> QueryOne(keyAt index)
+    | TryQueryStep -> TryQueryOne(keyAt index)
+    | RowsQueryStep -> QueryRows(keyAt index)
 
 let rec private programFrom outcome =
     function
@@ -153,6 +162,12 @@ let rec private programFrom outcome =
             | QueryStep ->
                 let! _ = StoreProgram.queryOne (keyAt index) parameters readValue
                 ()
+            | TryQueryStep ->
+                let! _ = StoreProgram.tryQueryOne (keyAt index) parameters readValue
+                ()
+            | RowsQueryStep ->
+                let! _ = StoreProgram.queryRows (keyAt index) parameters readValue
+                ()
 
             return! programFrom outcome rest
         }
@@ -160,8 +175,10 @@ let rec private programFrom outcome =
 let private rowsFor steps =
     steps
     |> List.choose (function
-        | QueryStep -> Some(Map [ "value", "read" ])
-        | ExecuteStep -> None)
+        | QueryStep
+        | TryQueryStep -> Some(Map [ "value", "read" ])
+        | ExecuteStep
+        | RowsQueryStep -> None)
 
 let private run interpreter program =
     StoreProgram.run interpreter CancellationToken.None program
@@ -171,6 +188,77 @@ let tests =
     testList
         "store program"
         [ Property.property
+              "bind identity and associativity preserve outcomes and effects"
+              (fun (a: ProgramStep list, b: ProgramStep list, c: ProgramStep list, value: int) ->
+                  let a, b, c = List.truncate 8 a, List.truncate 8 b, List.truncate 8 c
+                  let make steps result = programFrom result (List.indexed steps)
+                  let program = make a value
+                  let f x = make b (x ^^^ 17)
+                  let g x = make c (x ^^^ 31)
+
+                  let observe program =
+                      let interpreter = RecordingInterpreter(rowsFor (a @ b @ c))
+                      run interpreter program, interpreter.Instructions, interpreter.Arguments
+
+                  observe (StoreProgram.bind StoreProgram.ok program) = observe program
+                  && observe (StoreProgram.bind f (StoreProgram.ok value)) = observe (f value)
+                  && observe (StoreProgram.bind g (StoreProgram.bind f program)) = observe (
+                      StoreProgram.bind (fun x -> StoreProgram.bind g (f x)) program
+                  ))
+
+          Property.property "finalization standing selects exactly its authorized branch" (fun (choice: byte) ->
+              let parameters = Map [ "choice", string choice ]
+
+              let check standing =
+                  let read = StoreProgram.queryOne first parameters (fun _ -> Ok standing)
+
+                  let already status =
+                      StoreProgram.queryOne second parameters (fun _ -> Ok(AlreadyFinalized(Epoch.initial, status)))
+
+                  let resolve () =
+                      StoreProgram.executeDiscard third parameters
+                      |> StoreProgram.map (fun () -> Finalized(Epoch.next Epoch.initial))
+
+                  let interpreter = RecordingInterpreter([ parameters; parameters ])
+
+                  let program =
+                      FinalizeProgram.finish (
+                          CheckedFinalization(read, already, resolve, StoreError.NotFound "missing")
+                      )
+
+                  let actual = run interpreter program
+
+                  let expected, instructions =
+                      match standing with
+                      | Unknown -> Error(StoreError.NotFound "missing"), [ QueryOne first ]
+                      | FinishedByCaller status ->
+                          Ok(AlreadyFinalized(Epoch.initial, status)), [ QueryOne first; QueryOne second ]
+                      | FinishedByAnother
+                      | HeldByAnother -> Ok FinalizeOutcome.LeaseLost, [ QueryOne first ]
+                      | HeldByCaller() -> Ok(Finalized(Epoch.next Epoch.initial)), [ QueryOne first; Execute third ]
+
+                  let keys =
+                      instructions
+                      |> List.map (function
+                          | Execute key
+                          | QueryOne key
+                          | TryQueryOne key
+                          | QueryRows key -> key)
+
+                  actual = expected
+                  && interpreter.Instructions = instructions
+                  && interpreter.Arguments = (keys |> List.map (fun key -> key, parameters))
+
+              [ Unknown
+                FinishedByCaller CommandStatus.Succeeded
+                FinishedByCaller CommandStatus.Rejected
+                FinishedByCaller CommandStatus.DeadLettered
+                FinishedByAnother
+                HeldByAnother
+                HeldByCaller() ]
+              |> List.forall check)
+
+          Property.property
               "instructions are cold and execute sequentially"
               (fun (steps: ProgramStep list, outcome: int) ->
                   let indexed = List.indexed steps

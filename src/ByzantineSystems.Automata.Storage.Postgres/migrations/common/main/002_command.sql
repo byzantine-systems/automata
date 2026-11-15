@@ -188,6 +188,7 @@ WHERE
 -- The primary key is the command, so a command owns at most one error.
 -- ---------------------------------------------------------------------------
 CREATE DOMAIN $schema$.failure_kind AS text CHECK (VALUE IN ('domain', 'machine', 'replay'));
+
 CREATE DOMAIN $schema$.replay_failure AS text CHECK (VALUE IN ('unknown_chart_version', 'diverged', 'budget_exceeded', 'history_purged'));
 
 CREATE TABLE $schema$.command_error (command_id bigint PRIMARY KEY, kind $schema$.failure_kind NOT NULL,
@@ -197,25 +198,24 @@ CREATE TABLE $schema$.command_error (command_id bigint PRIMARY KEY, kind $schema
     recorded_at timestamptz NOT NULL DEFAULT STATEMENT_TIMESTAMP(), UNIQUE (command_id, kind), CONSTRAINT command_error_command_fkey FOREIGN KEY (command_id) REFERENCES $schema$.command (command_id)
 );
 
-CREATE TABLE $schema$.command_error_domain (
-    command_id bigint PRIMARY KEY, kind $schema$.failure_kind NOT NULL DEFAULT 'domain' CHECK (kind = 'domain'),
-    error jsonb NOT NULL, FOREIGN KEY (command_id, kind) REFERENCES $schema$.command_error (command_id, kind)
+CREATE TABLE $schema$.command_error_domain (command_id bigint PRIMARY KEY, kind $schema$.failure_kind NOT NULL DEFAULT 'domain' CHECK (kind = 'domain'), error jsonb NOT NULL, FOREIGN KEY (command_id, kind) REFERENCES $schema$.command_error (command_id, kind)
 );
-CREATE TABLE $schema$.command_error_machine (
-    command_id bigint PRIMARY KEY, kind $schema$.failure_kind NOT NULL DEFAULT 'machine' CHECK (kind = 'machine'),
-    reason text NOT NULL, FOREIGN KEY (command_id, kind) REFERENCES $schema$.command_error (command_id, kind)
+
+CREATE TABLE $schema$.command_error_machine (command_id bigint PRIMARY KEY, kind $schema$.failure_kind NOT NULL DEFAULT 'machine' CHECK (kind = 'machine'), reason text NOT NULL, FOREIGN KEY (command_id, kind) REFERENCES $schema$.command_error (command_id, kind)
 );
-CREATE TABLE $schema$.command_error_replay (
-    command_id bigint PRIMARY KEY, kind $schema$.failure_kind NOT NULL DEFAULT 'replay' CHECK (kind = 'replay'),
-    replay_kind $schema$.replay_failure NOT NULL, version integer NOT NULL DEFAULT 0,
-    epoch bigint NOT NULL DEFAULT 0, reason text NOT NULL DEFAULT '', budget integer NOT NULL DEFAULT 0,
-    FOREIGN KEY (command_id, kind) REFERENCES $schema$.command_error (command_id, kind),
-    CHECK (CASE replay_kind
-        WHEN 'unknown_chart_version' THEN version > 0 AND epoch = 0 AND reason = '' AND budget = 0
-        WHEN 'diverged' THEN version = 0 AND epoch >= 0 AND budget = 0
-        WHEN 'budget_exceeded' THEN version = 0 AND epoch = 0 AND reason = ''
-        WHEN 'history_purged' THEN version = 0 AND epoch = 0 AND reason = '' AND budget = 0
-        ELSE FALSE END)
+
+CREATE TABLE $schema$.command_error_replay (command_id bigint PRIMARY KEY, kind $schema$.failure_kind NOT NULL DEFAULT 'replay' CHECK (kind = 'replay'), replay_kind $schema$.replay_failure NOT NULL, version integer NOT NULL DEFAULT 0, epoch bigint NOT NULL DEFAULT 0, reason text NOT NULL DEFAULT '', budget integer NOT NULL DEFAULT 0, FOREIGN KEY (command_id, kind) REFERENCES $schema$.command_error (command_id, kind), CHECK (CASE replay_kind
+    WHEN 'unknown_chart_version' THEN
+        version > 0 AND epoch = 0 AND reason = '' AND budget = 0
+    WHEN 'diverged' THEN
+        version = 0 AND epoch >= 0 AND budget = 0
+    WHEN 'budget_exceeded' THEN
+        version = 0 AND epoch = 0 AND reason = ''
+    WHEN 'history_purged' THEN
+        version = 0 AND epoch = 0 AND reason = '' AND budget = 0
+    ELSE
+        FALSE
+    END)
 );
 
 -- ---------------------------------------------------------------------------

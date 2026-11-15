@@ -8,9 +8,12 @@
 -- v1 store that was replaced around it.
 -- ---------------------------------------------------------------------------
 CREATE DOMAIN $schema$.supervision_kind AS text CHECK (VALUE IN ('Started', 'Restarted', 'Escalated', 'Stopped'));
+
 CREATE DOMAIN $schema$.supervision_strategy AS text CHECK (VALUE IN ('OneForOne', 'OneForAll', 'RestForOne'));
+
 CREATE TABLE $schema$.supervision_event (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, supervisor text NOT NULL, child_id text NOT NULL, kind $schema$.supervision_kind NOT NULL, strategy $schema$.supervision_strategy NOT NULL, reason text NOT NULL DEFAULT '', at timestamptz NOT NULL
 );
 
 -- Newest first is the only way this table is ever read.
 CREATE INDEX supervision_event_recent_idx ON $schema$.supervision_event (at DESC, id DESC);
+

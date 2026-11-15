@@ -1,6 +1,5 @@
 -- Transactional timeline rewrite. Callers hold the entity lock and establish the fence first.
-CREATE OR REPLACE FUNCTION $temporal_schema$.rewrite_beliefs (p_machine text, p_entity text, p_from timestamptz,
-    p_states jsonb[], p_statuses text[], p_valid_froms timestamptz[], p_epochs bigint[], p_command_ids bigint[], p_chart_versions integer[])
+CREATE OR REPLACE FUNCTION $temporal_schema$.rewrite_beliefs (p_machine text, p_entity text, p_from timestamptz, p_states jsonb[], p_statuses text[], p_valid_froms timestamptz[], p_epochs bigint[], p_command_ids bigint[], p_chart_versions integer[])
     RETURNS integer
     LANGUAGE plpgsql
     VOLATILE PARALLEL UNSAFE
@@ -13,42 +12,34 @@ DECLARE
     changed integer;
     removed integer;
 BEGIN
-    IF p_states IS NULL OR p_statuses IS NULL OR p_valid_froms IS NULL OR p_epochs IS NULL OR p_command_ids IS NULL OR p_chart_versions IS NULL
-        OR cardinality(p_states) <> cardinality(p_statuses)
-        OR cardinality(p_states) <> cardinality(p_valid_froms)
-        OR cardinality(p_states) <> cardinality(p_epochs)
-        OR cardinality(p_states) <> cardinality(p_command_ids)
-        OR cardinality(p_states) <> cardinality(p_chart_versions)
-        OR coalesce(array_ndims(p_states), 1) <> 1 OR coalesce(array_ndims(p_statuses), 1) <> 1
-        OR coalesce(array_ndims(p_valid_froms), 1) <> 1 OR coalesce(array_ndims(p_epochs), 1) <> 1
-        OR coalesce(array_ndims(p_command_ids), 1) <> 1 OR coalesce(array_ndims(p_chart_versions), 1) <> 1 THEN
+    IF p_states IS NULL OR p_statuses IS NULL OR p_valid_froms IS NULL OR p_epochs IS NULL OR p_command_ids IS NULL OR p_chart_versions IS NULL OR CARDINALITY(p_states) <> CARDINALITY(p_statuses) OR CARDINALITY(p_states) <> CARDINALITY(p_valid_froms) OR CARDINALITY(p_states) <> CARDINALITY(p_epochs) OR CARDINALITY(p_states) <> CARDINALITY(p_command_ids) OR CARDINALITY(p_states) <> CARDINALITY(p_chart_versions) OR COALESCE(ARRAY_NDIMS(p_states), 1) <> 1 OR COALESCE(ARRAY_NDIMS(p_statuses), 1) <> 1 OR COALESCE(ARRAY_NDIMS(p_valid_froms), 1) <> 1 OR COALESCE(ARRAY_NDIMS(p_epochs), 1) <> 1 OR COALESCE(ARRAY_NDIMS(p_command_ids), 1) <> 1 OR COALESCE(ARRAY_NDIMS(p_chart_versions), 1) <> 1 THEN
         RAISE EXCEPTION 'belief arrays must be non-null, one-dimensional and equal in cardinality'
             USING ERRCODE = 'invalid_parameter_value';
     END IF;
-    IF array_position(p_states, NULL) IS NOT NULL OR array_position(p_statuses, NULL) IS NOT NULL
-        OR array_position(p_valid_froms, NULL) IS NOT NULL OR array_position(p_epochs, NULL) IS NOT NULL
-        OR array_position(p_command_ids, NULL) IS NOT NULL OR array_position(p_chart_versions, NULL) IS NOT NULL THEN
-        RAISE EXCEPTION 'belief arrays cannot contain SQL NULL' USING ERRCODE = 'invalid_parameter_value';
+    IF ARRAY_POSITION(p_states, NULL) IS NOT NULL OR ARRAY_POSITION(p_statuses, NULL) IS NOT NULL OR ARRAY_POSITION(p_valid_froms, NULL) IS NOT NULL OR ARRAY_POSITION(p_epochs, NULL) IS NOT NULL OR ARRAY_POSITION(p_command_ids, NULL) IS NOT NULL OR ARRAY_POSITION(p_chart_versions, NULL) IS NOT NULL THEN
+        RAISE EXCEPTION 'belief arrays cannot contain SQL NULL'
+            USING ERRCODE = 'invalid_parameter_value';
     END IF;
     FOR b IN
     SELECT
         t.*
     FROM
-        unnest(p_states, p_statuses, p_valid_froms, p_epochs, p_command_ids, p_chart_versions)
-        WITH ORDINALITY AS t(state, status, valid_from, epoch, command_id, chart_version, ordinal)
-    ORDER BY t.ordinal
-        LOOP
-            IF b.ordinal = 1 THEN
-                IF b.valid_from IS DISTINCT FROM p_from THEN
-                    RAISE EXCEPTION 'first belief must start at the corrected instant' USING ERRCODE = 'invalid_parameter_value';
-        END IF;
+        UNNEST(p_states, p_statuses, p_valid_froms, p_epochs, p_command_ids, p_chart_versions)
+    WITH ORDINALITY AS t (state, status, valid_from, epoch, command_id, chart_version, ordinal)
+ORDER BY
+    t.ordinal LOOP
+        IF b.ordinal = 1 THEN
+            IF b.valid_from IS DISTINCT FROM p_from THEN
+                RAISE EXCEPTION 'first belief must start at the corrected instant' USING ERRCODE = 'invalid_parameter_value';
+    END IF;
 ELSIF b.valid_from <= previous_at THEN
     RAISE EXCEPTION 'beliefs must have strictly ascending valid times'
         USING ERRCODE = 'invalid_parameter_value';
 END IF;
     previous_at := b.valid_from;
     IF b.epoch <= 0 OR b.command_id <= 0 OR b.chart_version <= 0 OR b.status NOT IN ('running', 'suspended', 'terminated') THEN
-        RAISE EXCEPTION 'invalid belief fields' USING ERRCODE = 'invalid_parameter_value';
+        RAISE EXCEPTION 'invalid belief fields'
+            USING ERRCODE = 'invalid_parameter_value';
     END IF;
 END LOOP;
     UPDATE
@@ -68,12 +59,13 @@ END LOOP;
     GET DIAGNOSTICS removed = ROW_COUNT;
     FOR b IN
     SELECT
-        t.*, LEAD(t.valid_from) OVER (ORDER BY t.ordinal) AS next_at
+        t.*,
+        LEAD(t.valid_from) OVER (ORDER BY t.ordinal) AS next_at
     FROM
-        unnest(p_states, p_statuses, p_valid_froms, p_epochs, p_command_ids, p_chart_versions)
-    WITH ORDINALITY AS t(state, status, valid_from, epoch, command_id, chart_version, ordinal)
-    ORDER BY t.ordinal
-    LOOP
+        UNNEST(p_states, p_statuses, p_valid_froms, p_epochs, p_command_ids, p_chart_versions)
+    WITH ORDINALITY AS t (state, status, valid_from, epoch, command_id, chart_version, ordinal)
+ORDER BY
+    t.ordinal LOOP
         INSERT INTO $temporal_schema$.instance_state (machine_id, entity_id, state, status, epoch, command_id, chart_version, valid_during)
             VALUES (p_machine, p_entity, b.state, b.status::$schema$.instance_status, b.epoch, b.command_id, b.chart_version, TSTZRANGE(b.valid_from, COALESCE(b.next_at, 'infinity'), '[)'));
     END LOOP;
@@ -82,8 +74,7 @@ END
 $$;
 
 -- Operator correction: optimistic concurrency against the core epoch, without advancing it.
-CREATE OR REPLACE FUNCTION $temporal_schema$.correct_beliefs (p_machine text, p_entity text, p_expected bigint, p_from timestamptz,
-    p_states jsonb[], p_statuses text[], p_valid_froms timestamptz[], p_epochs bigint[], p_command_ids bigint[], p_chart_versions integer[])
+CREATE OR REPLACE FUNCTION $temporal_schema$.correct_beliefs (p_machine text, p_entity text, p_expected bigint, p_from timestamptz, p_states jsonb[], p_statuses text[], p_valid_froms timestamptz[], p_epochs bigint[], p_command_ids bigint[], p_chart_versions integer[])
     RETURNS TABLE (
         superseded integer,
         actual_epoch bigint,
@@ -125,9 +116,7 @@ BEGIN
 END
 $$;
 
-CREATE OR REPLACE FUNCTION $temporal_schema$.commit_correction (p_command_id bigint, p_lease_token bigint, p_expected_epoch bigint, p_valid_from timestamptz,
-    p_states jsonb[], p_statuses text[], p_valid_froms timestamptz[], p_epochs bigint[], p_command_ids bigint[], p_chart_versions integer[],
-    p_instance_status $schema$.instance_status, p_from_state jsonb, p_to_state jsonb, p_handled_by text, p_exited text[], p_entered text[])
+CREATE OR REPLACE FUNCTION $temporal_schema$.commit_correction (p_command_id bigint, p_lease_token bigint, p_expected_epoch bigint, p_valid_from timestamptz, p_states jsonb[], p_statuses text[], p_valid_froms timestamptz[], p_epochs bigint[], p_command_ids bigint[], p_chart_versions integer[], p_instance_status $schema$.instance_status, p_from_state jsonb, p_to_state jsonb, p_handled_by text, p_exited text[], p_entered text[])
     RETURNS TABLE (
         outcome $schema$.finalize_outcome,
         epoch bigint,
@@ -179,8 +168,9 @@ END IF;
             standing.status;
         RETURN;
     END IF;
-    IF p_states IS NULL OR cardinality(p_states) = 0 THEN
-        RAISE EXCEPTION 'a correction commit requires at least one belief' USING ERRCODE = 'invalid_parameter_value';
+    IF p_states IS NULL OR CARDINALITY(p_states) = 0 THEN
+        RAISE EXCEPTION 'a correction commit requires at least one belief'
+            USING ERRCODE = 'invalid_parameter_value';
     END IF;
     PERFORM
         $schema$.append_transition (standing.machine_id, standing.entity_id, p_expected_epoch + 1, p_command_id, standing.chart_version, '[]', p_from_state, p_to_state, p_handled_by, p_exited, p_entered, p_instance_status, p_valid_from);
@@ -197,3 +187,4 @@ END IF;
         'succeeded'::$schema$.command_status;
 END
 $$;
+

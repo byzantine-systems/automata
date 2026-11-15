@@ -41,37 +41,14 @@ type internal FinalizeTarget =
       Holder: LeaseToken<CommandWork>
       Version: int64 }
 
-/// <summary>
-/// Where a finalizing caller stands with its command, as the command row shows it. Decided
-/// before anything is written, and the only thing that decides whether anything is.
-/// </summary>
-type internal LeaseStanding =
-    /// <summary>No command has this id.</summary>
-    | Unknown
-
-    /// <summary>
-    /// The caller's own lease already finished it: a retry, answered with what it did and the
-    /// resolution that was stored.
-    /// </summary>
-    | FinishedByCaller of status: CommandStatus
-
-    /// <summary>Finished under somebody else's lease.</summary>
-    | FinishedByAnother
-
-    /// <summary>
-    /// Open, and held by somebody else. Expiry is not consulted: the token is the fence, and a
-    /// worker past its deadline whose command nobody reclaimed still holds the only token.
-    /// </summary>
-    | HeldByAnother
-
-    /// <summary>Open, and the caller holds it: the finalize writes.</summary>
-    | HeldByCaller of FinalizeTarget
-
-/// <summary>Operations on <see cref="T:ByzantineSystems.Automata.Storage.Sqlite.LeaseStanding" />.</summary>
+/// <summary>Classifies a SQLite command using the shared finalization vocabulary.</summary>
 [<RequireQualifiedAccess>]
 module internal LeaseStanding =
 
-    let classify (held: LeaseToken<CommandWork>) (target: FinalizeTarget option) : LeaseStanding =
+    let classify
+        (held: LeaseToken<CommandWork>)
+        (target: FinalizeTarget option)
+        : FinalizationStanding<FinalizeTarget> =
         match target with
         | None -> Unknown
         | Some target ->
@@ -140,23 +117,8 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
 
     let commandResult = StatementKey.create "command" "result" |> Sql.prepareProgram
 
-    let encodeDraft
-        (draft: TransitionDraft<'EntityId, 'State, 'Event, 'Action>)
-        : Result<EncodedDraft<'EntityId, 'State, 'Event, 'Action>, StoreError> =
-        match
-            options.ActionCodec.Encode draft.Actions,
-            options.StateCodec.Encode draft.FromState,
-            options.StateCodec.Encode draft.ToState
-        with
-        | Ok actions, Ok fromState, Ok toState ->
-            Ok
-                { Source = draft
-                  ActionsJson = actions
-                  FromJson = fromState
-                  ToJson = toState }
-        | Error error, _, _
-        | _, Error error, _
-        | _, _, Error error -> Error(Db.toStoreError error)
+    let encodeDraft expected draft =
+        DraftEncoding.encode options.StateCodec options.ActionCodec (Some expected) draft
 
     /// <summary>
     /// The failure column is a tagged envelope rather than the bare domain error, because the
@@ -381,7 +343,7 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
                     insertTransition
                     (written
                      @ [ "@actions", Param.Text encoded.ActionsJson
-                         "@from_state", Param.Text encoded.FromJson
+                         "@from_state", Param.TextOrNull(CommitOrigin.payload encoded.Origin)
                          "@to_state", Param.Text encoded.ToJson
                          "@handled_by", Param.Text(StateId.value draft.HandledBy)
                          "@exited", Param.Text(encodePath draft.Exited)
@@ -488,17 +450,19 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
         Sql.writeProgramWith
             context
             (fun now ->
-                store {
-                    let! read =
-                        StoreProgram.tryQueryOne
-                            finalizeRead
-                            [ Params.commandId "@command_id" commandId ]
-                            finalizeTargetRow
+                let standing =
+                    store {
+                        let! read =
+                            StoreProgram.tryQueryOne
+                                finalizeRead
+                                [ Params.commandId "@command_id" commandId ]
+                                finalizeTargetRow
 
-                    match LeaseStanding.classify token read with
-                    | Unknown ->
-                        return! StoreProgram.fail (StoreError.NotFound $"command %d{CommandId.value commandId}")
-                    | FinishedByCaller status ->
+                        return LeaseStanding.classify token read
+                    }
+
+                let already status =
+                    store {
                         let! committed =
                             StoreProgram.tryQueryOne
                                 committedEpoch
@@ -507,10 +471,16 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
 
                         return
                             AlreadyFinalized(committed |> Option.defaultValue (Resolution.unmoved resolution), status)
-                    | FinishedByAnother
-                    | HeldByAnother -> return FinalizeOutcome.LeaseLost
-                    | HeldByCaller target -> return! resolve now commandId target resolution
-                })
+                    }
+
+                FinalizeProgram.finish (
+                    CheckedFinalization(
+                        standing,
+                        already,
+                        (fun target -> resolve now commandId target resolution),
+                        StoreError.NotFound $"command %d{CommandId.value commandId}"
+                    )
+                ))
             ct
 
     /// <summary>
@@ -573,7 +543,7 @@ type SqliteCommandProcessorStore<'EntityId, 'State, 'Event, 'Action, 'Err>
             // transaction would be time every machine sharing the file waits for.
             Tap.start cancellationToken (fun () ->
                 backgroundTaskResult {
-                    let! encoded = encodeDraft draft
+                    let! encoded = encodeDraft expected draft
                     return! finalize commandId token (Commit(expected, encoded)) cancellationToken
                 })
 

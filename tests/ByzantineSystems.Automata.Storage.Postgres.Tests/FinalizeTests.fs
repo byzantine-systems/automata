@@ -71,6 +71,30 @@ let tests =
               Expect.equal result (Finalized(Epoch.next Epoch.initial)) "lifecycle writes remain possible"
           }
 
+          testTask "direct ordinary commits reject incompatible origin shapes atomically" {
+              do! reset ()
+              let inbox = newInbox ()
+              let! first = leased inbox "origins" "first"
+
+              let invoke (held: Claimed) expected origin =
+                  exec
+                      $"SELECT * FROM fsm.finish_command({CommandId.value held.Work.CommandId},{LeaseToken.value held.Token},{expected},'succeeded',
+                       p_instance_status => 'running', p_effective_at => '2026-01-01', p_actions => '[]', p_from_state => {origin},
+                       p_to_state => '{{}}', p_handled_by => 'root', p_exited => '{{}}', p_entered => '{{}}')"
+
+              let refuses phrase (result: Result<unit, exn>) =
+                  match result with
+                  | Error error -> Expect.stringContains error.Message phrase "the origin validation refused it"
+                  | Ok() -> failtest "invalid origin accepted"
+
+              invoke first 0 "NULL" |> refuses "initial commit requires"
+              Expect.equal (counts ()) "0/0/0" "validation wrote nothing"
+              let! _ = commit (newProcessor ()) first Epoch.initial (Active 1)
+              let! second = leased inbox "origins" "second"
+              invoke second 1 "'{}'::jsonb" |> refuses "continuing commit derives"
+              Expect.equal (counts ()) "1/1/0" "only the first commit remains"
+          }
+
           testTask "committing appends the transition, advances the belief and closes the command" {
               do! reset ()
               let inbox = newInbox ()

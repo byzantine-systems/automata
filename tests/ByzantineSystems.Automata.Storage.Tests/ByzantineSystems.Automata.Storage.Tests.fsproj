@@ -14,6 +14,7 @@
         <Compile Include="StoreProgramTests.fs" />
         <Compile Include="EnumCodecTests.fs" />
         <Compile Include="FailureTests.fs" />
+        <Compile Include="FinalizeTests.fs" />
         <Compile Include="Program.fs" />
     </ItemGroup>
 

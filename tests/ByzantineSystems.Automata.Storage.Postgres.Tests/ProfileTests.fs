@@ -333,7 +333,7 @@ let tests =
                       use commit =
                           new NpgsqlCommand(
                               $"SELECT * FROM {owner}.commit_command(@id,@token,@expected,'succeeded',NULL,'running',@at,
-                              '[]'::jsonb,'{{}}'::jsonb,'{{}}'::jsonb,'root','{{}}'::text[],'{{}}'::text[])",
+                              '[]'::jsonb,@origin::jsonb,'{{}}'::jsonb,'root','{{}}'::text[],'{{}}'::text[])",
                               connection,
                               transaction
                           )
@@ -344,6 +344,10 @@ let tests =
                       commit.Parameters.AddWithValue("token", LeaseToken.value held.Token) |> ignore
                       commit.Parameters.AddWithValue("expected", int64 step) |> ignore
                       commit.Parameters.AddWithValue("at", startTime.AddHours(float step)) |> ignore
+
+                      commit.Parameters.Add("origin", NpgsqlTypes.NpgsqlDbType.Jsonb).Value <-
+                          if step = 0 then box "{}" else box DBNull.Value
+
                       let! _ = commit.ExecuteNonQueryAsync noCancellation
                       writes <- writes @ [ count () - before ]
                       do! transaction.CommitAsync noCancellation
