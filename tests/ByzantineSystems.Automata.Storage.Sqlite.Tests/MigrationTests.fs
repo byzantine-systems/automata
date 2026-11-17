@@ -60,11 +60,18 @@ let tests =
 
               Expect.equal
                   triggers
-                  [ "fsm_command_closure_has_evidence"
+                  [ "fsm_action_dead_letter_is_append_only"
+                    "fsm_command_closure_has_evidence"
+                    "fsm_command_correction_is_append_only"
                     "fsm_command_correction_owned_delete"
+                    "fsm_command_correction_requires_ready_owner"
+                    "fsm_command_error_domain_is_append_only"
                     "fsm_command_error_domain_owned_delete"
+                    "fsm_command_error_is_append_only"
+                    "fsm_command_error_machine_is_append_only"
                     "fsm_command_error_machine_owned_delete"
                     "fsm_command_error_owned_delete"
+                    "fsm_command_error_replay_is_append_only"
                     "fsm_command_error_replay_owned_delete"
                     "fsm_command_error_requires_live_owner"
                     "fsm_command_starts_ready"

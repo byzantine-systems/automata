@@ -150,7 +150,7 @@ END;
 -- UPDATE OF fires whenever a statement names one of these columns, whatever
 -- the value, so no store statement names them at all.
 CREATE TRIGGER fsm_command_submission_is_immutable
-    BEFORE UPDATE OF command_id, machine_id, entity_id, seq, idempotency_key, chart_version, event, kind, received_at, tenant, principal, source, correlation_id, causation_id ON fsm_command
+    BEFORE UPDATE OF command_id, machine_id, entity_id, seq, idempotency_key, request_digest, chart_version, event, kind, received_at, tenant, principal, source, correlation_id, causation_id ON fsm_command
 BEGIN
     SELECT
         RAISE(ABORT, 'fsm_command: a submitted command is never rewritten');
@@ -272,3 +272,19 @@ BEGIN SELECT RAISE(ABORT, 'fsm_command_error: delete the owning command'); END;
 CREATE TRIGGER fsm_command_correction_owned_delete BEFORE DELETE ON fsm_command_correction
     WHEN EXISTS (SELECT 1 FROM fsm_command WHERE command_id = OLD.command_id)
 BEGIN SELECT RAISE(ABORT, 'fsm_command_correction: delete the owning command'); END;
+
+CREATE TRIGGER fsm_command_correction_requires_ready_owner
+    BEFORE INSERT ON fsm_command_correction
+    WHEN EXISTS (SELECT 1 FROM fsm_command WHERE command_id = NEW.command_id AND (kind <> 'correction' OR status <> 'ready'))
+BEGIN SELECT RAISE(ABORT, 'fsm_command_correction: details belong to a ready correction'); END;
+
+CREATE TRIGGER fsm_command_error_is_append_only BEFORE UPDATE ON fsm_command_error
+BEGIN SELECT RAISE(ABORT, 'fsm_command_error: facts are immutable'); END;
+CREATE TRIGGER fsm_command_error_domain_is_append_only BEFORE UPDATE ON fsm_command_error_domain
+BEGIN SELECT RAISE(ABORT, 'fsm_command_error_domain: facts are immutable'); END;
+CREATE TRIGGER fsm_command_error_machine_is_append_only BEFORE UPDATE ON fsm_command_error_machine
+BEGIN SELECT RAISE(ABORT, 'fsm_command_error_machine: facts are immutable'); END;
+CREATE TRIGGER fsm_command_error_replay_is_append_only BEFORE UPDATE ON fsm_command_error_replay
+BEGIN SELECT RAISE(ABORT, 'fsm_command_error_replay: facts are immutable'); END;
+CREATE TRIGGER fsm_command_correction_is_append_only BEFORE UPDATE ON fsm_command_correction
+BEGIN SELECT RAISE(ABORT, 'fsm_command_correction: submitted details are immutable'); END;

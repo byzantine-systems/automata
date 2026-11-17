@@ -14,6 +14,7 @@ type Database =
       Refuses: string -> bool
       Scalar: string -> string
       Snapshot: unit -> string list list list
+      Columns: string -> string list
       Insert: CommandStatus -> string -> int64
       Now: string
       Dispose: unit -> unit }
@@ -188,3 +189,109 @@ let lifecycleTests fresh =
                             for table in [ "command_error"; "command_error_" + failureKind variant ] do
                                 yield db.Scalar $"SELECT count(*) FROM {db.Table table} WHERE command_id = {id}" = "0" ]
                   |> List.forall id)) ]
+
+let immutableTests fresh =
+    testList
+        "database immutable fact laws"
+        [ property "every submitted field rejects even same-value assignments on a live command" (fun (seed: int) ->
+              withDatabase fresh (fun db ->
+                  let id = db.Insert CommandStatus.Ready "event"
+
+                  if seed % 2 <> 0 then
+                      db.Execute(assign db id CommandStatus.Leased)
+
+                  db.Execute
+                      $"UPDATE {db.Table command} SET attempts = {int (uint32 seed % 100u)} WHERE command_id = {id}"
+
+                  let before = db.Snapshot()
+
+                  [ "command_id"
+                    "machine_id"
+                    "entity_id"
+                    "seq"
+                    "idempotency_key"
+                    "chart_version"
+                    "event"
+                    "request_digest"
+                    "kind"
+                    "received_at"
+                    "tenant"
+                    "principal"
+                    "source"
+                    "correlation_id"
+                    "causation_id" ]
+                  |> List.forall (fun field ->
+                      db.Refuses $"UPDATE {db.Table command} SET {field} = {field} WHERE command_id = {id}"
+                      && db.Snapshot() = before)))
+
+          property "every failure fact column rejects updates without changing the stored evidence" (fun (seed: int) ->
+              withDatabase fresh (fun db ->
+                  [ for variant in 0..5 do
+                        let id = db.Insert CommandStatus.Ready "event"
+                        header db id variant
+                        child db id variant seed
+
+                        for table in [ error; "command_error_" + failureKind variant ] do
+                            let before = db.Snapshot()
+
+                            for field in db.Columns table do
+                                yield
+                                    db.Refuses
+                                        $"UPDATE {db.Table table} SET {field} = {field} WHERE command_id = {id}"
+                                    && db.Snapshot() = before ]
+                  |> List.forall id))
+
+          property "correction details are immutable root-owned requests" (fun (seed: int) ->
+              withDatabase fresh (fun db ->
+                  let id = db.Insert CommandStatus.Ready "correction"
+                  let correction = db.Table "command_correction"
+
+                  db.Execute
+                      $"INSERT INTO {correction}(command_id, effective_at, on_divergence, replay_limit) VALUES ({id}, {db.Now}, 'fail', {1 + int (uint32 seed % 100u)})"
+
+                  let before = db.Snapshot()
+
+                  let protectedFields =
+                      db.Columns "command_correction"
+                      |> List.forall (fun field ->
+                          db.Refuses $"UPDATE {correction} SET {field} = {field} WHERE command_id = {id}"
+                          && db.Snapshot() = before)
+
+                  let owned = db.Refuses $"DELETE FROM {correction} WHERE command_id = {id}"
+                  db.Execute $"DELETE FROM {db.Table command} WHERE command_id = {id}"
+
+                  protectedFields
+                  && owned
+                  && db.Scalar $"SELECT count(*) FROM {correction} WHERE command_id = {id}" = "0"))
+
+          property "transition and delivery evidence reject updates but permit retention deletion" (fun (seed: int) ->
+              withDatabase fresh (fun db ->
+                  let id = db.Insert CommandStatus.Ready "event"
+                  let transition = db.Table "transition"
+                  let deadLetter = db.Table "action_dead_letter"
+                  let emptyPaths = if db.Now = "0" then "[]" else "{}"
+
+                  db.Execute
+                      $"INSERT INTO {transition}(machine_id, entity_id, epoch, command_id, chart_version, actions, from_state, to_state, handled_by, exited, entered, status, effective_at, committed_at)
+                               SELECT machine_id, entity_id, 1, command_id, chart_version, '[]', '{{}}', '{{}}', 'root', '{emptyPaths}', '{emptyPaths}', 'running', {db.Now}, {db.Now} FROM {db.Table command} WHERE command_id = {id}"
+
+                  db.Execute
+                      $"INSERT INTO {deadLetter}(machine_id, entity_id, command_id, epoch, ordinal, action, reason, deliveries, recorded_at)
+                               SELECT machine_id, entity_id, command_id, 1, 0, '{{}}', 'undelivered-{seed}', 1, {db.Now} FROM {db.Table command} WHERE command_id = {id}"
+
+                  let protectedFields =
+                      [ transition, "transition"; deadLetter, "action_dead_letter" ]
+                      |> List.forall (fun (table, name) ->
+                          db.Columns name
+                          |> List.forall (fun field ->
+                              let before = db.Snapshot()
+
+                              db.Refuses $"UPDATE {table} SET {field} = {field} WHERE command_id = {id}"
+                              && db.Snapshot() = before))
+
+                  db.Execute $"DELETE FROM {transition} WHERE command_id = {id}"
+                  db.Execute $"DELETE FROM {deadLetter} WHERE command_id = {id}"
+
+                  protectedFields
+                  && db.Scalar $"SELECT count(*) FROM {transition} WHERE command_id = {id}" = "0"
+                  && db.Scalar $"SELECT count(*) FROM {deadLetter} WHERE command_id = {id}" = "0")) ]

@@ -70,3 +70,6 @@ CREATE TABLE fsm_action_dead_letter (
 
 -- "What has this machine failed to deliver lately".
 CREATE INDEX fsm_action_dead_letter_machine_idx ON fsm_action_dead_letter (machine_id, recorded_at DESC);
+
+CREATE TRIGGER fsm_action_dead_letter_is_append_only BEFORE UPDATE ON fsm_action_dead_letter
+BEGIN SELECT RAISE(ABORT, 'fsm_action_dead_letter: facts are immutable'); END;

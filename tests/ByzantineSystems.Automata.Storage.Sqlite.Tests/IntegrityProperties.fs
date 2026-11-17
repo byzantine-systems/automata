@@ -1,6 +1,9 @@
 module ByzantineSystems.Automata.Storage.Sqlite.Tests.IntegrityProperties
 
 open System
+open Expecto
+open FsCheck
+open ByzantineSystems.Automata.Storage.Sqlite
 open ByzantineSystems.Automata.Storage
 open ByzantineSystems.Automata.Storage.DatabaseIntegrity
 open ByzantineSystems.Automata.Storage.LifecycleModel
@@ -63,8 +66,14 @@ let private fresh () : Database =
               "command_error_domain", "command_id"
               "command_error_machine", "command_id"
               "command_error_replay", "command_id"
-              "command_correction", "command_id" ]
+              "command_correction", "command_id"
+              "transition", "command_id"
+              "action_dead_letter", "command_id, ordinal" ]
             |> List.map (fun (name, order) -> read $"SELECT * FROM fsm_{name} ORDER BY {order}")
+      Columns =
+        fun table ->
+            read $"SELECT name FROM pragma_table_info('fsm_{table}') ORDER BY cid"
+            |> List.collect id
       Insert =
         fun status kind ->
             next <- next + 1
@@ -80,4 +89,14 @@ let private fresh () : Database =
             transaction.Dispose()
             conn.Dispose() }
 
-let tests = lifecycleTests fresh
+let private driverProperty =
+    testCase "integrity failures are never transient retry candidates" (fun () ->
+        Check.One(
+            Config.QuickThrowOnFailure,
+            fun (seed: int) ->
+                [ 275; 787; 1555; 1811; 2067 ]
+                |> List.forall (fun code -> not (Db.isTransient (SqliteException($"guard-{seed}", 19, code))))
+        ))
+
+let tests =
+    testList "SQLite database integrity" [ lifecycleTests fresh; immutableTests fresh; driverProperty ]
