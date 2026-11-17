@@ -119,6 +119,85 @@ module internal CommandMapping =
           causation_id = Row.string reader "causation_id" }
 
 /// <summary>
+/// Quarantines one claimed row whose payload cannot be decoded, inside one write transaction.
+///
+/// The fence is read before any write: a row that is no longer this claim's leased command
+/// produces no error fact, no closure and no promotion, so a recovery that arrives after a
+/// re-claim, a reschedule or another worker's finish changes nothing. When the fence holds,
+/// the machine error is recorded first — header, then child — so the dead-letter closure never
+/// lands on a command that failed without evidence. The fenced close must then change exactly
+/// one row; anything else means the fence vanished inside the transaction itself, which is a
+/// defect, and the whole transaction fails rather than half-landing.
+/// </summary>
+[<RequireQualifiedAccess>]
+module internal CommandRecovery =
+
+    let private fence = StatementKey.create "command" "recovery_fence" |> Sql.prepareProgram
+
+    let private insertError = StatementKey.create "command" "insert_error" |> Sql.prepareProgram
+
+    let private deadLetter = StatementKey.create "command" "dead_letter_undecodable" |> Sql.prepareProgram
+
+    let private promoteHead = StatementKey.create "command" "promote_head" |> Sql.prepareProgram
+
+    let recover
+        (context: SqliteContext)
+        (row: main.fsm_command)
+        (reason: string)
+        (ct: CancellationToken)
+        : Task<Result<unit, StoreError>> =
+        Sql.writeProgramWith
+            context
+            (fun now ->
+                store {
+                    let! held =
+                        StoreProgram.tryQueryOne
+                            fence
+                            [ "@command_id", Param.Integer row.command_id ]
+                            (fun reader -> Ok(Row.string reader "status", Row.int64 reader "lease_token"))
+
+                    match held with
+                    | Some(status, token) when status = "leased" && token = row.lease_token ->
+                        do!
+                            StoreProgram.executeDiscard
+                                insertError
+                                [ "@command_id", Param.Integer row.command_id
+                                  "@kind", Param.Text "machine"
+                                  "@domain", Param.Text "null"
+                                  "@reason", Param.Text reason
+                                  "@replay_kind", Param.Text ""
+                                  "@version", Param.Integer 0L
+                                  "@failure_epoch", Param.Integer 0L
+                                  "@budget", Param.Integer 0L
+                                  "@now", Param.Integer now ]
+
+                        let! changed =
+                            StoreProgram.executeCount
+                                deadLetter
+                                [ "@command_id", Param.Integer row.command_id
+                                  "@lease_token", Param.Integer row.lease_token ]
+
+                        if changed <> 1 then
+                            return!
+                                StoreProgram.fail (
+                                    StoreError.Unexpected(
+                                        InvalidOperationException
+                                            "the poison recovery fence vanished inside its own write transaction"
+                                    )
+                                )
+                        else
+                            do!
+                                StoreProgram.executeDiscard
+                                    promoteHead
+                                    [ "@machine_id", Param.Text row.machine_id
+                                      "@entity_id", Param.Text row.entity_id ]
+                    | _ -> ()
+
+                    return ()
+                })
+            ct
+
+/// <summary>
 /// The SQLite command inbox.
 ///
 /// Per-entity ordering is durable and holds across processes sharing the file: the schema holds
@@ -156,12 +235,6 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
 
     let nextToken = StatementKey.create "system" "next_token" |> Sql.prepareProgram
     let claimCommands = StatementKey.create "command" "claim" |> Sql.prepareProgram
-
-    let deadLetterUndecodable =
-        StatementKey.create "command" "dead_letter_undecodable" |> Sql.prepareProgram
-
-    let insertError = StatementKey.create "command" "insert_error" |> Sql.prepareProgram
-    let promoteHead = StatementKey.create "command" "promote_head" |> Sql.prepareProgram
 
     let rescheduleCommand =
         StatementKey.create "command" "reschedule" |> Sql.prepareProgram
@@ -437,38 +510,7 @@ type SqliteCommandInbox<'EntityId, 'Event>(options: CommandInboxOptions<'EntityI
                     return!
                         ClaimRecovery.collect
                             leasedRow
-                            (fun (row, _) reason ->
-                                Sql.writeProgramWith
-                                    context
-                                    (fun now ->
-                                        store {
-                                            let! changed =
-                                                StoreProgram.executeCount
-                                                    deadLetterUndecodable
-                                                    [ "@command_id", Param.Integer row.command_id
-                                                      "@lease_token", Param.Integer row.lease_token ]
-
-                                            if changed = 1 then
-                                                do!
-                                                    StoreProgram.executeDiscard
-                                                        insertError
-                                                        [ "@command_id", Param.Integer row.command_id
-                                                          "@kind", Param.Text "machine"
-                                                          "@domain", Param.Text "null"
-                                                          "@reason", Param.Text reason
-                                                          "@replay_kind", Param.Text ""
-                                                          "@version", Param.Integer 0L
-                                                          "@failure_epoch", Param.Integer 0L
-                                                          "@budget", Param.Integer 0L
-                                                          "@now", Param.Integer now ]
-
-                                                do!
-                                                    StoreProgram.executeDiscard
-                                                        promoteHead
-                                                        [ "@machine_id", Param.Text row.machine_id
-                                                          "@entity_id", Param.Text row.entity_id ]
-                                        })
-                                    cancellationToken)
+                            (fun (row, _) reason -> CommandRecovery.recover context row reason cancellationToken)
                             rows
                             cancellationToken
                 })
