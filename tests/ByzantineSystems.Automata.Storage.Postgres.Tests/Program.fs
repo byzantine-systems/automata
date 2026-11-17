@@ -1,5 +1,6 @@
 module ByzantineSystems.Automata.Storage.Postgres.Tests.Program
 
+open ByzantineSystems.Automata.Storage
 open Expecto
 
 /// The database-backed suites are gated on AUTOMATA_TEST_DB so the project stays runnable
@@ -16,6 +17,7 @@ let tests =
           ListenerTests.tests
           MaintenanceTests.pureTests
           MaintenanceTests.migratorTests
+          LifecycleModel.tests
 
           if TestContext.configured then
               testList

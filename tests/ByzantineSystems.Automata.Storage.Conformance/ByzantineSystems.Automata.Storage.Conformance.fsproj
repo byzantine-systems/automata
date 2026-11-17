@@ -5,6 +5,7 @@
     </PropertyGroup>
 
     <ItemGroup>
+        <Compile Include="LifecycleModel.fs" />
         <Compile Include="ContractProperties.fs" />
         <Compile Include="CorrectionContract.fs" />
         <Compile Include="StorageTapContracts.fs" />
