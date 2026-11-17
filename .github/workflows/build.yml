@@ -104,6 +104,10 @@ jobs:
     - name: Check async context independence
       run: nix develop .#ci --impure -c make async-context-check
 
+    # Compile the README against packed libraries before a release tag can pass its build gate.
+    - name: Pack and smoke-test packages
+      run: nix develop .#ci --impure -c make package-smoke
+
     # --impure because the devenv shell reads PWD to locate its state directory.
     #
     # --detached, not --detach: devenv forwards the flag to process-compose, which rejects the

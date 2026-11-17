@@ -116,6 +116,7 @@ open System
 open System.Threading.Tasks
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.DependencyInjection
+open ByzantineSystems.Automata.Resilience
 open ByzantineSystems.Automata.Runtime
 open ByzantineSystems.Automata.Storage
 open ByzantineSystems.Automata.Storage.Postgres
@@ -130,7 +131,7 @@ let switches (context: PostgresContext) =
         chart switchChart
         // Declared, never inferred: every command records the version it was resolved under.
         chartVersion 1
-        initialState Off
+        initialState SwitchState.Off
         // JSON codecs, entity keys and a keep-everything retention policy, overridable with
         // { ... with }. The store owns the action queue, so this is the only place it is named.
         store (
