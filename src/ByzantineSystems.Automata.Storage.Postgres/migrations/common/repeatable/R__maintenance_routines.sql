@@ -177,10 +177,8 @@ CREATE OR REPLACE FUNCTION $schema$.purge_commands (p_machine_id text, p_before 
                 FOR UPDATE
                     SKIP LOCKED
 ),
-            corrections AS (
-                DELETE FROM $schema$.command_correction cc USING doomed d
-WHERE cc.command_id = d.command_id), transitions AS (
-    DELETE FROM $schema$.transition t USING doomed d
+            transitions AS (
+                DELETE FROM $schema$.transition t USING doomed d
 WHERE t.command_id = d.command_id
 RETURNING
     d.machine_id, d.entity_id, t.effective_at), watermark AS (
@@ -197,27 +195,15 @@ INSERT INTO $schema$.entity_purge (machine_id, entity_id, max_purged_effective_a
     ON CONFLICT (machine_id,
         entity_id)
         DO UPDATE SET
-            max_purged_effective_at = GREATEST ($schema$.entity_purge.max_purged_effective_at, EXCLUDED.max_purged_effective_at)), domain_errors AS (
-            DELETE FROM $schema$.command_error_domain e
+            max_purged_effective_at = GREATEST ($schema$.entity_purge.max_purged_effective_at, EXCLUDED.max_purged_effective_at)), undelivered AS (
+            DELETE FROM $schema$.action_dead_letter a
             USING doomed d
-            WHERE e.command_id = d.command_id), machine_errors AS (
+            WHERE a.command_id = d.command_id), purged AS (
                     DELETE
-                        FROM $schema$.command_error_machine e USING doomed d
-            WHERE e.command_id = d.command_id), replay_errors AS (
-        DELETE
-            FROM $schema$.command_error_replay e USING doomed d
-WHERE e.command_id = d.command_id), errors AS (
-        DELETE
-            FROM $schema$.command_error e USING doomed d
-WHERE e.command_id = d.command_id), undelivered AS (
-        DELETE
-            FROM $schema$.action_dead_letter a USING doomed d
-WHERE a.command_id = d.command_id), purged AS (
-        DELETE
-            FROM $schema$.command c USING doomed d
-WHERE c.command_id = d.command_id
-RETURNING
-    1)
+                        FROM $schema$.command c USING doomed d
+            WHERE c.command_id = d.command_id
+            RETURNING
+                1)
         SELECT
             COUNT(*) FROM purged;
 $$;

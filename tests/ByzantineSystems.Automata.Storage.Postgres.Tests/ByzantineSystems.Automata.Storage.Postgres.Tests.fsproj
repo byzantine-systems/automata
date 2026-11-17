@@ -30,6 +30,7 @@
         <Compile Include="ProcessorIntegrationTests.fs" />
         <Compile Include="ReplayIntegrationTests.fs" />
         <Compile Include="SchemaContractTests.fs" />
+        <Compile Include="IntegrityProperties.fs" />
         <Compile Include="MaintenanceTests.fs" />
         <Compile Include="PostgresSupervisionStoreTests.fs" />
         <Compile Include="TapTests.fs" />

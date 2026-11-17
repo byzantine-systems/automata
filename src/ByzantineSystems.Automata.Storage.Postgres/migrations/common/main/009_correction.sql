@@ -10,7 +10,8 @@ CREATE DOMAIN $schema$.divergence AS text CONSTRAINT divergence_valid CHECK (VAL
 CREATE TABLE $schema$.command_correction (command_id bigint PRIMARY KEY,
     -- When the missed event should have happened: the instant the belief
     -- timeline is rewritten from.
-    effective_at timestamptz NOT NULL, on_divergence $schema$.divergence NOT NULL, replay_limit integer NOT NULL, CONSTRAINT command_correction_replay_limit_positive CHECK (replay_limit > 0), CONSTRAINT command_correction_command_fkey FOREIGN KEY (command_id) REFERENCES $schema$.command (command_id)
+    effective_at timestamptz NOT NULL, on_divergence $schema$.divergence NOT NULL, replay_limit integer NOT NULL, CONSTRAINT command_correction_replay_limit_positive CHECK (replay_limit > 0), CONSTRAINT command_correction_command_fkey FOREIGN KEY (command_id) REFERENCES $schema$.command (command_id
+) ON DELETE CASCADE
 );
 
 -- ---------------------------------------------------------------------------

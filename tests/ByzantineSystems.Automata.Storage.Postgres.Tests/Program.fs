@@ -39,6 +39,7 @@ let tests =
                     ReplayRetentionProperties.tests
                     ReplayFinalizeProperties.tests
                     SchemaContractTests.tests
+                    IntegrityProperties.tests
                     MaintenanceTests.integration
                     PostgresSupervisionStoreTests.tests
                     TapTests.tests
