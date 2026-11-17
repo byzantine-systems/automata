@@ -16,6 +16,7 @@
         <Compile Include="CommandInboxTests.fs" />
         <Compile Include="ConformanceTests.fs" />
         <Compile Include="FinalizeTests.fs" />
+        <Compile Include="RecoveryProperties.fs" />
         <Compile Include="ActionQueueTests.fs" />
         <Compile Include="HistoryTests.fs" />
         <Compile Include="ChartRegistryTests.fs" />

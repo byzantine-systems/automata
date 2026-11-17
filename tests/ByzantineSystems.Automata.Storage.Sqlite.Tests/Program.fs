@@ -17,6 +17,7 @@ let tests =
           CommandInboxTests.tests
           ConformanceTests.tests
           FinalizeTests.tests
+          RecoveryProperties.tests
           ActionQueueTests.tests
           HistoryTests.tests
           ChartRegistryTests.tests
