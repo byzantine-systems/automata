@@ -297,10 +297,8 @@ let tests =
 
               let! built = seededRetained "retained" retention
 
-              // Age the first command so retention removes it and its transition, while the
-              // newest command is kept.
-              arrange
-                  "UPDATE fsm.command SET received_at = now() - interval '2 hours' WHERE entity_id = 'retained' AND seq = 1"
+              // The seed submits historical arrivals; retention removes the first
+              // command without rewriting its request. The current snapshot pins the second.
 
               let! reports = (newMaintenance ()).RunAsync(ClaimBatch.create 100, noCancellation)
               reports |> expectOk "maintenance" |> ignore

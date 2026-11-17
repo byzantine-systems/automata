@@ -27,11 +27,20 @@ let private keepCommandsFor span =
 // actually writes rather than rows a test imagined.
 // ---------------------------------------------------------------------------
 
-let private submit (name: string) (key: string) =
+let private submitAt receivedAt (name: string) (key: string) =
     task {
-        let! outcome = (newInbox ()).SubmitAsync(submission (entity name) key (Start 1), noCancellation)
+        let request =
+            { submission (entity name) key (Start 1) with
+                ReceivedAt = receivedAt }
+
+        let! outcome = (newInbox ()).SubmitAsync(request, noCancellation)
         return outcome |> expectOk "submit" |> commandIdOf
     }
+
+let private submit = submitAt None
+
+let private submitOld =
+    submitAt (Some(DateTimeOffset(1900, 1, 1, 0, 0, 0, TimeSpan.Zero)))
 
 let private submitCorrection (name: string) (key: string) =
     task {
@@ -90,9 +99,6 @@ let private reportFor (reports: MaintenanceReport list) =
     |> Option.defaultWith (fun () -> failtestf "no report for the test machine in %A" reports)
 
 let private count (sql: string) = scalar<int64> sql
-
-let private ageCommands () =
-    arrange "UPDATE fsm.command SET received_at = now() - interval '2 hours'"
 
 // ---------------------------------------------------------------------------
 // Listening, the way a second process would.
@@ -384,14 +390,13 @@ let retentionTests =
           testTask "old terminal commands are purged with everything that references them" {
               do! reset ()
               do! boot (keepCommandsFor hour)
-              let! _ = submit "e1" "k1"
-              let! _ = submit "e1" "k2"
-              let! _ = submit "e1" "k3"
+              let! _ = submitOld "e1" "k1"
+              let! _ = submitOld "e1" "k2"
+              let! _ = submitOld "e1" "k3"
               let! first = claimed "k1"
               let! _ = commit first Epoch.initial
               let! second = claimed "k2"
               do! reject second
-              ageCommands ()
 
               let! reports = run 100
 
@@ -415,12 +420,13 @@ let retentionTests =
 
           testTask "a terminal correction is purged with its correction metadata" {
               do! reset ()
-              do! boot (keepCommandsFor hour)
+              // Corrections intentionally arrive at database now, so use a finite
+              // microsecond horizon rather than rewriting their immutable arrival.
+              do! boot (keepCommandsFor (TimeSpan.FromTicks 10L))
               let! _ = submitCorrection "corrected" "c1"
               let! _ = submit "corrected" "later"
               let! correction = claimed "c1"
               do! reject correction
-              ageCommands ()
 
               let! reports = run 100
 
@@ -436,10 +442,9 @@ let retentionTests =
           testTask "an entity's newest command is kept, so its sequence never restarts" {
               do! reset ()
               do! boot (keepCommandsFor hour)
-              let! _ = submit "e2" "only"
+              let! _ = submitOld "e2" "only"
               let! only = claimed "only"
               let! _ = commit only Epoch.initial
-              ageCommands ()
 
               let! reports = run 100
               Expect.equal (reportFor reports).PurgedCommands 0L "the newest command is kept"
@@ -455,11 +460,10 @@ let retentionTests =
           testTask "keeping forever purges nothing, however old" {
               do! reset ()
               do! boot RetentionPolicy.keepEverything
-              let! _ = submit "e1" "k1"
-              let! _ = submit "e1" "k2"
+              let! _ = submitOld "e1" "k1"
+              let! _ = submitOld "e1" "k2"
               let! first = claimed "k1"
               let! _ = commit first Epoch.initial
-              arrange "UPDATE fsm.command SET received_at = now() - interval '100 years'"
 
               let! reports = run 100
               Expect.equal (reportFor reports).PurgedCommands 0L "deleting audit data is never a default"
@@ -471,7 +475,7 @@ let retentionTests =
               do! boot (keepCommandsFor hour)
 
               for key in [ "k1"; "k2"; "k3" ] do
-                  let! _ = submit "e1" key
+                  let! _ = submitOld "e1" key
                   let! leased = claimed key
                   let! snapshot = (newReader ()).TryGetSnapshotAsync(machine, entity "e1", noCancellation)
 
@@ -485,7 +489,6 @@ let retentionTests =
                   ()
 
               let! _ = submit "e1" "k4"
-              ageCommands ()
 
               let! reports = run 2
               Expect.equal (reportFor reports).PurgedCommands 2L "the batch bounds the purge"

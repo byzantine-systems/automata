@@ -24,9 +24,13 @@ let private keepCommandsFor span =
 // clock is bent with SQL; every transition and command is written the way an application would.
 // ---------------------------------------------------------------------------------------------
 
-let private submit (name: string) (key: string) =
+let private submit (name: string) (key: string) receivedAt =
     task {
-        let! outcome = (newInbox ()).SubmitAsync(submission (entity name) key (Start 1), noCancellation)
+        let request =
+            { submission (entity name) key (Start 1) with
+                ReceivedAt = receivedAt }
+
+        let! outcome = (newInbox ()).SubmitAsync(request, noCancellation)
         outcome |> expectOk "submit" |> ignore
     }
 
@@ -94,22 +98,17 @@ let private retentionProperty =
                         |> List.skip 1
                         |> List.map (float >> baseTime.AddMinutes)
 
-                    for index in 0 .. times.Length - 1 do
-                        do! submit name $"k{index}"
-
-                    for index, effectiveAt in List.indexed times do
-                        do! commitAt name $"k{index}" effectiveAt (Epoch.ofUInt64 (uint64 index))
-
-                    // Age a prefix so retention removes exactly it; the newest command is kept.
                     let purged =
                         if List.isEmpty times then
                             0
                         else
                             min (int case.Purge) (times.Length - 1)
 
-                    if purged > 0 then
-                        arrange
-                            $"UPDATE fsm.command SET received_at = now() - interval '2 hours' WHERE entity_id = '{name}' AND seq <= {purged}"
+                    for index in 0 .. times.Length - 1 do
+                        do! submit name $"k{index}" (if index < purged then Some baseTime else None)
+
+                    for index, effectiveAt in List.indexed times do
+                        do! commitAt name $"k{index}" effectiveAt (Epoch.ofUInt64 (uint64 index))
 
                     let! _ = (newMaintenance ()).RunAsync(ClaimBatch.create 100, noCancellation)
 
@@ -140,13 +139,10 @@ let private regressions =
               do! reset ()
               do! boot (keepCommandsFor hour)
               let name = "gap"
-              do! submit name "k1"
-              do! submit name "k2"
+              do! submit name "k1" (Some baseTime)
+              do! submit name "k2" None
               do! commitAt name "k1" (baseTime.AddHours 10.) Epoch.initial
               do! commitAt name "k2" (baseTime.AddHours 12.) (Epoch.ofUInt64 1UL)
-
-              arrange
-                  $"UPDATE fsm.command SET received_at = now() - interval '2 hours' WHERE entity_id = '{name}' AND seq = 1"
 
               let! _ = (newMaintenance ()).RunAsync(ClaimBatch.create 100, noCancellation)
 
@@ -162,13 +158,10 @@ let private regressions =
               do! reset ()
               do! boot (keepCommandsFor hour)
               let name = "edge"
-              do! submit name "k1"
-              do! submit name "k2"
+              do! submit name "k1" (Some baseTime)
+              do! submit name "k2" None
               do! commitAt name "k1" (baseTime.AddHours 10.) Epoch.initial
               do! commitAt name "k2" (baseTime.AddHours 12.) (Epoch.ofUInt64 1UL)
-
-              arrange
-                  $"UPDATE fsm.command SET received_at = now() - interval '2 hours' WHERE entity_id = '{name}' AND seq = 1"
 
               let! _ = (newMaintenance ()).RunAsync(ClaimBatch.create 100, noCancellation)
 
@@ -182,8 +175,8 @@ let private regressions =
               do! reset ()
               do! boot (keepCommandsFor hour)
               let name = "gone"
-              do! submit name "k1"
-              do! submit name "k2"
+              do! submit name "k1" (Some baseTime)
+              do! submit name "k2" None
               do! commitAt name "k1" (baseTime.AddHours 10.) Epoch.initial
 
               let! batch =
@@ -198,9 +191,6 @@ let private regressions =
               let! _ =
                   (newProcessor ())
                       .RejectAsync(k2.Work.CommandId, k2.Token, CommandFailure.Machine "refused", noCancellation)
-
-              arrange
-                  $"UPDATE fsm.command SET received_at = now() - interval '2 hours' WHERE entity_id = '{name}' AND seq = 1"
 
               let! _ = (newMaintenance ()).RunAsync(ClaimBatch.create 100, noCancellation)
 
