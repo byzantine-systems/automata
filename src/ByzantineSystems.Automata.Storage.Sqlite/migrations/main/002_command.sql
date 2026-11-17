@@ -169,19 +169,19 @@ CREATE TABLE fsm_command_error (
     kind TEXT NOT NULL CHECK (kind IN ('domain', 'machine', 'replay')),
     recorded_at INTEGER NOT NULL,
     UNIQUE (command_id, kind),
-    CONSTRAINT command_error_command_fkey FOREIGN KEY (command_id) REFERENCES fsm_command (command_id)
+    CONSTRAINT command_error_command_fkey FOREIGN KEY (command_id) REFERENCES fsm_command (command_id) ON DELETE CASCADE
 ) STRICT;
 
 CREATE TABLE fsm_command_error_domain (
     command_id INTEGER NOT NULL PRIMARY KEY,
     kind TEXT NOT NULL DEFAULT 'domain' CHECK (kind = 'domain'),
     error TEXT NOT NULL CHECK (JSON_VALID(error)),
-    FOREIGN KEY (command_id, kind) REFERENCES fsm_command_error (command_id, kind)
+    FOREIGN KEY (command_id, kind) REFERENCES fsm_command_error (command_id, kind) ON DELETE CASCADE
 ) STRICT;
 CREATE TABLE fsm_command_error_machine (
     command_id INTEGER NOT NULL PRIMARY KEY,
     kind TEXT NOT NULL DEFAULT 'machine' CHECK (kind = 'machine'), reason TEXT NOT NULL,
-    FOREIGN KEY (command_id, kind) REFERENCES fsm_command_error (command_id, kind)
+    FOREIGN KEY (command_id, kind) REFERENCES fsm_command_error (command_id, kind) ON DELETE CASCADE
 ) STRICT;
 CREATE TABLE fsm_command_error_replay (
     command_id INTEGER NOT NULL PRIMARY KEY,
@@ -189,7 +189,7 @@ CREATE TABLE fsm_command_error_replay (
     replay_kind TEXT NOT NULL CHECK (replay_kind IN ('unknown_chart_version', 'diverged', 'budget_exceeded', 'history_purged')),
     version INTEGER NOT NULL DEFAULT 0, epoch INTEGER NOT NULL DEFAULT 0,
     reason TEXT NOT NULL DEFAULT '', budget INTEGER NOT NULL DEFAULT 0,
-    FOREIGN KEY (command_id, kind) REFERENCES fsm_command_error (command_id, kind),
+    FOREIGN KEY (command_id, kind) REFERENCES fsm_command_error (command_id, kind) ON DELETE CASCADE,
     CHECK (CASE replay_kind
         WHEN 'unknown_chart_version' THEN version > 0 AND epoch = 0 AND reason = '' AND budget = 0
         WHEN 'diverged' THEN version = 0 AND epoch >= 0 AND budget = 0
@@ -214,5 +214,61 @@ CREATE TABLE fsm_command_correction (
     replay_limit INTEGER NOT NULL,
     CONSTRAINT command_correction_divergence_valid CHECK (on_divergence IN ('fail', 'truncate')),
     CONSTRAINT command_correction_replay_limit_positive CHECK (replay_limit > 0),
-    CONSTRAINT command_correction_command_fkey FOREIGN KEY (command_id) REFERENCES fsm_command (command_id)
+    CONSTRAINT command_correction_command_fkey FOREIGN KEY (command_id) REFERENCES fsm_command (command_id) ON DELETE CASCADE
 ) STRICT;
+
+-- Creation and closure are separate operations. A terminal INSERT must not
+-- bypass the evidence check on the UPDATE that normally closes a command.
+CREATE TRIGGER fsm_command_starts_ready
+    BEFORE INSERT ON fsm_command
+    WHEN NEW.status IS NOT 'ready'
+BEGIN
+    SELECT RAISE(ABORT, 'fsm_command: a new command must be ready');
+END;
+
+CREATE TRIGGER fsm_command_closure_has_evidence
+    AFTER UPDATE OF status ON fsm_command
+    WHEN NEW.status IN ('succeeded', 'rejected', 'dead_letter')
+BEGIN
+    SELECT RAISE(ABORT, 'fsm_command: success cannot carry failure evidence')
+    WHERE NEW.status = 'succeeded'
+        AND EXISTS (SELECT 1 FROM fsm_command_error WHERE command_id = NEW.command_id);
+
+    SELECT RAISE(ABORT, 'fsm_command: failure requires its header and selected child')
+    WHERE NEW.status IN ('rejected', 'dead_letter') AND NOT EXISTS (
+        SELECT 1 FROM fsm_command_error h
+        WHERE h.command_id = NEW.command_id AND CASE h.kind
+            WHEN 'domain' THEN EXISTS (SELECT 1 FROM fsm_command_error_domain d WHERE d.command_id = h.command_id AND d.kind = h.kind)
+            WHEN 'machine' THEN EXISTS (SELECT 1 FROM fsm_command_error_machine m WHERE m.command_id = h.command_id AND m.kind = h.kind)
+            WHEN 'replay' THEN EXISTS (SELECT 1 FROM fsm_command_error_replay r WHERE r.command_id = h.command_id AND r.kind = h.kind)
+            ELSE FALSE END
+    );
+END;
+
+-- Close versus late evidence insertion must be safe in both orders. SQLite's
+-- single writer makes this status observation atomic with the insertion.
+CREATE TRIGGER fsm_command_error_requires_live_owner
+    BEFORE INSERT ON fsm_command_error
+    WHEN EXISTS (SELECT 1 FROM fsm_command WHERE command_id = NEW.command_id AND status NOT IN ('ready', 'leased'))
+BEGIN
+    SELECT RAISE(ABORT, 'fsm_command_error: the owner must still be live');
+END;
+
+-- Error facts and correction requests belong to their command. Root deletion
+-- removes the parent before executing FK actions, so the guards permit the
+-- cascade but never a partial deletion while the command survives.
+CREATE TRIGGER fsm_command_error_owned_delete BEFORE DELETE ON fsm_command_error
+    WHEN EXISTS (SELECT 1 FROM fsm_command WHERE command_id = OLD.command_id)
+BEGIN SELECT RAISE(ABORT, 'fsm_command_error: delete the owning command'); END;
+CREATE TRIGGER fsm_command_error_domain_owned_delete BEFORE DELETE ON fsm_command_error_domain
+    WHEN EXISTS (SELECT 1 FROM fsm_command WHERE command_id = OLD.command_id)
+BEGIN SELECT RAISE(ABORT, 'fsm_command_error: delete the owning command'); END;
+CREATE TRIGGER fsm_command_error_machine_owned_delete BEFORE DELETE ON fsm_command_error_machine
+    WHEN EXISTS (SELECT 1 FROM fsm_command WHERE command_id = OLD.command_id)
+BEGIN SELECT RAISE(ABORT, 'fsm_command_error: delete the owning command'); END;
+CREATE TRIGGER fsm_command_error_replay_owned_delete BEFORE DELETE ON fsm_command_error_replay
+    WHEN EXISTS (SELECT 1 FROM fsm_command WHERE command_id = OLD.command_id)
+BEGIN SELECT RAISE(ABORT, 'fsm_command_error: delete the owning command'); END;
+CREATE TRIGGER fsm_command_correction_owned_delete BEFORE DELETE ON fsm_command_correction
+    WHEN EXISTS (SELECT 1 FROM fsm_command WHERE command_id = OLD.command_id)
+BEGIN SELECT RAISE(ABORT, 'fsm_command_correction: delete the owning command'); END;

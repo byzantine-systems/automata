@@ -60,7 +60,15 @@ let tests =
 
               Expect.equal
                   triggers
-                  [ "fsm_command_submission_is_immutable"
+                  [ "fsm_command_closure_has_evidence"
+                    "fsm_command_correction_owned_delete"
+                    "fsm_command_error_domain_owned_delete"
+                    "fsm_command_error_machine_owned_delete"
+                    "fsm_command_error_owned_delete"
+                    "fsm_command_error_replay_owned_delete"
+                    "fsm_command_error_requires_live_owner"
+                    "fsm_command_starts_ready"
+                    "fsm_command_submission_is_immutable"
                     "fsm_command_terminal_is_final"
                     "fsm_transition_is_append_only" ]
                   "every guard is installed"

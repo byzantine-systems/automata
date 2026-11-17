@@ -14,6 +14,7 @@ let tests =
           DbTests.tests
           MigrationTests.tests
           SchemaContractTests.tests
+          IntegrityProperties.tests
           CommandInboxTests.tests
           ConformanceTests.tests
           FinalizeTests.tests
