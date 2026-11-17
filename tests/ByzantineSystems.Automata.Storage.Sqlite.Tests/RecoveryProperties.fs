@@ -74,25 +74,11 @@ let private commandRow (db: string) (key: string) =
     query db "SELECT * FROM fsm_command WHERE idempotency_key = @key;" [ "@key", box key ] CommandMapping.commandRow
     |> List.exactlyOne
 
-/// The submission trigger, restored exactly as the migration declares it, so a payload the test
-/// corrupted is the only thing standing between the schema and its own rules.
-let private restoreSubmissionTrigger (db: string) =
-    exec
-        db
-        "CREATE TRIGGER fsm_command_submission_is_immutable
-         BEFORE UPDATE OF command_id, machine_id, entity_id, seq, idempotency_key, chart_version, event, kind, received_at, tenant, principal, source, correlation_id, causation_id ON fsm_command
-         BEGIN
-             SELECT
-                 RAISE(ABORT, 'fsm_command: a submitted command is never rewritten');
-         END;"
-        []
-
 let private corruptPayload (db: string) (key: string) (garbage: string) =
-    exec db "DROP TRIGGER fsm_command_submission_is_immutable;" []
-
-    exec db "UPDATE fsm_command SET event = @g WHERE idempotency_key = @k;" [ "@g", box garbage; "@k", box key ]
-
-    restoreSubmissionTrigger db
+    corruptCommand
+        db
+        "UPDATE fsm_command SET event = @g WHERE idempotency_key = @k;"
+        [ "@g", box garbage; "@k", box key ]
 
 let private statusOfKey (db: string) (key: string) : string =
     query db "SELECT status FROM fsm_command WHERE idempotency_key = @k;" [ "@k", box key ] (fun r -> r.GetString 0)
