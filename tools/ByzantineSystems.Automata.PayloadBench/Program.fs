@@ -265,6 +265,35 @@ let private run connectionString label beliefs emitActions =
             emitActions
             (scalar $"SELECT sum(pg_column_size(t)) FROM {name}.transition t")
 
+        // Failed commands need a newer sibling to become retention candidates.
+        // Do not age immutable requests after submission: infinity is an explicit
+        // benchmark cutoff. Every sample must remove a full batch, never a no-op.
+        for index in 0..59 do
+            let! result =
+                inbox.SubmitAsync(
+                    { MachineId = machine
+                      EntityId = entityId $"failure-{index}"
+                      IdempotencyKey = "successor"
+                      ChartVersion = version
+                      Kind = CommandKind.Event
+                      Event = event
+                      VisibleAt = None
+                      ReceivedAt = None
+                      Audit = AuditContext.empty },
+                    ct
+                )
+
+            require result |> ignore
+
+        do!
+            measure "purge-commands-25" 0 12 (fun _ ->
+                task {
+                    let purged = scalar $"SELECT {name}.purge_commands('bench', 'infinity', 25)"
+
+                    if purged <> 25L then
+                        invalidOp $"purge sample removed {purged} commands instead of 25"
+                })
+
         execute
             $"SELECT pgmq.drop_queue('{queue}'); DROP SCHEMA IF EXISTS {name}_temporal CASCADE; DROP SCHEMA {name} CASCADE"
     }
