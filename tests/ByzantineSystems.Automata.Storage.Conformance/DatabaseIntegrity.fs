@@ -68,6 +68,14 @@ let private withDatabase fresh action =
 let private property name law =
     testCase name (fun () -> Check.One(Config.QuickThrowOnFailure.WithMaxTest(12), law))
 
+/// Fail at the first unexpected acceptance rather than interpreting a later
+/// constraint error in already-corrupted state as the original counterexample.
+let private requiredRefusal db statement reason =
+    let before = db.Snapshot()
+    Expect.isTrue (db.Refuses statement) reason
+    Expect.equal (db.Snapshot()) before "refusal preserves the complete observation"
+    true
+
 let lifecycleTests fresh =
     testList
         "database lifecycle laws"
@@ -146,13 +154,29 @@ let lifecycleTests fresh =
                       [ for terminal in [ CommandStatus.Rejected; CommandStatus.DeadLettered ] do
                             for variant in 0..5 do
                                 let id = db.Insert CommandStatus.Ready "event"
-                                let before = db.Snapshot()
-                                yield db.Refuses(assign db id terminal) && db.Snapshot() = before
+
+                                yield
+                                    requiredRefusal
+                                        db
+                                        (assign db id terminal)
+                                        "closing without a header must be refused"
+
                                 header db id variant
-                                let incomplete = db.Snapshot()
-                                yield db.Refuses(assign db id terminal) && db.Snapshot() = incomplete
+
+                                yield
+                                    requiredRefusal
+                                        db
+                                        (assign db id terminal)
+                                        "closing with only a header must be refused"
+
                                 child db id variant seed
-                                yield db.Refuses(assign db id CommandStatus.Succeeded)
+
+                                yield
+                                    requiredRefusal
+                                        db
+                                        (assign db id CommandStatus.Succeeded)
+                                        "success must refuse existing failure evidence"
+
                                 db.Execute(assign db id terminal)
 
                                 yield
