@@ -91,18 +91,20 @@ let private retentionProperty =
                     let name = "e1"
 
                     let times =
-                        case.Deltas
+                        // Construct at least one purgeable transition and a pinned
+                        // survivor. Empty/singleton traces otherwise make this law
+                        // pass without ever evaluating its watermark boundary.
+                        (match case.Deltas with
+                         | [] -> [ 0uy; 0uy ]
+                         | [ only ] -> [ only; 0uy ]
+                         | many -> many)
                         |> List.truncate 5
                         |> List.map (fun delta -> 1 + int delta % 30)
                         |> List.scan (+) 0
                         |> List.skip 1
                         |> List.map (float >> baseTime.AddMinutes)
 
-                    let purged =
-                        if List.isEmpty times then
-                            0
-                        else
-                            min (int case.Purge) (times.Length - 1)
+                    let purged = 1 + int case.Purge % (times.Length - 1)
 
                     for index in 0 .. times.Length - 1 do
                         do! submit name $"k{index}" (if index < purged then Some baseTime else None)
@@ -110,18 +112,31 @@ let private retentionProperty =
                     for index, effectiveAt in List.indexed times do
                         do! commitAt name $"k{index}" effectiveAt (Epoch.ofUInt64 (uint64 index))
 
-                    let! _ = (newMaintenance ()).RunAsync(ClaimBatch.create 100, noCancellation)
+                    let! intact = suffixIncomplete name baseTime
+                    Expect.isFalse intact "before retention, the full suffix is present"
+                    let! reports = (newMaintenance ()).RunAsync(ClaimBatch.create 100, noCancellation)
 
-                    let watermark = if purged = 0 then None else List.tryItem (purged - 1) times
-                    let probe = baseTime.AddMinutes(float (int case.From % 120))
+                    let report =
+                        reports
+                        |> expectOk "maintenance"
+                        |> List.find (fun report -> report.MachineId = machine)
 
-                    let expected =
-                        match watermark with
-                        | Some w -> w >= probe
-                        | None -> false
+                    Expect.equal report.PurgedCommands (int64 purged) "the generated prefix was actually purged"
+                    let watermark = times[purged - 1]
 
-                    let! incomplete = suffixIncomplete name probe
-                    return incomplete = expected
+                    let probes =
+                        [ watermark.AddTicks -10L
+                          watermark
+                          watermark.AddTicks 10L
+                          baseTime.AddMinutes(float (int case.From % 120)) ]
+
+                    let mutable agrees = true
+
+                    for probe in probes do
+                        let! incomplete = suffixIncomplete name probe
+                        agrees <- agrees && incomplete = (watermark >= probe)
+
+                    return agrees
                 }
         ))
 
