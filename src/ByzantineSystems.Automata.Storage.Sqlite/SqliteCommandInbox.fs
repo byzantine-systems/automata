@@ -132,13 +132,17 @@ module internal CommandMapping =
 [<RequireQualifiedAccess>]
 module internal CommandRecovery =
 
-    let private fence = StatementKey.create "command" "recovery_fence" |> Sql.prepareProgram
+    let private fence =
+        StatementKey.create "command" "recovery_fence" |> Sql.prepareProgram
 
-    let private insertError = StatementKey.create "command" "insert_error" |> Sql.prepareProgram
+    let private insertError =
+        StatementKey.create "command" "insert_error" |> Sql.prepareProgram
 
-    let private deadLetter = StatementKey.create "command" "dead_letter_undecodable" |> Sql.prepareProgram
+    let private deadLetter =
+        StatementKey.create "command" "dead_letter_undecodable" |> Sql.prepareProgram
 
-    let private promoteHead = StatementKey.create "command" "promote_head" |> Sql.prepareProgram
+    let private promoteHead =
+        StatementKey.create "command" "promote_head" |> Sql.prepareProgram
 
     let recover
         (context: SqliteContext)
@@ -151,10 +155,8 @@ module internal CommandRecovery =
             (fun now ->
                 store {
                     let! held =
-                        StoreProgram.tryQueryOne
-                            fence
-                            [ "@command_id", Param.Integer row.command_id ]
-                            (fun reader -> Ok(Row.string reader "status", Row.int64 reader "lease_token"))
+                        StoreProgram.tryQueryOne fence [ "@command_id", Param.Integer row.command_id ] (fun reader ->
+                            Ok(Row.string reader "status", Row.int64 reader "lease_token"))
 
                     match held with
                     | Some(status, token) when status = "leased" && token = row.lease_token ->

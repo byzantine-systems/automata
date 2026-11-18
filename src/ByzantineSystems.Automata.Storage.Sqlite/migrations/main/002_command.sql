@@ -162,8 +162,8 @@ END;
 --
 -- Separate from fsm_command for the reasons fsm.command_error gives: the claim
 -- path never reads it, most commands never have one, and a succeeded command's
--- result lives in fsm_transition. The error is the tagged-JSON failure envelope
--- the PostgreSQL store writes, so the two stores read each other's shape.
+-- result lives in fsm_transition. The discriminant header and selected child
+-- keep machine/replay metadata relational; only a domain error is codec JSON.
 -- ---------------------------------------------------------------------------
 CREATE TABLE fsm_command_error (
     command_id INTEGER NOT NULL PRIMARY KEY,
