@@ -190,6 +190,29 @@ let lifecycleTests fresh =
                                 yield db.Scalar $"SELECT count(*) FROM {db.Table table} WHERE command_id = {id}" = "0" ]
                   |> List.forall id)) ]
 
+let ownershipRollbackTests fresh =
+    property "a restricted root deletion restores its entire cascaded failure graph" (fun (seed: int) ->
+        withDatabase fresh (fun db ->
+            let id = db.Insert CommandStatus.Ready "event"
+            let variant = int (uint32 seed % 6u)
+            header db id variant
+            child db id variant seed
+            db.Execute(assign db id CommandStatus.Rejected)
+            let pin = db.Table "integrity_pin"
+            db.Execute $"CREATE TABLE {pin}(command_id bigint REFERENCES {db.Table command}(command_id))"
+            db.Execute $"INSERT INTO {pin} VALUES ({id})"
+            let before = db.Snapshot()
+
+            let restored =
+                db.Refuses $"DELETE FROM {db.Table command} WHERE command_id = {id}"
+                && db.Snapshot() = before
+
+            db.Execute $"DELETE FROM {pin}"
+            db.Execute $"DELETE FROM {db.Table command} WHERE command_id = {id}"
+
+            restored
+            && db.Scalar $"SELECT count(*) FROM {db.Table error} WHERE command_id = {id}" = "0"))
+
 let immutableTests fresh =
     testList
         "database immutable fact laws"

@@ -262,7 +262,7 @@ let tests =
               Expect.equal
                   (counts.TryFind LifecycleVerdict.Refused)
                   (Some 15)
-                  "fifteen refused cells: seventeen non-edges plus three terminal no-ops")
+                  "twelve illegal changed edges plus three terminal no-ops")
 
           // A generated walk: attempts to move are classified, and only legal ones move the
           // status. The law is absorption — once the walk reaches a terminal status, no

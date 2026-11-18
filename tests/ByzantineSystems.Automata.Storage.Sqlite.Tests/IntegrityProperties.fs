@@ -102,6 +102,7 @@ let tests =
     testList
         "SQLite database integrity"
         [ lifecycleTests fresh
+          ownershipRollbackTests fresh
           immutableTests fresh
           replacementTests fresh
           driverProperty ]

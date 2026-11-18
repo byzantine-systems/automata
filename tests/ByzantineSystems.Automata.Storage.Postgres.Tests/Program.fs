@@ -26,6 +26,7 @@ let tests =
                     CommandInboxTests.tests
                     ConformanceTests.tests
                     ProfileTests.conformance
+                    ProfileTests.integrity
                     ChartRegistryTests.tests
                     TemporalTests.tests
                     TemporalBoundaryTests.tests
@@ -40,6 +41,7 @@ let tests =
                     ReplayFinalizeProperties.tests
                     SchemaContractTests.tests
                     IntegrityProperties.tests
+                    IntegrityConcurrencyProperties.tests
                     MaintenanceTests.integration
                     PostgresSupervisionStoreTests.tests
                     TapTests.tests

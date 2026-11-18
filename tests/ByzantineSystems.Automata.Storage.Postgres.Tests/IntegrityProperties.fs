@@ -1,6 +1,7 @@
 module ByzantineSystems.Automata.Storage.Postgres.Tests.IntegrityProperties
 
 open System
+open System.Threading.Tasks
 open Expecto
 open FsCheck
 open ByzantineSystems.Automata.Storage.Postgres
@@ -11,8 +12,8 @@ open ByzantineSystems.Automata.Storage.LifecycleModel
 open ByzantineSystems.Automata.Storage.Postgres.Tests.TestContext
 open Npgsql
 
-let private fresh () : Database =
-    (reset ()).GetAwaiter().GetResult()
+let private freshFor (schemaValue: string) (initialize: unit -> Task) () : Database =
+    (initialize ()).GetAwaiter().GetResult()
     let conn = new NpgsqlConnection(connectionString)
     conn.Open()
     let transaction = conn.BeginTransaction()
@@ -53,7 +54,9 @@ let private fresh () : Database =
             try
                 attempt text
                 false
-            with :? PostgresException as error when error.SqlState.StartsWith "23" ->
+            // GENERATED ALWAYS identities refuse assignment during rewrite,
+            // before row triggers. Do not mistake that protection for bad SQL.
+            with :? PostgresException as error when error.SqlState.StartsWith "23" || error.SqlState = "428C9" ->
                 true
       Scalar = scalar
       Snapshot =
@@ -87,6 +90,12 @@ let private fresh () : Database =
         fun () ->
             transaction.Dispose()
             conn.Dispose() }
+
+let private fresh () = freshFor schemaValue reset ()
+
+let forInstallation schema initialize =
+    let fresh () = freshFor schema initialize ()
+    testList "snapshot database integrity" [ lifecycleTests fresh; ownershipRollbackTests fresh; immutableTests fresh ]
 
 let private auditProperties =
     testCase "supervision and quarantine facts reject every column update and retain duplicate no-ops" (fun () ->
@@ -139,4 +148,8 @@ let private driverProperty =
 let tests =
     testList
         "Postgres database integrity"
-        [ lifecycleTests fresh; immutableTests fresh; auditProperties; driverProperty ]
+        [ lifecycleTests fresh
+          ownershipRollbackTests fresh
+          immutableTests fresh
+          auditProperties
+          driverProperty ]

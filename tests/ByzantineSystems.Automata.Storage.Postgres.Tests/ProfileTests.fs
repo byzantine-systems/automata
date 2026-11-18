@@ -145,6 +145,8 @@ let conformance =
             |> SnapshotCorrectionStore
             :> CorrectionContract.Store))
 
+let integrity = IntegrityProperties.forInstallation name resetSnapshot
+
 let tests =
     testList
         "PostgreSQL profiles"

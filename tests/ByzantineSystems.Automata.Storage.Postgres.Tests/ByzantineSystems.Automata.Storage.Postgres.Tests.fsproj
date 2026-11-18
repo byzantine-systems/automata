@@ -16,6 +16,7 @@
         <Compile Include="CommandInboxTests.fs" />
         <Compile Include="ConformanceTests.fs" />
         <Compile Include="SnapshotCorrectionStore.fs" />
+        <Compile Include="IntegrityProperties.fs" />
         <Compile Include="ProfileTests.fs" />
         <Compile Include="ChartRegistryTests.fs" />
         <Compile Include="TemporalTests.fs" />
@@ -30,7 +31,7 @@
         <Compile Include="ProcessorIntegrationTests.fs" />
         <Compile Include="ReplayIntegrationTests.fs" />
         <Compile Include="SchemaContractTests.fs" />
-        <Compile Include="IntegrityProperties.fs" />
+        <Compile Include="IntegrityConcurrencyProperties.fs" />
         <Compile Include="MaintenanceTests.fs" />
         <Compile Include="PostgresSupervisionStoreTests.fs" />
         <Compile Include="TapTests.fs" />
