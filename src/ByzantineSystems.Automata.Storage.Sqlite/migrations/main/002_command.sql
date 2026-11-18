@@ -65,6 +65,7 @@ CREATE TABLE fsm_command (
     -- sequence number" with one backward seek.
     CONSTRAINT command_unique_seq UNIQUE (machine_id, entity_id, seq),
     CONSTRAINT command_seq_positive CHECK (seq > 0),
+    CONSTRAINT command_id_positive CHECK (command_id > 0),
     -- The checked vocabularies that PostgreSQL spells as domains.
     CONSTRAINT command_status_valid CHECK (status IN ('ready', 'leased', 'succeeded', 'rejected', 'dead_letter')),
     CONSTRAINT command_kind_valid CHECK (kind IN ('event', 'correction')),
@@ -288,3 +289,57 @@ CREATE TRIGGER fsm_command_error_replay_is_append_only BEFORE UPDATE ON fsm_comm
 BEGIN SELECT RAISE(ABORT, 'fsm_command_error_replay: facts are immutable'); END;
 CREATE TRIGGER fsm_command_correction_is_append_only BEFORE UPDATE ON fsm_command_correction
 BEGIN SELECT RAISE(ABORT, 'fsm_command_correction: submitted details are immutable'); END;
+
+-- REPLACE resolves uniqueness by deleting the victim, not by UPDATE. Reject
+-- all conflicting identities before it reaches that machinery, including the
+-- partial unique head slot. Auto-assigned command IDs still come from SQLite's
+-- AUTOINCREMENT allocator; no trigger depends on a particular NEW.rowid sentinel.
+CREATE TRIGGER fsm_command_insert_preserves_identity BEFORE INSERT ON fsm_command
+BEGIN
+    SELECT RAISE(ABORT, 'fsm_command: status and blocked cannot be NULL')
+    WHERE NEW.status IS NULL OR NEW.blocked IS NULL;
+    SELECT RAISE(ABORT, 'fsm_command: an existing identity cannot be replaced')
+    WHERE EXISTS (
+        SELECT 1 FROM fsm_command c WHERE c.command_id = NEW.command_id
+    ) OR EXISTS (
+        SELECT 1 FROM fsm_command c WHERE c.machine_id = NEW.machine_id AND c.entity_id = NEW.entity_id AND c.seq = NEW.seq
+    ) OR EXISTS (
+        SELECT 1 FROM fsm_command c WHERE c.machine_id = NEW.machine_id AND c.entity_id = NEW.entity_id AND c.idempotency_key = NEW.idempotency_key
+    ) OR (NEW.blocked = 0 AND NEW.status IN ('ready', 'leased') AND EXISTS (
+        SELECT 1 FROM fsm_command c WHERE c.machine_id = NEW.machine_id AND c.entity_id = NEW.entity_id AND c.blocked = 0 AND c.status IN ('ready', 'leased')
+    ));
+END;
+
+-- UPDATE OF command_id alone misses assignments through rowid/_rowid_/oid.
+-- The second check prevents UPDATE OR REPLACE from deleting another head when
+-- a blocked command is unblocked. Ordinary promotion follows closure, so its
+-- former head is already terminal and cannot conflict.
+CREATE TRIGGER fsm_command_update_preserves_identity BEFORE UPDATE ON fsm_command
+BEGIN
+    SELECT RAISE(ABORT, 'fsm_command: identity is immutable')
+    WHERE NEW.command_id IS NOT OLD.command_id;
+    SELECT RAISE(ABORT, 'fsm_command: status and blocked cannot be NULL')
+    WHERE NEW.status IS NULL OR NEW.blocked IS NULL;
+    SELECT RAISE(ABORT, 'fsm_command: another head cannot be replaced')
+    WHERE NEW.blocked = 0 AND NEW.status IN ('ready', 'leased') AND EXISTS (
+        SELECT 1 FROM fsm_command c
+        WHERE c.machine_id = NEW.machine_id AND c.entity_id = NEW.entity_id
+          AND c.command_id <> OLD.command_id AND c.blocked = 0 AND c.status IN ('ready', 'leased')
+    );
+END;
+
+CREATE TRIGGER fsm_command_error_insert_preserves_identity BEFORE INSERT ON fsm_command_error
+    WHEN EXISTS (SELECT 1 FROM fsm_command_error WHERE command_id = NEW.command_id)
+BEGIN SELECT RAISE(ABORT, 'fsm_command_error: an existing fact cannot be replaced'); END;
+CREATE TRIGGER fsm_command_error_domain_insert_preserves_identity BEFORE INSERT ON fsm_command_error_domain
+    WHEN EXISTS (SELECT 1 FROM fsm_command_error_domain WHERE command_id = NEW.command_id)
+BEGIN SELECT RAISE(ABORT, 'fsm_command_error_domain: an existing fact cannot be replaced'); END;
+CREATE TRIGGER fsm_command_error_machine_insert_preserves_identity BEFORE INSERT ON fsm_command_error_machine
+    WHEN EXISTS (SELECT 1 FROM fsm_command_error_machine WHERE command_id = NEW.command_id)
+BEGIN SELECT RAISE(ABORT, 'fsm_command_error_machine: an existing fact cannot be replaced'); END;
+CREATE TRIGGER fsm_command_error_replay_insert_preserves_identity BEFORE INSERT ON fsm_command_error_replay
+    WHEN EXISTS (SELECT 1 FROM fsm_command_error_replay WHERE command_id = NEW.command_id)
+BEGIN SELECT RAISE(ABORT, 'fsm_command_error_replay: an existing fact cannot be replaced'); END;
+CREATE TRIGGER fsm_command_correction_insert_preserves_identity BEFORE INSERT ON fsm_command_correction
+    WHEN EXISTS (SELECT 1 FROM fsm_command_correction WHERE command_id = NEW.command_id)
+BEGIN SELECT RAISE(ABORT, 'fsm_command_correction: an existing request cannot be replaced'); END;

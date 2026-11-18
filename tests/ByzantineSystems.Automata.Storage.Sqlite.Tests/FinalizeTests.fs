@@ -146,5 +146,8 @@ let tests =
                            FROM fsm_transition;"
                           [])
 
-              Expect.equal code Code.constraintUnique "the schema, not the code, is what refuses it"
+              Expect.equal
+                  code
+                  Code.constraintTrigger
+                  "the schema refuses replacement before uniqueness conflict handling"
           } ]

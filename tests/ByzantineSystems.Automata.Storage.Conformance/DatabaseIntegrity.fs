@@ -295,3 +295,153 @@ let immutableTests fresh =
                   protectedFields
                   && db.Scalar $"SELECT count(*) FROM {transition} WHERE command_id = {id}" = "0"
                   && db.Scalar $"SELECT count(*) FROM {deadLetter} WHERE command_id = {id}" = "0")) ]
+
+/// SQLite's conflict algorithms can delete a victim without visiting its UPDATE
+/// guard. Exercise each identity independently, not just identical primary keys.
+let replacementTests fresh =
+    let copy db table id omit overrides =
+        let columns =
+            db.Columns table |> List.filter (fun field -> not (List.contains field omit))
+
+        let projection =
+            columns
+            |> List.map (fun field -> Map.tryFind field overrides |> Option.defaultValue field)
+            |> String.concat ", "
+
+        let names = String.concat ", " columns
+        $"INTO {db.Table table} ({names}) SELECT {projection} FROM {db.Table table} WHERE command_id = {id}"
+
+    testList
+        "SQLite conflict algorithm laws"
+        [ property "all conflict algorithms preserve existing failure and correction identities" (fun (seed: int) ->
+              withDatabase fresh (fun db ->
+                  [ for variant in 0..5 do
+                        let id = db.Insert CommandStatus.Ready "event"
+                        header db id variant
+                        child db id variant seed
+
+                        for table in [ error; "command_error_" + failureKind variant ] do
+                            let insertion = copy db table id [] Map.empty
+                            let before = db.Snapshot()
+
+                            for prefix, suffix in
+                                [ "INSERT OR REPLACE", ""
+                                  "REPLACE", ""
+                                  "INSERT OR IGNORE", ""
+                                  "INSERT", " ON CONFLICT DO NOTHING"
+                                  "INSERT", " ON CONFLICT DO UPDATE SET command_id = excluded.command_id" ] do
+                                yield db.Refuses $"{prefix} {insertion}{suffix}" && db.Snapshot() = before
+                    let id = db.Insert CommandStatus.Ready "correction"
+                    let table = db.Table "command_correction"
+                    db.Execute $"INSERT INTO {table} VALUES ({id}, {db.Now}, 'fail', 2)"
+                    let before = db.Snapshot()
+                    let insertion = copy db "command_correction" id [] Map.empty
+                    yield db.Refuses $"INSERT OR REPLACE {insertion}" && db.Snapshot() = before ]
+                  |> List.forall id))
+
+          property "replacement cannot steal any command identity or the current head slot" (fun (seed: int) ->
+              withDatabase fresh (fun db ->
+                  let id = db.Insert CommandStatus.Ready "event"
+                  let original = db.Snapshot()
+
+                  let changes =
+                      [ [],
+                        Map
+                            [ "entity_id", "entity_id || '-other'"
+                              "idempotency_key", "idempotency_key || '-other'" ]
+                        [ "command_id" ], Map [ "idempotency_key", "idempotency_key || '-seq'"; "blocked", "1" ]
+                        [ "command_id" ], Map [ "seq", "seq + 1"; "blocked", "1" ]
+                        [ "command_id" ], Map [ "seq", "seq + 1"; "idempotency_key", "idempotency_key || '-head'" ]
+                        [ "command_id" ],
+                        Map
+                            [ "seq", "seq + 1"
+                              "idempotency_key", "idempotency_key || '-null'"
+                              "blocked", "NULL" ] ]
+
+                  let preserved =
+                      changes
+                      |> List.forall (fun (omit, overrides) ->
+                          let insertion = copy db command id omit overrides
+                          db.Refuses $"INSERT OR REPLACE {insertion}" && db.Snapshot() = original)
+
+                  let waiting =
+                      copy
+                          db
+                          command
+                          id
+                          [ "command_id" ]
+                          (Map
+                              [ "seq", "seq + 1"
+                                "idempotency_key", "idempotency_key || '-waiting'"
+                                "blocked", "1" ])
+
+                  db.Execute $"INSERT {waiting}"
+
+                  let pending =
+                      db.Scalar $"SELECT command_id FROM {db.Table command} WHERE command_id <> {id}"
+                      |> int64
+
+                  let before = db.Snapshot()
+
+                  let headProtected =
+                      db.Refuses $"UPDATE OR REPLACE {db.Table command} SET blocked = 0 WHERE command_id = {pending}"
+                      && db.Snapshot() = before
+
+                  let nullProtected =
+                      db.Refuses
+                          $"UPDATE OR REPLACE {db.Table command} SET blocked = NULL WHERE command_id = {pending}"
+                      && db.Snapshot() = before
+
+                  let aliasesProtected =
+                      [ "rowid"; "_rowid_"; "oid" ]
+                      |> List.forall (fun alias ->
+                          db.Refuses
+                              $"UPDATE OR REPLACE {db.Table command} SET {alias} = {id} WHERE command_id = {pending}"
+                          && db.Snapshot() = before)
+
+                  db.Execute(assign db id CommandStatus.Succeeded)
+
+                  db.Execute
+                      $"UPDATE {db.Table command} SET blocked = 0, read_ct = {int (uint32 seed % 100u)} WHERE command_id = {pending}"
+
+                  preserved
+                  && headProtected
+                  && nullProtected
+                  && aliasesProtected
+                  && db.Scalar $"SELECT blocked FROM {db.Table command} WHERE command_id = {pending}" = "0"))
+
+          property
+              "composite-key evidence cannot be replaced through either declared keys or hidden rowids"
+              (fun (seed: int) ->
+                  withDatabase fresh (fun db ->
+                      let id = db.Insert CommandStatus.Ready "event"
+                      let other = db.Insert CommandStatus.Ready "event"
+                      let transition = db.Table "transition"
+                      let deadLetter = db.Table "action_dead_letter"
+
+                      db.Execute
+                          $"INSERT INTO {transition}(machine_id, entity_id, epoch, command_id, chart_version, actions, from_state, to_state, handled_by, exited, entered, status, effective_at, committed_at)
+                               SELECT machine_id, entity_id, 1, command_id, chart_version, '[]', '{{}}', '{{}}', 'root', '[]', '[]', 'running', 0, 0 FROM {db.Table command} WHERE command_id = {id}"
+
+                      db.Execute
+                          $"INSERT INTO {deadLetter}(machine_id, entity_id, command_id, epoch, ordinal, action, reason, deliveries, recorded_at)
+                               SELECT machine_id, entity_id, command_id, 1, 0, '{{}}', 'undelivered-{seed}', 1, 0 FROM {db.Table command} WHERE command_id = {id}"
+
+                      let before = db.Snapshot()
+
+                      let identitiesProtected =
+                          [ "transition", Map.empty
+                            "transition", Map [ "command_id", string other ]
+                            "transition", Map [ "epoch", "epoch + 1" ]
+                            "action_dead_letter", Map.empty ]
+                          |> List.forall (fun (table, overrides) ->
+                              let insertion = copy db table id [] overrides
+                              db.Refuses $"INSERT OR REPLACE {insertion}" && db.Snapshot() = before)
+
+                      let rowidsAbsent =
+                          [ "transition"; "action_dead_letter" ]
+                          |> List.forall (fun table ->
+                              let tableName = db.Table table
+                              db.Scalar $"SELECT wr FROM pragma_table_list WHERE name = '{tableName}'" = "1")
+
+                      identitiesProtected && rowidsAbsent)) ]

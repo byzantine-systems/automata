@@ -66,10 +66,14 @@ CREATE TABLE fsm_action_dead_letter (
     CONSTRAINT action_dead_letter_reason_not_blank CHECK (LENGTH(TRIM(reason)) > 0),
     CONSTRAINT action_dead_letter_is_json CHECK (JSON_VALID(action)),
     CONSTRAINT action_dead_letter_command_fkey FOREIGN KEY (command_id) REFERENCES fsm_command (command_id)
-) STRICT;
+) STRICT, WITHOUT ROWID;
 
 -- "What has this machine failed to deliver lately".
 CREATE INDEX fsm_action_dead_letter_machine_idx ON fsm_action_dead_letter (machine_id, recorded_at DESC);
 
 CREATE TRIGGER fsm_action_dead_letter_is_append_only BEFORE UPDATE ON fsm_action_dead_letter
 BEGIN SELECT RAISE(ABORT, 'fsm_action_dead_letter: facts are immutable'); END;
+
+CREATE TRIGGER fsm_action_dead_letter_insert_preserves_identity BEFORE INSERT ON fsm_action_dead_letter
+    WHEN EXISTS (SELECT 1 FROM fsm_action_dead_letter WHERE command_id = NEW.command_id AND ordinal = NEW.ordinal)
+BEGIN SELECT RAISE(ABORT, 'fsm_action_dead_letter: an existing fact cannot be replaced'); END;

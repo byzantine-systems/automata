@@ -53,7 +53,7 @@ let private fresh () : Database =
             try
                 attempt text
                 false
-            with :? PostgresException ->
+            with :? PostgresException as error when error.SqlState.StartsWith "23" ->
                 true
       Scalar = scalar
       Snapshot =

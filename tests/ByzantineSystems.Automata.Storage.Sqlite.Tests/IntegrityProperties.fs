@@ -56,7 +56,7 @@ let private fresh () : Database =
             try
                 attempt sql
                 false
-            with :? SqliteException ->
+            with :? SqliteException as error when error.SqliteErrorCode = 19 ->
                 true
       Scalar = scalar
       Snapshot =
@@ -99,4 +99,9 @@ let private driverProperty =
         ))
 
 let tests =
-    testList "SQLite database integrity" [ lifecycleTests fresh; immutableTests fresh; driverProperty ]
+    testList
+        "SQLite database integrity"
+        [ lifecycleTests fresh
+          immutableTests fresh
+          replacementTests fresh
+          driverProperty ]
