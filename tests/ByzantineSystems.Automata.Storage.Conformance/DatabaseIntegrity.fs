@@ -343,6 +343,36 @@ let immutableTests fresh =
                   && db.Scalar $"SELECT count(*) FROM {transition} WHERE command_id = {id}" = "0"
                   && db.Scalar $"SELECT count(*) FROM {deadLetter} WHERE command_id = {id}" = "0")) ]
 
+let upsertTests fresh =
+    property "conflict-update paths cannot rewrite requests or failure facts" (fun (seed: int) ->
+        withDatabase fresh (fun db ->
+            let results =
+                [ for variant in 0..5 do
+                      let id = db.Insert CommandStatus.Ready "event"
+                      header db id variant
+                      child db id variant seed
+
+                      for table in [ error; "command_error_" + failureKind variant ] do
+                          let names = db.Columns table |> String.concat ", "
+                          let before = db.Snapshot()
+
+                          yield
+                              db.Refuses
+                                  $"INSERT INTO {db.Table table}({names}) SELECT {names} FROM {db.Table table} WHERE command_id = {id} ON CONFLICT(command_id) DO UPDATE SET command_id = excluded.command_id"
+                              && db.Snapshot() = before
+
+                      let names =
+                          db.Columns command |> List.filter ((<>) "command_id") |> String.concat ", "
+
+                      let before = db.Snapshot()
+
+                      yield
+                          db.Refuses
+                              $"INSERT INTO {db.Table command}({names}) SELECT {names} FROM {db.Table command} WHERE command_id = {id} ON CONFLICT(machine_id, entity_id, idempotency_key) DO UPDATE SET event = excluded.event"
+                          && db.Snapshot() = before ]
+
+            List.forall id results))
+
 /// SQLite's conflict algorithms can delete a victim without visiting its UPDATE
 /// guard. Exercise each identity independently, not just identical primary keys.
 let replacementTests fresh =

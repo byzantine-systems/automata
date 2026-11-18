@@ -40,6 +40,7 @@ let private freshFor (schemaValue: string) (initialize: unit -> Task) () : Datab
               [ for index in 0 .. reader.FieldCount - 1 do
                     match reader.GetValue index with
                     | :? (byte array) as bytes -> Convert.ToHexString bytes
+                    | :? (string array) as values -> System.Text.Json.JsonSerializer.Serialize values
                     | value -> Convert.ToString(value, Globalization.CultureInfo.InvariantCulture) ] ]
 
     let scalar text =
@@ -95,7 +96,13 @@ let private fresh () = freshFor schemaValue reset ()
 
 let forInstallation schema initialize =
     let fresh () = freshFor schema initialize ()
-    testList "snapshot database integrity" [ lifecycleTests fresh; ownershipRollbackTests fresh; immutableTests fresh ]
+
+    testList
+        "snapshot database integrity"
+        [ lifecycleTests fresh
+          ownershipRollbackTests fresh
+          immutableTests fresh
+          upsertTests fresh ]
 
 let private auditProperties =
     testCase "supervision and quarantine facts reject every column update and retain duplicate no-ops" (fun () ->
@@ -151,5 +158,6 @@ let tests =
         [ lifecycleTests fresh
           ownershipRollbackTests fresh
           immutableTests fresh
+          upsertTests fresh
           auditProperties
           driverProperty ]

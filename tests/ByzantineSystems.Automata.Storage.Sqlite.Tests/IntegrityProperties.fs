@@ -104,5 +104,6 @@ let tests =
         [ lifecycleTests fresh
           ownershipRollbackTests fresh
           immutableTests fresh
+          upsertTests fresh
           replacementTests fresh
           driverProperty ]
