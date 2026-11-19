@@ -32,11 +32,11 @@
         "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "lastModified": 1793700691,
-        "narHash": "sha256-g2PRN40ToD3ji0c4wpOI6pOMFgyWPY7yNxxn/+y5e7o=",
+        "lastModified": 1794848549,
+        "narHash": "sha256-BS2B4IQTYpB9/lERr9zsb7VsiYQq0kBj9VVXo2FschE=",
         "owner": "cachix",
         "repo": "devenv",
-        "rev": "8e6eb8ecb878146883526ea0ebcbb7344a83be68",
+        "rev": "fa46b70717c80cf39b067b7f309d7d31babaeae8",
         "type": "github"
       },
       "original": {
@@ -210,11 +210,11 @@
     },
     "nixpkgs": {
       "locked": {
-        "lastModified": 1793540411,
-        "narHash": "sha256-us2GRWGXbOQpN1blyJGvmdx+g4bv9GoFYq5iiOHRiZ8=",
-        "rev": "0bb2eedc20e4739f29e8045034f2828ad7054f8f",
+        "lastModified": 1794537146,
+        "narHash": "sha256-bTKSclXJAmo9qdxPedTBHUGr8awPr4BrbOoOutJsYIc=",
+        "rev": "d5cc6833999746cffdfe0598f7bc801a57b887a9",
         "type": "tarball",
-        "url": "https://releases.nixos.org/nixos/unstable/nixos-26.11pre1106360.0bb2eedc20e4/nixexprs.tar.zst"
+        "url": "https://releases.nixos.org/nixos/unstable/nixos-26.11pre1119549.d5cc68339997/nixexprs.tar.zst"
       },
       "original": {
         "type": "tarball",
