@@ -113,8 +113,8 @@ let tests =
           testTask "purge_commands deletes every table that references fsm.command" {
               do! reset ()
 
-              // Every table with a foreign key into fsm.command. The keys are NO ACTION, so a
-              // child the purge does not delete would leave a dangling reference and wedge
+              // Every table with a foreign key into fsm.command. A child neither deleted
+              // explicitly nor reached by a cascade would leave a dangling reference and wedge
               // run_maintenance for every machine once one row ages past the horizon. This is
               // the generic form of the correction wedge: it fails when the next child table
               // arrives without a matching delete, not only when the correction one is missing.
@@ -147,10 +147,22 @@ let tests =
                   |> Seq.map (fun matched -> matched.Groups[1].Value)
                   |> Set.ofSeq
 
+              let covered =
+                  rows
+                      "WITH RECURSIVE deleted(oid) AS (
+                          SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                          WHERE n.nspname = @schema AND c.relname = ANY(@roots)
+                          UNION SELECT con.conrelid FROM pg_constraint con JOIN deleted d ON con.confrelid = d.oid
+                          WHERE con.contype = 'f' AND con.confdeltype = 'c')
+                        SELECT c.relname FROM pg_class c JOIN deleted d ON c.oid = d.oid"
+                      [ "schema", box schemaValue; "roots", box (Set.toArray targets) ]
+                      (fun reader -> reader.GetString 0)
+                  |> Set.ofList
+
               Expect.equal
-                  (Set.difference (Set.remove "entity_state" children) targets |> Set.toList)
+                  (Set.difference (Set.remove "entity_state" children) covered |> Set.toList)
                   []
-                  "every table with a foreign key into fsm.command has a matching DELETE in purge_commands"
+                  "every referent is deleted explicitly or by a verified cascade from a deleted root"
 
               Expect.isTrue
                   (Regex.IsMatch(

@@ -221,9 +221,9 @@ module internal Db =
     /// Runs a unit of work that is safe to repeat, with the pipeline applied.
     ///
     /// The unit is the whole transaction, from opening the connection to committing it, and
-    /// never a single statement inside one. SQLite rolls a transaction back when a statement in
-    /// it fails with <c>SQLITE_BUSY</c>, so retrying the statement alone would run it outside the
-    /// transaction it was written for.
+    /// never a single statement inside one. A failed statement does not universally undo its
+    /// preceding writes. The write runner disposes the failed transaction before this boundary
+    /// retries, so the next attempt always starts with a fresh connection and transaction.
     /// </summary>
     let protect
         (pipeline: ResiliencePipeline)

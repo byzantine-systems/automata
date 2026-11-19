@@ -65,6 +65,7 @@ CREATE TABLE fsm_command (
     -- sequence number" with one backward seek.
     CONSTRAINT command_unique_seq UNIQUE (machine_id, entity_id, seq),
     CONSTRAINT command_seq_positive CHECK (seq > 0),
+    CONSTRAINT command_id_positive CHECK (command_id > 0),
     -- The checked vocabularies that PostgreSQL spells as domains.
     CONSTRAINT command_status_valid CHECK (status IN ('ready', 'leased', 'succeeded', 'rejected', 'dead_letter')),
     CONSTRAINT command_kind_valid CHECK (kind IN ('event', 'correction')),
@@ -150,7 +151,7 @@ END;
 -- UPDATE OF fires whenever a statement names one of these columns, whatever
 -- the value, so no store statement names them at all.
 CREATE TRIGGER fsm_command_submission_is_immutable
-    BEFORE UPDATE OF command_id, machine_id, entity_id, seq, idempotency_key, chart_version, event, kind, received_at, tenant, principal, source, correlation_id, causation_id ON fsm_command
+    BEFORE UPDATE OF command_id, machine_id, entity_id, seq, idempotency_key, request_digest, chart_version, event, kind, received_at, tenant, principal, source, correlation_id, causation_id ON fsm_command
 BEGIN
     SELECT
         RAISE(ABORT, 'fsm_command: a submitted command is never rewritten');
@@ -161,27 +162,27 @@ END;
 --
 -- Separate from fsm_command for the reasons fsm.command_error gives: the claim
 -- path never reads it, most commands never have one, and a succeeded command's
--- result lives in fsm_transition. The error is the tagged-JSON failure envelope
--- the PostgreSQL store writes, so the two stores read each other's shape.
+-- result lives in fsm_transition. The discriminant header and selected child
+-- keep machine/replay metadata relational; only a domain error is codec JSON.
 -- ---------------------------------------------------------------------------
 CREATE TABLE fsm_command_error (
     command_id INTEGER NOT NULL PRIMARY KEY,
     kind TEXT NOT NULL CHECK (kind IN ('domain', 'machine', 'replay')),
     recorded_at INTEGER NOT NULL,
     UNIQUE (command_id, kind),
-    CONSTRAINT command_error_command_fkey FOREIGN KEY (command_id) REFERENCES fsm_command (command_id)
+    CONSTRAINT command_error_command_fkey FOREIGN KEY (command_id) REFERENCES fsm_command (command_id) ON DELETE CASCADE
 ) STRICT;
 
 CREATE TABLE fsm_command_error_domain (
     command_id INTEGER NOT NULL PRIMARY KEY,
     kind TEXT NOT NULL DEFAULT 'domain' CHECK (kind = 'domain'),
     error TEXT NOT NULL CHECK (JSON_VALID(error)),
-    FOREIGN KEY (command_id, kind) REFERENCES fsm_command_error (command_id, kind)
+    FOREIGN KEY (command_id, kind) REFERENCES fsm_command_error (command_id, kind) ON DELETE CASCADE
 ) STRICT;
 CREATE TABLE fsm_command_error_machine (
     command_id INTEGER NOT NULL PRIMARY KEY,
     kind TEXT NOT NULL DEFAULT 'machine' CHECK (kind = 'machine'), reason TEXT NOT NULL,
-    FOREIGN KEY (command_id, kind) REFERENCES fsm_command_error (command_id, kind)
+    FOREIGN KEY (command_id, kind) REFERENCES fsm_command_error (command_id, kind) ON DELETE CASCADE
 ) STRICT;
 CREATE TABLE fsm_command_error_replay (
     command_id INTEGER NOT NULL PRIMARY KEY,
@@ -189,7 +190,7 @@ CREATE TABLE fsm_command_error_replay (
     replay_kind TEXT NOT NULL CHECK (replay_kind IN ('unknown_chart_version', 'diverged', 'budget_exceeded', 'history_purged')),
     version INTEGER NOT NULL DEFAULT 0, epoch INTEGER NOT NULL DEFAULT 0,
     reason TEXT NOT NULL DEFAULT '', budget INTEGER NOT NULL DEFAULT 0,
-    FOREIGN KEY (command_id, kind) REFERENCES fsm_command_error (command_id, kind),
+    FOREIGN KEY (command_id, kind) REFERENCES fsm_command_error (command_id, kind) ON DELETE CASCADE,
     CHECK (CASE replay_kind
         WHEN 'unknown_chart_version' THEN version > 0 AND epoch = 0 AND reason = '' AND budget = 0
         WHEN 'diverged' THEN version = 0 AND epoch >= 0 AND budget = 0
@@ -214,5 +215,131 @@ CREATE TABLE fsm_command_correction (
     replay_limit INTEGER NOT NULL,
     CONSTRAINT command_correction_divergence_valid CHECK (on_divergence IN ('fail', 'truncate')),
     CONSTRAINT command_correction_replay_limit_positive CHECK (replay_limit > 0),
-    CONSTRAINT command_correction_command_fkey FOREIGN KEY (command_id) REFERENCES fsm_command (command_id)
+    CONSTRAINT command_correction_command_fkey FOREIGN KEY (command_id) REFERENCES fsm_command (command_id) ON DELETE CASCADE
 ) STRICT;
+
+-- Creation and closure are separate operations. A terminal INSERT must not
+-- bypass the evidence check on the UPDATE that normally closes a command.
+CREATE TRIGGER fsm_command_starts_ready
+    BEFORE INSERT ON fsm_command
+    WHEN NEW.status IS NOT 'ready'
+BEGIN
+    SELECT RAISE(ABORT, 'fsm_command: a new command must be ready');
+END;
+
+CREATE TRIGGER fsm_command_closure_has_evidence
+    AFTER UPDATE OF status ON fsm_command
+    WHEN NEW.status IN ('succeeded', 'rejected', 'dead_letter')
+BEGIN
+    SELECT RAISE(ABORT, 'fsm_command: success cannot carry failure evidence')
+    WHERE NEW.status = 'succeeded'
+        AND EXISTS (SELECT 1 FROM fsm_command_error WHERE command_id = NEW.command_id);
+
+    SELECT RAISE(ABORT, 'fsm_command: failure requires its header and selected child')
+    WHERE NEW.status IN ('rejected', 'dead_letter') AND NOT EXISTS (
+        SELECT 1 FROM fsm_command_error h
+        WHERE h.command_id = NEW.command_id AND CASE h.kind
+            WHEN 'domain' THEN EXISTS (SELECT 1 FROM fsm_command_error_domain d WHERE d.command_id = h.command_id AND d.kind = h.kind)
+            WHEN 'machine' THEN EXISTS (SELECT 1 FROM fsm_command_error_machine m WHERE m.command_id = h.command_id AND m.kind = h.kind)
+            WHEN 'replay' THEN EXISTS (SELECT 1 FROM fsm_command_error_replay r WHERE r.command_id = h.command_id AND r.kind = h.kind)
+            ELSE FALSE END
+    );
+END;
+
+-- Close versus late evidence insertion must be safe in both orders. SQLite's
+-- single writer makes this status observation atomic with the insertion.
+CREATE TRIGGER fsm_command_error_requires_live_owner
+    BEFORE INSERT ON fsm_command_error
+    WHEN EXISTS (SELECT 1 FROM fsm_command WHERE command_id = NEW.command_id AND status NOT IN ('ready', 'leased'))
+BEGIN
+    SELECT RAISE(ABORT, 'fsm_command_error: the owner must still be live');
+END;
+
+-- Error facts and correction requests belong to their command. Root deletion
+-- removes the parent before executing FK actions, so the guards permit the
+-- cascade but never a partial deletion while the command survives.
+CREATE TRIGGER fsm_command_error_owned_delete BEFORE DELETE ON fsm_command_error
+    WHEN EXISTS (SELECT 1 FROM fsm_command WHERE command_id = OLD.command_id)
+BEGIN SELECT RAISE(ABORT, 'fsm_command_error: delete the owning command'); END;
+CREATE TRIGGER fsm_command_error_domain_owned_delete BEFORE DELETE ON fsm_command_error_domain
+    WHEN EXISTS (SELECT 1 FROM fsm_command WHERE command_id = OLD.command_id)
+BEGIN SELECT RAISE(ABORT, 'fsm_command_error: delete the owning command'); END;
+CREATE TRIGGER fsm_command_error_machine_owned_delete BEFORE DELETE ON fsm_command_error_machine
+    WHEN EXISTS (SELECT 1 FROM fsm_command WHERE command_id = OLD.command_id)
+BEGIN SELECT RAISE(ABORT, 'fsm_command_error: delete the owning command'); END;
+CREATE TRIGGER fsm_command_error_replay_owned_delete BEFORE DELETE ON fsm_command_error_replay
+    WHEN EXISTS (SELECT 1 FROM fsm_command WHERE command_id = OLD.command_id)
+BEGIN SELECT RAISE(ABORT, 'fsm_command_error: delete the owning command'); END;
+CREATE TRIGGER fsm_command_correction_owned_delete BEFORE DELETE ON fsm_command_correction
+    WHEN EXISTS (SELECT 1 FROM fsm_command WHERE command_id = OLD.command_id)
+BEGIN SELECT RAISE(ABORT, 'fsm_command_correction: delete the owning command'); END;
+
+CREATE TRIGGER fsm_command_correction_requires_ready_owner
+    BEFORE INSERT ON fsm_command_correction
+    WHEN EXISTS (SELECT 1 FROM fsm_command WHERE command_id = NEW.command_id AND (kind <> 'correction' OR status <> 'ready'))
+BEGIN SELECT RAISE(ABORT, 'fsm_command_correction: details belong to a ready correction'); END;
+
+CREATE TRIGGER fsm_command_error_is_append_only BEFORE UPDATE ON fsm_command_error
+BEGIN SELECT RAISE(ABORT, 'fsm_command_error: facts are immutable'); END;
+CREATE TRIGGER fsm_command_error_domain_is_append_only BEFORE UPDATE ON fsm_command_error_domain
+BEGIN SELECT RAISE(ABORT, 'fsm_command_error_domain: facts are immutable'); END;
+CREATE TRIGGER fsm_command_error_machine_is_append_only BEFORE UPDATE ON fsm_command_error_machine
+BEGIN SELECT RAISE(ABORT, 'fsm_command_error_machine: facts are immutable'); END;
+CREATE TRIGGER fsm_command_error_replay_is_append_only BEFORE UPDATE ON fsm_command_error_replay
+BEGIN SELECT RAISE(ABORT, 'fsm_command_error_replay: facts are immutable'); END;
+CREATE TRIGGER fsm_command_correction_is_append_only BEFORE UPDATE ON fsm_command_correction
+BEGIN SELECT RAISE(ABORT, 'fsm_command_correction: submitted details are immutable'); END;
+
+-- REPLACE resolves uniqueness by deleting the victim, not by UPDATE. Reject
+-- all conflicting identities before it reaches that machinery, including the
+-- partial unique head slot. Auto-assigned command IDs still come from SQLite's
+-- AUTOINCREMENT allocator; no trigger depends on a particular NEW.rowid sentinel.
+CREATE TRIGGER fsm_command_insert_preserves_identity BEFORE INSERT ON fsm_command
+BEGIN
+    SELECT RAISE(ABORT, 'fsm_command: status and blocked cannot be NULL')
+    WHERE NEW.status IS NULL OR NEW.blocked IS NULL;
+    SELECT RAISE(ABORT, 'fsm_command: an existing identity cannot be replaced')
+    WHERE EXISTS (
+        SELECT 1 FROM fsm_command c WHERE c.command_id = NEW.command_id
+    ) OR EXISTS (
+        SELECT 1 FROM fsm_command c WHERE c.machine_id = NEW.machine_id AND c.entity_id = NEW.entity_id AND c.seq = NEW.seq
+    ) OR EXISTS (
+        SELECT 1 FROM fsm_command c WHERE c.machine_id = NEW.machine_id AND c.entity_id = NEW.entity_id AND c.idempotency_key = NEW.idempotency_key
+    ) OR (NEW.blocked = 0 AND NEW.status IN ('ready', 'leased') AND EXISTS (
+        SELECT 1 FROM fsm_command c WHERE c.machine_id = NEW.machine_id AND c.entity_id = NEW.entity_id AND c.blocked = 0 AND c.status IN ('ready', 'leased')
+    ));
+END;
+
+-- UPDATE OF command_id alone misses assignments through rowid/_rowid_/oid.
+-- The second check prevents UPDATE OR REPLACE from deleting another head when
+-- a blocked command is unblocked. Ordinary promotion follows closure, so its
+-- former head is already terminal and cannot conflict.
+CREATE TRIGGER fsm_command_update_preserves_identity BEFORE UPDATE ON fsm_command
+BEGIN
+    SELECT RAISE(ABORT, 'fsm_command: identity is immutable')
+    WHERE NEW.command_id IS NOT OLD.command_id;
+    SELECT RAISE(ABORT, 'fsm_command: status and blocked cannot be NULL')
+    WHERE NEW.status IS NULL OR NEW.blocked IS NULL;
+    SELECT RAISE(ABORT, 'fsm_command: another head cannot be replaced')
+    WHERE NEW.blocked = 0 AND NEW.status IN ('ready', 'leased') AND EXISTS (
+        SELECT 1 FROM fsm_command c
+        WHERE c.machine_id = NEW.machine_id AND c.entity_id = NEW.entity_id
+          AND c.command_id <> OLD.command_id AND c.blocked = 0 AND c.status IN ('ready', 'leased')
+    );
+END;
+
+CREATE TRIGGER fsm_command_error_insert_preserves_identity BEFORE INSERT ON fsm_command_error
+    WHEN EXISTS (SELECT 1 FROM fsm_command_error WHERE command_id = NEW.command_id)
+BEGIN SELECT RAISE(ABORT, 'fsm_command_error: an existing fact cannot be replaced'); END;
+CREATE TRIGGER fsm_command_error_domain_insert_preserves_identity BEFORE INSERT ON fsm_command_error_domain
+    WHEN EXISTS (SELECT 1 FROM fsm_command_error_domain WHERE command_id = NEW.command_id)
+BEGIN SELECT RAISE(ABORT, 'fsm_command_error_domain: an existing fact cannot be replaced'); END;
+CREATE TRIGGER fsm_command_error_machine_insert_preserves_identity BEFORE INSERT ON fsm_command_error_machine
+    WHEN EXISTS (SELECT 1 FROM fsm_command_error_machine WHERE command_id = NEW.command_id)
+BEGIN SELECT RAISE(ABORT, 'fsm_command_error_machine: an existing fact cannot be replaced'); END;
+CREATE TRIGGER fsm_command_error_replay_insert_preserves_identity BEFORE INSERT ON fsm_command_error_replay
+    WHEN EXISTS (SELECT 1 FROM fsm_command_error_replay WHERE command_id = NEW.command_id)
+BEGIN SELECT RAISE(ABORT, 'fsm_command_error_replay: an existing fact cannot be replaced'); END;
+CREATE TRIGGER fsm_command_correction_insert_preserves_identity BEFORE INSERT ON fsm_command_correction
+    WHEN EXISTS (SELECT 1 FROM fsm_command_correction WHERE command_id = NEW.command_id)
+BEGIN SELECT RAISE(ABORT, 'fsm_command_correction: an existing request cannot be replaced'); END;

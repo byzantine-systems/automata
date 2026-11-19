@@ -55,6 +55,29 @@ let exec (connectionString: string) (sql: string) (parameters: (string * obj) li
     bind parameters cmd
     cmd.ExecuteNonQuery() |> ignore
 
+/// Corrupt a command with the exact deployed guard restored in the same
+/// transaction. Failure rolls back both the DROP and the deliberate mutation.
+let corruptCommand connectionString statement parameters =
+    use conn = new SqliteConnection(connectionString)
+    conn.Open()
+    use transaction = conn.BeginTransaction(deferred = false)
+    use cmd = conn.CreateCommand()
+    cmd.Transaction <- transaction
+
+    cmd.CommandText <-
+        "SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'fsm_command_submission_is_immutable'"
+
+    let guard = cmd.ExecuteScalar() :?> string
+    cmd.CommandText <- "DROP TRIGGER fsm_command_submission_is_immutable"
+    cmd.ExecuteNonQuery() |> ignore
+    cmd.CommandText <- statement
+    bind parameters cmd
+    cmd.ExecuteNonQuery() |> ignore
+    cmd.Parameters.Clear()
+    cmd.CommandText <- guard
+    cmd.ExecuteNonQuery() |> ignore
+    transaction.Commit()
+
 /// Reads the first column of every row, as text.
 let column (connectionString: string) (sql: string) (parameters: (string * obj) list) : string list =
     use conn = new SqliteConnection(connectionString)
@@ -104,11 +127,6 @@ let reset () : unit =
         (shared ())
         "DELETE FROM fsm_action_dead_letter;
          DELETE FROM fsm_action;
-         DELETE FROM fsm_command_error_domain;
-         DELETE FROM fsm_command_error_machine;
-         DELETE FROM fsm_command_error_replay;
-         DELETE FROM fsm_command_error;
-         DELETE FROM fsm_command_correction;
          DELETE FROM fsm_entity_snapshot;
          DELETE FROM fsm_transition;
          DELETE FROM fsm_command;

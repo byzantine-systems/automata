@@ -177,13 +177,16 @@ let private poisonFixture actions count payload =
               Corrupt =
                 fun id ->
                     task {
-                        let sql =
-                            if actions then
+                        if actions then
+                            exec
+                                db.Db
                                 "UPDATE fsm_action SET action = '{}' WHERE command_id = @id"
-                            else
-                                "DROP TRIGGER fsm_command_submission_is_immutable; UPDATE fsm_command SET event = '{}' WHERE command_id = @id"
-
-                        exec db.Db sql [ "@id", box (CommandId.value id) ]
+                                [ "@id", box (CommandId.value id) ]
+                        else
+                            corruptCommand
+                                db.Db
+                                "UPDATE fsm_command SET event = '{}' WHERE command_id = @id"
+                                [ "@id", box (CommandId.value id) ]
                     }
               Claim =
                 fun () ->

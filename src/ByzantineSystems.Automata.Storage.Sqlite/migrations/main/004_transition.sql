@@ -36,7 +36,7 @@ CREATE TABLE fsm_transition (
     -- One command can never produce two transitions, whatever a retry does.
     CONSTRAINT transition_unique_command UNIQUE (command_id),
     CONSTRAINT transition_command_fkey FOREIGN KEY (command_id) REFERENCES fsm_command (command_id)
-) STRICT;
+) STRICT, WITHOUT ROWID;
 
 -- Append-only, enforced rather than intended. History that could be edited in
 -- place is not history. Deleting stays possible, because retention deletes.
@@ -46,3 +46,10 @@ BEGIN
     SELECT
         RAISE(ABORT, 'fsm_transition: the transition log is append-only');
 END;
+
+-- WITHOUT ROWID removes a hidden replacement identity independent of the two
+-- declared keys. Both declared identities must be checked before REPLACE.
+CREATE TRIGGER fsm_transition_insert_preserves_identity BEFORE INSERT ON fsm_transition
+    WHEN EXISTS (SELECT 1 FROM fsm_transition t WHERE t.command_id = NEW.command_id
+        OR (t.machine_id = NEW.machine_id AND t.entity_id = NEW.entity_id AND t.epoch = NEW.epoch))
+BEGIN SELECT RAISE(ABORT, 'fsm_transition: an existing fact cannot be replaced'); END;

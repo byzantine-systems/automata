@@ -195,16 +195,20 @@ CREATE TABLE $schema$.command_error (command_id bigint PRIMARY KEY, kind $schema
     -- When we gave up: the failure path's counterpart to
     -- $schema$.transition.committed_at, which a rejected command never writes. Same
     -- clock as that column, since they answer the same question.
-    recorded_at timestamptz NOT NULL DEFAULT STATEMENT_TIMESTAMP(), UNIQUE (command_id, kind), CONSTRAINT command_error_command_fkey FOREIGN KEY (command_id) REFERENCES $schema$.command (command_id)
+    recorded_at timestamptz NOT NULL DEFAULT STATEMENT_TIMESTAMP(), UNIQUE (command_id, kind), CONSTRAINT command_error_command_fkey FOREIGN KEY (command_id) REFERENCES $schema$.command (command_id
+) ON DELETE CASCADE
 );
 
-CREATE TABLE $schema$.command_error_domain (command_id bigint PRIMARY KEY, kind $schema$.failure_kind NOT NULL DEFAULT 'domain' CHECK (kind = 'domain'), error jsonb NOT NULL, FOREIGN KEY (command_id, kind) REFERENCES $schema$.command_error (command_id, kind)
+CREATE TABLE $schema$.command_error_domain (command_id bigint PRIMARY KEY, kind $schema$.failure_kind NOT NULL DEFAULT 'domain' CHECK (kind = 'domain'), error jsonb NOT NULL, FOREIGN KEY (command_id, kind) REFERENCES $schema$.command_error (command_id, kind
+) ON DELETE CASCADE
 );
 
-CREATE TABLE $schema$.command_error_machine (command_id bigint PRIMARY KEY, kind $schema$.failure_kind NOT NULL DEFAULT 'machine' CHECK (kind = 'machine'), reason text NOT NULL, FOREIGN KEY (command_id, kind) REFERENCES $schema$.command_error (command_id, kind)
+CREATE TABLE $schema$.command_error_machine (command_id bigint PRIMARY KEY, kind $schema$.failure_kind NOT NULL DEFAULT 'machine' CHECK (kind = 'machine'), reason text NOT NULL, FOREIGN KEY (command_id, kind) REFERENCES $schema$.command_error (command_id, kind
+) ON DELETE CASCADE
 );
 
-CREATE TABLE $schema$.command_error_replay (command_id bigint PRIMARY KEY, kind $schema$.failure_kind NOT NULL DEFAULT 'replay' CHECK (kind = 'replay'), replay_kind $schema$.replay_failure NOT NULL, version integer NOT NULL DEFAULT 0, epoch bigint NOT NULL DEFAULT 0, reason text NOT NULL DEFAULT '', budget integer NOT NULL DEFAULT 0, FOREIGN KEY (command_id, kind) REFERENCES $schema$.command_error (command_id, kind), CHECK (CASE replay_kind
+CREATE TABLE $schema$.command_error_replay (command_id bigint PRIMARY KEY, kind $schema$.failure_kind NOT NULL DEFAULT 'replay' CHECK (kind = 'replay'), replay_kind $schema$.replay_failure NOT NULL, version integer NOT NULL DEFAULT 0, epoch bigint NOT NULL DEFAULT 0, reason text NOT NULL DEFAULT '', budget integer NOT NULL DEFAULT 0, FOREIGN KEY (command_id, kind) REFERENCES $schema$.command_error (command_id, kind
+) ON DELETE CASCADE, CHECK (CASE replay_kind
     WHEN 'unknown_chart_version' THEN
         version > 0 AND epoch = 0 AND reason = '' AND budget = 0
     WHEN 'diverged' THEN

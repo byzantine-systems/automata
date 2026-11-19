@@ -24,9 +24,13 @@ let private keepCommandsFor span =
 // clock is bent with SQL; every transition and command is written the way an application would.
 // ---------------------------------------------------------------------------------------------
 
-let private submit (name: string) (key: string) =
+let private submit (name: string) (key: string) receivedAt =
     task {
-        let! outcome = (newInbox ()).SubmitAsync(submission (entity name) key (Start 1), noCancellation)
+        let request =
+            { submission (entity name) key (Start 1) with
+                ReceivedAt = receivedAt }
+
+        let! outcome = (newInbox ()).SubmitAsync(request, noCancellation)
         outcome |> expectOk "submit" |> ignore
     }
 
@@ -87,42 +91,52 @@ let private retentionProperty =
                     let name = "e1"
 
                     let times =
-                        case.Deltas
+                        // Construct at least one purgeable transition and a pinned
+                        // survivor. Empty/singleton traces otherwise make this law
+                        // pass without ever evaluating its watermark boundary.
+                        (match case.Deltas with
+                         | [] -> [ 0uy; 0uy ]
+                         | [ only ] -> [ only; 0uy ]
+                         | many -> many)
                         |> List.truncate 5
                         |> List.map (fun delta -> 1 + int delta % 30)
                         |> List.scan (+) 0
                         |> List.skip 1
                         |> List.map (float >> baseTime.AddMinutes)
 
+                    let purged = 1 + int case.Purge % (times.Length - 1)
+
                     for index in 0 .. times.Length - 1 do
-                        do! submit name $"k{index}"
+                        do! submit name $"k{index}" (if index < purged then Some baseTime else None)
 
                     for index, effectiveAt in List.indexed times do
                         do! commitAt name $"k{index}" effectiveAt (Epoch.ofUInt64 (uint64 index))
 
-                    // Age a prefix so retention removes exactly it; the newest command is kept.
-                    let purged =
-                        if List.isEmpty times then
-                            0
-                        else
-                            min (int case.Purge) (times.Length - 1)
+                    let! intact = suffixIncomplete name baseTime
+                    Expect.isFalse intact "before retention, the full suffix is present"
+                    let! reports = (newMaintenance ()).RunAsync(ClaimBatch.create 100, noCancellation)
 
-                    if purged > 0 then
-                        arrange
-                            $"UPDATE fsm.command SET received_at = now() - interval '2 hours' WHERE entity_id = '{name}' AND seq <= {purged}"
+                    let report =
+                        reports
+                        |> expectOk "maintenance"
+                        |> List.find (fun report -> report.MachineId = machine)
 
-                    let! _ = (newMaintenance ()).RunAsync(ClaimBatch.create 100, noCancellation)
+                    Expect.equal report.PurgedCommands (int64 purged) "the generated prefix was actually purged"
+                    let watermark = times[purged - 1]
 
-                    let watermark = if purged = 0 then None else List.tryItem (purged - 1) times
-                    let probe = baseTime.AddMinutes(float (int case.From % 120))
+                    let probes =
+                        [ watermark.AddTicks -10L
+                          watermark
+                          watermark.AddTicks 10L
+                          baseTime.AddMinutes(float (int case.From % 120)) ]
 
-                    let expected =
-                        match watermark with
-                        | Some w -> w >= probe
-                        | None -> false
+                    let mutable agrees = true
 
-                    let! incomplete = suffixIncomplete name probe
-                    return incomplete = expected
+                    for probe in probes do
+                        let! incomplete = suffixIncomplete name probe
+                        agrees <- agrees && incomplete = (watermark >= probe)
+
+                    return agrees
                 }
         ))
 
@@ -140,13 +154,10 @@ let private regressions =
               do! reset ()
               do! boot (keepCommandsFor hour)
               let name = "gap"
-              do! submit name "k1"
-              do! submit name "k2"
+              do! submit name "k1" (Some baseTime)
+              do! submit name "k2" None
               do! commitAt name "k1" (baseTime.AddHours 10.) Epoch.initial
               do! commitAt name "k2" (baseTime.AddHours 12.) (Epoch.ofUInt64 1UL)
-
-              arrange
-                  $"UPDATE fsm.command SET received_at = now() - interval '2 hours' WHERE entity_id = '{name}' AND seq = 1"
 
               let! _ = (newMaintenance ()).RunAsync(ClaimBatch.create 100, noCancellation)
 
@@ -162,13 +173,10 @@ let private regressions =
               do! reset ()
               do! boot (keepCommandsFor hour)
               let name = "edge"
-              do! submit name "k1"
-              do! submit name "k2"
+              do! submit name "k1" (Some baseTime)
+              do! submit name "k2" None
               do! commitAt name "k1" (baseTime.AddHours 10.) Epoch.initial
               do! commitAt name "k2" (baseTime.AddHours 12.) (Epoch.ofUInt64 1UL)
-
-              arrange
-                  $"UPDATE fsm.command SET received_at = now() - interval '2 hours' WHERE entity_id = '{name}' AND seq = 1"
 
               let! _ = (newMaintenance ()).RunAsync(ClaimBatch.create 100, noCancellation)
 
@@ -182,8 +190,8 @@ let private regressions =
               do! reset ()
               do! boot (keepCommandsFor hour)
               let name = "gone"
-              do! submit name "k1"
-              do! submit name "k2"
+              do! submit name "k1" (Some baseTime)
+              do! submit name "k2" None
               do! commitAt name "k1" (baseTime.AddHours 10.) Epoch.initial
 
               let! batch =
@@ -198,9 +206,6 @@ let private regressions =
               let! _ =
                   (newProcessor ())
                       .RejectAsync(k2.Work.CommandId, k2.Token, CommandFailure.Machine "refused", noCancellation)
-
-              arrange
-                  $"UPDATE fsm.command SET received_at = now() - interval '2 hours' WHERE entity_id = '{name}' AND seq = 1"
 
               let! _ = (newMaintenance ()).RunAsync(ClaimBatch.create 100, noCancellation)
 

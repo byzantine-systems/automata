@@ -46,7 +46,7 @@ let private invariantTests =
                   "INSERT INTO fsm_command_error_replay(command_id, replay_kind) SELECT command_id, 'history_purged' FROM fsm_command"
                   []
 
-              refuses 1555 "second child" (fun () ->
+              refuses Code.constraintTrigger "second child" (fun () ->
                   exec
                       db
                       "INSERT INTO fsm_command_error_replay(command_id, replay_kind) SELECT command_id, 'history_purged' FROM fsm_command"
@@ -56,7 +56,7 @@ let private invariantTests =
           <| fun db ->
               insertCommand db []
 
-              refuses Code.constraintUnique "a second head" (fun () ->
+              refuses Code.constraintTrigger "a second head" (fun () ->
                   insertCommand db [ "seq", box 2L; "idempotency_key", box "key-2" ])
 
               // Waiting its turn is how a second command is admitted.
@@ -69,9 +69,10 @@ let private invariantTests =
 
           fixture "a resubmitted key is one command"
           <| fun db ->
-              insertCommand db [ "status", box "succeeded"; "lease_token", box 1L ]
+              insertCommand db []
+              exec db "UPDATE fsm_command SET status = 'succeeded', lease_token = 1" []
 
-              refuses Code.constraintUnique "same entity, same key" (fun () ->
+              refuses Code.constraintTrigger "same entity, same key" (fun () ->
                   insertCommand db [ "seq", box 2L; "blocked", box 1L ]) ]
 
 let private triggerTests =
@@ -79,7 +80,8 @@ let private triggerTests =
         "guards"
         [ fixture "a terminal command is never updated"
           <| fun db ->
-              insertCommand db [ "status", box "succeeded"; "lease_token", box 7L ]
+              insertCommand db []
+              exec db "UPDATE fsm_command SET status = 'succeeded', lease_token = 7" []
 
               refuses Code.constraintTrigger "reopening a finished command" (fun () ->
                   exec db "UPDATE fsm_command SET status = 'ready', lease_token = 0;" [])
@@ -102,7 +104,8 @@ let private triggerTests =
 
           fixture "the transition log is append-only"
           <| fun db ->
-              insertCommand db [ "status", box "succeeded"; "lease_token", box 1L ]
+              insertCommand db []
+              exec db "UPDATE fsm_command SET status = 'succeeded', lease_token = 1" []
               let id = commandId db "key-1"
 
               exec
@@ -118,7 +121,15 @@ let private triggerTests =
 
           fixture "retention may still delete a finished command"
           <| fun db ->
-              insertCommand db [ "status", box "dead_letter"; "lease_token", box 2L ]
+              insertCommand db []
+
+              exec
+                  db
+                  "INSERT INTO fsm_command_error SELECT command_id, 'machine', 0 FROM fsm_command;
+                       INSERT INTO fsm_command_error_machine(command_id, reason) SELECT command_id, 'retained failure' FROM fsm_command;
+                       UPDATE fsm_command SET status = 'dead_letter', lease_token = 2"
+                  []
+
               exec db "DELETE FROM fsm_command;" []
               Expect.equal (scalar db "SELECT count(*) FROM fsm_command;") "0" "deletes are not guarded" ]
 
@@ -167,7 +178,9 @@ let private planTests =
 
               Expect.exists
                   steps
-                  (fun step -> step.StartsWith "SEARCH t " && step.Contains "fsm_transition")
+                  (fun step ->
+                      step.StartsWith "SEARCH t "
+                      && (step.Contains "fsm_transition" || step.Contains "USING PRIMARY KEY"))
                   "the log alias seeks its index"
 
               Expect.exists

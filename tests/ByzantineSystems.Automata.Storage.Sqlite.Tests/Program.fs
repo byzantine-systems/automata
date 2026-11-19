@@ -1,5 +1,6 @@
 module ByzantineSystems.Automata.Storage.Sqlite.Tests.Program
 
+open ByzantineSystems.Automata.Storage
 open Expecto
 
 /// Nothing here is gated. An embedded database needs no service, so every suite runs wherever
@@ -9,12 +10,15 @@ let tests =
     testList
         "ByzantineSystems.Automata.Storage.Sqlite.Tests"
         [ SqlResourceTests.tests
+          LifecycleModel.tests
           DbTests.tests
           MigrationTests.tests
           SchemaContractTests.tests
+          IntegrityProperties.tests
           CommandInboxTests.tests
           ConformanceTests.tests
           FinalizeTests.tests
+          RecoveryProperties.tests
           ActionQueueTests.tests
           HistoryTests.tests
           ChartRegistryTests.tests
